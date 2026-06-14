@@ -1,0 +1,11 @@
+node_modules/
+.DS_Store
+.env
+.env.*
+*.log
+
+reports/lark-capabilities/*.json
+data/*.sqlite
+data/*.sqlite-*
+logs/
+lark-im-resources/

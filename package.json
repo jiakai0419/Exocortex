@@ -1,0 +1,11 @@
+{
+  "name": "exocortex",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "node --check scripts/*.mjs scripts/lib/*.mjs",
+    "help": "node scripts/help.mjs",
+    "test": "node --test tests/*.test.mjs"
+  }
+}
