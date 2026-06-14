@@ -1,5 +1,7 @@
 # Exocortex / 衍我
 
+[![CI](https://github.com/jiakai0419/Exocortex/actions/workflows/ci.yml/badge.svg)](https://github.com/jiakai0419/Exocortex/actions/workflows/ci.yml)
+
 衍我是一个本地优先的外部认知系统。当前阶段只做一件事：
 
 ```text
