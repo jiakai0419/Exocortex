@@ -161,7 +161,7 @@ test("buildPeopleContext resolves app sender from application API", () => {
       assert.equal(params.lang, "zh_cn");
       return {
         data: {
-          app: { app_id: "cli_app", app_name: "新人融入助手" },
+          app: { app_id: "cli_app", app_name: "Demo Workflow Bot" },
         },
       };
     },
@@ -183,10 +183,10 @@ test("buildPeopleContext resolves app sender from application API", () => {
     name: "Self Name",
   });
 
-  assert.equal(context.apps.get("cli_app"), "新人融入助手");
+  assert.equal(context.apps.get("cli_app"), "Demo Workflow Bot");
   const record = recordFromMessage(messages[0], "scope", "received", context);
   const canonical = JSON.parse(record.canonical_json);
-  assert.equal(canonical.sender_name, "新人融入助手");
+  assert.equal(canonical.sender_name, "Demo Workflow Bot");
   assert.equal(canonical.sender_name_source, "application_api");
   assert.equal(canonical.sender_name_confidence, "high");
 });
@@ -198,7 +198,7 @@ test("buildPeopleContext falls back to a unique chat bot when application API is
       if (args[0] === "im" && args[1] === "chat.members" && args[2] === "bots") {
         const params = JSON.parse(commandValue(args, "--params"));
         assert.equal(params.chat_id, "oc_group");
-        return { data: { items: [{ bot_id: "ou_bot", bot_name: "新人融入助手" }] } };
+        return { data: { items: [{ bot_id: "ou_bot", bot_name: "Demo Workflow Bot" }] } };
       }
       throw new Error(`unexpected command: ${args.join(" ")}`);
     },
@@ -217,10 +217,10 @@ test("buildPeopleContext falls back to a unique chat bot when application API is
   const context = adapter.buildPeopleContext(messages, adapterOpts(), null);
 
   assert.equal(context.apps.has("cli_app"), false);
-  assert.equal(context.app_fallbacks.get("oc_group:cli_app").name, "新人融入助手");
+  assert.equal(context.app_fallbacks.get("oc_group:cli_app").name, "Demo Workflow Bot");
   const record = recordFromMessage(messages[0], "scope", "received", context);
   const canonical = JSON.parse(record.canonical_json);
-  assert.equal(canonical.sender_name, "新人融入助手");
+  assert.equal(canonical.sender_name, "Demo Workflow Bot");
   assert.equal(canonical.sender_name_source, "chat_bot_unique");
   assert.equal(canonical.sender_name_confidence, "medium");
 });

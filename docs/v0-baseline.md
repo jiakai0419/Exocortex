@@ -20,25 +20,25 @@
 
 ```text
 npm run check                           passed
-npm test                                43 passed
+npm test                                passed
 node scripts/doctor.mjs                 fresh / syncing only when worker is active
 node scripts/doctor.mjs --live          healthy in a shell with keychain access
 node scripts/lark-im-quality.mjs        OK
 node scripts/lark-im-service.mjs status ACTIVE
 ```
 
-当前本地同步状态：
+当前本地同步状态应满足：
 
 ```text
-records total             30
-sent                       5
-received                   25
-received scopes enabled    4478
-received without cursor    0
-initial discovery          complete, 112 pages
-periodic reconcile         complete, 56 pages
-latest live probe missing  0
-latest live lag            0 ms
+records exist
+sent records exist
+received records exist
+received scopes are enabled
+received without cursor = 0
+initial discovery complete
+periodic reconcile complete
+latest live probe missing = 0
+latest live lag is acceptable
 ```
 
 历史失败仍保留在 `sync_runs` 中，这是事实记录。当前健康状态使用 `OK_WITH_HISTORY` 或 worker 正在跑时的 `SYNCING`，不等于当前故障。
@@ -121,11 +121,10 @@ sender_name_confidence
 当前历史 app sender 回溯结果：
 
 ```text
-official application api resolved  0
-permission denied app ids          2
-fallback resolved app ids          2
-fallback affected records          6
-ambiguous fallback                 0
+official application api path was attempted
+permission-denied app ids were handled without failing the sync
+fallback path resolved eligible app senders
+ambiguous fallback remained unresolved instead of guessed
 ```
 
 ## V0 不保证
