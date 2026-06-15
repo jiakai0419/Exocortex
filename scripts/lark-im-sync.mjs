@@ -24,7 +24,7 @@ import {
   sqliteExec,
   sqliteQuery,
   succeedMessageRun,
-} from "../src/storage/sqlite/ingestion-store.mjs";
+} from "../dist/storage/sqlite/ingestion-store.js";
 import {
   CHAT_DISCOVERY_SCOPE_ID,
   CHAT_HOT_DISCOVERY_SCOPE_ID,
@@ -314,11 +314,14 @@ function listReceivedScopes(dbPath, mode = "all") {
      ${orderBy}`,
     "list received scopes",
   );
-  return rows.map((row) => ({
-    ...row,
-    config: row.config_json ? JSON.parse(row.config_json) : {},
-    cursor: row.cursor_json ? JSON.parse(row.cursor_json) : null,
-  }));
+  return rows.map((row) => {
+    const scope = /** @type {ScopeRow} */ (row);
+    return {
+      ...scope,
+      config: scope.config_json ? JSON.parse(scope.config_json) : {},
+      cursor: scope.cursor_json ? JSON.parse(scope.cursor_json) : null,
+    };
+  });
 }
 
 /**

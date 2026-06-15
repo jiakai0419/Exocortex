@@ -6,7 +6,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "build:check": "npm run build && test -z \"$(git status --porcelain -- dist)\"",
-    "check": "npm run build && node --check scripts/*.mjs scripts/lib/*.mjs dist/terminal/*.js dist/runtime/worker/*.js src/diagnostics/*.mjs src/adapters/lark-im/*.mjs src/storage/sqlite/*.mjs",
+    "check": "npm run build && node --check scripts/*.mjs scripts/lib/*.mjs dist/terminal/*.js dist/runtime/worker/*.js dist/storage/sqlite/*.js src/diagnostics/*.mjs src/adapters/lark-im/*.mjs",
     "help": "node scripts/help.mjs",
     "test": "npm run build && node --test tests/*.test.mjs",
     "typecheck": "tsc -p tsconfig.json"

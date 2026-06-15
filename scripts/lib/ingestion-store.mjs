@@ -1,1 +1,1 @@
-export * from "../../src/storage/sqlite/ingestion-store.mjs";
+export * from "../../dist/storage/sqlite/ingestion-store.js";

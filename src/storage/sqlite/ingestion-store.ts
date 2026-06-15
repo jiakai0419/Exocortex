@@ -1,70 +1,65 @@
-// @ts-check
-
 import { spawnSync } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
-/**
- * @typedef {Record<string, any>} JsonObject
- *
- * @typedef {object} SyncScope
- * @property {string} id
- * @property {string} source_id
- * @property {string=} name
- * @property {number=} enabled
- * @property {string=} config_json
- * @property {string | null=} cursor_json
- * @property {JsonObject=} config
- * @property {JsonObject | null=} cursor
- *
- * @typedef {object} StoredRecord
- * @property {string} source_id
- * @property {string} first_seen_scope_id
- * @property {string} external_id
- * @property {string | null} external_version
- * @property {string} record_type
- * @property {string | null} occurred_at
- * @property {number} occurred_at_ms
- * @property {string | null} actor_id
- * @property {string | null} container_id
- * @property {string | null} direction
- * @property {string | null} title
- * @property {string} body
- * @property {string} content_hash
- * @property {string} canonical_json
- * @property {string} raw_json
- *
- * @typedef {object} WriteEffects
- * @property {number} inserted
- * @property {number} updated
- * @property {number} duplicate
- *
- * @typedef {"alive" | "dead" | "unknown"} OwnerState
- *
- * @typedef {object} RecoveryOptions
- * @property {string | null=} scopeId
- * @property {Date=} now
- * @property {((owner: string) => OwnerState)=} ownerState
- * @property {number=} orphanRunSeconds
- */
+type JsonObject = Record<string, any>;
 
-/** @param {unknown} value */
-function quoteSql(value) {
+type SyncScope = {
+  id: string;
+  source_id: string;
+  name?: string;
+  enabled?: number;
+  config_json?: string;
+  cursor_json?: string | null;
+  config?: JsonObject;
+  cursor?: JsonObject | null;
+};
+
+type StoredRecord = {
+  source_id: string;
+  first_seen_scope_id: string;
+  external_id: string;
+  external_version: string | null;
+  record_type: string;
+  occurred_at: string | null;
+  occurred_at_ms: number;
+  actor_id: string | null;
+  container_id: string | null;
+  direction: string | null;
+  title: string | null;
+  body: string;
+  content_hash: string;
+  canonical_json: string;
+  raw_json: string;
+};
+
+type WriteEffects = {
+  inserted: number;
+  updated: number;
+  duplicate: number;
+};
+
+type OwnerState = "alive" | "dead" | "unknown";
+
+type RecoveryOptions = {
+  scopeId?: string | null;
+  now?: Date;
+  ownerState?: (owner: string) => OwnerState;
+  orphanRunSeconds?: number;
+};
+
+type SqliteRow = Record<string, any>;
+
+function quoteSql(value: unknown) {
   if (value === null || value === undefined) return "NULL";
   return `'${String(value).replaceAll("'", "''")}'`;
 }
 
-/** @param {unknown} value */
-function sqlJson(value) {
+function sqlJson(value: unknown) {
   return quoteSql(JSON.stringify(value));
 }
 
-/**
- * @param {string} dbPath
- * @param {string} sql
- * @param {string} label
- */
-function sqliteExec(dbPath, sql, label) {
+function sqliteExec(dbPath: string, sql: string, label: string) {
   const result = spawnSync("sqlite3", [dbPath], {
     input: `.timeout 5000\nPRAGMA foreign_keys = ON;\n${sql}`,
     encoding: "utf8",
@@ -76,13 +71,7 @@ function sqliteExec(dbPath, sql, label) {
   return result.stdout;
 }
 
-/**
- * @param {string} dbPath
- * @param {string} sql
- * @param {string} label
- * @returns {any[]}
- */
-function sqliteQuery(dbPath, sql, label) {
+function sqliteQuery(dbPath: string, sql: string, label: string): SqliteRow[] {
   const result = spawnSync("sqlite3", ["-json", dbPath], {
     input: `.timeout 5000\nPRAGMA foreign_keys = ON;\n${sql}`,
     encoding: "utf8",
@@ -95,44 +84,31 @@ function sqliteQuery(dbPath, sql, label) {
   return trimmed ? JSON.parse(trimmed) : [];
 }
 
-/** @param {string} owner */
-function ownerPid(owner) {
+function ownerPid(owner: string) {
   const match = String(owner || "").match(/^pid:(\d+)$/);
   return match ? Number(match[1]) : null;
 }
 
-/**
- * @param {string} owner
- * @returns {OwnerState}
- */
-function defaultOwnerState(owner) {
+function defaultOwnerState(owner: string): OwnerState {
   const pid = ownerPid(owner);
   if (!pid) return "unknown";
   try {
     process.kill(pid, 0);
     return "alive";
   } catch (error) {
-    const err = /** @type {NodeJS.ErrnoException} */ (error);
+    const err = error as NodeJS.ErrnoException;
     if (err.code === "ESRCH") return "dead";
     if (err.code === "EPERM") return "alive";
     return "unknown";
   }
 }
 
-/**
- * @param {unknown} value
- * @returns {OwnerState}
- */
-function normalizeOwnerState(value) {
+function normalizeOwnerState(value: unknown): OwnerState {
   const state = String(value);
   return state === "alive" || state === "dead" || state === "unknown" ? state : "unknown";
 }
 
-/**
- * @param {string} dbPath
- * @param {RecoveryOptions} [options]
- */
-function recoverStaleSyncState(dbPath, options = {}) {
+function recoverStaleSyncState(dbPath: string, options: RecoveryOptions = {}) {
   const {
     scopeId = null,
     now = new Date(),
@@ -151,8 +127,8 @@ function recoverStaleSyncState(dbPath, options = {}) {
     "read sync locks for recovery",
   );
 
-  const staleLocks = [];
-  const activeExpiredLocks = [];
+  const staleLocks: Array<SqliteRow & { reason: string }> = [];
+  const activeExpiredLocks: SqliteRow[] = [];
   for (const lock of locks) {
     const state = normalizeOwnerState(ownerState(lock.locked_by));
     const expiresAtMs = Date.parse(lock.expires_at);
@@ -240,8 +216,7 @@ COMMIT;
   };
 }
 
-/** @param {string} dbPath */
-function ensureInitialized(dbPath) {
+function ensureInitialized(dbPath: string) {
   mkdirSync(dirname(dbPath), { recursive: true });
   const result = spawnSync("node", ["scripts/init-ingestion-core.mjs", "--db", dbPath], {
     encoding: "utf8",
@@ -252,12 +227,7 @@ function ensureInitialized(dbPath) {
   }
 }
 
-/**
- * @param {string} dbPath
- * @param {string} scopeId
- * @returns {SyncScope}
- */
-function readScope(dbPath, scopeId) {
+function readScope(dbPath: string, scopeId: string): SyncScope {
   const rows = sqliteQuery(
     dbPath,
     `SELECT id, source_id, name, enabled, config_json, cursor_json
@@ -267,20 +237,15 @@ function readScope(dbPath, scopeId) {
     `read scope ${scopeId}`,
   );
   if (!rows[0]) throw new Error(`sync scope not found: ${scopeId}`);
+  const row = rows[0] as SyncScope;
   return {
-    ...rows[0],
-    config: rows[0].config_json ? JSON.parse(rows[0].config_json) : {},
-    cursor: rows[0].cursor_json ? JSON.parse(rows[0].cursor_json) : null,
+    ...row,
+    config: row.config_json ? JSON.parse(row.config_json) : {},
+    cursor: row.cursor_json ? JSON.parse(row.cursor_json) : null,
   };
 }
 
-/**
- * @param {string} dbPath
- * @param {string} scopeId
- * @param {number} ttlSeconds
- * @param {string} [owner]
- */
-function acquireLock(dbPath, scopeId, ttlSeconds, owner = `pid:${process.pid}`) {
+function acquireLock(dbPath: string, scopeId: string, ttlSeconds: number, owner = `pid:${process.pid}`) {
   const now = new Date();
   const expires = new Date(now.getTime() + ttlSeconds * 1000);
   recoverStaleSyncState(dbPath, { scopeId, now });
@@ -303,12 +268,7 @@ COMMIT;
   }
 }
 
-/**
- * @param {string} dbPath
- * @param {string} scopeId
- * @param {string} [owner]
- */
-function releaseLock(dbPath, scopeId, owner = `pid:${process.pid}`) {
+function releaseLock(dbPath: string, scopeId: string, owner = `pid:${process.pid}`) {
   sqliteExec(
     dbPath,
     `DELETE FROM sync_locks WHERE scope_id = ${quoteSql(scopeId)} AND locked_by = ${quoteSql(owner)};`,
@@ -316,12 +276,7 @@ function releaseLock(dbPath, scopeId, owner = `pid:${process.pid}`) {
   );
 }
 
-/**
- * @param {string} dbPath
- * @param {SyncScope} scope
- * @param {JsonObject} [metadata]
- */
-function createRun(dbPath, scope, metadata = { runner: "scripts/lark-im-sync.mjs" }) {
+function createRun(dbPath: string, scope: SyncScope, metadata: JsonObject = { runner: "scripts/lark-im-sync.mjs" }) {
   const rows = sqliteQuery(
     dbPath,
     `INSERT INTO sync_runs (source_id, scope_id, status, cursor_before_json, metadata_json)
@@ -338,13 +293,7 @@ function createRun(dbPath, scope, metadata = { runner: "scripts/lark-im-sync.mjs
   return rows[0].id;
 }
 
-/**
- * @param {string} dbPath
- * @param {SyncScope} scope
- * @param {number} runId
- * @param {Error} error
- */
-function failRun(dbPath, scope, runId, error) {
+function failRun(dbPath: string, scope: SyncScope, runId: number, error: Error) {
   const now = new Date().toISOString();
   sqliteExec(
     dbPath,
@@ -366,13 +315,7 @@ COMMIT;
   );
 }
 
-/**
- * @param {string} dbPath
- * @param {string} sourceId
- * @param {StoredRecord[]} records
- * @returns {Map<string, string>}
- */
-function existingRecordMap(dbPath, sourceId, records) {
+function existingRecordMap(dbPath: string, sourceId: string, records: StoredRecord[]) {
   if (records.length === 0) return new Map();
   const ids = records.map((record) => quoteSql(record.external_id)).join(", ");
   const rows = sqliteQuery(
@@ -386,8 +329,7 @@ function existingRecordMap(dbPath, sourceId, records) {
   return new Map(rows.map((row) => [row.external_id, row.content_hash]));
 }
 
-/** @param {StoredRecord[]} records */
-function upsertRecordsSql(records) {
+function upsertRecordsSql(records: StoredRecord[]) {
   return records
     .map(
       (record) => `
@@ -446,13 +388,7 @@ ON CONFLICT(source_id, external_id) DO UPDATE SET
     .join("\n");
 }
 
-/**
- * @param {string} dbPath
- * @param {string} sourceId
- * @param {StoredRecord[]} records
- * @returns {WriteEffects}
- */
-function countWriteEffects(dbPath, sourceId, records) {
+function countWriteEffects(dbPath: string, sourceId: string, records: StoredRecord[]): WriteEffects {
   const existing = existingRecordMap(dbPath, sourceId, records);
   let inserted = 0;
   let updated = 0;
@@ -465,17 +401,15 @@ function countWriteEffects(dbPath, sourceId, records) {
   return { inserted, updated, duplicate };
 }
 
-/**
- * @param {string} dbPath
- * @param {SyncScope} scope
- * @param {number} runId
- * @param {StoredRecord[]} records
- * @param {number} scannedCount
- * @param {JsonObject | null} cursor
- * @param {JsonObject} metadata
- * @returns {WriteEffects}
- */
-function succeedRecordRun(dbPath, scope, runId, records, scannedCount, cursor, metadata) {
+function succeedRecordRun(
+  dbPath: string,
+  scope: SyncScope,
+  runId: number,
+  records: StoredRecord[],
+  scannedCount: number,
+  cursor: JsonObject | null,
+  metadata: JsonObject,
+): WriteEffects {
   const effects = countWriteEffects(dbPath, scope.source_id, records);
   const now = new Date().toISOString();
   sqliteExec(

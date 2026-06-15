@@ -12,7 +12,7 @@ import {
   readScope,
   sqliteExec,
   succeedMessageRun,
-} from "../src/storage/sqlite/ingestion-store.mjs";
+} from "../dist/storage/sqlite/ingestion-store.js";
 import { cursorAfter, recordFromMessage } from "../scripts/lark-im-sync.mjs";
 
 function tempDb(t) {

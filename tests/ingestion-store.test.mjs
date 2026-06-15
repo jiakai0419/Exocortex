@@ -8,13 +8,14 @@ import {
   acquireLock,
   createRun,
   ensureInitialized,
+  failRun,
   readScope,
   recoverStaleSyncState,
   releaseLock,
   sqliteExec,
   sqliteQuery,
   succeedRecordRun,
-} from "../src/storage/sqlite/ingestion-store.mjs";
+} from "../dist/storage/sqlite/ingestion-store.js";
 import * as ingestionStoreShim from "../scripts/lib/ingestion-store.mjs";
 
 function tempDir(t) {
@@ -68,6 +69,26 @@ function record(overrides = {}) {
     ...overrides,
   };
 }
+
+test("readScope parses config and cursor JSON into stable objects", (t) => {
+  const dbPath = tempDb(t);
+  const scope = readScope(dbPath, "lark.im.sent_by_me");
+  const cursor = { kind: "test.cursor/v1", created_at_ms: 1700000000000 };
+  sqliteExec(
+    dbPath,
+    `UPDATE sync_scopes
+     SET config_json = '{"adapter":"synthetic"}',
+         cursor_json = '${JSON.stringify(cursor)}'
+     WHERE id = '${scope.id}';`,
+    "seed scope config and cursor",
+  );
+
+  const updated = readScope(dbPath, "lark.im.sent_by_me");
+
+  assert.equal(updated.id, "lark.im.sent_by_me");
+  assert.deepEqual(updated.config, { adapter: "synthetic" });
+  assert.deepEqual(updated.cursor, cursor);
+});
 
 test("scope locks reject competing owners and release only by owner", (t) => {
   const dbPath = tempDb(t);
@@ -217,4 +238,37 @@ test("record runs are source-agnostic and count insert, update, duplicate effect
       content_hash: "hash:2",
     },
   ]);
+});
+
+test("failed record runs preserve the previous successful cursor", (t) => {
+  const dbPath = tempDb(t);
+  const scope = installTestScope(dbPath);
+  const successfulCursor = { kind: "test.cursor/v1", occurred_at_ms: record().occurred_at_ms };
+  const successfulRunId = createRun(dbPath, scope, { runner: "tests/ingestion-store.test.mjs" });
+  succeedRecordRun(dbPath, scope, successfulRunId, [record()], 1, successfulCursor, { test: true });
+
+  const updatedScope = readScope(dbPath, scope.id);
+  const failedRunId = createRun(dbPath, updatedScope, { runner: "tests/ingestion-store.test.mjs" });
+  failRun(dbPath, updatedScope, failedRunId, new Error("synthetic failure"));
+
+  const finalScope = readScope(dbPath, scope.id);
+  assert.deepEqual(finalScope.cursor, successfulCursor);
+  assert.equal(
+    sqliteQuery(dbPath, `SELECT last_error_run_id FROM sync_scopes WHERE id = '${scope.id}';`, "read last error")[0]
+      .last_error_run_id,
+    failedRunId,
+  );
+  assert.deepEqual(
+    sqliteQuery(
+      dbPath,
+      `SELECT status, cursor_after_json, error_type, error_message FROM sync_runs WHERE id = ${Number(failedRunId)};`,
+      "read failed run",
+    )[0],
+    {
+      status: "failed",
+      cursor_after_json: null,
+      error_type: "Error",
+      error_message: "synthetic failure",
+    },
+  );
 });
