@@ -4,7 +4,8 @@ import test from "node:test";
 import {
   prepareRecords,
   readBoundedPages,
-} from "../scripts/lib/lark-im-core.mjs";
+} from "../src/adapters/lark-im/core.mjs";
+import { readBoundedPages as shimReadBoundedPages } from "../scripts/lib/lark-im-core.mjs";
 
 function message(id, occurredAtMs) {
   return {
@@ -39,6 +40,10 @@ test("readBoundedPages reads every page before returning success", () => {
   assert.deepEqual(calls, ["", "p2"]);
   assert.equal(result.pages, 2);
   assert.deepEqual(result.messages.map((item) => item.message_id), ["om_1", "om_2"]);
+});
+
+test("lark im core shim re-exports the src implementation", () => {
+  assert.equal(shimReadBoundedPages, readBoundedPages);
 });
 
 test("readBoundedPages fails when a continuing page lacks a page token", () => {

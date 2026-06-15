@@ -6,7 +6,7 @@ import {
   isRestrictedModeError,
   isTransientLarkFailure,
 } from "../scripts/lib/lark-im-adapter.mjs";
-import { recordFromMessage } from "../scripts/lib/lark-im-core.mjs";
+import { recordFromMessage } from "../src/adapters/lark-im/core.mjs";
 
 function adapterOpts(overrides = {}) {
   return {
