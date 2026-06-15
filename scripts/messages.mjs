@@ -197,6 +197,11 @@ function messageTypeLabel(type) {
     post: "富文本",
     text: "文本",
     image: "图片",
+    sticker: "贴纸",
+    file: "文件",
+    audio: "语音",
+    video: "视频",
+    system: "系统",
   };
   const key = String(type);
   return labels[key] || key;
@@ -215,6 +220,11 @@ function isInvalidRenderedContent(value) {
 function displayBody(body, canonical, raw) {
   if ((canonical.deleted === true || raw.deleted === true) && isInvalidRenderedContent(body)) {
     return "[已撤回/已删除：飞书未返回原始富文本内容]";
+  }
+  const messageType = canonical.msg_type || raw.msg_type || raw.message_type || null;
+  if (messageType === "sticker" && String(body || "").trim() === "[Sticker]") {
+    const position = raw.message_position ? `，位置 ${raw.message_position}` : "";
+    return `贴纸消息（飞书未返回贴纸资源${position}）`;
   }
   return body;
 }
@@ -244,6 +254,8 @@ function enrichRow(row) {
   const messageType = canonical.msg_type || raw.msg_type || raw.message_type || null;
   const partnerId = chatPartner?.open_id || chatPartner?.id || chatPartner?.user_id || null;
   const partnerName = chatPartner?.name || chatPartner?.display_name || null;
+  const p2pPartnerName = partnerName || chatName;
+  const p2pPartnerId = partnerId || chatId;
   const isP2p = chatType === "p2p";
   const isGroupLike = !isP2p;
   return {
@@ -260,7 +272,7 @@ function enrichRow(row) {
       recipient:
         isP2p
           ? row.direction === "sent"
-            ? nameOrId(partnerName, partnerId)
+            ? nameOrId(p2pPartnerName, p2pPartnerId)
             : "我"
           : null,
       chat: isGroupLike ? nameOrId(chatName, chatId) : null,
