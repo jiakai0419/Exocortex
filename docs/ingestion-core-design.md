@@ -557,7 +557,7 @@ fallback 结果必须写入来源和置信度，例如 `sender_name_source=chat_
 读取路径：
 
 ```text
-lark-cli im +chat-list --as user --exclude-muted --types group
+lark-cli im +chat-list --as user --exclude-muted --types group,p2p
   -> paginate with page_token cursor
   -> create or enable one received message Scope per chat
 ```

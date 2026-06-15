@@ -23,6 +23,7 @@ const LABEL = "com.exocortex.lark-im-worker";
 const DEFAULT_LOG_DIR = "logs/lark-im";
 const DEFAULT_MAX_CHAT_PAGES = 300;
 const DEFAULT_RECONCILE_INTERVAL_HOURS = 24;
+const DEFAULT_CHAT_TYPES = "group,p2p";
 
 /**
  * @typedef {"install" | "start" | "stop" | "restart" | "status" | "tail" | "uninstall" | string} ServiceCommand
@@ -36,6 +37,7 @@ const DEFAULT_RECONCILE_INTERVAL_HOURS = 24;
  * @property {number} discoveryPagesPerCycle
  * @property {number} maxChatPages
  * @property {number} reconcileIntervalHours
+ * @property {string} chatTypes
  * @property {string} logDir
  * @property {number} lines
  *
@@ -72,6 +74,7 @@ Options:
   --discovery-pages-per-cycle <n>     Full discovery pages per cycle. Default: 1
   --max-chat-pages <n>                Max full-discovery pages per snapshot. Default: ${DEFAULT_MAX_CHAT_PAGES}
   --reconcile-interval-hours <n>      Minimum hours between full reconcile snapshots. Default: ${DEFAULT_RECONCILE_INTERVAL_HOURS}
+  --chat-types <types>                Chat types for received discovery. Default: ${DEFAULT_CHAT_TYPES}
   --log-dir <path>                    Log directory. Default: ${DEFAULT_LOG_DIR}
   --lines <n>                         Lines for tail. Default: 20
   --help                              Show this help.
@@ -105,6 +108,7 @@ function parseArgs(argv) {
     discoveryPagesPerCycle: 1,
     maxChatPages: DEFAULT_MAX_CHAT_PAGES,
     reconcileIntervalHours: DEFAULT_RECONCILE_INTERVAL_HOURS,
+    chatTypes: DEFAULT_CHAT_TYPES,
     logDir: DEFAULT_LOG_DIR,
     lines: 20,
   };
@@ -129,6 +133,7 @@ function parseArgs(argv) {
       opts.maxChatPages = parsePositiveInt(next, "max-chat-pages");
     else if (arg === "--reconcile-interval-hours")
       opts.reconcileIntervalHours = parsePositiveInt(next, "reconcile-interval-hours");
+    else if (arg === "--chat-types") opts.chatTypes = next;
     else if (arg === "--log-dir") opts.logDir = next;
     else if (arg === "--lines") opts.lines = parsePositiveInt(next, "lines");
     else throw new Error(`Unknown option: ${arg}`);
@@ -201,6 +206,8 @@ function plistXml(opts) {
     <string>${opts.maxChatPages}</string>
     <string>--reconcile-interval-hours</string>
     <string>${opts.reconcileIntervalHours}</string>
+    <string>--chat-types</string>
+    <string>${opts.chatTypes}</string>
     <string>--log-dir</string>
     <string>${logDir}</string>
   </array>

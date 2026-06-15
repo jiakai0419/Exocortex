@@ -9,6 +9,7 @@
  * @property {number} receivedScopesPerCycle
  * @property {number} maxChatPages
  * @property {number} reconcileIntervalHours
+ * @property {string=} chatTypes
  * @property {string=} logDir
  *
  * @typedef {object} WorkerStepSpec
@@ -73,6 +74,7 @@
 
 /** @param {WorkerCycleOptions} opts */
 function buildCycleStepSpecs(opts) {
+  const chatTypes = opts.chatTypes || "group,p2p";
   return [
     {
       name: "sent",
@@ -91,6 +93,8 @@ function buildCycleStepSpecs(opts) {
         String(opts.hotDiscoveryPagesPerCycle),
         "--max-chat-pages",
         String(opts.maxChatPages),
+        "--chat-types",
+        chatTypes,
       ],
     },
     {
@@ -119,6 +123,8 @@ function buildCycleStepSpecs(opts) {
         String(opts.discoveryPagesPerCycle),
         "--max-chat-pages",
         String(opts.maxChatPages),
+        "--chat-types",
+        chatTypes,
       ],
     },
     {
@@ -136,6 +142,8 @@ function buildCycleStepSpecs(opts) {
         String(opts.maxChatPages),
         "--reconcile-interval-hours",
         String(opts.reconcileIntervalHours),
+        "--chat-types",
+        chatTypes,
       ],
     },
     {

@@ -52,6 +52,7 @@ const DEFAULT_PAGE_SIZE = 50;
 const DEFAULT_MAX_PAGES = 40;
 const DEFAULT_CHAT_PAGE_SIZE = 100;
 const DEFAULT_MAX_CHAT_PAGES = 100;
+const DEFAULT_CHAT_TYPES = "group,p2p";
 const DEFAULT_STABLE_HORIZON_SECONDS = 30;
 const DEFAULT_RETRIES = 4;
 const DEFAULT_RETRY_DELAY_MS = 2000;
@@ -138,7 +139,7 @@ Options:
   --reconcile-interval-hours <n>
                               Minimum hours between completed reconcile snapshots. Default: 24
   --received-mode <mode>      all | hot | catchup. Default: all
-  --chat-types <types>        Chat types for discovery. Default: group
+  --chat-types <types>        Chat types for discovery. Default: ${DEFAULT_CHAT_TYPES}
   --stable-horizon-seconds <n>
                               Do not advance message cursors into the freshest N seconds unless --end is explicit.
                               Default: ${DEFAULT_STABLE_HORIZON_SECONDS}
@@ -205,7 +206,7 @@ function parseArgs(argv) {
     discoveryMode: "cursor",
     reconcileIntervalHours: 24,
     receivedMode: "all",
-    chatTypes: "group",
+    chatTypes: DEFAULT_CHAT_TYPES,
     stableHorizonSeconds: DEFAULT_STABLE_HORIZON_SECONDS,
     endExplicit: false,
     lockTtlSeconds: 600,

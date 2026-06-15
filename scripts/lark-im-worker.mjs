@@ -17,6 +17,7 @@ const DEFAULT_DISCOVERY_PAGES_PER_CYCLE = 1;
 const DEFAULT_HOT_DISCOVERY_PAGES_PER_CYCLE = 5;
 const DEFAULT_MAX_CHAT_PAGES = 300;
 const DEFAULT_RECONCILE_INTERVAL_HOURS = 24;
+const DEFAULT_CHAT_TYPES = "group,p2p";
 
 /**
  * @typedef {object} WorkerOptions
@@ -28,6 +29,7 @@ const DEFAULT_RECONCILE_INTERVAL_HOURS = 24;
  * @property {number} hotDiscoveryPagesPerCycle
  * @property {number} maxChatPages
  * @property {number} reconcileIntervalHours
+ * @property {string} chatTypes
  * @property {string} logDir
  * @property {number | null} maxCycles
  *
@@ -55,6 +57,7 @@ Options:
   --discovery-pages-per-cycle <n>     Full discovery pages per cycle. Default: ${DEFAULT_DISCOVERY_PAGES_PER_CYCLE}
   --max-chat-pages <n>                Max full-discovery pages per snapshot. Default: ${DEFAULT_MAX_CHAT_PAGES}
   --reconcile-interval-hours <n>      Minimum hours between full reconcile snapshots. Default: ${DEFAULT_RECONCILE_INTERVAL_HOURS}
+  --chat-types <types>                Chat types for received discovery. Default: ${DEFAULT_CHAT_TYPES}
   --log-dir <path>                    JSONL log directory. Default: logs/lark-im
   --max-cycles <n>                    Stop after N cycles. Omit to run forever.
   --once                              Run one cycle and exit.
@@ -84,6 +87,7 @@ function parseArgs(argv) {
     hotDiscoveryPagesPerCycle: DEFAULT_HOT_DISCOVERY_PAGES_PER_CYCLE,
     maxChatPages: DEFAULT_MAX_CHAT_PAGES,
     reconcileIntervalHours: DEFAULT_RECONCILE_INTERVAL_HOURS,
+    chatTypes: DEFAULT_CHAT_TYPES,
     logDir: "logs/lark-im",
     maxCycles: null,
   };
@@ -114,6 +118,7 @@ function parseArgs(argv) {
       opts.maxChatPages = parsePositiveInt(next, "max-chat-pages");
     else if (arg === "--reconcile-interval-hours")
       opts.reconcileIntervalHours = parsePositiveInt(next, "reconcile-interval-hours");
+    else if (arg === "--chat-types") opts.chatTypes = next;
     else if (arg === "--log-dir") opts.logDir = next;
     else if (arg === "--max-cycles") opts.maxCycles = parsePositiveInt(next, "max-cycles");
     else throw new Error(`Unknown option: ${arg}`);

@@ -17,7 +17,7 @@
 3. 我收到过的消息如何实现：
    - 当前阶段不建模“已读”。
    - `received` 的第一版定义是：用户身份可拉取、发送者不是我、且来自非免打扰会话的消息。
-   - 默认先做非免打扰群；单聊可以后续用 `--chat-types p2p,group` 纳入。
+   - 默认纳入非免打扰群聊和私聊：`--chat-types group,p2p`。
 
 ## 低隐私原则
 
@@ -124,4 +124,4 @@ AND chat is not muted
 AND chat is within the selected chat types
 ```
 
-默认 chat types 是 `group`。这让第一版保持朴素：只记“我发过的”和“我收到过的”，不引入已读模型。
+默认 chat types 是 `group,p2p`。这让第一版覆盖“我发过的”和“我收到过的”，但仍不引入已读模型。

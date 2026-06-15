@@ -18,6 +18,7 @@ function opts(overrides = {}) {
     receivedScopesPerCycle: 50,
     maxChatPages: 300,
     reconcileIntervalHours: 24,
+    chatTypes: "group,p2p",
     ...overrides,
   };
 }
@@ -44,6 +45,7 @@ test("worker cycle runs sent, hot lane, then catch-up lane in a stable order", (
   assert.equal(argValue(hotDiscover.args, "--discovery-mode"), "hot");
   assert.equal(argValue(hotDiscover.args, "--discovery-pages-per-run"), "5");
   assert.equal(argValue(hotDiscover.args, "--max-chat-pages"), "300");
+  assert.equal(argValue(hotDiscover.args, "--chat-types"), "group,p2p");
 
   const hotReceived = specs.find((spec) => spec.name === "received-hot");
   assert.equal(argValue(hotReceived.args, "--scope"), "received");
@@ -54,12 +56,14 @@ test("worker cycle runs sent, hot lane, then catch-up lane in a stable order", (
   assert.equal(argValue(catchupDiscover.args, "--discovery-mode"), "cursor");
   assert.equal(argValue(catchupDiscover.args, "--discovery-pages-per-run"), "1");
   assert.equal(argValue(catchupDiscover.args, "--max-chat-pages"), "300");
+  assert.equal(argValue(catchupDiscover.args, "--chat-types"), "group,p2p");
 
   const reconcileDiscover = specs.find((spec) => spec.name === "discover-reconcile");
   assert.equal(argValue(reconcileDiscover.args, "--discovery-mode"), "reconcile");
   assert.equal(argValue(reconcileDiscover.args, "--discovery-pages-per-run"), "1");
   assert.equal(argValue(reconcileDiscover.args, "--max-chat-pages"), "300");
   assert.equal(argValue(reconcileDiscover.args, "--reconcile-interval-hours"), "24");
+  assert.equal(argValue(reconcileDiscover.args, "--chat-types"), "group,p2p");
 
   const catchupReceived = specs.find((spec) => spec.name === "received-catchup");
   assert.equal(argValue(catchupReceived.args, "--received-mode"), "catchup");
