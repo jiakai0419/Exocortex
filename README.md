@@ -64,6 +64,7 @@ node scripts/doctor.mjs
 - [Operations](docs/operations.md)
 - [Ingestion core design](docs/ingestion-core-design.md)
 - [Terminal experience](docs/terminal-experience.md)
+- [Language and refactor plan](docs/language-and-refactor-plan.md)
 - [Sync core hardening plan](docs/sync-core-hardening-plan.md)
 - [Lark capability probe](docs/lark-capability-probe.md)
 

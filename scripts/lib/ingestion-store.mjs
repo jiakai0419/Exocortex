@@ -1,16 +1,69 @@
+// @ts-check
+
 import { spawnSync } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
+/**
+ * @typedef {Record<string, any>} JsonObject
+ *
+ * @typedef {object} SyncScope
+ * @property {string} id
+ * @property {string} source_id
+ * @property {string=} name
+ * @property {number=} enabled
+ * @property {string=} config_json
+ * @property {string | null=} cursor_json
+ * @property {JsonObject=} config
+ * @property {JsonObject | null=} cursor
+ *
+ * @typedef {object} StoredRecord
+ * @property {string} source_id
+ * @property {string} first_seen_scope_id
+ * @property {string} external_id
+ * @property {string | null} external_version
+ * @property {string} record_type
+ * @property {string | null} occurred_at
+ * @property {number} occurred_at_ms
+ * @property {string | null} actor_id
+ * @property {string | null} container_id
+ * @property {string | null} direction
+ * @property {string | null} title
+ * @property {string} body
+ * @property {string} content_hash
+ * @property {string} canonical_json
+ * @property {string} raw_json
+ *
+ * @typedef {object} WriteEffects
+ * @property {number} inserted
+ * @property {number} updated
+ * @property {number} duplicate
+ *
+ * @typedef {"alive" | "dead" | "unknown"} OwnerState
+ *
+ * @typedef {object} RecoveryOptions
+ * @property {string | null=} scopeId
+ * @property {Date=} now
+ * @property {((owner: string) => OwnerState)=} ownerState
+ * @property {number=} orphanRunSeconds
+ */
+
+/** @param {unknown} value */
 function quoteSql(value) {
   if (value === null || value === undefined) return "NULL";
   return `'${String(value).replaceAll("'", "''")}'`;
 }
 
+/** @param {unknown} value */
 function sqlJson(value) {
   return quoteSql(JSON.stringify(value));
 }
 
+/**
+ * @param {string} dbPath
+ * @param {string} sql
+ * @param {string} label
+ */
 function sqliteExec(dbPath, sql, label) {
   const result = spawnSync("sqlite3", [dbPath], {
     input: `.timeout 5000\nPRAGMA foreign_keys = ON;\n${sql}`,
@@ -23,6 +76,12 @@ function sqliteExec(dbPath, sql, label) {
   return result.stdout;
 }
 
+/**
+ * @param {string} dbPath
+ * @param {string} sql
+ * @param {string} label
+ * @returns {any[]}
+ */
 function sqliteQuery(dbPath, sql, label) {
   const result = spawnSync("sqlite3", ["-json", dbPath], {
     input: `.timeout 5000\nPRAGMA foreign_keys = ON;\n${sql}`,
@@ -36,11 +95,16 @@ function sqliteQuery(dbPath, sql, label) {
   return trimmed ? JSON.parse(trimmed) : [];
 }
 
+/** @param {string} owner */
 function ownerPid(owner) {
   const match = String(owner || "").match(/^pid:(\d+)$/);
   return match ? Number(match[1]) : null;
 }
 
+/**
+ * @param {string} owner
+ * @returns {OwnerState}
+ */
 function defaultOwnerState(owner) {
   const pid = ownerPid(owner);
   if (!pid) return "unknown";
@@ -48,16 +112,26 @@ function defaultOwnerState(owner) {
     process.kill(pid, 0);
     return "alive";
   } catch (error) {
-    if (error?.code === "ESRCH") return "dead";
-    if (error?.code === "EPERM") return "alive";
+    const err = /** @type {NodeJS.ErrnoException} */ (error);
+    if (err.code === "ESRCH") return "dead";
+    if (err.code === "EPERM") return "alive";
     return "unknown";
   }
 }
 
+/**
+ * @param {unknown} value
+ * @returns {OwnerState}
+ */
 function normalizeOwnerState(value) {
-  return ["alive", "dead", "unknown"].includes(value) ? value : "unknown";
+  const state = String(value);
+  return state === "alive" || state === "dead" || state === "unknown" ? state : "unknown";
 }
 
+/**
+ * @param {string} dbPath
+ * @param {RecoveryOptions} [options]
+ */
 function recoverStaleSyncState(dbPath, options = {}) {
   const {
     scopeId = null,
@@ -166,6 +240,7 @@ COMMIT;
   };
 }
 
+/** @param {string} dbPath */
 function ensureInitialized(dbPath) {
   mkdirSync(dirname(dbPath), { recursive: true });
   const result = spawnSync("node", ["scripts/init-ingestion-core.mjs", "--db", dbPath], {
@@ -177,6 +252,11 @@ function ensureInitialized(dbPath) {
   }
 }
 
+/**
+ * @param {string} dbPath
+ * @param {string} scopeId
+ * @returns {SyncScope}
+ */
 function readScope(dbPath, scopeId) {
   const rows = sqliteQuery(
     dbPath,
@@ -194,6 +274,12 @@ function readScope(dbPath, scopeId) {
   };
 }
 
+/**
+ * @param {string} dbPath
+ * @param {string} scopeId
+ * @param {number} ttlSeconds
+ * @param {string} [owner]
+ */
 function acquireLock(dbPath, scopeId, ttlSeconds, owner = `pid:${process.pid}`) {
   const now = new Date();
   const expires = new Date(now.getTime() + ttlSeconds * 1000);
@@ -211,11 +297,17 @@ COMMIT;
     );
     return true;
   } catch (error) {
-    if (/UNIQUE constraint failed: sync_locks\.scope_id/.test(String(error.message || error))) return false;
+    const message = error instanceof Error ? error.message : String(error);
+    if (/UNIQUE constraint failed: sync_locks\.scope_id/.test(message)) return false;
     throw error;
   }
 }
 
+/**
+ * @param {string} dbPath
+ * @param {string} scopeId
+ * @param {string} [owner]
+ */
 function releaseLock(dbPath, scopeId, owner = `pid:${process.pid}`) {
   sqliteExec(
     dbPath,
@@ -224,6 +316,11 @@ function releaseLock(dbPath, scopeId, owner = `pid:${process.pid}`) {
   );
 }
 
+/**
+ * @param {string} dbPath
+ * @param {SyncScope} scope
+ * @param {JsonObject} [metadata]
+ */
 function createRun(dbPath, scope, metadata = { runner: "scripts/lark-im-sync.mjs" }) {
   const rows = sqliteQuery(
     dbPath,
@@ -241,6 +338,12 @@ function createRun(dbPath, scope, metadata = { runner: "scripts/lark-im-sync.mjs
   return rows[0].id;
 }
 
+/**
+ * @param {string} dbPath
+ * @param {SyncScope} scope
+ * @param {number} runId
+ * @param {Error} error
+ */
 function failRun(dbPath, scope, runId, error) {
   const now = new Date().toISOString();
   sqliteExec(
@@ -263,6 +366,12 @@ COMMIT;
   );
 }
 
+/**
+ * @param {string} dbPath
+ * @param {string} sourceId
+ * @param {StoredRecord[]} records
+ * @returns {Map<string, string>}
+ */
 function existingRecordMap(dbPath, sourceId, records) {
   if (records.length === 0) return new Map();
   const ids = records.map((record) => quoteSql(record.external_id)).join(", ");
@@ -277,6 +386,7 @@ function existingRecordMap(dbPath, sourceId, records) {
   return new Map(rows.map((row) => [row.external_id, row.content_hash]));
 }
 
+/** @param {StoredRecord[]} records */
 function upsertRecordsSql(records) {
   return records
     .map(
@@ -336,6 +446,12 @@ ON CONFLICT(source_id, external_id) DO UPDATE SET
     .join("\n");
 }
 
+/**
+ * @param {string} dbPath
+ * @param {string} sourceId
+ * @param {StoredRecord[]} records
+ * @returns {WriteEffects}
+ */
 function countWriteEffects(dbPath, sourceId, records) {
   const existing = existingRecordMap(dbPath, sourceId, records);
   let inserted = 0;
@@ -349,6 +465,16 @@ function countWriteEffects(dbPath, sourceId, records) {
   return { inserted, updated, duplicate };
 }
 
+/**
+ * @param {string} dbPath
+ * @param {SyncScope} scope
+ * @param {number} runId
+ * @param {StoredRecord[]} records
+ * @param {number} scannedCount
+ * @param {JsonObject | null} cursor
+ * @param {JsonObject} metadata
+ * @returns {WriteEffects}
+ */
 function succeedRecordRun(dbPath, scope, runId, records, scannedCount, cursor, metadata) {
   const effects = countWriteEffects(dbPath, scope.source_id, records);
   const now = new Date().toISOString();

@@ -1,4 +1,87 @@
+// @ts-check
+
 import { createHash } from "node:crypto";
+
+/**
+ * @typedef {"sent" | "received"} MessageDirection
+ *
+ * @typedef {object} MessageCursor
+ * @property {string=} kind
+ * @property {number=} created_at_ms
+ * @property {string=} message_id
+ * @property {string=} updated_at
+ *
+ * @typedef {object} LarkMessage
+ * @property {string=} message_id
+ * @property {string=} id
+ * @property {string | number=} create_time
+ * @property {string | number=} created_at
+ * @property {string | number=} create_time_ms
+ * @property {string=} update_time
+ * @property {string=} msg_type
+ * @property {string=} message_type
+ * @property {Record<string, any>=} sender
+ * @property {string=} chat_id
+ * @property {Record<string, any>=} chat
+ * @property {string=} chat_type
+ * @property {string=} chat_name
+ * @property {Record<string, any>=} chat_partner
+ * @property {string=} thread_id
+ * @property {boolean=} deleted
+ * @property {boolean=} updated
+ * @property {Array<Record<string, any>>=} mentions
+ * @property {unknown=} content
+ *
+ * @typedef {object} NameDetails
+ * @property {string} name
+ * @property {string} source
+ * @property {string} confidence
+ *
+ * @typedef {string | NameDetails | Record<string, any>} NameValue
+ *
+ * @typedef {object} PeopleContext
+ * @property {Map<string, NameValue>=} apps
+ * @property {Map<string, NameValue>=} app_fallbacks
+ * @property {Map<string, NameValue>=} chat_members
+ * @property {Map<string, NameValue>=} contacts
+ * @property {{open_id?: string, name?: string}=} self
+ *
+ * @typedef {object} ScopeConfig
+ * @property {string=} chat_id
+ * @property {string=} chat_type
+ * @property {string=} chat_name
+ *
+ * @typedef {object} LocalRecord
+ * @property {string} source_id
+ * @property {string} first_seen_scope_id
+ * @property {string} external_id
+ * @property {string | null} external_version
+ * @property {string} record_type
+ * @property {string | null} occurred_at
+ * @property {number} occurred_at_ms
+ * @property {string | null} actor_id
+ * @property {string | null} container_id
+ * @property {MessageDirection} direction
+ * @property {string | null} title
+ * @property {string} body
+ * @property {string} content_hash
+ * @property {string} canonical_json
+ * @property {string} raw_json
+ *
+ * @typedef {object} MessageWindowOptions
+ * @property {number} startMs
+ * @property {number} endMs
+ * @property {number=} stableHorizonMs
+ * @property {boolean=} endExplicit
+ *
+ * @typedef {object} SyncScopeLike
+ * @property {MessageCursor | null=} cursor
+ *
+ * @typedef {object} PageResult
+ * @property {LarkMessage[]=} messages
+ * @property {boolean=} has_more
+ * @property {string=} page_token
+ */
 
 const SOURCE_ID = "lark.im";
 const SENT_SCOPE_ID = "lark.im.sent_by_me";
@@ -6,10 +89,12 @@ const CHAT_DISCOVERY_SCOPE_ID = "lark.im.unmuted_chat_discovery";
 const CHAT_HOT_DISCOVERY_SCOPE_ID = "lark.im.unmuted_chat_hot";
 const CHAT_RECONCILE_SCOPE_ID = "lark.im.unmuted_chat_reconcile";
 
+/** @param {number} n */
 function pad2(n) {
   return String(n).padStart(2, "0");
 }
 
+/** @param {Date} date */
 function localOffset(date) {
   const minutes = -date.getTimezoneOffset();
   const sign = minutes >= 0 ? "+" : "-";
@@ -17,10 +102,12 @@ function localOffset(date) {
   return `${sign}${pad2(Math.floor(abs / 60))}:${pad2(abs % 60)}`;
 }
 
+/** @param {Date} date */
 function localDay(date) {
   return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
 }
 
+/** @param {number} ms */
 function localIsoFromMs(ms) {
   const date = new Date(ms);
   return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}T${pad2(
@@ -28,6 +115,7 @@ function localIsoFromMs(ms) {
   )}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}${localOffset(date)}`;
 }
 
+/** @param {LarkMessage | null | undefined} message */
 function senderId(message) {
   const sender = message?.sender;
   if (!sender || typeof sender !== "object") return "";
@@ -41,12 +129,14 @@ function senderId(message) {
   );
 }
 
+/** @param {LarkMessage | null | undefined} message */
 function senderName(message) {
   const sender = message?.sender;
   if (!sender || typeof sender !== "object") return "";
   return sender.name || sender.display_name || "";
 }
 
+/** @param {LarkMessage | null | undefined} message */
 function senderType(message) {
   const sender = message?.sender;
   if (!sender || typeof sender !== "object") return null;
@@ -56,14 +146,17 @@ function senderType(message) {
   return null;
 }
 
+/** @param {LarkMessage | null | undefined} message */
 function chatId(message) {
   return message?.chat_id || message?.chat?.chat_id || message?.chat?.id || "";
 }
 
+/** @param {LarkMessage | null | undefined} message */
 function messageId(message) {
   return message?.message_id || message?.id || "";
 }
 
+/** @param {unknown} value */
 function parseLarkTimeMs(value) {
   if (value === null || value === undefined || value === "") return NaN;
   if (typeof value === "number" || /^\d+$/.test(String(value))) {
@@ -88,25 +181,30 @@ function parseLarkTimeMs(value) {
   return Date.parse(text);
 }
 
+/** @param {number} ms */
 function occurredAtIso(ms) {
   return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
 }
 
+/** @param {unknown} content */
 function bodyFromContent(content) {
   if (content === null || content === undefined) return "";
   if (typeof content === "string") return content;
   if (typeof content === "object") {
-    if (typeof content.text === "string") return content.text;
-    if (typeof content.content === "string") return content.content;
-    return JSON.stringify(content);
+    const objectContent = /** @type {Record<string, any>} */ (content);
+    if (typeof objectContent.text === "string") return objectContent.text;
+    if (typeof objectContent.content === "string") return objectContent.content;
+    return JSON.stringify(objectContent);
   }
   return String(content);
 }
 
+/** @param {unknown} value */
 function isInvalidRenderedContent(value) {
   return /^\[Invalid .+ JSON\]$/.test(String(value || "").trim());
 }
 
+/** @param {LarkMessage | null | undefined} message */
 function bodyFromMessage(message) {
   const body = bodyFromContent(message?.content);
   if (message?.deleted === true && isInvalidRenderedContent(body)) {
@@ -115,31 +213,46 @@ function bodyFromMessage(message) {
   return body;
 }
 
+/** @param {unknown} value */
 function hash(value) {
   return createHash("sha256").update(String(value)).digest("hex");
 }
 
+/** @param {unknown} value */
 function shortHash(value) {
   return hash(value).slice(0, 16);
 }
 
+/**
+ * @param {NameValue | null | undefined} value
+ * @param {string} source
+ * @param {string} confidence
+ * @returns {NameDetails | null}
+ */
 function nameCandidate(value, source, confidence) {
   if (!value) return null;
   if (typeof value === "string") return { name: value, source, confidence };
   if (typeof value === "object") {
-    const name = value.name || value.display_name || value.bot_name || "";
+    const objectValue = /** @type {Record<string, any>} */ (value);
+    const name = objectValue.name || objectValue.display_name || objectValue.bot_name || "";
     if (!name) return null;
     return {
       name,
-      source: value.source || source,
-      confidence: value.confidence || confidence,
+      source: objectValue.source || source,
+      confidence: objectValue.confidence || confidence,
     };
   }
   return null;
 }
 
+/**
+ * @param {PeopleContext} context
+ * @param {string | null | undefined} id
+ * @param {string} chatIdValue
+ * @returns {NameDetails | null}
+ */
 function lookupDisplayNameDetails(context, id, chatIdValue) {
-  if (!id) return "";
+  if (!id) return null;
   const app = nameCandidate(context.apps?.get(id), "application_api", "high");
   if (app) return app;
   const appFallback = nameCandidate(context.app_fallbacks?.get(`${chatIdValue}:${id}`), "chat_bot_unique", "medium");
@@ -154,10 +267,23 @@ function lookupDisplayNameDetails(context, id, chatIdValue) {
   return null;
 }
 
+/**
+ * @param {PeopleContext} context
+ * @param {string | null | undefined} id
+ * @param {string} chatIdValue
+ */
 function lookupDisplayName(context, id, chatIdValue) {
   return lookupDisplayNameDetails(context, id, chatIdValue)?.name || "";
 }
 
+/**
+ * @param {LarkMessage} message
+ * @param {string} scopeId
+ * @param {MessageDirection} direction
+ * @param {PeopleContext} [context]
+ * @param {ScopeConfig} [scopeConfig]
+ * @returns {LocalRecord}
+ */
 function recordFromMessage(message, scopeId, direction, context = {}, scopeConfig = {}) {
   const externalId = messageId(message);
   const occurredAtMs = parseLarkTimeMs(message?.create_time ?? message?.created_at ?? message?.create_time_ms);
@@ -221,6 +347,11 @@ function recordFromMessage(message, scopeId, direction, context = {}, scopeConfi
   };
 }
 
+/**
+ * @param {LocalRecord} record
+ * @param {MessageCursor | null | undefined} cursor
+ * @param {number} fallbackStartMs
+ */
 function compareRecordToCursor(record, cursor, fallbackStartMs) {
   const hasCursor = cursor?.created_at_ms !== undefined && cursor?.created_at_ms !== null;
   const cursorMs = Number(hasCursor ? cursor.created_at_ms : fallbackStartMs - 1);
@@ -230,6 +361,18 @@ function compareRecordToCursor(record, cursor, fallbackStartMs) {
   return String(record.external_id).localeCompare(cursorId);
 }
 
+/**
+ * @param {LarkMessage[]} messages
+ * @param {string} scopeId
+ * @param {MessageDirection} direction
+ * @param {MessageCursor | null | undefined} cursor
+ * @param {number} startMs
+ * @param {number} endMs
+ * @param {((record: LocalRecord) => boolean) | null} [filterFn]
+ * @param {PeopleContext} [context]
+ * @param {ScopeConfig} [scopeConfig]
+ * @returns {LocalRecord[]}
+ */
 function prepareRecords(messages, scopeId, direction, cursor, startMs, endMs, filterFn = null, context = {}, scopeConfig = {}) {
   return messages
     .filter((message) => messageId(message))
@@ -241,6 +384,7 @@ function prepareRecords(messages, scopeId, direction, cursor, startMs, endMs, fi
     .sort((a, b) => a.occurred_at_ms - b.occurred_at_ms || a.external_id.localeCompare(b.external_id));
 }
 
+/** @param {number} endMs */
 function cursorAfter(endMs) {
   return {
     kind: "time_message_cursor/v1",
@@ -251,11 +395,19 @@ function cursorAfter(endMs) {
   };
 }
 
+/**
+ * @param {MessageWindowOptions} opts
+ * @param {number} startMs
+ */
 function stableMessageEndMs(opts, startMs) {
   const guardMs = opts.endExplicit ? 0 : Number(opts.stableHorizonMs || 0);
   return Math.max(startMs, opts.endMs - guardMs);
 }
 
+/**
+ * @param {SyncScopeLike} scope
+ * @param {MessageWindowOptions} opts
+ */
 function messageWindow(scope, opts) {
   const startMs = Number(scope.cursor?.created_at_ms ?? opts.startMs);
   return {
@@ -264,6 +416,13 @@ function messageWindow(scope, opts) {
   };
 }
 
+/**
+ * @param {object} options
+ * @param {(pageToken: string) => PageResult} options.fetchPage
+ * @param {number} options.maxPages
+ * @param {string} options.missingPageTokenMessage
+ * @param {(maxPages: number) => string} options.maxPagesMessage
+ */
 function readBoundedPages({ fetchPage, maxPages, missingPageTokenMessage, maxPagesMessage }) {
   const messages = [];
   let pageToken = "";
@@ -281,6 +440,7 @@ function readBoundedPages({ fetchPage, maxPages, missingPageTokenMessage, maxPag
   return { messages, pages };
 }
 
+/** @param {string} chatIdValue */
 function chatScopeId(chatIdValue) {
   return `lark.im.received.chat.${shortHash(chatIdValue)}`;
 }
