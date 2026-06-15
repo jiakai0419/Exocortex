@@ -11,7 +11,7 @@ import {
   fetchSentMessages,
   getSelfProfile,
   isRestrictedModeError,
-} from "./lib/lark-im-adapter.mjs";
+} from "../src/adapters/lark-im/adapter.mjs";
 import {
   acquireLock,
   createRun,

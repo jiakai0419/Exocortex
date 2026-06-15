@@ -5,7 +5,8 @@ import {
   createLarkImAdapter,
   isRestrictedModeError,
   isTransientLarkFailure,
-} from "../scripts/lib/lark-im-adapter.mjs";
+} from "../src/adapters/lark-im/adapter.mjs";
+import { createLarkImAdapter as shimCreateLarkImAdapter } from "../scripts/lib/lark-im-adapter.mjs";
 import { recordFromMessage } from "../src/adapters/lark-im/core.mjs";
 
 function adapterOpts(overrides = {}) {
@@ -24,6 +25,10 @@ function commandValue(args, flag) {
   const index = args.indexOf(flag);
   return index >= 0 ? args[index + 1] : "";
 }
+
+test("lark im adapter shim re-exports the src implementation", () => {
+  assert.equal(shimCreateLarkImAdapter, createLarkImAdapter);
+});
 
 test("fetchSentMessages builds user search commands and follows page tokens", () => {
   const calls = [];
