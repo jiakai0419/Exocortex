@@ -1,11 +1,43 @@
 #!/usr/bin/env node
 
+// @ts-check
+
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { block, compact, key, renderError, section, statusBadge, subtitle, title } from "./lib/terminal.mjs";
 
 const DEFAULT_DB = "data/exocortex.sqlite";
+
+/**
+ * @typedef {"all" | "sent" | "received"} MessageDirection
+ * @typedef {"text" | "json"} MessageFormat
+ *
+ * @typedef {object} MessageOptions
+ * @property {string} db
+ * @property {MessageDirection} direction
+ * @property {number} limit
+ * @property {string} search
+ * @property {MessageFormat} format
+ *
+ * @typedef {Record<string, any>} Row
+ *
+ * @typedef {Row & {
+ *   canonical: Row,
+ *   raw: Row,
+ *   scope_config: Row,
+ *   display: {
+ *     external_id: string,
+ *     scene: string,
+ *     sender: string,
+ *     sender_type: string,
+ *     message_type: string,
+ *     recipient: string | null,
+ *     chat: string | null,
+ *     body: unknown
+ *   }
+ * }} EnrichedMessage
+ */
 
 function usage() {
   return `Usage: node scripts/messages.mjs [options]
@@ -20,7 +52,9 @@ Options:
 `;
 }
 
+/** @param {string[]} argv */
 function parseArgs(argv) {
+  /** @type {MessageOptions} */
   const opts = { db: DEFAULT_DB, direction: "all", limit: 30, search: "", format: "text" };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -31,10 +65,10 @@ function parseArgs(argv) {
     const next = argv[i + 1];
     if (!next || next.startsWith("--")) throw new Error(`${arg} requires a value`);
     if (arg === "--db") opts.db = next;
-    else if (arg === "--direction") opts.direction = next;
+    else if (arg === "--direction") opts.direction = /** @type {MessageDirection} */ (next);
     else if (arg === "--limit") opts.limit = parsePositiveInt(next, "limit");
     else if (arg === "--search") opts.search = next;
-    else if (arg === "--format") opts.format = next;
+    else if (arg === "--format") opts.format = /** @type {MessageFormat} */ (next);
     else throw new Error(`Unknown option: ${arg}`);
     i += 1;
   }
@@ -45,16 +79,27 @@ function parseArgs(argv) {
   return opts;
 }
 
+/**
+ * @param {unknown} value
+ * @param {string} name
+ */
 function parsePositiveInt(value, name) {
   const parsed = Number.parseInt(String(value), 10);
   if (!Number.isInteger(parsed) || parsed <= 0) throw new Error(`${name} must be positive`);
   return parsed;
 }
 
+/** @param {unknown} value */
 function quoteSql(value) {
   return `'${String(value).replaceAll("'", "''")}'`;
 }
 
+/**
+ * @param {string} dbPath
+ * @param {string} sql
+ * @param {string} label
+ * @returns {Row[]}
+ */
 function sqliteJson(dbPath, sql, label) {
   const result = spawnSync("sqlite3", ["-json", dbPath], {
     input: `.timeout 5000\n${sql}`,
@@ -68,6 +113,7 @@ function sqliteJson(dbPath, sql, label) {
   return trimmed ? JSON.parse(trimmed) : [];
 }
 
+/** @param {MessageOptions} opts */
 function buildWhere(opts) {
   const clauses = [];
   if (opts.direction !== "all") clauses.push(`direction = ${quoteSql(opts.direction)}`);
@@ -75,6 +121,11 @@ function buildWhere(opts) {
   return clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
 }
 
+/**
+ * @param {string} dbPath
+ * @param {MessageOptions} opts
+ * @returns {EnrichedMessage[]}
+ */
 function loadMessages(dbPath, opts) {
   return sqliteJson(
     dbPath,
@@ -100,44 +151,67 @@ function loadMessages(dbPath, opts) {
   ).map((row) => enrichRow(row));
 }
 
+/** @param {unknown} value */
 function parseMaybeJson(value) {
   if (!value) return null;
   try {
-    return JSON.parse(value);
+    return JSON.parse(String(value));
   } catch {
     return null;
   }
 }
 
+/**
+ * @param {unknown} value
+ * @param {number} [length]
+ */
 function shortId(value, length = 8) {
   return value ? `${String(value).slice(0, length)}...` : "unknown";
 }
 
+/**
+ * @param {unknown} name
+ * @param {unknown} id
+ */
 function nameOrId(name, id) {
   if (!name && String(id || "").startsWith("cli_")) return `应用 ${shortId(id, 8)}`;
-  return name || shortId(id, 8);
+  return name ? String(name) : shortId(id, 8);
 }
 
+/**
+ * @param {unknown} name
+ * @param {unknown} id
+ * @param {unknown} senderType
+ */
 function senderLabel(name, id, senderType) {
   const display = nameOrId(name, id);
   return senderType === "app" ? `应用：${display.replace(/^应用\s+/, "")}` : display;
 }
 
+/** @param {unknown} type */
 function messageTypeLabel(type) {
   if (!type) return "unknown";
+  /** @type {Record<string, string>} */
   const labels = {
     interactive: "卡片",
     post: "富文本",
     text: "文本",
     image: "图片",
   };
-  return labels[type] || type;
+  const key = String(type);
+  return labels[key] || key;
 }
 
+/** @param {unknown} value */
 function isInvalidRenderedContent(value) {
   return /^\[Invalid .+ JSON\]$/.test(String(value || "").trim());
 }
 
+/**
+ * @param {unknown} body
+ * @param {Row} canonical
+ * @param {Row} raw
+ */
 function displayBody(body, canonical, raw) {
   if ((canonical.deleted === true || raw.deleted === true) && isInvalidRenderedContent(body)) {
     return "[已撤回/已删除：飞书未返回原始富文本内容]";
@@ -145,6 +219,10 @@ function displayBody(body, canonical, raw) {
   return body;
 }
 
+/**
+ * @param {Row} row
+ * @returns {EnrichedMessage}
+ */
 function enrichRow(row) {
   const canonical = parseMaybeJson(row.canonical_json) || {};
   const raw = parseMaybeJson(row.raw_json) || {};
@@ -191,6 +269,7 @@ function enrichRow(row) {
   };
 }
 
+/** @param {EnrichedMessage[]} messages */
 function renderText(messages) {
   if (messages.length === 0) return "No messages.\n";
   const lines = [];

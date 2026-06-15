@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+// @ts-check
+
 import { spawnSync } from "node:child_process";
 import {
   closeSync,
@@ -21,6 +23,34 @@ const LABEL = "com.exocortex.lark-im-worker";
 const DEFAULT_LOG_DIR = "logs/lark-im";
 const DEFAULT_MAX_CHAT_PAGES = 300;
 const DEFAULT_RECONCILE_INTERVAL_HOURS = 24;
+
+/**
+ * @typedef {"install" | "start" | "stop" | "restart" | "status" | "tail" | "uninstall" | string} ServiceCommand
+ *
+ * @typedef {object} ServiceOptions
+ * @property {ServiceCommand} command
+ * @property {number} intervalSeconds
+ * @property {number} hotReceivedScopesPerCycle
+ * @property {number} receivedScopesPerCycle
+ * @property {number} hotDiscoveryPagesPerCycle
+ * @property {number} discoveryPagesPerCycle
+ * @property {number} maxChatPages
+ * @property {number} reconcileIntervalHours
+ * @property {string} logDir
+ * @property {number} lines
+ *
+ * @typedef {object} RunOptions
+ * @property {boolean=} allowFailure
+ *
+ * @typedef {Record<string, any>} JsonObject
+ *
+ * @typedef {object} WorkerLogTail
+ * @property {string} path
+ * @property {boolean} exists
+ * @property {JsonObject[]} events
+ *
+ * @typedef {import("node:child_process").SpawnSyncReturns<string>} SpawnResult
+ */
 
 function usage() {
   return `Usage: node scripts/lark-im-service.mjs <command> [options]
@@ -48,18 +78,24 @@ Options:
 `;
 }
 
+/**
+ * @param {unknown} value
+ * @param {string} name
+ */
 function parsePositiveInt(value, name) {
   const parsed = Number.parseInt(String(value), 10);
   if (!Number.isInteger(parsed) || parsed <= 0) throw new Error(`${name} must be positive`);
   return parsed;
 }
 
+/** @param {string[]} argv */
 function parseArgs(argv) {
   const [command, ...rest] = argv;
   if (!command || command === "--help" || command === "-h") {
     process.stdout.write(usage());
     process.exit(0);
   }
+  /** @type {ServiceOptions} */
   const opts = {
     command,
     intervalSeconds: 60,
@@ -117,6 +153,12 @@ function plistPath() {
   return resolve(homedir(), "Library/LaunchAgents", `${LABEL}.plist`);
 }
 
+/**
+ * @param {string} cmd
+ * @param {string[]} args
+ * @param {RunOptions} [options]
+ * @returns {SpawnResult}
+ */
 function run(cmd, args, options = {}) {
   const result = spawnSync(cmd, args, { encoding: "utf8", maxBuffer: 20 * 1024 * 1024 });
   if (result.status !== 0 && !options.allowFailure) {
@@ -125,6 +167,7 @@ function run(cmd, args, options = {}) {
   return result;
 }
 
+/** @param {ServiceOptions} opts */
 function plistXml(opts) {
   const cwd = process.cwd();
   const logDir = resolve(opts.logDir);
@@ -181,6 +224,7 @@ function plistXml(opts) {
 `;
 }
 
+/** @param {ServiceOptions} opts */
 function install(opts) {
   mkdirSync(resolve(homedir(), "Library/LaunchAgents"), { recursive: true });
   writeFileSync(plistPath(), plistXml(opts));
@@ -211,7 +255,9 @@ function uninstall() {
   process.stdout.write(`removed ${plistPath()}\n`);
 }
 
+/** @param {string} stdout */
 function parseLaunchdState(stdout) {
+  /** @type {Record<string, string>} */
   const result = {};
   for (const line of stdout.split("\n")) {
     const match = line.trim().match(/^(state|pid|last exit code) = (.+)$/);
@@ -220,6 +266,10 @@ function parseLaunchdState(stdout) {
   return result;
 }
 
+/**
+ * @param {SpawnResult} result
+ * @returns {JsonObject | null}
+ */
 function parseJsonOutput(result) {
   try {
     return JSON.parse(result.stdout.trim());
@@ -228,6 +278,10 @@ function parseJsonOutput(result) {
   }
 }
 
+/**
+ * @param {string} path
+ * @param {number} [maxBytes]
+ */
 function readFileTail(path, maxBytes = 512 * 1024) {
   const stat = statSync(path);
   const length = Math.min(stat.size, maxBytes);
@@ -243,6 +297,10 @@ function readFileTail(path, maxBytes = 512 * 1024) {
   return start > 0 ? text.slice(text.indexOf("\n") + 1) : text;
 }
 
+/**
+ * @param {string} logDir
+ * @returns {WorkerLogTail}
+ */
 function readRecentWorkerEvents(logDir) {
   const path = resolve(logDir, "worker.jsonl");
   if (!existsSync(path)) return { path, exists: false, events: [] };
@@ -251,6 +309,7 @@ function readRecentWorkerEvents(logDir) {
     .split("\n")
     .filter(Boolean)
     .slice(-200);
+  /** @type {JsonObject[]} */
   const events = [];
   for (const line of lines) {
     try {
@@ -262,6 +321,7 @@ function readRecentWorkerEvents(logDir) {
   return { path, exists: true, events };
 }
 
+/** @param {unknown} ms */
 function ageText(ms) {
   if (ms === null || ms === undefined) return "unknown";
   const seconds = Math.floor(Number(ms) / 1000);
@@ -274,17 +334,20 @@ function ageText(ms) {
   return `${days}d ${hours % 24}h ago`;
 }
 
+/** @param {unknown} value */
 function localIso(value) {
   if (!value) return "none";
-  return new Date(value).toLocaleString();
+  return new Date(String(value)).toLocaleString();
 }
 
+/** @param {JsonObject} summary */
 function formatWorkerEvent(summary) {
   if (!summary.has_events) return "no worker events yet";
   const eventType = String(summary.last_event_type || "").replace(/^lark_im_worker_/, "");
   return `${eventType || "event"} ${ageText(summary.last_event_age_ms)}`;
 }
 
+/** @param {JsonObject} summary */
 function formatWorkerCycle(summary) {
   if (!summary.last_cycle) return "none";
   return `#${summary.last_cycle.cycle} ${summary.last_cycle.ok ? statusBadge("ok") : statusBadge("failed")} ${localIso(
@@ -292,6 +355,7 @@ function formatWorkerCycle(summary) {
   )} (${ageText(summary.last_cycle.age_ms)})`;
 }
 
+/** @param {JsonObject} summary */
 function formatWorkerStep(summary) {
   if (!summary.last_step) return "none";
   return `cycle #${summary.last_step.cycle} ${summary.last_step.name} ${
@@ -299,6 +363,7 @@ function formatWorkerStep(summary) {
   } (${ageText(summary.last_step.age_ms)})`;
 }
 
+/** @param {JsonObject} summary */
 function formatWorkerFailure(summary) {
   if (!summary.last_failure) return "none in recent log";
   if (summary.last_failure.name === "cycle") {
@@ -311,6 +376,7 @@ function formatWorkerFailure(summary) {
   )})`;
 }
 
+/** @param {ServiceOptions} opts */
 function status(opts) {
   const launchd = run("launchctl", ["print", target()], { allowFailure: true });
   const loaded = launchd.status === 0;
@@ -345,7 +411,7 @@ function status(opts) {
         ? "in progress"
         : "not started";
     const hotDiscoveryState = syncStatus.hot_discovery?.ran
-      ? `last run ${new Date(syncStatus.hot_discovery.cursor_updated_at).toLocaleString()}`
+      ? `last run ${localIso(syncStatus.hot_discovery.cursor_updated_at)}`
       : "not started";
     lines.push(
       kv([
@@ -389,6 +455,7 @@ function status(opts) {
   process.stdout.write(`${block(lines)}\n`);
 }
 
+/** @param {ServiceOptions} opts */
 function tail(opts) {
   const path = resolve(opts.logDir, "worker.jsonl");
   if (!existsSync(path)) {
@@ -404,6 +471,7 @@ function tail(opts) {
   );
 }
 
+/** @param {string} line */
 function formatLogLine(line) {
   let event;
   try {
