@@ -71,6 +71,9 @@ node scripts/doctor.mjs
 ## Development
 
 ```bash
+npm run build
+npm run build:check
+npm run typecheck
 npm test
 npm run check
 ```

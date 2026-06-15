@@ -18,4 +18,4 @@ export {
   title,
   value,
   visibleLength,
-} from "../../src/terminal/index.mjs";
+} from "../../dist/terminal/index.js";

@@ -1,98 +1,78 @@
-// @ts-check
-
 import { stdout } from "node:process";
+import type { Writable } from "node:stream";
 import { stripVTControlCharacters, styleText } from "node:util";
 
-/**
- * @typedef {import("node:stream").Writable} WritableStream
- *
- * @typedef {object} PaintOptions
- * @property {WritableStream=} stream
- *
- * @typedef {object} KvOptions
- * @property {number=} width
- *
- * @typedef {object} TableColumn
- * @property {string} header
- * @property {string} key
- * @property {((row: Record<string, any>) => unknown)=} render
- *
- * @typedef {object} ListOptions
- * @property {string=} empty
- */
+type PaintOptions = {
+  stream?: Writable;
+};
 
-/**
- * @param {string | string[]} format
- * @param {unknown} text
- * @param {PaintOptions} [options]
- */
-function paint(format, text, options = {}) {
+type KvOptions = {
+  width?: number;
+};
+
+type TableColumn<Row extends Record<string, any> = Record<string, any>> = {
+  header: string;
+  key: string;
+  render?: (row: Row) => unknown;
+};
+
+type ListOptions = {
+  empty?: string;
+};
+
+type StyleFormat = Parameters<typeof styleText>[0];
+type StyleName = Extract<StyleFormat, string>;
+
+function paint(format: StyleFormat, text: unknown, options: PaintOptions = {}) {
   const stream = options.stream || stdout;
-  return styleText(/** @type {any} */ (format), String(text), { stream });
+  return styleText(format, String(text), { stream });
 }
 
-/** @param {unknown} value */
-function plain(value) {
+function plain(value: unknown) {
   return stripVTControlCharacters(String(value ?? ""));
 }
 
-/** @param {unknown} value */
-function visibleLength(value) {
+function visibleLength(value: unknown) {
   return plain(value).length;
 }
 
-/**
- * @param {unknown} value
- * @param {number} width
- */
-function padRight(value, width) {
+function padRight(value: unknown, width: number) {
   const text = String(value ?? "");
   const padding = Math.max(0, width - visibleLength(text));
   return `${text}${" ".repeat(padding)}`;
 }
 
-/** @param {unknown} text */
-function title(text) {
+function title(text: unknown) {
   return paint("bold", text);
 }
 
-/** @param {unknown} text */
-function subtitle(text) {
+function subtitle(text: unknown) {
   return paint("dim", text);
 }
 
-/** @param {unknown} text */
-function section(text) {
+function section(text: unknown) {
   return paint(["bold", "green"], text);
 }
 
-/** @param {unknown} text */
-function command(text) {
+function command(text: unknown) {
   return paint(["bold", "cyan"], text);
 }
 
-/** @param {unknown} text */
-function key(text) {
+function key(text: unknown) {
   return paint("dim", text);
 }
 
-/** @param {unknown} text */
-function value(text) {
+function value(text: unknown) {
   return String(text ?? "");
 }
 
-/**
- * @param {unknown} label
- * @param {unknown} text
- */
-function hint(label, text) {
+function hint(label: unknown, text: unknown) {
   return `${paint("yellow", label)} ${subtitle(text)}`;
 }
 
-/** @param {unknown} status */
-function statusBadge(status) {
+function statusBadge(status: unknown) {
   const normalized = String(status || "unknown").toLowerCase();
-  const labels = {
+  const labels: Record<string, [string, StyleName]> = {
     fresh: ["OK", "green"],
     healthy: ["OK", "green"],
     ok: ["OK", "green"],
@@ -113,17 +93,13 @@ function statusBadge(status) {
     skipped: ["SKIPPED", "gray"],
     unknown: ["UNKNOWN", "gray"],
   };
-  const [label, color] = labels[normalized] || [String(status || "UNKNOWN").toUpperCase(), "gray"];
+  const fallback: [string, StyleName] = [String(status || "UNKNOWN").toUpperCase(), "gray"];
+  const [label, color] = labels[normalized] || fallback;
   return paint(["bold", color], label);
 }
 
-/**
- * @param {Array<[unknown, unknown] | null | undefined>} rows
- * @param {KvOptions} [options]
- */
-function kv(rows, options = {}) {
-  /** @type {Array<[string, string]>} */
-  const entries = [];
+function kv(rows: Array<[unknown, unknown] | null | undefined>, options: KvOptions = {}) {
+  const entries: Array<[string, string]> = [];
   for (const row of rows) {
     if (!row) continue;
     const [name, val] = row;
@@ -133,11 +109,7 @@ function kv(rows, options = {}) {
   return entries.map(([name, val]) => `  ${key(padRight(name, width))}  ${value(val)}`).join("\n");
 }
 
-/**
- * @param {Array<Record<string, any>>} rows
- * @param {TableColumn[]} columns
- */
-function table(rows, columns) {
+function table<Row extends Record<string, any>>(rows: Row[], columns: Array<TableColumn<Row>>) {
   if (rows.length === 0) return "";
   const widths = columns.map((column) =>
     Math.max(
@@ -156,37 +128,26 @@ function table(rows, columns) {
   return [header, ...body].join("\n");
 }
 
-/**
- * @param {unknown[] | null | undefined} items
- * @param {ListOptions} [options]
- */
-function list(items, options = {}) {
+function list(items: unknown[] | null | undefined, options: ListOptions = {}) {
   if (!items || items.length === 0) return options.empty || "";
   return items.map((item) => `  - ${item}`).join("\n");
 }
 
-/** @param {Array<unknown>} lines */
-function block(lines) {
+function block(lines: unknown[]) {
   return lines.filter((line) => line !== null && line !== undefined).join("\n").trimEnd();
 }
 
-/**
- * @param {unknown} value
- * @param {number} [limit]
- */
-function compact(value, limit = 240) {
+function compact(value: unknown, limit = 240) {
   const text = String(value || "").replace(/\s+/g, " ").trim();
   if (!text) return "(empty)";
   return text.length > limit ? `${text.slice(0, limit - 3)}...` : text;
 }
 
-/** @param {unknown} value */
-function json(value) {
+function json(value: unknown) {
   return `${JSON.stringify(value, null, 2)}\n`;
 }
 
-/** @param {unknown} text */
-function parseEmbeddedJson(text) {
+function parseEmbeddedJson(text: unknown) {
   const trimmed = String(text || "").trim();
   if (!trimmed.startsWith("{")) return null;
   try {
@@ -196,8 +157,7 @@ function parseEmbeddedJson(text) {
   }
 }
 
-/** @param {unknown} error */
-function renderError(error) {
+function renderError(error: unknown) {
   const message = String(error instanceof Error ? error.message : error || "unknown error");
   const payload = parseEmbeddedJson(message);
   const inner = payload?.error && typeof payload.error === "object" ? payload.error : null;

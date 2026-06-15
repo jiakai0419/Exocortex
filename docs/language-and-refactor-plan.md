@@ -201,6 +201,12 @@ docs
 
 Terminal 输出渲染层。
 
+当前状态：
+
+- 源码在 `src/terminal/index.ts`。
+- 构建产物在 `dist/terminal/index.js`。
+- 运行时兼容入口仍是 `scripts/lib/terminal.mjs`，它只 re-export 已编译 JS。
+
 原则继续沿用 `docs/terminal-experience.md`：
 
 - text 给人看。
@@ -353,6 +359,8 @@ node scripts/lark-im-service.mjs status
 
 ### Phase 3: 迁移纯核心到 TypeScript
 
+状态：已开始。第一刀选择 `src/terminal`，用于验证显式 build、`dist` 运行时入口和兼容 shim 的组合是否稳定。
+
 目标：
 
 - 先迁移不依赖外部系统的纯核心模块。
@@ -362,7 +370,7 @@ node scripts/lark-im-service.mjs status
 优先迁移：
 
 1. `src/core`
-2. `src/terminal`
+2. `src/terminal`：已完成第一版 TS 迁移
 3. `src/runtime/worker` 的纯函数部分
 4. `src/storage/sqlite` 的类型和 SQL 构造边界
 
@@ -378,11 +386,14 @@ node scripts/lark-im-service.mjs status
 - `dist` 不作为产品数据，不应混入本地运行状态。
 - build 必须可重复。
 - `scripts/*.mjs` 必须只 import 已编译 JS，不能 import TS source。
+- 若某个 `scripts/lib` shim 指向 `dist`，对应测试也必须直接覆盖 `dist` 实现，并验证 shim 仍然可用。
+- CI 必须运行 `npm run build:check`，保证提交里的 `dist` 与 TS 源码一致。
 
 验收：
 
 ```bash
 npm run build
+npm run build:check
 npm run typecheck
 npm run check
 npm test
@@ -480,6 +491,6 @@ probe/maintenance scripts mostly JavaScript
 
 下一次实际改代码前，建议先做一个小复盘：
 
-1. Phase 2 已经验证了 `src` 真实实现 + `scripts/lib` 兼容 shim 的迁移方式。
-2. Phase 2 的主要边界迁移已经完成。下一步应先复盘是否进入 Phase 3：把纯核心模块迁到 TypeScript，还是先继续补同步质量测试。
-3. 不论选择哪条路，都继续保持 no runtime loader、不改 LaunchAgent、不改核心三命令。
+1. Phase 3 已经用 `src/terminal` 验证了 `src/**/*.ts -> dist/**/*.js` 的显式 build。
+2. 下一步不要急着迁外部系统 adapter；优先考虑 `src/runtime/worker` 的纯函数部分，或补同步质量测试。
+3. 继续保持 no runtime loader、不改 LaunchAgent、不改核心三命令。

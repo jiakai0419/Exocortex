@@ -4,9 +4,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "node --check scripts/*.mjs scripts/lib/*.mjs src/terminal/*.mjs src/diagnostics/*.mjs src/adapters/lark-im/*.mjs src/runtime/worker/*.mjs src/storage/sqlite/*.mjs",
+    "build": "tsc -p tsconfig.build.json",
+    "build:check": "npm run build && test -z \"$(git status --porcelain -- dist)\"",
+    "check": "npm run build && node --check scripts/*.mjs scripts/lib/*.mjs dist/terminal/*.js src/diagnostics/*.mjs src/adapters/lark-im/*.mjs src/runtime/worker/*.mjs src/storage/sqlite/*.mjs",
     "help": "node scripts/help.mjs",
-    "test": "node --test tests/*.test.mjs",
+    "test": "npm run build && node --test tests/*.test.mjs",
     "typecheck": "tsc -p tsconfig.json"
   },
   "devDependencies": {
