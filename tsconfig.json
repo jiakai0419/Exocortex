@@ -16,6 +16,8 @@
     "scripts/lib/ingestion-store.mjs",
     "scripts/lib/lark-im-adapter.mjs",
     "scripts/lib/lark-im-worker-core.mjs",
-    "scripts/lib/sync-status-core.mjs"
+    "scripts/lib/sync-status-core.mjs",
+    "scripts/lib/doctor-core.mjs",
+    "scripts/lib/terminal.mjs"
   ]
 }
