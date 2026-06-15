@@ -385,6 +385,54 @@ function syncSent(dbPath, opts, selfProfile) {
 }
 
 /**
+ * @param {JsonObject[]} messages
+ * @param {string} scopeId
+ * @param {JsonObject | null | undefined} cursor
+ * @param {number} startMs
+ * @param {number} endMs
+ * @param {string} selfOpenId
+ * @param {JsonObject} peopleContext
+ * @param {JsonObject} scopeConfig
+ */
+function prepareChatWindowRecords(
+  messages,
+  scopeId,
+  cursor,
+  startMs,
+  endMs,
+  selfOpenId,
+  peopleContext,
+  scopeConfig,
+) {
+  const selfHash = hash(selfOpenId);
+  const isSelfRecord = (record) => hash(record.actor_id || "") === selfHash;
+  return [
+    ...prepareRecords(
+      messages,
+      scopeId,
+      "received",
+      cursor,
+      startMs,
+      endMs,
+      (record) => !isSelfRecord(record),
+      /** @type {any} */ (peopleContext),
+      scopeConfig,
+    ),
+    ...prepareRecords(
+      messages,
+      scopeId,
+      "sent",
+      cursor,
+      startMs,
+      endMs,
+      isSelfRecord,
+      /** @type {any} */ (peopleContext),
+      scopeConfig,
+    ),
+  ].sort((a, b) => a.occurred_at_ms - b.occurred_at_ms || a.external_id.localeCompare(b.external_id));
+}
+
+/**
  * @param {ScopeRow} scope
  * @param {SyncOptions} opts
  * @returns {DiscoveryResult}
@@ -757,18 +805,17 @@ function syncReceivedScope(dbPath, opts, scope, selfProfile) {
       }
       throw error;
     }
-    const selfHash = hash(selfProfile.open_id);
-    const peopleContext = buildPeopleContext(fetched.messages, opts, selfProfile, lockedScope.config);
-    const records = prepareRecords(
+    const scopeConfig = lockedScope.config || {};
+    const peopleContext = buildPeopleContext(fetched.messages, opts, selfProfile, scopeConfig);
+    const records = prepareChatWindowRecords(
       fetched.messages,
       lockedScope.id,
-      "received",
       lockedScope.cursor,
       opts.startMs,
       endMs,
-      (record) => hash(record.actor_id || "") !== selfHash,
+      selfProfile.open_id,
       /** @type {any} */ (peopleContext),
-      lockedScope.config,
+      scopeConfig,
     );
     const cursor = cursorAfter(endMs);
     const effects = succeedMessageRun(dbPath, lockedScope, runId, records, fetched.messages.length, cursor, {
@@ -859,6 +906,7 @@ export {
   messageWindow,
   parseArgs,
   parseLarkTimeMs,
+  prepareChatWindowRecords,
   prepareRecords,
   readScope,
   recordFromMessage,

@@ -14,6 +14,7 @@ import {
   messageWindow,
   parseArgs,
   parseLarkTimeMs,
+  prepareChatWindowRecords,
   prepareRecords,
   readScope,
   recordFromMessage,
@@ -92,6 +93,40 @@ test("deleted invalid rich text content is rendered as an explicit deleted marke
   assert.equal(
     bodyFromMessage({ deleted: true, content: "[Invalid rich text JSON]" }),
     "[已撤回/已删除：飞书未返回原始富文本内容]",
+  );
+});
+
+test("chat window records keep self non-text messages as sent while storing received messages", () => {
+  const base = 1700000000000;
+  const records = prepareChatWindowRecords(
+    [
+      message("om_received_text", base, {
+        senderId: "ou_other",
+        senderName: "Other",
+        content: "hello",
+      }),
+      message("om_self_sticker", base + 1000, {
+        senderId: "ou_self",
+        senderName: "Me",
+        msg_type: "sticker",
+        content: "[Sticker]",
+      }),
+    ],
+    "lark.im.received.chat.test",
+    null,
+    base - 1000,
+    base + 1000,
+    "ou_self",
+    { self: { open_id: "ou_self", name: "Me" } },
+    { chat_id: "oc_chat", chat_type: "p2p", chat_name: "Other" },
+  );
+
+  assert.deepEqual(
+    records.map((record) => [record.external_id, record.direction, record.body]),
+    [
+      ["om_received_text", "received", "hello"],
+      ["om_self_sticker", "sent", "[Sticker]"],
+    ],
   );
 });
 
