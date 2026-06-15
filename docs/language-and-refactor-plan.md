@@ -309,6 +309,8 @@ node scripts/lark-im-service.mjs status
 
 ### Phase 2: 稳定目录边界
 
+状态：第一刀已落地，`terminal` 已迁入 `src/terminal/index.mjs`，`scripts/lib/terminal.mjs` 保留为兼容 shim。
+
 目标：
 
 - 把可复用库代码逐步从 `scripts/lib` 移向 `src`。
@@ -317,7 +319,7 @@ node scripts/lark-im-service.mjs status
 
 推荐顺序：
 
-1. `terminal`
+1. `terminal`：已完成
 2. `doctor-core` / `sync-status-core`
 3. `lark-im-core`
 4. `ingestion-store`
@@ -469,6 +471,6 @@ probe/maintenance scripts mostly JavaScript
 
 下一次实际改代码前，建议先做一个小复盘：
 
-1. Phase 1 已经覆盖核心库、生产同步入口、worker 入口、诊断入口、核心 help、消息阅读入口和服务状态入口；继续扩 maintenance / probe 脚本的收益要逐个判断。
-2. 更推荐下一步进入 Phase 2，从 `terminal` 或诊断 core 这种低风险边界开始整理目录。
+1. Phase 2 已经从 `terminal` 开始，验证了 `src` 真实实现 + `scripts/lib` 兼容 shim 的迁移方式。
+2. 下一步优先移动 `doctor-core` / `sync-status-core`，继续选择低风险、无外部 API 依赖的诊断边界。
 3. 不论选择哪条路，都继续保持 no runtime loader、不改 LaunchAgent、不改核心三命令。
