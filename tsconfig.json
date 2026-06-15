@@ -13,6 +13,7 @@
   },
   "include": [
     "scripts/lib/lark-im-core.mjs",
-    "scripts/lib/ingestion-store.mjs"
+    "scripts/lib/ingestion-store.mjs",
+    "scripts/lib/lark-im-adapter.mjs"
   ]
 }

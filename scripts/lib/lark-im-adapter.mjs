@@ -1,3 +1,5 @@
+// @ts-check
+
 import { spawnSync } from "node:child_process";
 import {
   chatId,
@@ -8,16 +10,97 @@ import {
   senderType,
 } from "./lark-im-core.mjs";
 
+/**
+ * @typedef {Record<string, any>} JsonObject
+ *
+ * @typedef {object} AdapterRunOptions
+ * @property {string[]=} redactedFlags
+ * @property {number=} retries
+ * @property {number=} retryDelayMs
+ *
+ * @typedef {(args: string[], options?: AdapterRunOptions) => JsonObject | null} LarkRunner
+ *
+ * @typedef {object} AdapterOptions
+ * @property {number=} retries
+ * @property {number=} retryDelayMs
+ *
+ * @typedef {AdapterOptions & {
+ *   pageSize: number,
+ *   maxPages: number,
+ *   chatPageSize: number,
+ *   chatTypes: string
+ * }} FetchOptions
+ *
+ * @typedef {object} ApiEnvelope
+ * @property {any[]} items
+ * @property {boolean} has_more
+ * @property {string} page_token
+ *
+ * @typedef {object} SelfProfile
+ * @property {string} open_id
+ * @property {string} name
+ *
+ * @typedef {object} ChatDiscoveryItem
+ * @property {string} chat_id
+ * @property {string | null} chat_type
+ * @property {string | null} chat_name
+ *
+ * @typedef {object} ChatDiscoveryPage
+ * @property {ChatDiscoveryItem[]} chats
+ * @property {boolean} has_more
+ * @property {string} page_token
+ *
+ * @typedef {object} MessageFetchResult
+ * @property {any[]} messages
+ * @property {number} pages
+ *
+ * @typedef {object} NameDetails
+ * @property {string} name
+ * @property {string} source
+ * @property {string} confidence
+ *
+ * @typedef {object} PeopleContext
+ * @property {SelfProfile | null} self
+ * @property {Map<string, string>} contacts
+ * @property {Map<string, string>} chat_members
+ * @property {Map<string, string>} apps
+ * @property {Map<string, NameDetails>} app_fallbacks
+ * @property {Map<string, string>} userNames
+ * @property {Map<string, string>} chatMemberNames
+ * @property {Map<string, string>} appNames
+ * @property {Map<string, NameDetails>} appFallbackNames
+ *
+ * @typedef {object} LarkImAdapter
+ * @property {(opts?: AdapterOptions) => SelfProfile} getSelfProfile
+ * @property {(openIds: unknown[], opts: AdapterOptions, seed?: Map<string, string>) => Map<string, string>} resolveContactNames
+ * @property {(chatIdValue: string, openIds: unknown[], opts: AdapterOptions) => Map<string, string>} resolveChatMemberNames
+ * @property {(appIds: unknown[], opts: AdapterOptions) => Map<string, string>} resolveApplicationNames
+ * @property {(appIdsByChat: Map<string, Set<string>>, officialApps: Map<string, string>, opts: AdapterOptions) => Map<string, NameDetails>} resolveChatBotAppFallbackNames
+ * @property {(messages: any[], opts: AdapterOptions, selfProfile: SelfProfile | null, scopeConfig?: JsonObject) => PeopleContext} buildPeopleContext
+ * @property {(selfOpenId: string, startMs: number, endMs: number, opts: FetchOptions) => MessageFetchResult} fetchSentMessages
+ * @property {(chatIdValue: string, startMs: number, endMs: number, opts: FetchOptions) => MessageFetchResult} fetchChatMessages
+ * @property {(opts: FetchOptions, pageToken: string) => ChatDiscoveryPage} fetchChatDiscoveryPage
+ */
+
+/**
+ * @param {string} stdout
+ * @returns {JsonObject | null}
+ */
 function parseJson(stdout) {
   const trimmed = stdout.trim();
   if (!trimmed) return null;
   try {
     return JSON.parse(trimmed);
   } catch (error) {
-    throw new Error(`lark-cli returned non-JSON output: ${error.message}`);
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`lark-cli returned non-JSON output: ${message}`);
   }
 }
 
+/**
+ * @param {string[]} args
+ * @param {string[]} [redactedFlags]
+ */
 function redactCommand(args, redactedFlags = []) {
   const parts = ["lark-cli", ...args];
   for (const flag of redactedFlags) {
@@ -27,10 +110,12 @@ function redactCommand(args, redactedFlags = []) {
   return parts.join(" ");
 }
 
+/** @param {number} ms */
 function sleepMs(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+/** @param {unknown} stderr */
 function isTransientLarkFailure(stderr) {
   const text = String(stderr || "");
   if (/TLS handshake timeout|Client\.Timeout|timeout awaiting response headers|i\/o timeout/i.test(text)) {
@@ -44,6 +129,11 @@ function isTransientLarkFailure(stderr) {
   }
 }
 
+/**
+ * @param {string[]} args
+ * @param {AdapterRunOptions} [options]
+ * @returns {JsonObject | null}
+ */
 function runLark(args, options = {}) {
   const bin = process.env.LARK_CLI || "lark-cli";
   const retries = Number(options.retries ?? 0);
@@ -67,13 +157,19 @@ function runLark(args, options = {}) {
   throw new Error(`${redactCommand(args, options.redactedFlags)} failed: ${stderr}`);
 }
 
+/** @param {...unknown} values */
 function firstArray(...values) {
   return values.find((value) => Array.isArray(value)) || [];
 }
 
+/**
+ * @param {JsonObject | null} json
+ * @param {string} collectionName
+ * @returns {ApiEnvelope}
+ */
 function getEnvelope(json, collectionName) {
-  const root = json && typeof json === "object" ? json : {};
-  const data = root.data && typeof root.data === "object" ? root.data : {};
+  const root = json && typeof json === "object" ? json : /** @type {JsonObject} */ ({});
+  const data = root.data && typeof root.data === "object" ? /** @type {JsonObject} */ (root.data) : {};
   return {
     items: firstArray(root[collectionName], data[collectionName], root.items, data.items, root.results, data.results),
     has_more: Boolean(root.has_more ?? data.has_more),
@@ -81,45 +177,69 @@ function getEnvelope(json, collectionName) {
   };
 }
 
+/** @param {unknown} user */
 function displayNameFromUser(user) {
   if (!user || typeof user !== "object") return "";
-  return user.localized_name || user.name || user.display_name || user.en_name || user.open_id || "";
+  const objectUser = /** @type {JsonObject} */ (user);
+  return objectUser.localized_name || objectUser.name || objectUser.display_name || objectUser.en_name || objectUser.open_id || "";
 }
 
+/**
+ * @param {unknown[]} values
+ * @returns {string[]}
+ */
 function uniqueNonEmpty(values) {
-  return [...new Set(values.filter((value) => typeof value === "string" && value.length > 0))];
+  return [...new Set(values.filter((value) => typeof value === "string" && value.length > 0).map(String))];
 }
 
+/** @param {unknown[]} values */
 function uniqueOpenIds(values) {
   return uniqueNonEmpty(values).filter((value) => value.startsWith("ou_"));
 }
 
+/** @param {unknown[]} values */
 function uniqueAppIds(values) {
   return uniqueNonEmpty(values).filter((value) => value.startsWith("cli_"));
 }
 
+/**
+ * @template T
+ * @param {T[]} values
+ * @param {number} size
+ * @returns {T[][]}
+ */
 function chunk(values, size) {
   const chunks = [];
   for (let i = 0; i < values.length; i += size) chunks.push(values.slice(i, i + size));
   return chunks;
 }
 
+/** @param {unknown} error */
 function isRestrictedModeError(error) {
-  const message = String(error?.message || error || "");
+  const message = String(error instanceof Error ? error.message : error || "");
   return /"code"\s*:\s*231203|Restricted Mode|don't allow copying or forwarding messages/i.test(message);
 }
 
+/** @param {unknown} bot */
 function botName(bot) {
   if (!bot || typeof bot !== "object") return "";
-  return bot.bot_name || bot.name || bot.display_name || "";
+  const objectBot = /** @type {JsonObject} */ (bot);
+  return objectBot.bot_name || objectBot.name || objectBot.display_name || "";
 }
 
+/** @param {unknown} bot */
 function botAppId(bot) {
   if (!bot || typeof bot !== "object") return "";
-  return bot.app_id || bot.application_id || bot.bot_app_id || bot.cli_id || "";
+  const objectBot = /** @type {JsonObject} */ (bot);
+  return objectBot.app_id || objectBot.application_id || objectBot.bot_app_id || objectBot.cli_id || "";
 }
 
+/**
+ * @param {{run?: LarkRunner}} [deps]
+ * @returns {LarkImAdapter}
+ */
 function createLarkImAdapter({ run = runLark } = {}) {
+  /** @param {AdapterOptions} [opts] */
   function getSelfProfile(opts = {}) {
     const json = run(["contact", "+get-user", "--as", "user", "--format", "json"], {
       retries: opts.retries ?? 2,
@@ -141,6 +261,11 @@ function createLarkImAdapter({ run = runLark } = {}) {
     return { open_id: openId, name };
   }
 
+  /**
+   * @param {unknown[]} openIds
+   * @param {AdapterOptions} opts
+   * @param {Map<string, string>} [seed]
+   */
   function resolveContactNames(openIds, opts, seed = new Map()) {
     const names = new Map(seed);
     const unresolved = uniqueOpenIds(openIds).filter((id) => !names.has(id));
@@ -176,6 +301,11 @@ function createLarkImAdapter({ run = runLark } = {}) {
     return names;
   }
 
+  /**
+   * @param {string} chatIdValue
+   * @param {unknown[]} openIds
+   * @param {AdapterOptions} opts
+   */
   function resolveChatMemberNames(chatIdValue, openIds, opts) {
     const targetIds = new Set(uniqueOpenIds(openIds));
     const names = new Map();
@@ -227,6 +357,10 @@ function createLarkImAdapter({ run = runLark } = {}) {
     return names;
   }
 
+  /**
+   * @param {unknown[]} appIds
+   * @param {AdapterOptions} opts
+   */
   function resolveApplicationNames(appIds, opts) {
     const names = new Map();
     for (const appId of uniqueAppIds(appIds)) {
@@ -258,6 +392,11 @@ function createLarkImAdapter({ run = runLark } = {}) {
     return names;
   }
 
+  /**
+   * @param {Map<string, Set<string>>} appIdsByChat
+   * @param {Map<string, string>} officialApps
+   * @param {AdapterOptions} opts
+   */
   function resolveChatBotAppFallbackNames(appIdsByChat, officialApps, opts) {
     const names = new Map();
     for (const [chatIdValue, ids] of appIdsByChat.entries()) {
@@ -312,6 +451,12 @@ function createLarkImAdapter({ run = runLark } = {}) {
     return names;
   }
 
+  /**
+   * @param {any[]} messages
+   * @param {AdapterOptions} opts
+   * @param {SelfProfile | null} selfProfile
+   * @param {JsonObject} [scopeConfig]
+   */
   function buildPeopleContext(messages, opts, selfProfile, scopeConfig = {}) {
     const seed = new Map();
     if (selfProfile?.open_id && selfProfile?.name) seed.set(selfProfile.open_id, selfProfile.name);
@@ -365,6 +510,12 @@ function createLarkImAdapter({ run = runLark } = {}) {
     };
   }
 
+  /**
+   * @param {string} selfOpenId
+   * @param {number} startMs
+   * @param {number} endMs
+   * @param {FetchOptions} opts
+   */
   function fetchSentMessages(selfOpenId, startMs, endMs, opts) {
     return readBoundedPages({
       maxPages: opts.maxPages,
@@ -406,6 +557,12 @@ function createLarkImAdapter({ run = runLark } = {}) {
     });
   }
 
+  /**
+   * @param {string} chatIdValue
+   * @param {number} startMs
+   * @param {number} endMs
+   * @param {FetchOptions} opts
+   */
   function fetchChatMessages(chatIdValue, startMs, endMs, opts) {
     return readBoundedPages({
       maxPages: opts.maxPages,
@@ -447,6 +604,11 @@ function createLarkImAdapter({ run = runLark } = {}) {
     });
   }
 
+  /**
+   * @param {FetchOptions} opts
+   * @param {string} pageToken
+   * @returns {ChatDiscoveryPage}
+   */
   function fetchChatDiscoveryPage(opts, pageToken) {
     const args = [
       "im",
@@ -498,13 +660,24 @@ function createLarkImAdapter({ run = runLark } = {}) {
 
 const defaultAdapter = createLarkImAdapter();
 
-const buildPeopleContext = (...args) => defaultAdapter.buildPeopleContext(...args);
-const fetchChatDiscoveryPage = (...args) => defaultAdapter.fetchChatDiscoveryPage(...args);
-const fetchChatMessages = (...args) => defaultAdapter.fetchChatMessages(...args);
-const fetchSentMessages = (...args) => defaultAdapter.fetchSentMessages(...args);
-const getSelfProfile = (...args) => defaultAdapter.getSelfProfile(...args);
-const resolveApplicationNames = (...args) => defaultAdapter.resolveApplicationNames(...args);
-const resolveChatBotAppFallbackNames = (...args) => defaultAdapter.resolveChatBotAppFallbackNames(...args);
+/** @type {LarkImAdapter["buildPeopleContext"]} */
+const buildPeopleContext = (messages, opts, selfProfile, scopeConfig) =>
+  defaultAdapter.buildPeopleContext(messages, opts, selfProfile, scopeConfig);
+/** @type {LarkImAdapter["fetchChatDiscoveryPage"]} */
+const fetchChatDiscoveryPage = (opts, pageToken) => defaultAdapter.fetchChatDiscoveryPage(opts, pageToken);
+/** @type {LarkImAdapter["fetchChatMessages"]} */
+const fetchChatMessages = (chatIdValue, startMs, endMs, opts) =>
+  defaultAdapter.fetchChatMessages(chatIdValue, startMs, endMs, opts);
+/** @type {LarkImAdapter["fetchSentMessages"]} */
+const fetchSentMessages = (selfOpenId, startMs, endMs, opts) =>
+  defaultAdapter.fetchSentMessages(selfOpenId, startMs, endMs, opts);
+/** @type {LarkImAdapter["getSelfProfile"]} */
+const getSelfProfile = (opts) => defaultAdapter.getSelfProfile(opts);
+/** @type {LarkImAdapter["resolveApplicationNames"]} */
+const resolveApplicationNames = (appIds, opts) => defaultAdapter.resolveApplicationNames(appIds, opts);
+/** @type {LarkImAdapter["resolveChatBotAppFallbackNames"]} */
+const resolveChatBotAppFallbackNames = (appIdsByChat, officialApps, opts) =>
+  defaultAdapter.resolveChatBotAppFallbackNames(appIdsByChat, officialApps, opts);
 
 export {
   buildPeopleContext,
