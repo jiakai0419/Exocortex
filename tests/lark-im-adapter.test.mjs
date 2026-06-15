@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   createLarkImAdapter,
   isRestrictedModeError,
+  isTransientLarkFailure,
 } from "../scripts/lib/lark-im-adapter.mjs";
 import { recordFromMessage } from "../scripts/lib/lark-im-core.mjs";
 
@@ -89,6 +90,24 @@ test("fetchChatDiscoveryPage normalizes non-muted chat-list output", () => {
     has_more: true,
     page_token: "after",
   });
+});
+
+test("transient classifier retries Lark internal API errors", () => {
+  const stderr = JSON.stringify({
+    ok: false,
+    error: {
+      type: "api",
+      subtype: "unknown",
+      code: 2200,
+      message: "Internal Error",
+    },
+  });
+
+  assert.equal(isTransientLarkFailure(stderr), true);
+  assert.equal(
+    isTransientLarkFailure(JSON.stringify({ error: { type: "api", code: 999, message: "Permission denied" } })),
+    false,
+  );
 });
 
 test("buildPeopleContext returns record-compatible contact and chat member maps", () => {

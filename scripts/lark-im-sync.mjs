@@ -53,6 +53,8 @@ const DEFAULT_MAX_PAGES = 40;
 const DEFAULT_CHAT_PAGE_SIZE = 100;
 const DEFAULT_MAX_CHAT_PAGES = 100;
 const DEFAULT_STABLE_HORIZON_SECONDS = 30;
+const DEFAULT_RETRIES = 4;
+const DEFAULT_RETRY_DELAY_MS = 2000;
 
 /**
  * @typedef {"all" | "sent" | "discover" | "received"} SyncScopeOption
@@ -141,8 +143,8 @@ Options:
                               Do not advance message cursors into the freshest N seconds unless --end is explicit.
                               Default: ${DEFAULT_STABLE_HORIZON_SECONDS}
   --lock-ttl-seconds <n>      Scope lock TTL. Default: 600
-  --retries <n>               Retries for transient lark-cli network timeouts. Default: 2
-  --retry-delay-ms <n>        Delay between transient retries. Default: 1000
+  --retries <n>               Retries for transient lark-cli failures. Default: ${DEFAULT_RETRIES}
+  --retry-delay-ms <n>        Delay between transient retries. Default: ${DEFAULT_RETRY_DELAY_MS}
   --help                      Show this help.
 `;
 }
@@ -207,8 +209,8 @@ function parseArgs(argv) {
     stableHorizonSeconds: DEFAULT_STABLE_HORIZON_SECONDS,
     endExplicit: false,
     lockTtlSeconds: 600,
-    retries: 2,
-    retryDelayMs: 1000,
+    retries: DEFAULT_RETRIES,
+    retryDelayMs: DEFAULT_RETRY_DELAY_MS,
     startMs: 0,
     endMs: 0,
     stableHorizonMs: DEFAULT_STABLE_HORIZON_SECONDS * 1000,

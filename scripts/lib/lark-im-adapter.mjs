@@ -123,7 +123,9 @@ function isTransientLarkFailure(stderr) {
   }
   try {
     const parsed = JSON.parse(text);
-    return parsed?.error?.type === "network" && parsed?.error?.subtype === "timeout";
+    const error = parsed?.error;
+    if (error?.type === "network" && error?.subtype === "timeout") return true;
+    return error?.type === "api" && Number(error?.code) === 2200 && /Internal Error/i.test(String(error?.message || ""));
   } catch {
     return false;
   }
