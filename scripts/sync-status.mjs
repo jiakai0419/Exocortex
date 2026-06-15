@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+// @ts-check
+
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
@@ -13,6 +15,17 @@ import { block, kv, list, renderError, section, statusBadge, subtitle, title } f
 
 const DEFAULT_DB = "data/exocortex.sqlite";
 
+/**
+ * @typedef {"text" | "json"} SyncStatusFormat
+ *
+ * @typedef {object} SyncStatusOptions
+ * @property {string} db
+ * @property {SyncStatusFormat} format
+ *
+ * @typedef {Record<string, any>} Row
+ * @typedef {Record<string, any>} JsonObject
+ */
+
 function usage() {
   return `Usage: node scripts/sync-status.mjs [options]
 
@@ -23,7 +36,9 @@ Options:
 `;
 }
 
+/** @param {string[]} argv */
 function parseArgs(argv) {
+  /** @type {SyncStatusOptions} */
   const opts = { db: DEFAULT_DB, format: "text" };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -34,7 +49,7 @@ function parseArgs(argv) {
     const next = argv[i + 1];
     if (!next || next.startsWith("--")) throw new Error(`${arg} requires a value`);
     if (arg === "--db") opts.db = next;
-    else if (arg === "--format") opts.format = next;
+    else if (arg === "--format") opts.format = /** @type {SyncStatusFormat} */ (next);
     else throw new Error(`Unknown option: ${arg}`);
     i += 1;
   }
@@ -42,6 +57,12 @@ function parseArgs(argv) {
   return opts;
 }
 
+/**
+ * @param {string} dbPath
+ * @param {string} sql
+ * @param {string} label
+ * @returns {Row[]}
+ */
 function sqliteJson(dbPath, sql, label) {
   const result = spawnSync("sqlite3", ["-json", dbPath], {
     input: `.timeout 5000\n${sql}`,
@@ -55,23 +76,35 @@ function sqliteJson(dbPath, sql, label) {
   return trimmed ? JSON.parse(trimmed) : [];
 }
 
+/** @param {unknown} value */
 function parseMaybeJson(value) {
   if (!value) return null;
   try {
-    return JSON.parse(value);
+    return JSON.parse(String(value));
   } catch {
     return null;
   }
 }
 
+/**
+ * @param {Row[]} rows
+ * @param {Row} [fallback]
+ * @returns {Row}
+ */
 function first(rows, fallback = {}) {
   return rows[0] || fallback;
 }
 
+/** @param {unknown} value */
 function quoteSql(value) {
   return `'${String(value).replaceAll("'", "''")}'`;
 }
 
+/**
+ * @param {string} dbPath
+ * @param {string} scopeId
+ * @param {string} label
+ */
 function readScopeStatus(dbPath, scopeId, label) {
   return first(
     sqliteJson(
@@ -86,6 +119,7 @@ function readScopeStatus(dbPath, scopeId, label) {
   );
 }
 
+/** @param {string} dbPath */
 function buildStatus(dbPath) {
   const recovery = recoverStaleSyncState(dbPath);
   const totals = first(
@@ -200,16 +234,19 @@ function buildStatus(dbPath) {
   };
 }
 
+/** @param {unknown} ms */
 function localTime(ms) {
   if (!ms) return "none";
   return new Date(Number(ms)).toLocaleString();
 }
 
+/** @param {unknown} value */
 function localIso(value) {
   if (!value) return "none";
-  return new Date(value).toLocaleString();
+  return new Date(String(value)).toLocaleString();
 }
 
+/** @param {JsonObject} status */
 function renderText(status) {
   const byDirection = Object.fromEntries(
     status.records.by_direction.map((row) => [row.direction, row]),

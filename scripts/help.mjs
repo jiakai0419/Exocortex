@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+// @ts-check
+
 import { pathToFileURL } from "node:url";
 import {
   command as renderCommand,
@@ -12,6 +14,29 @@ import {
   title,
 } from "./lib/terminal.mjs";
 
+/**
+ * @typedef {object} CommandGroup
+ * @property {string} id
+ * @property {string} title
+ *
+ * @typedef {object} CommandEntry
+ * @property {string} group
+ * @property {string} command
+ * @property {string} file
+ * @property {string} summary
+ * @property {string[]} examples
+ * @property {boolean=} core
+ *
+ * @typedef {"text" | "json"} HelpFormat
+ *
+ * @typedef {object} HelpOptions
+ * @property {HelpFormat} format
+ * @property {string | null} group
+ * @property {string | null} command
+ * @property {boolean} all
+ */
+
+/** @type {CommandGroup[]} */
 const GROUPS = [
   { id: "daily", title: "Daily Use" },
   { id: "sync", title: "Sync Lifecycle" },
@@ -21,6 +46,7 @@ const GROUPS = [
   { id: "development", title: "Development" },
 ];
 
+/** @type {CommandEntry[]} */
 const COMMANDS = [
   {
     group: "daily",
@@ -162,7 +188,9 @@ ${GROUPS.map((group) => `  ${group.id.padEnd(12)} ${group.title}`).join("\n")}
 `;
 }
 
+/** @param {string[]} argv */
 function parseArgs(argv) {
+  /** @type {HelpOptions} */
   const opts = { format: "text", group: null, command: null, all: false };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -176,7 +204,7 @@ function parseArgs(argv) {
     }
     const next = argv[i + 1];
     if (!next || next.startsWith("--")) throw new Error(`${arg} requires a value`);
-    if (arg === "--format") opts.format = next;
+    if (arg === "--format") opts.format = /** @type {HelpFormat} */ (next);
     else if (arg === "--group") opts.group = next;
     else if (arg === "--command") opts.command = next;
     else throw new Error(`Unknown option: ${arg}`);
@@ -189,6 +217,7 @@ function parseArgs(argv) {
   return opts;
 }
 
+/** @param {HelpOptions} opts */
 function filteredCommands(opts) {
   const fullCatalog = opts.all || opts.group || opts.command;
   return COMMANDS.filter((item) => {
@@ -202,6 +231,7 @@ function filteredCommands(opts) {
   });
 }
 
+/** @param {CommandEntry[]} commands */
 function renderCoreText(commands) {
   const lines = [];
   const width = Math.max(...commands.map((item) => item.command.length));
@@ -219,6 +249,10 @@ function renderCoreText(commands) {
   return `${lines.join("\n")}\n`;
 }
 
+/**
+ * @param {CommandEntry[]} commands
+ * @param {Partial<HelpOptions>} [opts]
+ */
 function renderText(commands, opts = {}) {
   if (!opts.all && !opts.group && !opts.command) return renderCoreText(commands);
 

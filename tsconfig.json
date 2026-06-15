@@ -12,6 +12,9 @@
     "types": ["node"]
   },
   "include": [
+    "scripts/help.mjs",
+    "scripts/doctor.mjs",
+    "scripts/sync-status.mjs",
     "scripts/lib/lark-im-core.mjs",
     "scripts/lib/ingestion-store.mjs",
     "scripts/lib/lark-im-adapter.mjs",

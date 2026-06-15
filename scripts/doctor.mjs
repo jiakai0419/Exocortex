@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+// @ts-check
+
 import { spawnSync } from "node:child_process";
 import { resolve } from "node:path";
 import {
@@ -10,6 +12,29 @@ import {
 import { block, hint, kv, list, renderError, section, statusBadge, subtitle, title } from "./lib/terminal.mjs";
 
 const DEFAULT_DB = "data/exocortex.sqlite";
+
+/**
+ * @typedef {"text" | "json"} DoctorFormat
+ *
+ * @typedef {object} DoctorOptions
+ * @property {string} db
+ * @property {boolean} live
+ * @property {number} hotChats
+ * @property {number} messagesPerChat
+ * @property {DoctorFormat} format
+ *
+ * @typedef {Record<string, any>} JsonObject
+ *
+ * @typedef {object} DoctorReport
+ * @property {boolean} ok
+ * @property {string} overall
+ * @property {string} checked_at
+ * @property {string} db_path
+ * @property {JsonObject} status
+ * @property {JsonObject} quality
+ * @property {JsonObject | null} live
+ * @property {string[]} findings
+ */
 
 function usage() {
   return `Usage: node scripts/doctor.mjs [options]
@@ -24,13 +49,19 @@ Options:
 `;
 }
 
+/**
+ * @param {unknown} value
+ * @param {string} name
+ */
 function parsePositiveInt(value, name) {
   const parsed = Number.parseInt(String(value), 10);
   if (!Number.isInteger(parsed) || parsed <= 0) throw new Error(`${name} must be positive`);
   return parsed;
 }
 
+/** @param {string[]} argv */
 function parseArgs(argv) {
+  /** @type {DoctorOptions} */
   const opts = {
     db: DEFAULT_DB,
     live: false,
@@ -55,7 +86,7 @@ function parseArgs(argv) {
     else if (arg === "--hot-chats") opts.hotChats = parsePositiveInt(next, "hot-chats");
     else if (arg === "--messages-per-chat")
       opts.messagesPerChat = parsePositiveInt(next, "messages-per-chat");
-    else if (arg === "--format") opts.format = next;
+    else if (arg === "--format") opts.format = /** @type {DoctorFormat} */ (next);
     else throw new Error(`Unknown option: ${arg}`);
     i += 1;
   }
@@ -64,29 +95,36 @@ function parseArgs(argv) {
   return opts;
 }
 
+/**
+ * @param {string[]} args
+ * @param {Set<number>} [okStatuses]
+ * @returns {JsonObject}
+ */
 function runJson(args, okStatuses = new Set([0])) {
   const result = spawnSync("node", args, {
     encoding: "utf8",
     maxBuffer: 100 * 1024 * 1024,
   });
+  const status = result.status ?? 1;
   const stdout = result.stdout.trim();
   if (stdout) {
     try {
       const json = JSON.parse(stdout);
-      if (!okStatuses.has(result.status)) json._command_status = result.status;
+      if (!okStatuses.has(status)) json._command_status = status;
       return json;
     } catch (error) {
-      if (okStatuses.has(result.status)) {
-        throw new Error(`${args.join(" ")} returned non-JSON output: ${error.message}`);
+      if (okStatuses.has(status)) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(`${args.join(" ")} returned non-JSON output: ${message}`);
       }
     }
   }
-  if (!okStatuses.has(result.status)) {
+  if (!okStatuses.has(status)) {
     return {
       ok: false,
       status: "command_failed",
       command: ["node", ...args].join(" "),
-      exit_status: result.status,
+      exit_status: status,
       stderr: result.stderr.trim(),
       stdout,
     };
@@ -94,6 +132,10 @@ function runJson(args, okStatuses = new Set([0])) {
   return {};
 }
 
+/**
+ * @param {DoctorOptions} opts
+ * @returns {DoctorReport}
+ */
 function buildReport(opts) {
   const dbPath = resolve(opts.db);
   const status = runJson(["scripts/sync-status.mjs", "--db", dbPath, "--format", "json"]);
@@ -130,11 +172,13 @@ function buildReport(opts) {
   };
 }
 
+/** @param {JsonObject} status */
 function localLatest(status) {
   const ms = status.records?.latest_ms;
   return ms ? new Date(Number(ms)).toLocaleString() : "none";
 }
 
+/** @param {JsonObject} status */
 function reconcileText(status) {
   const state = status.reconcile?.complete
     ? "complete"
@@ -144,6 +188,7 @@ function reconcileText(status) {
   return `${state}, ${status.reconcile?.cursor?.pages_scanned || 0} pages`;
 }
 
+/** @param {JsonObject} status */
 function hotDiscoveryText(status) {
   if (!status.hot_discovery?.ran) return "not started";
   const time = status.hot_discovery.cursor_updated_at
@@ -152,6 +197,7 @@ function hotDiscoveryText(status) {
   return `last run ${time}`;
 }
 
+/** @param {DoctorReport} report */
 function render(report) {
   const byDirection = Object.fromEntries(
     (report.status.records?.by_direction || []).map((row) => [row.direction, row]),
@@ -190,6 +236,7 @@ function render(report) {
   lines.push("");
   if (report.live) {
     lines.push(section("Live"));
+    /** @type {Array<[unknown, unknown]>} */
     const liveRows = [
       ["Status", statusBadge(report.live.status || "unknown")],
       ["Missing", report.live.missing_count ?? "?"],
