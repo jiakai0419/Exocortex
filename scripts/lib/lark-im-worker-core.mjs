@@ -5,4 +5,4 @@ export {
   cyclePayload,
   runCycleWithRunner,
   summarizeWorkerEvents,
-} from "../../src/runtime/worker/lark-im-worker-core.mjs";
+} from "../../dist/runtime/worker/lark-im-worker-core.js";

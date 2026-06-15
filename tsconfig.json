@@ -24,7 +24,7 @@
     "src/diagnostics/sync-status-core.mjs",
     "src/adapters/lark-im/core.mjs",
     "src/adapters/lark-im/adapter.mjs",
-    "src/runtime/worker/lark-im-worker-core.mjs",
+    "src/runtime/worker/lark-im-worker-core.ts",
     "src/storage/sqlite/ingestion-store.mjs",
     "scripts/lib/lark-im-core.mjs",
     "scripts/lib/ingestion-store.mjs",

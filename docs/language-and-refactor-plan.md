@@ -190,6 +190,12 @@ docs
 
 长期运行编排层。
 
+当前状态：
+
+- 纯 worker core 源码在 `src/runtime/worker/lark-im-worker-core.ts`。
+- 构建产物在 `dist/runtime/worker/lark-im-worker-core.js`。
+- 运行时兼容入口仍是 `scripts/lib/lark-im-worker-core.mjs`，它只 re-export 已编译 JS。
+
 包含：
 
 - worker cycle step 顺序。
@@ -359,7 +365,7 @@ node scripts/lark-im-service.mjs status
 
 ### Phase 3: 迁移纯核心到 TypeScript
 
-状态：已开始。第一刀选择 `src/terminal`，用于验证显式 build、`dist` 运行时入口和兼容 shim 的组合是否稳定。
+状态：已开始。`src/terminal` 和 `src/runtime/worker` 的纯 core 已完成第一版 TS 迁移，用于验证显式 build、`dist` 运行时入口和兼容 shim 的组合是否稳定。
 
 目标：
 
@@ -371,7 +377,7 @@ node scripts/lark-im-service.mjs status
 
 1. `src/core`
 2. `src/terminal`：已完成第一版 TS 迁移
-3. `src/runtime/worker` 的纯函数部分
+3. `src/runtime/worker` 的纯函数部分：已完成第一版 TS 迁移
 4. `src/storage/sqlite` 的类型和 SQL 构造边界
 
 暂缓迁移：
@@ -491,6 +497,7 @@ probe/maintenance scripts mostly JavaScript
 
 下一次实际改代码前，建议先做一个小复盘：
 
-1. Phase 3 已经用 `src/terminal` 验证了 `src/**/*.ts -> dist/**/*.js` 的显式 build。
-2. 下一步不要急着迁外部系统 adapter；优先考虑 `src/runtime/worker` 的纯函数部分，或补同步质量测试。
-3. 继续保持 no runtime loader、不改 LaunchAgent、不改核心三命令。
+1. Phase 3 已经用 `src/terminal` 和 `src/runtime/worker` 验证了 `src/**/*.ts -> dist/**/*.js` 的显式 build。
+2. 同步质量测试已经开始覆盖 cursor 边界推进、边界重放安全、质量报告诊断。
+3. 下一步不要急着迁外部系统 adapter；优先考虑 `src/storage/sqlite` 的类型和 SQL 构造边界，或继续补真实同步一致性测试。
+4. 继续保持 no runtime loader、不改 LaunchAgent、不改核心三命令。

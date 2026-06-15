@@ -236,6 +236,49 @@ test("successful message runs atomically write records, run state, and cursor", 
   assert.equal(sqliteQuery(dbPath, "SELECT COUNT(*) AS count FROM records;", "count records")[0].count, 1);
 });
 
+test("empty successful message runs advance the stable cursor but keep boundary replay safe", (t) => {
+  const dbPath = tempDb(t);
+  const scope = readScope(dbPath, "lark.im.sent_by_me");
+  const runId = createRun(dbPath, scope);
+  const endMs = 1700000000000;
+  const cursor = cursorAfter(endMs);
+
+  const effects = succeedMessageRun(dbPath, scope, runId, [], 0, cursor, {
+    test: true,
+    window_end: new Date(endMs).toISOString(),
+  });
+
+  assert.deepEqual(effects, { inserted: 0, updated: 0, duplicate: 0 });
+  assert.equal(sqliteQuery(dbPath, "SELECT COUNT(*) AS count FROM records;", "count records")[0].count, 0);
+  assert.deepEqual(
+    sqliteQuery(
+      dbPath,
+      "SELECT status, scanned_count, inserted_count, updated_count, duplicate_count FROM sync_runs WHERE id = 1;",
+      "read empty run",
+    )[0],
+    { status: "succeeded", scanned_count: 0, inserted_count: 0, updated_count: 0, duplicate_count: 0 },
+  );
+
+  const updatedScope = readScope(dbPath, "lark.im.sent_by_me");
+  assert.equal(updatedScope.cursor.created_at_ms, endMs);
+  assert.equal(updatedScope.cursor.message_id, "");
+
+  const boundaryRecords = prepareRecords(
+    [
+      message("om_before_boundary", endMs - 1),
+      message("om_boundary_late_arrival", endMs),
+      message("om_after_window", endMs + 1000),
+    ],
+    scope.id,
+    "sent",
+    updatedScope.cursor,
+    endMs - 1000,
+    endMs,
+  );
+
+  assert.deepEqual(boundaryRecords.map((record) => record.external_id), ["om_boundary_late_arrival"]);
+});
+
 test("failed runs do not advance the scope cursor", (t) => {
   const dbPath = tempDb(t);
   const scope = readScope(dbPath, "lark.im.sent_by_me");

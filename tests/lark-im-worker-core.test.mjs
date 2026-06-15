@@ -6,7 +6,7 @@ import {
   compactSummary,
   runCycleWithRunner,
   summarizeWorkerEvents,
-} from "../src/runtime/worker/lark-im-worker-core.mjs";
+} from "../dist/runtime/worker/lark-im-worker-core.js";
 import { summarizeWorkerEvents as shimSummarizeWorkerEvents } from "../scripts/lib/lark-im-worker-core.mjs";
 
 function opts(overrides = {}) {

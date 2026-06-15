@@ -1,79 +1,85 @@
-// @ts-check
+type JsonObject = Record<string, any>;
 
-/**
- * @typedef {object} WorkerCycleOptions
- * @property {string} db
- * @property {number} hotDiscoveryPagesPerCycle
- * @property {number} hotReceivedScopesPerCycle
- * @property {number} discoveryPagesPerCycle
- * @property {number} receivedScopesPerCycle
- * @property {number} maxChatPages
- * @property {number} reconcileIntervalHours
- * @property {string=} chatTypes
- * @property {string=} logDir
- *
- * @typedef {object} WorkerStepSpec
- * @property {string} name
- * @property {string[]} args
- *
- * @typedef {object} RunSummary
- * @property {number | null=} run_id
- * @property {boolean=} ok
- * @property {number=} scanned
- * @property {number=} records
- * @property {number=} inserted
- * @property {number=} updated
- * @property {number=} duplicate
- * @property {string=} scope_id
- * @property {string=} mode
- * @property {number=} pages
- * @property {number=} discovered_in_run
- * @property {boolean=} has_more
- * @property {string=} snapshot_id
- * @property {boolean=} skipped
- * @property {string=} reason
- *
- * @typedef {object} SyncSummary
- * @property {boolean=} ok
- * @property {Record<string, any>=} window
- * @property {RunSummary | null=} sent
- * @property {RunSummary | null=} discovery
- * @property {RunSummary[]=} received
- *
- * @typedef {object} ReceivedTotals
- * @property {number} scopes
- * @property {number} scanned
- * @property {number} records
- * @property {number} inserted
- * @property {number} updated
- * @property {number} duplicate
- *
- * @typedef {object} WorkerEvent
- * @property {string=} type
- * @property {number=} cycle
- * @property {string=} name
- * @property {boolean=} ok
- * @property {string=} at
- * @property {string=} started_at
- * @property {string=} finished_at
- * @property {RunSummary | null=} summary
- * @property {WorkerEvent[]=} steps
- * @property {number=} exit_code
- * @property {string=} stderr
- *
- * @typedef {object} WorkerCyclePayload
- * @property {"lark_im_worker_cycle"} type
- * @property {number} cycle
- * @property {boolean} ok
- * @property {string} at
- * @property {WorkerEvent[]} steps
- *
- * @typedef {(name: string, args: string[]) => WorkerEvent} WorkerStepRunner
- * @typedef {(opts: WorkerCycleOptions, payload: WorkerEvent | WorkerCyclePayload) => void} WorkerLogWriter
- */
+type WorkerCycleOptions = {
+  db: string;
+  hotDiscoveryPagesPerCycle: number;
+  hotReceivedScopesPerCycle: number;
+  discoveryPagesPerCycle: number;
+  receivedScopesPerCycle: number;
+  maxChatPages: number;
+  reconcileIntervalHours: number;
+  chatTypes?: string;
+  logDir?: string;
+};
 
-/** @param {WorkerCycleOptions} opts */
-function buildCycleStepSpecs(opts) {
+type WorkerStepSpec = {
+  name: string;
+  args: string[];
+};
+
+type RunSummary = {
+  run_id?: number | null;
+  ok?: boolean;
+  scanned?: number;
+  records?: number;
+  inserted?: number;
+  updated?: number;
+  duplicate?: number;
+  scope_id?: string;
+  mode?: string;
+  pages?: number;
+  discovered_in_run?: number;
+  has_more?: boolean;
+  snapshot_id?: string;
+  skipped?: boolean;
+  reason?: string;
+  [key: string]: unknown;
+};
+
+type SyncSummary = {
+  ok?: boolean;
+  window?: JsonObject;
+  sent?: RunSummary | null;
+  discovery?: RunSummary | null;
+  received?: RunSummary[];
+};
+
+type ReceivedTotals = {
+  scopes: number;
+  scanned: number;
+  records: number;
+  inserted: number;
+  updated: number;
+  duplicate: number;
+};
+
+type WorkerEvent = {
+  type?: string;
+  cycle?: number;
+  name?: string;
+  ok?: boolean;
+  at?: string;
+  started_at?: string;
+  finished_at?: string;
+  summary?: RunSummary | null;
+  steps?: WorkerEvent[];
+  exit_code?: number;
+  stderr?: string;
+  [key: string]: unknown;
+};
+
+type WorkerCyclePayload = {
+  type: "lark_im_worker_cycle";
+  cycle: number;
+  ok: boolean;
+  at: string;
+  steps: WorkerEvent[];
+};
+
+type WorkerStepRunner = (name: string, args: string[]) => WorkerEvent;
+type WorkerLogWriter = (opts: WorkerCycleOptions, payload: WorkerEvent | WorkerCyclePayload) => void;
+
+function buildCycleStepSpecs(opts: WorkerCycleOptions): WorkerStepSpec[] {
   const chatTypes = opts.chatTypes || "group,p2p";
   return [
     {
@@ -162,8 +168,7 @@ function buildCycleStepSpecs(opts) {
   ];
 }
 
-/** @param {RunSummary | null | undefined} run */
-function compactRun(run) {
+function compactRun(run: RunSummary | null | undefined) {
   if (!run) return null;
   return {
     run_id: run.run_id,
@@ -176,14 +181,12 @@ function compactRun(run) {
   };
 }
 
-/** @param {SyncSummary | null | undefined} summary */
-function compactSummary(summary) {
+function compactSummary(summary: SyncSummary | null | undefined) {
   if (!summary) return null;
 
   const received = Array.isArray(summary.received) ? summary.received : [];
   const receivedFailures = received.filter((run) => !run.ok);
-  /** @type {ReceivedTotals} */
-  const initialReceivedTotals = { scopes: 0, scanned: 0, records: 0, inserted: 0, updated: 0, duplicate: 0 };
+  const initialReceivedTotals: ReceivedTotals = { scopes: 0, scanned: 0, records: 0, inserted: 0, updated: 0, duplicate: 0 };
   const receivedTotals = received.reduce(
     (totals, run) => ({
       scopes: totals.scopes + 1,
@@ -227,13 +230,11 @@ function compactSummary(summary) {
   };
 }
 
-/**
- * @param {number} cycle
- * @param {WorkerEvent[]} steps
- * @param {() => string} [now]
- * @returns {WorkerCyclePayload}
- */
-function cyclePayload(cycle, steps, now = () => new Date().toISOString()) {
+function cyclePayload(
+  cycle: number,
+  steps: WorkerEvent[],
+  now: () => string = () => new Date().toISOString(),
+): WorkerCyclePayload {
   return {
     type: "lark_im_worker_cycle",
     cycle,
@@ -243,15 +244,14 @@ function cyclePayload(cycle, steps, now = () => new Date().toISOString()) {
   };
 }
 
-/**
- * @param {WorkerCycleOptions} opts
- * @param {number} cycle
- * @param {WorkerStepRunner} runStep
- * @param {WorkerLogWriter} writeLog
- * @param {() => string} [now]
- */
-function runCycleWithRunner(opts, cycle, runStep, writeLog, now = () => new Date().toISOString()) {
-  const steps = [];
+function runCycleWithRunner(
+  opts: WorkerCycleOptions,
+  cycle: number,
+  runStep: WorkerStepRunner,
+  writeLog: WorkerLogWriter,
+  now: () => string = () => new Date().toISOString(),
+) {
+  const steps: WorkerEvent[] = [];
   for (const spec of buildCycleStepSpecs(opts)) {
     const step = runStep(spec.name, spec.args);
     steps.push(step);
@@ -262,38 +262,26 @@ function runCycleWithRunner(opts, cycle, runStep, writeLog, now = () => new Date
   return payload.ok;
 }
 
-/** @param {WorkerEvent | null | undefined} event */
-function eventTimeMs(event) {
+function eventTimeMs(event: WorkerEvent | null | undefined) {
   const value = event?.at || event?.finished_at || event?.started_at || "";
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-/** @param {WorkerEvent | null | undefined} event */
-function eventTimeIso(event) {
+function eventTimeIso(event: WorkerEvent | null | undefined) {
   const ms = eventTimeMs(event);
   return ms === null ? null : new Date(ms).toISOString();
 }
 
-/**
- * @param {WorkerEvent[]} events
- * @param {(event: WorkerEvent) => boolean} [predicate]
- */
-function latestEvent(events, predicate = () => true) {
+function latestEvent(events: WorkerEvent[], predicate: (event: WorkerEvent) => boolean = () => true) {
   for (let i = events.length - 1; i >= 0; i -= 1) {
     if (predicate(events[i])) return events[i];
   }
   return null;
 }
 
-/**
- * @param {unknown[]} events
- * @param {number} [nowMs]
- */
-function summarizeWorkerEvents(events, nowMs = Date.now()) {
-  const normalized = /** @type {WorkerEvent[]} */ (
-    (events || []).filter((event) => event && typeof event === "object")
-  );
+function summarizeWorkerEvents(events: unknown[], nowMs = Date.now()) {
+  const normalized = (events || []).filter((event) => event && typeof event === "object") as WorkerEvent[];
   const lastEvent = latestEvent(normalized, (event) => Boolean(event.type));
   const lastCycle = latestEvent(normalized, (event) => event.type === "lark_im_worker_cycle");
   const lastStep = latestEvent(normalized, (event) => event.type === "lark_im_worker_step");

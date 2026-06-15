@@ -9,5 +9,5 @@
     "outDir": "dist",
     "rootDir": "src"
   },
-  "include": ["src/terminal/**/*.ts"]
+  "include": ["src/terminal/**/*.ts", "src/runtime/worker/**/*.ts"]
 }

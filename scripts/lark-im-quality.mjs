@@ -3,6 +3,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { block, compact, kv, list, renderError, section, statusBadge, table, title } from "./lib/terminal.mjs";
 
 const DEFAULT_DB = "data/exocortex.sqlite";
@@ -204,8 +205,8 @@ function render(report) {
   return `${block(lines)}\n`;
 }
 
-function main() {
-  const opts = parseArgs(process.argv.slice(2));
+function main(argv = process.argv.slice(2)) {
+  const opts = parseArgs(argv);
   const dbPath = resolve(opts.db);
   if (!existsSync(dbPath)) throw new Error(`database not found: ${dbPath}`);
   const report = collect(dbPath);
@@ -213,9 +214,13 @@ function main() {
   else process.stdout.write(render(report));
 }
 
-try {
-  main();
-} catch (error) {
-  process.stderr.write(renderError(error));
-  process.exit(1);
+export { collect, main, one, parseArgs, render, sqliteJson };
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  try {
+    main();
+  } catch (error) {
+    process.stderr.write(renderError(error));
+    process.exit(1);
+  }
 }
