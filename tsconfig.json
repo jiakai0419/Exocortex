@@ -14,6 +14,8 @@
   "include": [
     "scripts/lib/lark-im-core.mjs",
     "scripts/lib/ingestion-store.mjs",
-    "scripts/lib/lark-im-adapter.mjs"
+    "scripts/lib/lark-im-adapter.mjs",
+    "scripts/lib/lark-im-worker-core.mjs",
+    "scripts/lib/sync-status-core.mjs"
   ]
 }

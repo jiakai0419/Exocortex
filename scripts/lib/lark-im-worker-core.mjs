@@ -1,3 +1,76 @@
+// @ts-check
+
+/**
+ * @typedef {object} WorkerCycleOptions
+ * @property {string} db
+ * @property {number} hotDiscoveryPagesPerCycle
+ * @property {number} hotReceivedScopesPerCycle
+ * @property {number} discoveryPagesPerCycle
+ * @property {number} receivedScopesPerCycle
+ * @property {number} maxChatPages
+ * @property {number} reconcileIntervalHours
+ *
+ * @typedef {object} WorkerStepSpec
+ * @property {string} name
+ * @property {string[]} args
+ *
+ * @typedef {object} RunSummary
+ * @property {number | null=} run_id
+ * @property {boolean=} ok
+ * @property {number=} scanned
+ * @property {number=} records
+ * @property {number=} inserted
+ * @property {number=} updated
+ * @property {number=} duplicate
+ * @property {string=} scope_id
+ * @property {string=} mode
+ * @property {number=} pages
+ * @property {number=} discovered_in_run
+ * @property {boolean=} has_more
+ * @property {string=} snapshot_id
+ * @property {boolean=} skipped
+ * @property {string=} reason
+ *
+ * @typedef {object} SyncSummary
+ * @property {boolean=} ok
+ * @property {Record<string, any>=} window
+ * @property {RunSummary | null=} sent
+ * @property {RunSummary | null=} discovery
+ * @property {RunSummary[]=} received
+ *
+ * @typedef {object} ReceivedTotals
+ * @property {number} scopes
+ * @property {number} scanned
+ * @property {number} records
+ * @property {number} inserted
+ * @property {number} updated
+ * @property {number} duplicate
+ *
+ * @typedef {object} WorkerEvent
+ * @property {string=} type
+ * @property {number=} cycle
+ * @property {string=} name
+ * @property {boolean=} ok
+ * @property {string=} at
+ * @property {string=} started_at
+ * @property {string=} finished_at
+ * @property {RunSummary | null=} summary
+ * @property {WorkerEvent[]=} steps
+ * @property {number=} exit_code
+ * @property {string=} stderr
+ *
+ * @typedef {object} WorkerCyclePayload
+ * @property {"lark_im_worker_cycle"} type
+ * @property {number} cycle
+ * @property {boolean} ok
+ * @property {string} at
+ * @property {WorkerEvent[]} steps
+ *
+ * @typedef {(name: string, args: string[]) => WorkerEvent} WorkerStepRunner
+ * @typedef {(opts: WorkerCycleOptions, payload: WorkerEvent | WorkerCyclePayload) => void} WorkerLogWriter
+ */
+
+/** @param {WorkerCycleOptions} opts */
 function buildCycleStepSpecs(opts) {
   return [
     {
@@ -80,6 +153,7 @@ function buildCycleStepSpecs(opts) {
   ];
 }
 
+/** @param {RunSummary | null | undefined} run */
 function compactRun(run) {
   if (!run) return null;
   return {
@@ -93,11 +167,14 @@ function compactRun(run) {
   };
 }
 
+/** @param {SyncSummary | null | undefined} summary */
 function compactSummary(summary) {
   if (!summary) return null;
 
   const received = Array.isArray(summary.received) ? summary.received : [];
   const receivedFailures = received.filter((run) => !run.ok);
+  /** @type {ReceivedTotals} */
+  const initialReceivedTotals = { scopes: 0, scanned: 0, records: 0, inserted: 0, updated: 0, duplicate: 0 };
   const receivedTotals = received.reduce(
     (totals, run) => ({
       scopes: totals.scopes + 1,
@@ -107,7 +184,7 @@ function compactSummary(summary) {
       updated: totals.updated + (run.updated || 0),
       duplicate: totals.duplicate + (run.duplicate || 0),
     }),
-    { scopes: 0, scanned: 0, records: 0, inserted: 0, updated: 0, duplicate: 0 },
+    initialReceivedTotals,
   );
 
   return {
@@ -141,6 +218,12 @@ function compactSummary(summary) {
   };
 }
 
+/**
+ * @param {number} cycle
+ * @param {WorkerEvent[]} steps
+ * @param {() => string} [now]
+ * @returns {WorkerCyclePayload}
+ */
 function cyclePayload(cycle, steps, now = () => new Date().toISOString()) {
   return {
     type: "lark_im_worker_cycle",
@@ -151,6 +234,13 @@ function cyclePayload(cycle, steps, now = () => new Date().toISOString()) {
   };
 }
 
+/**
+ * @param {WorkerCycleOptions} opts
+ * @param {number} cycle
+ * @param {WorkerStepRunner} runStep
+ * @param {WorkerLogWriter} writeLog
+ * @param {() => string} [now]
+ */
 function runCycleWithRunner(opts, cycle, runStep, writeLog, now = () => new Date().toISOString()) {
   const steps = [];
   for (const spec of buildCycleStepSpecs(opts)) {
@@ -163,17 +253,23 @@ function runCycleWithRunner(opts, cycle, runStep, writeLog, now = () => new Date
   return payload.ok;
 }
 
+/** @param {WorkerEvent | null | undefined} event */
 function eventTimeMs(event) {
   const value = event?.at || event?.finished_at || event?.started_at || "";
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+/** @param {WorkerEvent | null | undefined} event */
 function eventTimeIso(event) {
   const ms = eventTimeMs(event);
   return ms === null ? null : new Date(ms).toISOString();
 }
 
+/**
+ * @param {WorkerEvent[]} events
+ * @param {(event: WorkerEvent) => boolean} [predicate]
+ */
 function latestEvent(events, predicate = () => true) {
   for (let i = events.length - 1; i >= 0; i -= 1) {
     if (predicate(events[i])) return events[i];
@@ -181,15 +277,22 @@ function latestEvent(events, predicate = () => true) {
   return null;
 }
 
+/**
+ * @param {unknown[]} events
+ * @param {number} [nowMs]
+ */
 function summarizeWorkerEvents(events, nowMs = Date.now()) {
-  const normalized = (events || []).filter((event) => event && typeof event === "object");
-  const lastEvent = latestEvent(normalized, (event) => event.type);
+  const normalized = /** @type {WorkerEvent[]} */ (
+    (events || []).filter((event) => event && typeof event === "object")
+  );
+  const lastEvent = latestEvent(normalized, (event) => Boolean(event.type));
   const lastCycle = latestEvent(normalized, (event) => event.type === "lark_im_worker_cycle");
   const lastStep = latestEvent(normalized, (event) => event.type === "lark_im_worker_step");
   const lastFailure = latestEvent(normalized, (event) => event.ok === false);
   const lastEventMs = eventTimeMs(lastEvent);
   const lastCycleMs = eventTimeMs(lastCycle);
   const lastStepMs = eventTimeMs(lastStep);
+  const lastFailureMs = eventTimeMs(lastFailure);
   const stepAfterCycle =
     lastStep &&
     (!lastCycle ||
@@ -225,8 +328,7 @@ function summarizeWorkerEvents(events, nowMs = Date.now()) {
           cycle: lastFailure.cycle,
           name: lastFailure.name || "cycle",
           at: eventTimeIso(lastFailure),
-          age_ms:
-            eventTimeMs(lastFailure) === null ? null : Math.max(0, nowMs - eventTimeMs(lastFailure)),
+          age_ms: lastFailureMs === null ? null : Math.max(0, nowMs - lastFailureMs),
         }
       : null,
   };
