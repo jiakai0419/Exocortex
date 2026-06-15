@@ -24,7 +24,7 @@ import {
   sqliteExec,
   sqliteQuery,
   succeedMessageRun,
-} from "./lib/ingestion-store.mjs";
+} from "../src/storage/sqlite/ingestion-store.mjs";
 import {
   CHAT_DISCOVERY_SCOPE_ID,
   CHAT_HOT_DISCOVERY_SCOPE_ID,

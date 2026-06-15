@@ -5,7 +5,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
-import { recoverStaleSyncState } from "./lib/ingestion-store.mjs";
+import { recoverStaleSyncState } from "../src/storage/sqlite/ingestion-store.mjs";
 import {
   countBy,
   healthDetail,

@@ -14,7 +14,8 @@ import {
   sqliteExec,
   sqliteQuery,
   succeedRecordRun,
-} from "../scripts/lib/ingestion-store.mjs";
+} from "../src/storage/sqlite/ingestion-store.mjs";
+import * as ingestionStoreShim from "../scripts/lib/ingestion-store.mjs";
 
 function tempDir(t) {
   const dir = mkdtempSync(join(tmpdir(), "exocortex-store-test-"));
@@ -27,6 +28,11 @@ function tempDb(t) {
   ensureInitialized(dbPath);
   return dbPath;
 }
+
+test("ingestion store shim re-exports the src implementation", () => {
+  assert.equal(ingestionStoreShim.ensureInitialized, ensureInitialized);
+  assert.equal(ingestionStoreShim.succeedRecordRun, succeedRecordRun);
+});
 
 function installTestScope(dbPath) {
   sqliteExec(
