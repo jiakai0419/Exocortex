@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+// @ts-check
+
 import { spawnSync } from "node:child_process";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { resolve } from "node:path";
@@ -15,6 +17,31 @@ const DEFAULT_DISCOVERY_PAGES_PER_CYCLE = 1;
 const DEFAULT_HOT_DISCOVERY_PAGES_PER_CYCLE = 5;
 const DEFAULT_MAX_CHAT_PAGES = 300;
 const DEFAULT_RECONCILE_INTERVAL_HOURS = 24;
+
+/**
+ * @typedef {object} WorkerOptions
+ * @property {string} db
+ * @property {number} intervalSeconds
+ * @property {number} receivedScopesPerCycle
+ * @property {number} hotReceivedScopesPerCycle
+ * @property {number} discoveryPagesPerCycle
+ * @property {number} hotDiscoveryPagesPerCycle
+ * @property {number} maxChatPages
+ * @property {number} reconcileIntervalHours
+ * @property {string} logDir
+ * @property {number | null} maxCycles
+ *
+ * @typedef {Record<string, any>} JsonObject
+ *
+ * @typedef {object} WorkerStepResult
+ * @property {string} name
+ * @property {boolean} ok
+ * @property {number=} exit_code
+ * @property {string} started_at
+ * @property {string} finished_at
+ * @property {JsonObject | null} summary
+ * @property {string} stderr
+ */
 
 function usage() {
   return `Usage: node scripts/lark-im-worker.mjs [options]
@@ -35,13 +62,19 @@ Options:
 `;
 }
 
+/**
+ * @param {unknown} value
+ * @param {string} name
+ */
 function parsePositiveInt(value, name) {
   const parsed = Number.parseInt(String(value), 10);
   if (!Number.isInteger(parsed) || parsed <= 0) throw new Error(`${name} must be positive`);
   return parsed;
 }
 
+/** @param {string[]} argv */
 function parseArgs(argv) {
+  /** @type {WorkerOptions} */
   const opts = {
     db: "data/exocortex.sqlite",
     intervalSeconds: DEFAULT_INTERVAL_SECONDS,
@@ -89,10 +122,16 @@ function parseArgs(argv) {
   return opts;
 }
 
+/** @param {number} seconds */
 function sleepSeconds(seconds) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, seconds * 1000);
 }
 
+/**
+ * @param {string} name
+ * @param {string[]} args
+ * @returns {WorkerStepResult}
+ */
 function runStep(name, args) {
   const startedAt = new Date().toISOString();
   const result = spawnSync(process.execPath, ["scripts/lark-im-sync.mjs", ...args], {
@@ -100,6 +139,7 @@ function runStep(name, args) {
     maxBuffer: 100 * 1024 * 1024,
   });
   const finishedAt = new Date().toISOString();
+  /** @type {JsonObject | null} */
   let summary = null;
   try {
     summary = result.stdout.trim() ? JSON.parse(result.stdout) : null;
@@ -109,7 +149,7 @@ function runStep(name, args) {
   return {
     name,
     ok: result.status === 0,
-    exit_code: result.status,
+    exit_code: result.status ?? undefined,
     started_at: startedAt,
     finished_at: finishedAt,
     summary: compactSummary(summary),
@@ -117,6 +157,10 @@ function runStep(name, args) {
   };
 }
 
+/**
+ * @param {{logDir?: string}} opts
+ * @param {JsonObject} payload
+ */
 function writeLog(opts, payload) {
   const line = `${JSON.stringify(payload)}\n`;
   process.stdout.write(line);
@@ -127,6 +171,10 @@ function writeLog(opts, payload) {
   }
 }
 
+/**
+ * @param {WorkerOptions} opts
+ * @param {number} cycle
+ */
 function runCycle(opts, cycle) {
   return runCycleWithRunner(opts, cycle, runStep, writeLog);
 }
@@ -145,6 +193,7 @@ function main() {
 try {
   main();
 } catch (error) {
-  process.stderr.write(`${error.message}\n`);
+  const message = error instanceof Error ? error.message : String(error);
+  process.stderr.write(`${message}\n`);
   process.exit(1);
 }

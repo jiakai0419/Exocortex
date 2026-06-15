@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+// @ts-check
+
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
@@ -52,6 +54,67 @@ const DEFAULT_CHAT_PAGE_SIZE = 100;
 const DEFAULT_MAX_CHAT_PAGES = 100;
 const DEFAULT_STABLE_HORIZON_SECONDS = 30;
 
+/**
+ * @typedef {"all" | "sent" | "discover" | "received"} SyncScopeOption
+ * @typedef {"cursor" | "hot" | "reconcile"} DiscoveryMode
+ * @typedef {"all" | "hot" | "catchup"} ReceivedMode
+ *
+ * @typedef {Record<string, any>} JsonObject
+ *
+ * @typedef {object} SyncOptions
+ * @property {string} db
+ * @property {SyncScopeOption} scope
+ * @property {string} start
+ * @property {string} end
+ * @property {number} pageSize
+ * @property {number} maxPages
+ * @property {number} chatPageSize
+ * @property {number} maxChatPages
+ * @property {number} discoveryPagesPerRun
+ * @property {number} receivedScopesPerRun
+ * @property {DiscoveryMode} discoveryMode
+ * @property {number} reconcileIntervalHours
+ * @property {ReceivedMode} receivedMode
+ * @property {string} chatTypes
+ * @property {number} stableHorizonSeconds
+ * @property {boolean} endExplicit
+ * @property {number} lockTtlSeconds
+ * @property {number} retries
+ * @property {number} retryDelayMs
+ * @property {number} startMs
+ * @property {number} endMs
+ * @property {number} stableHorizonMs
+ *
+ * @typedef {JsonObject & {
+ *   id: string,
+ *   source_id: string,
+ *   enabled?: number,
+ *   config?: JsonObject,
+ *   cursor?: JsonObject | null,
+ *   cursor_json?: string | null
+ * }} ScopeRow
+ *
+ * @typedef {{open_id: string, name: string}} SelfProfile
+ *
+ * @typedef {JsonObject & {
+ *   ok?: boolean,
+ *   scope_id?: string,
+ *   run_id?: number | null,
+ *   skipped?: boolean,
+ *   reason?: string
+ * }} RunResult
+ *
+ * @typedef {object} DiscoveryResult
+ * @property {string} snapshot_id
+ * @property {string} snapshot_started_at
+ * @property {JsonObject[]} chats
+ * @property {number} pages
+ * @property {number} pages_scanned_total
+ * @property {boolean} has_more
+ * @property {string} page_token
+ * @property {boolean=} hot
+ */
+
 function usage() {
   return `Usage: node scripts/lark-im-sync.mjs [options]
 
@@ -84,6 +147,10 @@ Options:
 `;
 }
 
+/**
+ * @param {unknown} value
+ * @param {string} name
+ */
 function parsePositiveInt(value, name) {
   const parsed = Number.parseInt(String(value), 10);
   if (!Number.isInteger(parsed) || parsed <= 0) {
@@ -92,6 +159,10 @@ function parsePositiveInt(value, name) {
   return parsed;
 }
 
+/**
+ * @param {unknown} value
+ * @param {string} name
+ */
 function parseNonNegativeInt(value, name) {
   const parsed = Number.parseInt(String(value), 10);
   if (!Number.isInteger(parsed) || parsed < 0) {
@@ -100,6 +171,10 @@ function parseNonNegativeInt(value, name) {
   return parsed;
 }
 
+/**
+ * @param {unknown} value
+ * @param {string} name
+ */
 function parseTimeMs(value, name) {
   const parsed = parseLarkTimeMs(value);
   if (!Number.isFinite(parsed)) throw new Error(`${name} is not a valid time: ${value}`);
@@ -111,7 +186,9 @@ function defaultStartIso() {
   return `${localDay(now)}T00:00:00${localOffset(now)}`;
 }
 
+/** @param {string[]} argv */
 function parseArgs(argv) {
+  /** @type {SyncOptions} */
   const opts = {
     db: DEFAULT_DB,
     scope: "all",
@@ -132,6 +209,9 @@ function parseArgs(argv) {
     lockTtlSeconds: 600,
     retries: 2,
     retryDelayMs: 1000,
+    startMs: 0,
+    endMs: 0,
+    stableHorizonMs: DEFAULT_STABLE_HORIZON_SECONDS * 1000,
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -143,7 +223,7 @@ function parseArgs(argv) {
     const next = argv[i + 1];
     if (!next || next.startsWith("--")) throw new Error(`${arg} requires a value`);
     if (arg === "--db") opts.db = next;
-    else if (arg === "--scope") opts.scope = next;
+    else if (arg === "--scope") opts.scope = /** @type {SyncScopeOption} */ (next);
     else if (arg === "--start") opts.start = next;
     else if (arg === "--end") {
       opts.end = next;
@@ -158,10 +238,10 @@ function parseArgs(argv) {
       opts.discoveryPagesPerRun = parsePositiveInt(next, "discovery-pages-per-run");
     else if (arg === "--received-scopes-per-run")
       opts.receivedScopesPerRun = parseNonNegativeInt(next, "received-scopes-per-run");
-    else if (arg === "--discovery-mode") opts.discoveryMode = next;
+    else if (arg === "--discovery-mode") opts.discoveryMode = /** @type {DiscoveryMode} */ (next);
     else if (arg === "--reconcile-interval-hours")
       opts.reconcileIntervalHours = parsePositiveInt(next, "reconcile-interval-hours");
-    else if (arg === "--received-mode") opts.receivedMode = next;
+    else if (arg === "--received-mode") opts.receivedMode = /** @type {ReceivedMode} */ (next);
     else if (arg === "--chat-types") opts.chatTypes = next;
     else if (arg === "--stable-horizon-seconds")
       opts.stableHorizonSeconds = parseNonNegativeInt(next, "stable-horizon-seconds");
@@ -190,6 +270,11 @@ function parseArgs(argv) {
   return opts;
 }
 
+/**
+ * @param {string} dbPath
+ * @param {ReceivedMode} [mode]
+ * @returns {ScopeRow[]}
+ */
 function listReceivedScopes(dbPath, mode = "all") {
   const modeWhere =
     mode === "hot"
@@ -233,8 +318,15 @@ function listReceivedScopes(dbPath, mode = "all") {
   }));
 }
 
+/**
+ * @param {string} dbPath
+ * @param {string} scopeId
+ * @param {SyncOptions} opts
+ * @param {(scope: ScopeRow, runId: number) => RunResult} worker
+ * @returns {RunResult}
+ */
 function syncScope(dbPath, scopeId, opts, worker) {
-  const scope = readScope(dbPath, scopeId);
+  const scope = /** @type {ScopeRow} */ (readScope(dbPath, scopeId));
   if (!scope.enabled) return { scope_id: scopeId, skipped: true, reason: "scope_disabled" };
   if (!acquireLock(dbPath, scopeId, opts.lockTtlSeconds)) {
     return { scope_id: scopeId, skipped: true, reason: "scope_locked" };
@@ -245,12 +337,19 @@ function syncScope(dbPath, scopeId, opts, worker) {
     releaseLock(dbPath, scopeId);
     return { scope_id: scopeId, run_id: runId, ...result };
   } catch (error) {
-    failRun(dbPath, scope, runId, error);
+    const err = error instanceof Error ? error : new Error(String(error));
+    failRun(dbPath, scope, runId, err);
     releaseLock(dbPath, scopeId);
-    return { scope_id: scopeId, run_id: runId, ok: false, error: error.message };
+    return { scope_id: scopeId, run_id: runId, ok: false, error: err.message };
   }
 }
 
+/**
+ * @param {string} dbPath
+ * @param {SyncOptions} opts
+ * @param {SelfProfile} selfProfile
+ * @returns {RunResult}
+ */
 function syncSent(dbPath, opts, selfProfile) {
   return syncScope(dbPath, SENT_SCOPE_ID, opts, (scope, runId) => {
     const { startMs, endMs } = messageWindow(scope, opts);
@@ -264,7 +363,7 @@ function syncSent(dbPath, opts, selfProfile) {
       opts.startMs,
       endMs,
       null,
-      peopleContext,
+      /** @type {any} */ (peopleContext),
       scope.config,
     );
     const cursor = cursorAfter(endMs);
@@ -282,16 +381,23 @@ function syncSent(dbPath, opts, selfProfile) {
   });
 }
 
+/**
+ * @param {ScopeRow} scope
+ * @param {SyncOptions} opts
+ * @returns {DiscoveryResult}
+ */
 function discoverChatPages(scope, opts) {
+  /** @type {JsonObject[]} */
   const chats = [];
   const seen = new Set();
+  const cursor = scope.cursor || {};
   const activeCursor =
-    scope.cursor?.kind === "chat_discovery_cursor/v1" && scope.cursor?.has_more === true;
+    cursor.kind === "chat_discovery_cursor/v1" && cursor.has_more === true;
   const snapshotId = activeCursor
-    ? scope.cursor.snapshot_id
+    ? String(cursor.snapshot_id)
     : `snapshot_${Date.now()}_${shortHash(`${process.pid}:${Math.random()}`)}`;
-  const snapshotStartedAt = activeCursor ? scope.cursor.snapshot_started_at : new Date().toISOString();
-  let pageToken = activeCursor ? scope.cursor.page_token || "" : "";
+  const snapshotStartedAt = activeCursor ? String(cursor.snapshot_started_at) : new Date().toISOString();
+  let pageToken = activeCursor ? String(cursor.page_token || "") : "";
   let hasMore = false;
   let processedPages = 0;
   const previousPages = activeCursor ? Number(scope.cursor?.pages_scanned || 0) : 0;
@@ -324,7 +430,12 @@ function discoverChatPages(scope, opts) {
   };
 }
 
+/**
+ * @param {SyncOptions} opts
+ * @returns {DiscoveryResult}
+ */
 function discoverHotChatPages(opts) {
+  /** @type {JsonObject[]} */
   const chats = [];
   const seen = new Set();
   let pageToken = "";
@@ -357,6 +468,10 @@ function discoverHotChatPages(opts) {
   };
 }
 
+/**
+ * @param {ScopeRow} scope
+ * @param {SyncOptions} opts
+ */
 function shouldSkipCompletedDiscovery(scope, opts) {
   return (
     opts.discoveryMode === "cursor" &&
@@ -365,6 +480,10 @@ function shouldSkipCompletedDiscovery(scope, opts) {
   );
 }
 
+/**
+ * @param {ScopeRow} scope
+ * @param {SyncOptions} opts
+ */
 function shouldSkipReconcile(scope, opts) {
   if (opts.discoveryMode !== "reconcile") return false;
   if (scope.cursor?.kind === "chat_discovery_cursor/v1" && scope.cursor?.has_more === true) {
@@ -379,6 +498,11 @@ function shouldSkipReconcile(scope, opts) {
   return lastCompletedMs > dueBeforeMs;
 }
 
+/**
+ * @param {string} dbPath
+ * @param {SyncOptions} opts
+ * @returns {RunResult}
+ */
 function syncDiscovery(dbPath, opts) {
   const scopeId =
     opts.discoveryMode === "hot"
@@ -386,17 +510,18 @@ function syncDiscovery(dbPath, opts) {
       : opts.discoveryMode === "reconcile"
         ? CHAT_RECONCILE_SCOPE_ID
         : CHAT_DISCOVERY_SCOPE_ID;
-  const currentScope = readScope(dbPath, scopeId);
+  const currentScope = /** @type {ScopeRow} */ (readScope(dbPath, scopeId));
   if (shouldSkipReconcile(currentScope, opts)) {
-      return {
-        run_id: null,
-        scope_id: scopeId,
-        ok: true,
-        mode: opts.discoveryMode,
+    const cursor = currentScope.cursor || {};
+    return {
+      run_id: null,
+      scope_id: scopeId,
+      ok: true,
+      mode: opts.discoveryMode,
       discovered_in_run: 0,
       pages: 0,
       has_more: false,
-      snapshot_id: currentScope.cursor.snapshot_id,
+      snapshot_id: cursor.snapshot_id,
       skipped: true,
       reason: "not_due",
     };
@@ -404,12 +529,13 @@ function syncDiscovery(dbPath, opts) {
   return syncScope(dbPath, scopeId, opts, (scope, runId) => {
     if (shouldSkipCompletedDiscovery(scope, opts)) {
       const now = new Date().toISOString();
+      const cursor = scope.cursor || {};
       sqliteExec(
         dbPath,
         `
 UPDATE sync_runs
 SET status = 'succeeded',
-    cursor_after_json = ${sqlJson(scope.cursor)},
+    cursor_after_json = ${sqlJson(cursor)},
     finished_at = ${quoteSql(now)},
     scanned_count = 0,
     inserted_count = 0,
@@ -420,7 +546,7 @@ SET status = 'succeeded',
       discovery_mode: opts.discoveryMode,
       pages: 0,
       discovered_in_run: 0,
-      snapshot_id: scope.cursor.snapshot_id,
+      snapshot_id: cursor.snapshot_id,
       has_more: false,
       skipped_reason: "already_complete",
     })}
@@ -434,7 +560,7 @@ WHERE id = ${Number(runId)};
         discovered_in_run: 0,
         pages: 0,
         has_more: false,
-        snapshot_id: scope.cursor.snapshot_id,
+        snapshot_id: cursor.snapshot_id,
         skipped: true,
       };
     }
@@ -563,12 +689,19 @@ COMMIT;
   });
 }
 
+/**
+ * @param {string} dbPath
+ * @param {ScopeRow} scope
+ * @param {number} runId
+ * @param {unknown} error
+ * @param {string} reason
+ */
 function succeedUnsupportedRun(dbPath, scope, runId, error, reason) {
   const now = new Date().toISOString();
   const config = {
     unsupported_reason: reason,
     unsupported_at: now,
-    unsupported_error: String(error.message || error).slice(0, 1000),
+    unsupported_error: String(error instanceof Error ? error.message : error).slice(0, 1000),
   };
   sqliteExec(
     dbPath,
@@ -599,6 +732,13 @@ COMMIT;
   );
 }
 
+/**
+ * @param {string} dbPath
+ * @param {SyncOptions} opts
+ * @param {ScopeRow} scope
+ * @param {SelfProfile} selfProfile
+ * @returns {RunResult}
+ */
 function syncReceivedScope(dbPath, opts, scope, selfProfile) {
   return syncScope(dbPath, scope.id, opts, (lockedScope, runId) => {
     const chatIdValue = lockedScope.config?.chat_id;
@@ -624,7 +764,7 @@ function syncReceivedScope(dbPath, opts, scope, selfProfile) {
       opts.startMs,
       endMs,
       (record) => hash(record.actor_id || "") !== selfHash,
-      peopleContext,
+      /** @type {any} */ (peopleContext),
       lockedScope.config,
     );
     const cursor = cursorAfter(endMs);
@@ -643,6 +783,12 @@ function syncReceivedScope(dbPath, opts, scope, selfProfile) {
   });
 }
 
+/**
+ * @param {string} dbPath
+ * @param {SyncOptions} opts
+ * @param {SelfProfile} selfProfile
+ * @returns {RunResult[]}
+ */
 function syncReceived(dbPath, opts, selfProfile) {
   const allScopes = listReceivedScopes(dbPath, opts.receivedMode);
   const scopes =
@@ -656,11 +802,14 @@ function main() {
   ensureInitialized(dbPath);
 
   const needsSelfProfile = opts.scope === "all" || opts.scope === "sent" || opts.scope === "received";
-  const selfProfile = needsSelfProfile ? getSelfProfile(opts) : null;
-  if (needsSelfProfile && !selfProfile.open_id) {
+  const selfProfile = /** @type {SelfProfile | null} */ (needsSelfProfile ? getSelfProfile(opts) : null);
+  if (needsSelfProfile && !selfProfile?.open_id) {
     throw new Error("could not resolve current Lark user open_id");
   }
+  /** @type {SelfProfile | null} */
+  const requiredSelfProfile = needsSelfProfile ? selfProfile : null;
 
+  /** @type {JsonObject & {sent: RunResult | null, discovery: RunResult | null, received: RunResult[]}} */
   const summary = {
     ok: true,
     db_path: dbPath,
@@ -674,13 +823,13 @@ function main() {
   };
 
   if (opts.scope === "all" || opts.scope === "sent") {
-    summary.sent = syncSent(dbPath, opts, selfProfile);
+    summary.sent = syncSent(dbPath, opts, /** @type {SelfProfile} */ (requiredSelfProfile));
   }
   if (opts.scope === "all" || opts.scope === "discover") {
     summary.discovery = syncDiscovery(dbPath, opts);
   }
   if (opts.scope === "all" || opts.scope === "received") {
-    summary.received = syncReceived(dbPath, opts, selfProfile);
+    summary.received = syncReceived(dbPath, opts, /** @type {SelfProfile} */ (requiredSelfProfile));
   }
 
   const failures = [
@@ -722,7 +871,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   try {
     main();
   } catch (error) {
-    process.stderr.write(`${error.message}\n`);
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`${message}\n`);
     process.exit(1);
   }
 }

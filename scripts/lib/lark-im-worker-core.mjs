@@ -9,6 +9,7 @@
  * @property {number} receivedScopesPerCycle
  * @property {number} maxChatPages
  * @property {number} reconcileIntervalHours
+ * @property {string=} logDir
  *
  * @typedef {object} WorkerStepSpec
  * @property {string} name

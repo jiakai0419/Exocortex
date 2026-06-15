@@ -17,6 +17,8 @@
     "scripts/sync-status.mjs",
     "scripts/messages.mjs",
     "scripts/lark-im-service.mjs",
+    "scripts/lark-im-worker.mjs",
+    "scripts/lark-im-sync.mjs",
     "scripts/lib/lark-im-core.mjs",
     "scripts/lib/ingestion-store.mjs",
     "scripts/lib/lark-im-adapter.mjs",
