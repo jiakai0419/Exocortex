@@ -5,7 +5,8 @@ import {
   countBy,
   healthDetail,
   summarizeHealth,
-} from "../scripts/lib/sync-status-core.mjs";
+} from "../src/diagnostics/sync-status-core.mjs";
+import { summarizeHealth as shimSummarizeHealth } from "../scripts/lib/sync-status-core.mjs";
 
 function state(overrides = {}) {
   return {
@@ -67,5 +68,6 @@ test("health separates historical failures from current attention needs", () => 
     "ok_with_history",
   );
   assert.equal(summarizeHealth(state()), "ok");
+  assert.equal(shimSummarizeHealth(state()), "ok");
   assert.equal(healthDetail(state()), "all known enabled scopes have cursors");
 });

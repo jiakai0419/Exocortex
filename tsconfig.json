@@ -20,6 +20,8 @@
     "scripts/lark-im-worker.mjs",
     "scripts/lark-im-sync.mjs",
     "src/terminal/index.mjs",
+    "src/diagnostics/doctor-core.mjs",
+    "src/diagnostics/sync-status-core.mjs",
     "scripts/lib/lark-im-core.mjs",
     "scripts/lib/ingestion-store.mjs",
     "scripts/lib/lark-im-adapter.mjs",

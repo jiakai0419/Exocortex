@@ -6,7 +6,8 @@ import {
   isKeychainUnavailable,
   normalizeLiveResult,
   overallStatus,
-} from "../scripts/lib/doctor-core.mjs";
+} from "../src/diagnostics/doctor-core.mjs";
+import { overallStatus as shimOverallStatus } from "../scripts/lib/doctor-core.mjs";
 
 function localState(overrides = {}) {
   return {
@@ -31,6 +32,7 @@ test("keychain failures are classified as live unavailable, not sync failure", (
   assert.equal(live.reason, "keychain_unavailable");
   assert.match(live.hint, /background service can still be healthy/);
   assert.equal(overallStatus(localState({ live })), "fresh");
+  assert.equal(shimOverallStatus(localState({ live })), "fresh");
   assert.deepEqual(buildFindings(localState({ live })), ["live lag probe unavailable in this shell"]);
 });
 
