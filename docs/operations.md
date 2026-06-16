@@ -165,6 +165,8 @@ node scripts/doctor.mjs --live
 
 如果 `--live` 显示 `UNAVAILABLE / keychain_unavailable`，说明当前 shell 读不到 keychain。它不是同步系统故障。需要真实 live 验证时，在能访问 keychain 的普通终端环境里运行同一个命令。
 
+`doctor --live` / `lark-im-lag-check` 的真实验收使用本机飞书数据，但仓库里的自动化测试只使用 anonymized shape fixtures。它们保留飞书响应字段形状，不保留真实 ID、人名、群名、链接或消息正文。
+
 看后台服务：
 
 ```bash

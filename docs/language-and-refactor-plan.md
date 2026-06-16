@@ -482,7 +482,7 @@ probe/maintenance scripts mostly JavaScript
 
 特别要求：
 
-- 类型 fixture 使用合成数据。
+- 类型和诊断 fixture 使用 anonymized shape fixtures：字段形状可以来自真实 API，但值必须是脱敏占位符。
 - 不把真实 SQLite 数据导出为测试 fixture。
 - 不把真实 probe JSON 放入仓库。
 - 不在文档里记录真实消息、真实群名、真实人名、真实链接或本机运行规模。

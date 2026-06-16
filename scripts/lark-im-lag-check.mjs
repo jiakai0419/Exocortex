@@ -3,7 +3,9 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
+import { buildLagReport, exitCodeForReport, normalizeRemoteMessage } from "../src/diagnostics/lark-im-lag-core.mjs";
 import { block, compact as compactText, kv, list, renderError, section, statusBadge, subtitle, title } from "./lib/terminal.mjs";
+import { localIsoFromMs, parseLarkTimeMs } from "./lib/lark-im-core.mjs";
 
 const DEFAULT_DB = "data/exocortex.sqlite";
 const DEFAULT_CHAT_PAGES = 5;
@@ -34,13 +36,6 @@ function localOffset(date) {
   const sign = minutes >= 0 ? "+" : "-";
   const abs = Math.abs(minutes);
   return `${sign}${pad2(Math.floor(abs / 60))}:${pad2(abs % 60)}`;
-}
-
-function localIsoFromMs(ms) {
-  const date = new Date(ms);
-  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}T${pad2(
-    date.getHours(),
-  )}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}${localOffset(date)}`;
 }
 
 function defaultStartIso() {
@@ -130,53 +125,6 @@ function envelope(json, collectionName) {
     has_more: Boolean(root.has_more ?? data.has_more),
     page_token: root.page_token || data.page_token || "",
   };
-}
-
-function parseLarkTimeMs(value) {
-  if (value === null || value === undefined || value === "") return NaN;
-  if (typeof value === "number" || /^\d+$/.test(String(value))) {
-    const parsed = Number.parseInt(String(value), 10);
-    return parsed < 10_000_000_000 ? parsed * 1000 : parsed;
-  }
-  const simple = String(value).match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?/);
-  if (simple && !/[zZ]|[+-]\d{2}:\d{2}$/.test(String(value))) {
-    const [, year, month, day, hour, minute, second = "0"] = simple;
-    return new Date(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), Number(second)).getTime();
-  }
-  return Date.parse(String(value));
-}
-
-function messageId(message) {
-  return message?.message_id || message?.id || "";
-}
-
-function senderId(message) {
-  const sender = message?.sender && typeof message.sender === "object" ? message.sender : {};
-  return sender.id || sender.open_id || sender.sender_id?.open_id || sender.sender_id || "";
-}
-
-function senderName(message) {
-  const sender = message?.sender && typeof message.sender === "object" ? message.sender : {};
-  if (sender.name || sender.display_name) return sender.name || sender.display_name;
-  if (String(sender.id || "").startsWith("cli_")) return `应用 ${String(sender.id).slice(0, 8)}...`;
-  return sender.id ? `${String(sender.id).slice(0, 8)}...` : "unknown";
-}
-
-function bodyFromContent(content) {
-  if (content === null || content === undefined) return "";
-  if (typeof content === "string") return content;
-  if (typeof content === "object") {
-    if (typeof content.text === "string") return content.text;
-    if (typeof content.content === "string") return content.content;
-    return JSON.stringify(content);
-  }
-  return String(content);
-}
-
-function compact(value, limit = 120) {
-  const text = String(value || "").replace(/\s+/g, " ").trim();
-  if (text.length <= limit) return text;
-  return `${text.slice(0, limit - 3)}...`;
 }
 
 function isRestrictedModeError(error) {
@@ -299,22 +247,8 @@ function collect(dbPath, opts) {
     try {
       const messages = fetchRecentChatMessages(chat, opts);
       for (const message of messages) {
-        const id = messageId(message);
-        const createdMs = parseLarkTimeMs(message?.create_time ?? message?.created_at ?? message?.create_time_ms);
-        if (!id || !Number.isFinite(createdMs)) continue;
-        if (senderId(message) === selfOpenId) continue;
-        remoteMessages.push({
-          message_id: id,
-          chat_id: chat.chat_id,
-          chat_name: message.chat_name || chat.chat_name,
-          chat_type: message.chat_type || chat.chat_type,
-          sender_id: senderId(message),
-          sender_name: senderName(message),
-          msg_type: message.msg_type || message.message_type || "unknown",
-          create_time: message.create_time || new Date(createdMs).toISOString(),
-          created_at_ms: createdMs,
-          body: bodyFromContent(message.content),
-        });
+        const normalized = normalizeRemoteMessage(message, chat, selfOpenId);
+        if (normalized) remoteMessages.push(normalized);
       }
     } catch (error) {
       if (isRestrictedModeError(error)) {
@@ -325,68 +259,17 @@ function collect(dbPath, opts) {
     }
   }
 
-  remoteMessages.sort((a, b) => b.created_at_ms - a.created_at_ms || b.message_id.localeCompare(a.message_id));
   const existing = loadExistingRecords(dbPath, [...new Set(remoteMessages.map((message) => message.message_id))]);
-  const missing = remoteMessages.filter((message) => !existing.has(message.message_id));
-  const latestRemote = remoteMessages[0] || null;
   const latestLocal = localLatest(dbPath);
-  const latestRemoteIsLocal = latestRemote ? existing.has(latestRemote.message_id) : null;
-  const lagMs =
-    latestRemote && latestLocal?.occurred_at_ms
-      ? Math.max(0, Number(latestRemote.created_at_ms) - Number(latestLocal.occurred_at_ms))
-      : null;
-
-  let status = "healthy";
-  if (probeErrors.length > 0) status = "needs_attention";
-  else if (missing.length > 0) status = "delayed";
-  else if (latestRemoteIsLocal === false) status = "delayed";
-
-  return {
-    ok: status === "healthy",
-    status,
-    checked_at: new Date().toISOString(),
-    window: {
-      start: localIsoFromMs(opts.startMs),
-      end: localIsoFromMs(opts.endMs),
-    },
-    probe: {
-      hot_chats_requested: opts.hotChats,
-      hot_chats_found: chats.length,
-      messages_per_chat: opts.messagesPerChat,
-      remote_messages_checked: remoteMessages.length,
-      unsupported_chats: unsupportedChats.length,
-      probe_errors: probeErrors.length,
-    },
-    latest_remote: latestRemote
-      ? {
-          message_id: latestRemote.message_id,
-          created_at: new Date(latestRemote.created_at_ms).toISOString(),
-          chat_name: latestRemote.chat_name,
-          sender_name: latestRemote.sender_name,
-          body: compact(latestRemote.body),
-          exists_locally: existing.has(latestRemote.message_id),
-        }
-      : null,
-    latest_local: latestLocal
-      ? {
-          message_id: latestLocal.external_id,
-          created_at: latestLocal.occurred_at,
-          chat_name: latestLocal.chat_name,
-          direction: latestLocal.direction,
-        }
-      : null,
-    lag_ms: lagMs,
-    missing_count: missing.length,
-    missing: missing.slice(0, 10).map((message) => ({
-      message_id: message.message_id,
-      created_at: new Date(message.created_at_ms).toISOString(),
-      chat_name: message.chat_name,
-      sender_name: message.sender_name,
-      body: compact(message.body),
-    })),
-    unsupported_chats: unsupportedChats.slice(0, 10),
-    probe_errors: probeErrors.slice(0, 10),
-  };
+  return buildLagReport({
+    opts,
+    chats,
+    remoteMessages,
+    existingRecords: existing,
+    latestLocal,
+    probeErrors,
+    unsupportedChats,
+  });
 }
 
 function render(report) {
@@ -460,7 +343,7 @@ function main() {
   const report = collect(dbPath, opts);
   if (opts.format === "json") process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   else process.stdout.write(render(report));
-  if (!report.ok) process.exit(2);
+  process.exitCode = exitCodeForReport(report);
 }
 
 try {
