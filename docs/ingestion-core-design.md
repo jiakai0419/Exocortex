@@ -70,7 +70,23 @@ Cursor 的具体语义由 Source Adapter 定义。它可能是：
 - 版本号。
 - 复合位置，例如 `{created_at, external_id}`。
 
-核心层不解释 Cursor 的业务含义，只保存和提交它。
+核心层不解释 Cursor 的业务含义，但会执行 Source Adapter 明确声明的通用策略，例如：
+
+- 时间 Cursor 的比较规则。
+- 同一时间戳下的稳定 tie-breaker。
+- stable horizon。
+- 分页必须完整读完才算成功。
+- 远端时间精度对应的 Cursor 边界。
+
+也就是说：
+
+```text
+Adapter 定义 Cursor 语义
+Core 执行可复用的同步规则
+Store 原子保存 Cursor
+```
+
+这能避免每个 Source 都重新手写一套容易漏边界的同步规则。
 
 ### Record
 
@@ -175,6 +191,18 @@ end = 当前时间的稳定边界
 ```
 
 Adapter 必须从 `start` 重新读，并在本地过滤严格大于 Cursor 的 Record。这样即使 `start` 是包含式，重启后也只会重复读取已确认边界，不会漏掉边界之后的消息。
+
+如果远端 API 的时间精度低于本地时间精度，Cursor 必须推进到远端能表达的边界，而不是推进到本地秒级或毫秒级窗口终点。
+
+飞书 IM 用户态接口当前返回分钟精度的消息时间，因此它的消息 Cursor 使用：
+
+```text
+source_time_precision = minute
+created_at_ms = floor(window_end, 1 minute)
+message_id = ""
+```
+
+同一分钟边界的消息允许在下一轮重复读取，依赖 `records` 幂等写入去重。这是 Cursor 语义的一部分，不是靠模糊 backfill 补漏。
 
 对于分页发现类 Scope：
 
@@ -291,6 +319,7 @@ Run 失败时不能推进 Cursor。
 - 如何从 Cursor 后读取 Record。
 - 远端返回是否有稳定顺序。
 - Cursor 何时可以安全推进。
+- 远端时间或版本号的精度。
 - 分页是否需要完整读完才算一个成功 Run。
 
 ### 6. 不靠补漏保证正确

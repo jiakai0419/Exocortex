@@ -9,5 +9,10 @@
     "outDir": "dist",
     "rootDir": "src"
   },
-  "include": ["src/terminal/**/*.ts", "src/runtime/worker/**/*.ts", "src/storage/sqlite/**/*.ts"]
+  "include": [
+    "src/core/**/*.ts",
+    "src/terminal/**/*.ts",
+    "src/runtime/worker/**/*.ts",
+    "src/storage/sqlite/**/*.ts"
+  ]
 }

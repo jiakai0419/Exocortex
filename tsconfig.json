@@ -19,6 +19,7 @@
     "scripts/lark-im-service.mjs",
     "scripts/lark-im-worker.mjs",
     "scripts/lark-im-sync.mjs",
+    "src/core/**/*.ts",
     "src/terminal/index.ts",
     "src/diagnostics/doctor-core.mjs",
     "src/diagnostics/sync-status-core.mjs",

@@ -1,6 +1,15 @@
 // @ts-check
 
 import { createHash } from "node:crypto";
+import {
+  compareRecordToCursor,
+  floorToPrecisionMs,
+  readPaginatedPages,
+  stableWindowEndMs,
+  timeCursorAfter,
+  timeWindow,
+  windowRecordsAfterCursor,
+} from "../../../dist/core/sync.js";
 
 /**
  * @typedef {"sent" | "received"} MessageDirection
@@ -349,20 +358,6 @@ function recordFromMessage(message, scopeId, direction, context = {}, scopeConfi
 }
 
 /**
- * @param {LocalRecord} record
- * @param {MessageCursor | null | undefined} cursor
- * @param {number} fallbackStartMs
- */
-function compareRecordToCursor(record, cursor, fallbackStartMs) {
-  const hasCursor = cursor?.created_at_ms !== undefined && cursor?.created_at_ms !== null;
-  const cursorMs = Number(hasCursor ? cursor.created_at_ms : fallbackStartMs - 1);
-  const cursorId = String(cursor?.message_id ?? "");
-  if (record.occurred_at_ms > cursorMs) return 1;
-  if (record.occurred_at_ms < cursorMs) return -1;
-  return String(record.external_id).localeCompare(cursorId);
-}
-
-/**
  * @param {LarkMessage[]} messages
  * @param {string} scopeId
  * @param {MessageDirection} direction
@@ -375,19 +370,15 @@ function compareRecordToCursor(record, cursor, fallbackStartMs) {
  * @returns {LocalRecord[]}
  */
 function prepareRecords(messages, scopeId, direction, cursor, startMs, endMs, filterFn = null, context = {}, scopeConfig = {}) {
-  return messages
+  const records = messages
     .filter((message) => messageId(message))
     .map((message) => recordFromMessage(message, scopeId, direction, context, scopeConfig))
-    .filter((record) => Number.isFinite(record.occurred_at_ms))
-    .filter((record) => record.occurred_at_ms <= endMs)
-    .filter((record) => compareRecordToCursor(record, cursor, startMs) > 0)
-    .filter((record) => (filterFn ? filterFn(record) : true))
-    .sort((a, b) => a.occurred_at_ms - b.occurred_at_ms || a.external_id.localeCompare(b.external_id));
+  return windowRecordsAfterCursor(records, cursor, startMs, endMs, filterFn);
 }
 
 /** @param {number} ms */
 function floorToLarkMessageCursorMs(ms) {
-  return Math.floor(Number(ms) / LARK_MESSAGE_CURSOR_PRECISION_MS) * LARK_MESSAGE_CURSOR_PRECISION_MS;
+  return floorToPrecisionMs(Number(ms), LARK_MESSAGE_CURSOR_PRECISION_MS);
 }
 
 /**
@@ -398,14 +389,13 @@ function floorToLarkMessageCursorMs(ms) {
  * @param {number} endMs
  */
 function cursorAfter(endMs) {
-  return {
+  return timeCursorAfter({
     kind: "time_message_cursor/v1",
     meaning: "scanned_until_inclusive",
-    source_time_precision: "minute",
-    created_at_ms: floorToLarkMessageCursorMs(endMs),
-    message_id: "",
-    updated_at: new Date().toISOString(),
-  };
+    sourceTimePrecision: "minute",
+    endMs,
+    precisionMs: LARK_MESSAGE_CURSOR_PRECISION_MS,
+  });
 }
 
 /**
@@ -413,8 +403,7 @@ function cursorAfter(endMs) {
  * @param {number} startMs
  */
 function stableMessageEndMs(opts, startMs) {
-  const guardMs = opts.endExplicit ? 0 : Number(opts.stableHorizonMs || 0);
-  return Math.max(startMs, opts.endMs - guardMs);
+  return stableWindowEndMs(opts, startMs);
 }
 
 /**
@@ -422,11 +411,7 @@ function stableMessageEndMs(opts, startMs) {
  * @param {MessageWindowOptions} opts
  */
 function messageWindow(scope, opts) {
-  const startMs = Number(scope.cursor?.created_at_ms ?? opts.startMs);
-  return {
-    startMs,
-    endMs: stableMessageEndMs(opts, startMs),
-  };
+  return timeWindow(scope, opts);
 }
 
 /**
@@ -437,20 +422,16 @@ function messageWindow(scope, opts) {
  * @param {(maxPages: number) => string} options.maxPagesMessage
  */
 function readBoundedPages({ fetchPage, maxPages, missingPageTokenMessage, maxPagesMessage }) {
-  const messages = [];
-  let pageToken = "";
-  let hasMore = false;
-  let pages = 0;
-  do {
-    pages += 1;
-    const page = fetchPage(pageToken);
-    messages.push(...(page.messages || []));
-    hasMore = Boolean(page.has_more);
-    pageToken = page.page_token || "";
-    if (hasMore && !pageToken) throw new Error(missingPageTokenMessage);
-    if (hasMore && pages >= maxPages) throw new Error(maxPagesMessage(maxPages));
-  } while (hasMore);
-  return { messages, pages };
+  const result = readPaginatedPages({
+    fetchPage,
+    maxPages,
+    missingPageTokenMessage,
+    maxPagesMessage,
+    getItems: (page) => page.messages || [],
+    getHasMore: (page) => Boolean(page.has_more),
+    getPageToken: (page) => page.page_token || "",
+  });
+  return { messages: result.items, pages: result.pages };
 }
 
 /** @param {string} chatIdValue */
