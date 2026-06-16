@@ -226,7 +226,8 @@ function render(report) {
       ],
       [
         "Quality",
-        `${report.quality.quality?.missing_sender_name || 0} missing sender names, ` +
+        `${report.quality.quality?.actionable_missing_sender_name || 0} actionable sender gaps, ` +
+          `${report.quality.quality?.missing_sender_name || 0} total missing sender names, ` +
           `${report.quality.quality?.missing_chat_name || 0} missing chat names, ` +
           `${report.quality.quality?.invalid_rendered_body || 0} invalid bodies`,
       ],

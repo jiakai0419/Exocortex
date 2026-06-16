@@ -12,7 +12,7 @@
  *
  * @typedef {object} LocalQuality
  * @property {string=} status
- * @property {{missing_sender_name?: number, invalid_rendered_body?: number}=} quality
+ * @property {{missing_sender_name?: number, missing_user_sender_name?: number, missing_app_sender_name?: number, actionable_missing_sender_name?: number, invalid_rendered_body?: number}=} quality
  *
  * @typedef {object} LiveResult
  * @property {boolean | null=} ok
@@ -63,10 +63,19 @@ function normalizeLiveResult(live) {
 }
 
 /** @param {DoctorState} state */
+function actionableMissingSenderNames(state) {
+  const q = state.quality.quality || {};
+  if (q.actionable_missing_sender_name !== undefined && q.actionable_missing_sender_name !== null) {
+    return Number(q.actionable_missing_sender_name || 0);
+  }
+  return Number(q.missing_user_sender_name || 0) + Number(q.missing_app_sender_name || 0);
+}
+
+/** @param {DoctorState} state */
 function buildFindings({ status, quality, live }) {
   /** @type {string[]} */
   const findings = [];
-  const missingSenderName = Number(quality.quality?.missing_sender_name || 0);
+  const missingSenderName = actionableMissingSenderNames({ status, quality, live });
   const invalidRenderedBody = Number(quality.quality?.invalid_rendered_body || 0);
   if (status.status === "command_failed") findings.push("local status command failed");
   if (quality.status === "command_failed") findings.push("local quality command failed");
@@ -86,7 +95,7 @@ function buildFindings({ status, quality, live }) {
  * @returns {OverallStatus}
  */
 function overallStatus({ status, quality, live }) {
-  const missingSenderName = Number(quality.quality?.missing_sender_name || 0);
+  const missingSenderName = actionableMissingSenderNames({ status, quality, live });
   const invalidRenderedBody = Number(quality.quality?.invalid_rendered_body || 0);
   if (status.status === "command_failed" || quality.status === "command_failed") return "needs_attention";
   if (live?.status === "needs_attention" || live?.status === "command_failed") return "needs_attention";
@@ -100,6 +109,7 @@ function overallStatus({ status, quality, live }) {
 }
 
 export {
+  actionableMissingSenderNames,
   buildFindings,
   isKeychainUnavailable,
   normalizeLiveResult,

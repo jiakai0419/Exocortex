@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  actionableMissingSenderNames,
   buildFindings,
   isKeychainUnavailable,
   normalizeLiveResult,
@@ -65,4 +66,37 @@ test("real live failures still need attention and delayed live status stays dela
     overallStatus(localState({ live: { status: "delayed" } })),
     "delayed",
   );
+});
+
+test("doctor ignores non-actionable sender gaps but flags actionable sender gaps", () => {
+  const advisoryOnly = localState({
+    quality: {
+      quality: {
+        missing_sender_name: 33,
+        actionable_missing_sender_name: 0,
+        missing_user_sender_name: 0,
+        missing_app_sender_name: 1,
+        unresolved_app_sender_name: 1,
+        missing_system_sender_name: 32,
+      },
+    },
+  });
+
+  assert.equal(actionableMissingSenderNames(advisoryOnly), 0);
+  assert.equal(overallStatus(advisoryOnly), "fresh");
+  assert.deepEqual(buildFindings(advisoryOnly), []);
+
+  const actionable = localState({
+    quality: {
+      quality: {
+        missing_sender_name: 1,
+        actionable_missing_sender_name: 1,
+        missing_user_sender_name: 1,
+      },
+    },
+  });
+
+  assert.equal(actionableMissingSenderNames(actionable), 1);
+  assert.equal(overallStatus(actionable), "needs_attention");
+  assert.deepEqual(buildFindings(actionable), ["some senders still lack display names"]);
 });

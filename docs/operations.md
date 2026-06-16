@@ -181,6 +181,14 @@ Sync        -> 本地同步状态、records、scopes、discovery/reconcile
 Worker      -> 最近完整 cycle、最近 step、是否正在跑、最近失败、日志路径
 ```
 
+### Data Quality
+
+Sender name quality 分三类：
+
+- actionable sender gaps：用户 sender 缺名，或应用 sender 还没有被 resolver 判定为无法安全解析。它们会让 `doctor` 进入 `NEEDS ATTENTION`。
+- system senderless messages：飞书系统消息天然可能没有 sender，不算同步故障。
+- unresolved app sender names：官方应用 API 无权限，且会话机器人列表无法唯一匹配时，不强行猜名字；保留 unresolved 标记，作为质量报告里的 advisory。
+
 看最近 worker 日志：
 
 ```bash

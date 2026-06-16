@@ -496,6 +496,7 @@ function main() {
   }
   const appNames = resolveApplicationNames(appIds, diagnostics);
   const appFallbackNames = resolveChatBotAppFallbackNames(appIdsByChat, appNames, diagnostics);
+  const appProbeResultsById = new Map(diagnostics.app_lookup_results.map((result) => [result.app_id, result]));
 
   let updated = 0;
   const updates = [];
@@ -505,6 +506,7 @@ function main() {
     const ctype = chatType(row.raw, row.canonical, row.config);
     const cname = chatName(row.raw, row.canonical, row.config);
     const sid = senderId(row.raw, row, row.canonical);
+    const isAppSender = senderType(row.raw, row.canonical) === "app" || String(sid || "").startsWith("cli_");
     const existingSenderName = senderName(row.raw, row.canonical);
     const appName = appNames.get(sid);
     const appFallback = appFallbackNames.get(`${cid}:${sid}`);
@@ -524,6 +526,15 @@ function main() {
 
     next.sender_id = next.sender_id || sid || null;
     next.sender_name = sname;
+    if (sname) {
+      if (next.sender_name_resolution_status === "unresolved_app_sender") delete next.sender_name_resolution_status;
+      if (next.sender_name_resolution_reason) delete next.sender_name_resolution_reason;
+    } else if (isAppSender && sid) {
+      const probeStatus = appProbeResultsById.get(sid)?.status || "not_probed";
+      next.sender_name_resolution_status = "unresolved_app_sender";
+      next.sender_name_resolution_reason =
+        probeStatus === "permission_denied" ? "application_api_permission_denied_no_safe_fallback" : "no_safe_fallback";
+    }
     if (appName) {
       next.sender_name_source = "application_api";
       next.sender_name_confidence = "high";
@@ -559,7 +570,6 @@ function main() {
   }
 
   if (updates.length > 0) sqliteExec(dbPath, `BEGIN;\n${updates.join("\n")}\nCOMMIT;`, "update records");
-  const appProbeResultsById = new Map(diagnostics.app_lookup_results.map((result) => [result.app_id, result]));
   const appFallbacksById = new Map();
   for (const [key, fallback] of appFallbackNames.entries()) {
     const separatorIndex = key.lastIndexOf(":");

@@ -87,6 +87,38 @@ function collect(dbPath) {
          COALESCE(json_extract(canonical_json, '$.sender_name'), '') = ''
          AND COALESCE(json_extract(canonical_json, '$.sender_id'), '') LIKE 'cli_%'
        ) AS missing_app_sender_name,
+       SUM(
+         COALESCE(json_extract(canonical_json, '$.sender_name'), '') = ''
+         AND COALESCE(json_extract(canonical_json, '$.sender_id'), '') LIKE 'cli_%'
+         AND COALESCE(json_extract(canonical_json, '$.sender_name_resolution_status'), '') = 'unresolved_app_sender'
+       ) AS unresolved_app_sender_name,
+       SUM(
+         COALESCE(json_extract(canonical_json, '$.sender_name'), '') = ''
+         AND COALESCE(json_extract(canonical_json, '$.msg_type'), '') = 'system'
+         AND COALESCE(json_extract(canonical_json, '$.sender_id'), '') = ''
+       ) AS missing_system_sender_name,
+       SUM(
+         COALESCE(json_extract(canonical_json, '$.sender_name'), '') = ''
+         AND COALESCE(json_extract(canonical_json, '$.sender_id'), '') NOT LIKE 'ou_%'
+         AND (
+           COALESCE(json_extract(canonical_json, '$.sender_id'), '') NOT LIKE 'cli_%'
+           OR COALESCE(json_extract(canonical_json, '$.sender_name_resolution_status'), '') = 'unresolved_app_sender'
+         )
+         AND NOT (
+           COALESCE(json_extract(canonical_json, '$.msg_type'), '') = 'system'
+           AND COALESCE(json_extract(canonical_json, '$.sender_id'), '') = ''
+         )
+       ) AS missing_non_actionable_sender_name,
+       SUM(
+         COALESCE(json_extract(canonical_json, '$.sender_name'), '') = ''
+         AND (
+           COALESCE(json_extract(canonical_json, '$.sender_id'), '') LIKE 'ou_%'
+           OR (
+             COALESCE(json_extract(canonical_json, '$.sender_id'), '') LIKE 'cli_%'
+             AND COALESCE(json_extract(canonical_json, '$.sender_name_resolution_status'), '') <> 'unresolved_app_sender'
+           )
+         )
+       ) AS actionable_missing_sender_name,
        SUM(COALESCE(json_extract(canonical_json, '$.sender_id'), '') LIKE 'cli_%') AS app_sender_records,
        SUM(
          json_extract(canonical_json, '$.chat_type') IN ('group', 'topic')
@@ -150,8 +182,7 @@ function collect(dbPath) {
 
 function render(report) {
   const hasIssues =
-    Number(report.quality.missing_user_sender_name || 0) > 0 ||
-    Number(report.quality.missing_app_sender_name || 0) > 0 ||
+    Number(report.quality.actionable_missing_sender_name || 0) > 0 ||
     Number(report.quality.missing_chat_name || 0) > 0 ||
     Number(report.quality.invalid_rendered_body || 0) > 0;
   const lines = [
@@ -161,9 +192,12 @@ function render(report) {
     kv([
       ["Messages", `${report.messages.total} total, ${report.messages.sent} sent, ${report.messages.received} received`],
       ["Latest", report.messages.latest_at || "none"],
-      ["Missing sender names", report.quality.missing_sender_name || 0],
+      ["Actionable missing sender names", report.quality.actionable_missing_sender_name || 0],
+      ["Missing sender names", `${report.quality.missing_sender_name || 0} total`],
       ["Missing user sender names", report.quality.missing_user_sender_name || 0],
       ["Missing app sender names", report.quality.missing_app_sender_name || 0],
+      ["Unresolved app sender names", report.quality.unresolved_app_sender_name || 0],
+      ["System senderless messages", report.quality.missing_system_sender_name || 0],
       ["Missing chat names", report.quality.missing_chat_name || 0],
       ["Invalid bodies", report.quality.invalid_rendered_body || 0],
       ["Deleted/recalled bodies", report.quality.deleted_or_recalled_body || 0],
