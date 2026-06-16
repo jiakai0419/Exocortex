@@ -2,7 +2,7 @@
 
 ## 结论
 
-截至 2026-06-14，衍我的飞书消息同步已经达到 v0 baseline：
+截至 2026-06-16，衍我的飞书消息同步已经达到 v0 baseline：
 
 ```text
 后台 worker 持续运行，初始 catch-up 完成，真实 live probe 通过。
@@ -20,6 +20,7 @@
 
 ```text
 npm run check                           passed
+npm run build:check                     passed
 npm test                                passed
 node scripts/doctor.mjs                 fresh / syncing only when worker is active
 node scripts/doctor.mjs --live          healthy in a shell with keychain access
@@ -39,9 +40,16 @@ initial discovery complete
 periodic reconcile complete
 latest live probe missing = 0
 latest live lag is acceptable
+actionable sender gaps = 0
 ```
 
 历史失败仍保留在 `sync_runs` 中，这是事实记录。当前健康状态使用 `OK_WITH_HISTORY` 或 worker 正在跑时的 `SYNCING`，不等于当前故障。
+
+当前已知 advisory：
+
+- 飞书 system 消息可能天然没有 sender，不算同步故障。
+- 个别 app sender 在官方 Application API 无权限、且会话机器人列表无法唯一匹配时，保持 unresolved，不强行猜名字。
+- `lark-im-quality` 会显示这些 advisory，但只有 actionable sender gaps、缺群名、invalid body 等可修复问题会让 `doctor` 进入 `NEEDS ATTENTION`。
 
 ## V0 保证
 
@@ -93,6 +101,18 @@ sync_scopes.cursor_json 更新
 
 失败、中断、分页未读完、达到页数上限仍有更多数据，都不能推进 Cursor。
 
+### Source-time precision
+
+飞书 IM 用户态接口返回的 `create_time` 当前按分钟表达。
+
+因此 message cursor 不能推进到秒级 `window_end`，而是推进到源时间能表达的分钟边界：
+
+```text
+source_time_precision = minute
+```
+
+同一分钟边界上的消息会被下一轮重放，依赖本地幂等写入去重。这不是粗糙 backfill，而是和数据源时间精度匹配的 cursor 语义。
+
 ### 幂等写入
 
 `records` 使用：
@@ -127,6 +147,14 @@ official application api path was attempted
 permission-denied app ids were handled without failing the sync
 fallback path resolved eligible app senders
 ambiguous fallback remained unresolved instead of guessed
+```
+
+系统消息和无法安全解析的 app sender 分开处理：
+
+```text
+actionable sender gaps      -> 需要处理，会影响 doctor
+system senderless messages  -> 飞书系统事件允许无 sender，不影响 doctor
+unresolved app sender names -> 保留 unresolved 标记，不猜错名字，不影响 doctor
 ```
 
 ## V0 不保证
@@ -187,11 +215,11 @@ node scripts/doctor.mjs --live
 
 ## 下一步
 
-v0 baseline 之后，优先做长期运行观察，而不是立刻扩功能。
+v0 baseline 之后，不急于进入 UI、语义层或新信息源。
 
 建议顺序：
 
-1. 观察 24 小时 worker 持续运行情况。
-2. 定期运行 `doctor --live`，确认远端热消息仍然能端到端进入本地。
-3. 审计 P2P sent 消息的 `chat_partner`，确认“接收人”字段是否总是可靠。
-4. 如果 24 小时稳定，再考虑下一阶段：是否纳入单聊 received，或进入最小语义层。
+1. 继续观察 worker 长期运行，定期运行 `doctor --live`。
+2. 从飞书 IM 中抽出更通用的 sync core 模型：Source、Scope、Cursor、Record、Run。
+3. 把 cursor 精度、分页完整性、幂等写入、diagnostics 这些规则沉到通用层。
+4. 再考虑下一信息源或最小语义层。
