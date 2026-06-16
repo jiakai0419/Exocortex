@@ -226,7 +226,8 @@ test("successful message runs atomically write records, run state, and cursor", 
   assert.equal(sqliteQuery(dbPath, "SELECT status FROM sync_runs WHERE id = 1;", "read run")[0].status, "succeeded");
 
   const updatedScope = readScope(dbPath, "lark.im.sent_by_me");
-  assert.equal(updatedScope.cursor.created_at_ms, record.occurred_at_ms);
+  assert.equal(updatedScope.cursor.created_at_ms, cursor.created_at_ms);
+  assert.equal(updatedScope.cursor.source_time_precision, "minute");
 
   const secondRunId = createRun(dbPath, updatedScope);
   const duplicateEffects = succeedMessageRun(dbPath, updatedScope, secondRunId, [record], 1, cursor, {
@@ -236,11 +237,12 @@ test("successful message runs atomically write records, run state, and cursor", 
   assert.equal(sqliteQuery(dbPath, "SELECT COUNT(*) AS count FROM records;", "count records")[0].count, 1);
 });
 
-test("empty successful message runs advance the stable cursor but keep boundary replay safe", (t) => {
+test("empty successful message runs advance a minute cursor and keep boundary replay safe", (t) => {
   const dbPath = tempDb(t);
   const scope = readScope(dbPath, "lark.im.sent_by_me");
   const runId = createRun(dbPath, scope);
-  const endMs = 1700000000000;
+  const cursorMinuteMs = Date.parse("2026-06-16T08:03:00.000Z");
+  const endMs = cursorMinuteMs + 30_000;
   const cursor = cursorAfter(endMs);
 
   const effects = succeedMessageRun(dbPath, scope, runId, [], 0, cursor, {
@@ -260,23 +262,44 @@ test("empty successful message runs advance the stable cursor but keep boundary 
   );
 
   const updatedScope = readScope(dbPath, "lark.im.sent_by_me");
-  assert.equal(updatedScope.cursor.created_at_ms, endMs);
+  assert.equal(updatedScope.cursor.created_at_ms, cursorMinuteMs);
   assert.equal(updatedScope.cursor.message_id, "");
+  assert.equal(updatedScope.cursor.source_time_precision, "minute");
 
   const boundaryRecords = prepareRecords(
     [
-      message("om_before_boundary", endMs - 1),
-      message("om_boundary_late_arrival", endMs),
+      message("om_before_boundary", cursorMinuteMs - 1),
+      message("om_boundary_late_arrival", cursorMinuteMs),
       message("om_after_window", endMs + 1000),
     ],
     scope.id,
     "sent",
     updatedScope.cursor,
-    endMs - 1000,
+    cursorMinuteMs - 1000,
     endMs,
   );
 
   assert.deepEqual(boundaryRecords.map((record) => record.external_id), ["om_boundary_late_arrival"]);
+});
+
+test("minute cursors keep late same-minute Lark messages eligible", () => {
+  const minuteMs = Date.parse("2026-06-16T08:30:00.000Z");
+  const cursor = cursorAfter(minuteMs + 30_000);
+  const records = prepareRecords(
+    [
+      message("om_previous_minute", minuteMs - 60_000),
+      message("om_late_same_minute", minuteMs),
+      message("om_future", minuteMs + 60_000),
+    ],
+    "lark.im.received.chat.test",
+    "received",
+    cursor,
+    minuteMs,
+    minuteMs + 30_000,
+  );
+
+  assert.equal(cursor.created_at_ms, minuteMs);
+  assert.deepEqual(records.map((record) => record.external_id), ["om_late_same_minute"]);
 });
 
 test("failed runs do not advance the scope cursor", (t) => {

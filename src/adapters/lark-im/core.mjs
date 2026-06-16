@@ -88,6 +88,7 @@ const SENT_SCOPE_ID = "lark.im.sent_by_me";
 const CHAT_DISCOVERY_SCOPE_ID = "lark.im.unmuted_chat_discovery";
 const CHAT_HOT_DISCOVERY_SCOPE_ID = "lark.im.unmuted_chat_hot";
 const CHAT_RECONCILE_SCOPE_ID = "lark.im.unmuted_chat_reconcile";
+const LARK_MESSAGE_CURSOR_PRECISION_MS = 60_000;
 
 /** @param {number} n */
 function pad2(n) {
@@ -384,12 +385,24 @@ function prepareRecords(messages, scopeId, direction, cursor, startMs, endMs, fi
     .sort((a, b) => a.occurred_at_ms - b.occurred_at_ms || a.external_id.localeCompare(b.external_id));
 }
 
-/** @param {number} endMs */
+/** @param {number} ms */
+function floorToLarkMessageCursorMs(ms) {
+  return Math.floor(Number(ms) / LARK_MESSAGE_CURSOR_PRECISION_MS) * LARK_MESSAGE_CURSOR_PRECISION_MS;
+}
+
+/**
+ * Lark IM message create_time currently has minute precision in the user APIs
+ * we consume. Advancing a cursor to a second-level window end can skip messages
+ * that become visible later but still render as the same minute.
+ *
+ * @param {number} endMs
+ */
 function cursorAfter(endMs) {
   return {
     kind: "time_message_cursor/v1",
     meaning: "scanned_until_inclusive",
-    created_at_ms: endMs,
+    source_time_precision: "minute",
+    created_at_ms: floorToLarkMessageCursorMs(endMs),
     message_id: "",
     updated_at: new Date().toISOString(),
   };
@@ -457,6 +470,7 @@ export {
   chatScopeId,
   compareRecordToCursor,
   cursorAfter,
+  floorToLarkMessageCursorMs,
   hash,
   isInvalidRenderedContent,
   localDay,

@@ -631,8 +631,10 @@ Cursor 注意事项：
 
 - `+chat-messages-list --order asc` 已验证在样本内按 `create_time` 单调递增。
 - `--start` 边界表现为包含式。
+- 飞书 IM `create_time` 在当前用户态接口中按分钟返回；message cursor 只能推进到分钟边界，不能推进到秒级 `window_end`。否则后到但仍显示为同一分钟的消息会被本地 cursor 过滤掉。
 - 每个 chat Scope 独立维护 Cursor，不能用一个全局 received cursor 代表所有群。
 - Adapter 读取时从 cursor timestamp 开始，写入前本地过滤严格大于 `{created_at_ms, message_id}` 的记录。
+- cursor 的 `message_id` 保持为空字符串，允许同一分钟边界消息在下一轮重放；重复记录由 `(source_id, external_id)` 幂等约束消化。
 
 ## 飞书 Cursor 设计
 

@@ -14,5 +14,6 @@ data/*.sqlite3
 data/*.sqlite3-*
 data/*.db
 data/*.db-*
+data/*.bak
 logs/
 lark-im-resources/
