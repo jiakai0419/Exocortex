@@ -101,7 +101,11 @@ const COMMANDS = [
     command: "node scripts/lark-im-service.mjs status",
     file: "scripts/lark-im-service.mjs",
     summary: "Check whether the background worker service is running.",
-    examples: ["node scripts/lark-im-service.mjs status"],
+    examples: [
+      "node scripts/lark-im-service.mjs status",
+      "node scripts/lark-im-service.mjs restart",
+      "node scripts/lark-im-service.mjs wait-ok",
+    ],
     core: true,
   },
   {

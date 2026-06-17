@@ -26,7 +26,7 @@ const DEFAULT_RECONCILE_INTERVAL_HOURS = 24;
 const DEFAULT_CHAT_TYPES = "group,p2p";
 
 /**
- * @typedef {"install" | "start" | "stop" | "restart" | "status" | "tail" | "uninstall" | string} ServiceCommand
+ * @typedef {"install" | "start" | "stop" | "restart" | "status" | "wait-ok" | "tail" | "uninstall" | string} ServiceCommand
  *
  * @typedef {object} ServiceOptions
  * @property {ServiceCommand} command
@@ -40,6 +40,8 @@ const DEFAULT_CHAT_TYPES = "group,p2p";
  * @property {string} chatTypes
  * @property {string} logDir
  * @property {number} lines
+ * @property {number} timeoutSeconds
+ * @property {number} pollSeconds
  *
  * @typedef {object} RunOptions
  * @property {boolean=} allowFailure
@@ -63,6 +65,7 @@ Commands:
   stop        Stop the LaunchAgent but keep the plist.
   restart     Stop, then start.
   status      Show launchd status and sync status.
+  wait-ok     Wait until a new complete worker cycle succeeds.
   tail        Show recent worker log lines.
   uninstall   Stop and remove the plist.
 
@@ -77,6 +80,8 @@ Options:
   --chat-types <types>                Chat types for received discovery. Default: ${DEFAULT_CHAT_TYPES}
   --log-dir <path>                    Log directory. Default: ${DEFAULT_LOG_DIR}
   --lines <n>                         Lines for tail. Default: 20
+  --timeout-seconds <n>               Timeout for wait-ok. Default: 180
+  --poll-seconds <n>                  Poll interval for wait-ok. Default: 5
   --help                              Show this help.
 `;
 }
@@ -111,6 +116,8 @@ function parseArgs(argv) {
     chatTypes: DEFAULT_CHAT_TYPES,
     logDir: DEFAULT_LOG_DIR,
     lines: 20,
+    timeoutSeconds: 180,
+    pollSeconds: 5,
   };
   for (let i = 0; i < rest.length; i += 1) {
     const arg = rest[i];
@@ -136,6 +143,8 @@ function parseArgs(argv) {
     else if (arg === "--chat-types") opts.chatTypes = next;
     else if (arg === "--log-dir") opts.logDir = next;
     else if (arg === "--lines") opts.lines = parsePositiveInt(next, "lines");
+    else if (arg === "--timeout-seconds") opts.timeoutSeconds = parsePositiveInt(next, "timeout-seconds");
+    else if (arg === "--poll-seconds") opts.pollSeconds = parsePositiveInt(next, "poll-seconds");
     else throw new Error(`Unknown option: ${arg}`);
     i += 1;
   }
@@ -347,6 +356,16 @@ function localIso(value) {
   return new Date(String(value)).toLocaleString();
 }
 
+/** @param {number} ms */
+function sleepMs(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/** @param {unknown} value */
+function isReadyHealth(value) {
+  return ["fresh", "ok", "ok_with_history"].includes(String(value || "").toLowerCase());
+}
+
 /** @param {JsonObject} summary */
 function formatWorkerEvent(summary) {
   if (!summary.has_events) return "no worker events yet";
@@ -478,6 +497,50 @@ function tail(opts) {
   );
 }
 
+/** @param {ServiceOptions} opts */
+function waitOk(opts) {
+  const startedAt = Date.now();
+  const deadline = startedAt + opts.timeoutSeconds * 1000;
+  /** @type {string | null} */
+  let lastReason = null;
+
+  while (Date.now() <= deadline) {
+    const sync = run(process.execPath, ["scripts/sync-status.mjs", "--format", "json"], { allowFailure: true });
+    const syncStatus = parseJsonOutput(sync);
+    const workerLog = readRecentWorkerEvents(opts.logDir);
+    const workerSummary = summarizeWorkerEvents(workerLog.events);
+    const lastCycle = workerSummary.last_cycle;
+    const lastCycleAt = lastCycle?.at ? Date.parse(String(lastCycle.at)) : NaN;
+    const newOkCycle = lastCycle?.ok === true && Number.isFinite(lastCycleAt) && lastCycleAt >= startedAt;
+    const healthReady = syncStatus ? isReadyHealth(syncStatus.health) : false;
+
+    if (lastCycle && newOkCycle && !workerSummary.in_progress && healthReady) {
+      process.stdout.write(
+        `${block([
+          `${title("Lark IM service")} ${statusBadge("ok")}`,
+          kv([
+            ["Cycle", `#${lastCycle.cycle} ${localIso(lastCycle.at)}`],
+            ["Sync", String(syncStatus?.health || "unknown")],
+            ["Log", workerLog.exists ? workerLog.path : `${workerLog.path} (missing)`],
+          ]),
+        ])}\n`,
+      );
+      return;
+    }
+
+    lastReason = [
+      `cycle=${workerSummary.last_cycle?.cycle || "none"}`,
+      `cycle_ok=${workerSummary.last_cycle?.ok ?? "unknown"}`,
+      `cycle_new=${newOkCycle}`,
+      `in_progress=${Boolean(workerSummary.in_progress)}`,
+      `health=${syncStatus?.health || "unavailable"}`,
+    ].join(" ");
+    sleepMs(opts.pollSeconds * 1000);
+  }
+
+  throw new Error(`wait-ok timed out after ${opts.timeoutSeconds}s: ${lastReason || "no worker state"}`);
+}
+
 /** @param {string} line */
 function formatLogLine(line) {
   let event;
@@ -548,6 +611,7 @@ function main() {
     stop();
     start();
   } else if (opts.command === "status") status(opts);
+  else if (opts.command === "wait-ok") waitOk(opts);
   else if (opts.command === "tail") tail(opts);
   else if (opts.command === "uninstall") uninstall();
   else throw new Error(`Unknown command: ${opts.command}`);

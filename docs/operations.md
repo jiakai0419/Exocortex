@@ -149,6 +149,52 @@ periodic reconcile     -> 定期完整复核会话集合，处理冷门会话和
 
 它们分别使用独立 Scope。`hot discovery` 正常运行不应该覆盖 initial full discovery 的完成状态。
 
+## Safe Runtime Maintenance
+
+当前 LaunchAgent 直接运行工作区里的脚本和 `dist` 文件。修改这些 runtime 路径时，如果 worker 正好在中间态 import 文件，可能出现一次短暂失败。失败不会推进错误 Cursor，但会污染最近 worker 日志，也会让维护过程更难判断。
+
+因此，凡是改这些路径，先暂停 worker：
+
+```text
+scripts/
+src/
+dist/
+package.json
+tsconfig*.json
+migrations/
+```
+
+推荐维护流程：
+
+```bash
+node scripts/lark-im-service.mjs stop
+```
+
+然后修改代码并跑检查：
+
+```bash
+npm run typecheck
+npm run check
+npm test
+npm run build:check
+```
+
+检查通过后重新启动并等待一个新的完整成功 cycle：
+
+```bash
+node scripts/lark-im-service.mjs start
+node scripts/lark-im-service.mjs wait-ok
+```
+
+最后复查：
+
+```bash
+node scripts/doctor.mjs
+node scripts/lark-im-service.mjs status
+```
+
+如果只修改文档、测试或不会被 worker import 的旁路工具，可以不暂停 worker。但一旦不确定，就按上面的维护流程处理。
+
 ## When Something Looks Wrong
 
 先看总状态：
@@ -201,6 +247,12 @@ node scripts/lark-im-service.mjs tail
 node scripts/lark-im-service.mjs restart
 ```
 
+重启后等待一个完整成功 cycle：
+
+```bash
+node scripts/lark-im-service.mjs wait-ok
+```
+
 ## Acceptance Check
 
 当前 v0 验收结论见 `docs/v0-baseline.md`。
@@ -214,6 +266,7 @@ node scripts/doctor.mjs
 node scripts/doctor.mjs --live
 node scripts/messages.mjs --limit 20
 node scripts/lark-im-service.mjs status
+node scripts/lark-im-service.mjs wait-ok
 ```
 
 预期：
