@@ -183,7 +183,10 @@ docs
 
 包含：
 
-- `lark-cli` 调用。
+- `transport.mjs`：`lark-cli` 调用、JSON 解析、retry、命令脱敏、transient failure 分类。
+- `adapter.mjs`：Lark IM API shape normalization 和业务组合。
+- `message-record.mjs`：Lark message payload 解释、名称解析辅助和 record 映射。
+- `core.mjs`：兼容门面和 Lark IM 同步规则组合层。
 - sent messages fetch。
 - per-chat received messages fetch。
 - chat discovery。

@@ -1,6 +1,5 @@
 // @ts-check
 
-import { spawnSync } from "node:child_process";
 import {
   chatId,
   localIsoFromMs,
@@ -9,6 +8,12 @@ import {
   senderName,
   senderType,
 } from "./core.mjs";
+import {
+  isTransientLarkFailure,
+  parseJson,
+  redactCommand,
+  runLark,
+} from "./transport.mjs";
 
 /**
  * @typedef {Record<string, any>} JsonObject
@@ -81,83 +86,6 @@ import {
  * @property {(chatIdValue: string, startMs: number, endMs: number, opts: FetchOptions) => MessageFetchResult} fetchChatMessages
  * @property {(opts: FetchOptions, pageToken: string) => ChatDiscoveryPage} fetchChatDiscoveryPage
  */
-
-/**
- * @param {string} stdout
- * @returns {JsonObject | null}
- */
-function parseJson(stdout) {
-  const trimmed = stdout.trim();
-  if (!trimmed) return null;
-  try {
-    return JSON.parse(trimmed);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`lark-cli returned non-JSON output: ${message}`);
-  }
-}
-
-/**
- * @param {string[]} args
- * @param {string[]} [redactedFlags]
- */
-function redactCommand(args, redactedFlags = []) {
-  const parts = ["lark-cli", ...args];
-  for (const flag of redactedFlags) {
-    const index = parts.indexOf(flag);
-    if (index >= 0 && index + 1 < parts.length) parts[index + 1] = "<redacted>";
-  }
-  return parts.join(" ");
-}
-
-/** @param {number} ms */
-function sleepMs(ms) {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
-
-/** @param {unknown} stderr */
-function isTransientLarkFailure(stderr) {
-  const text = String(stderr || "");
-  if (/TLS handshake timeout|Client\.Timeout|timeout awaiting response headers|i\/o timeout/i.test(text)) {
-    return true;
-  }
-  try {
-    const parsed = JSON.parse(text);
-    const error = parsed?.error;
-    if (error?.type === "network" && error?.subtype === "timeout") return true;
-    return error?.type === "api" && Number(error?.code) === 2200 && /Internal Error/i.test(String(error?.message || ""));
-  } catch {
-    return false;
-  }
-}
-
-/**
- * @param {string[]} args
- * @param {AdapterRunOptions} [options]
- * @returns {JsonObject | null}
- */
-function runLark(args, options = {}) {
-  const bin = process.env.LARK_CLI || "lark-cli";
-  const retries = Number(options.retries ?? 0);
-  const retryDelayMs = Number(options.retryDelayMs ?? 1000);
-  let lastResult = null;
-  for (let attempt = 0; attempt <= retries; attempt += 1) {
-    const result = spawnSync(bin, args, {
-      encoding: "utf8",
-      maxBuffer: 50 * 1024 * 1024,
-    });
-    lastResult = result;
-    if (result.status === 0) return parseJson(result.stdout || "");
-    const stderr = result.stderr.trim();
-    if (attempt < retries && isTransientLarkFailure(stderr)) {
-      sleepMs(retryDelayMs);
-      continue;
-    }
-    break;
-  }
-  const stderr = lastResult?.stderr?.trim() || "";
-  throw new Error(`${redactCommand(args, options.redactedFlags)} failed: ${stderr}`);
-}
 
 /** @param {...unknown} values */
 function firstArray(...values) {

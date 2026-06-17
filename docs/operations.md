@@ -170,6 +170,14 @@ migrations/
 node scripts/lark-im-service.mjs stop
 ```
 
+确认服务真的卸载：
+
+```bash
+node scripts/lark-im-service.mjs status
+```
+
+预期 `LaunchAgent / Loaded` 显示 `NOT LOADED`。如果 `stop` 报 `Operation not permitted`，说明当前 shell 没有权限卸载 LaunchAgent；不要继续改 runtime 路径，先切到有权限的普通终端或授权当前操作。
+
 然后修改代码并跑检查：
 
 ```bash

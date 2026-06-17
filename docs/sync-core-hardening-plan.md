@@ -111,6 +111,8 @@ v0 质量验收已经完成并固化到 `docs/v0-baseline.md`。
 2026-06-17 起，下一轮重心转为通用同步内核抽取：
 
 - `src/core/sync.ts` 承载不依赖飞书、不依赖 SQLite 的同步规则。
+- `src/adapters/lark-im/transport.mjs` 承载 `lark-cli` 调用、JSON 解析、retry、命令脱敏和 transient failure 分类。
+- `src/adapters/lark-im/adapter.mjs` 承载 Lark IM API shape normalization 和业务组合。
 - `src/adapters/lark-im/message-record.mjs` 承载 Lark message payload 解释、名称解析辅助和 record 映射。
 - `src/adapters/lark-im/core.mjs` 保留为兼容门面和 Lark IM 同步规则组合层。
 - `dist/core` 是运行时入口，继续遵守 no runtime TypeScript loader。

@@ -167,6 +167,14 @@ function plistPath() {
   return resolve(homedir(), "Library/LaunchAgents", `${LABEL}.plist`);
 }
 
+function launchdPrint() {
+  return run("launchctl", ["print", target()], { allowFailure: true });
+}
+
+function isLaunchdLoaded() {
+  return launchdPrint().status === 0;
+}
+
 /**
  * @param {string} cmd
  * @param {string[]} args
@@ -245,6 +253,7 @@ function install(opts) {
   mkdirSync(resolve(homedir(), "Library/LaunchAgents"), { recursive: true });
   writeFileSync(plistPath(), plistXml(opts));
   run("launchctl", ["bootout", target()], { allowFailure: true });
+  run("launchctl", ["bootout", domain(), plistPath()], { allowFailure: true });
   run("launchctl", ["bootstrap", domain(), plistPath()]);
   run("launchctl", ["kickstart", "-k", target()], { allowFailure: true });
   process.stdout.write(`installed ${LABEL}\n`);
@@ -252,8 +261,13 @@ function install(opts) {
 
 function start() {
   if (!existsSync(plistPath())) throw new Error(`plist not found: ${plistPath()}`);
+  if (isLaunchdLoaded()) {
+    run("launchctl", ["kickstart", "-k", target()], { allowFailure: true });
+    process.stdout.write(`started ${LABEL}\n`);
+    return;
+  }
   const boot = run("launchctl", ["bootstrap", domain(), plistPath()], { allowFailure: true });
-  if (boot.status !== 0 && !/already bootstrapped|service already loaded/i.test(boot.stderr)) {
+  if (boot.status !== 0 && !isLaunchdLoaded()) {
     throw new Error(boot.stderr.trim() || "launchctl bootstrap failed");
   }
   run("launchctl", ["kickstart", "-k", target()], { allowFailure: true });
@@ -261,7 +275,17 @@ function start() {
 }
 
 function stop() {
-  run("launchctl", ["bootout", target()], { allowFailure: true });
+  const attempts = [
+    run("launchctl", ["bootout", target()], { allowFailure: true }),
+    run("launchctl", ["bootout", domain(), plistPath()], { allowFailure: true }),
+  ];
+  if (isLaunchdLoaded()) {
+    const detail = attempts
+      .map((result) => result.stderr.trim() || result.stdout.trim())
+      .filter(Boolean)
+      .join("; ");
+    throw new Error(`failed to stop ${LABEL}: ${detail || "service is still loaded"}`);
+  }
   process.stdout.write(`stopped ${LABEL}\n`);
 }
 
