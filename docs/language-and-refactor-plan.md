@@ -339,6 +339,7 @@ node scripts/lark-im-service.mjs status
 - `lark-im-core` 已迁入 `src/adapters/lark-im/core.mjs`，`scripts/lib/lark-im-core.mjs` 保留为兼容 shim。
 - `ingestion-store` 已迁入 `src/storage/sqlite/ingestion-store.mjs`，`scripts/lib/ingestion-store.mjs` 保留为兼容 shim。
 - `lark-im-adapter` 已迁入 `src/adapters/lark-im/adapter.mjs`，`scripts/lib/lark-im-adapter.mjs` 保留为兼容 shim。
+- `lark-im-name-resolver` 已拆入 `src/adapters/lark-im/name-resolver.mjs`，让 sender/contact/member/app 名称解析与消息 fetch facade 分离。
 - `lark-im-worker-core` 已迁入 `src/runtime/worker/lark-im-worker-core.mjs`，`scripts/lib/lark-im-worker-core.mjs` 保留为兼容 shim。
 
 目标：
@@ -508,5 +509,5 @@ probe/maintenance scripts mostly JavaScript
 
 1. Phase 3 已经用 `src/core`、`src/terminal`、`src/runtime/worker` 和 `src/storage/sqlite` 验证了 `src/**/*.ts -> dist/**/*.js` 的显式 build。
 2. 同步质量测试已经覆盖 cursor 边界推进、边界重放安全、source time precision、分页完整性、质量报告诊断、scope JSON 解析和失败 run 不污染成功 cursor。
-3. 下一步不要急着迁外部系统 adapter；优先继续收窄 `src/adapters/lark-im/core.mjs`，让它只保留 Lark payload 解释和 record 映射。
+3. `src/adapters/lark-im/name-resolver.mjs` 已从 `adapter.mjs` 拆出；下一步不要急着迁外部系统 adapter，优先继续让 `adapter.mjs` 只保留 lark-cli fetch/discovery facade 和错误分类。
 4. 继续保持 no runtime loader、不改 LaunchAgent、不改核心三命令。

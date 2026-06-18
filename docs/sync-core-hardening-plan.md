@@ -113,6 +113,7 @@ v0 质量验收已经完成并固化到 `docs/v0-baseline.md`。
 - `src/core/sync.ts` 承载不依赖飞书、不依赖 SQLite 的同步规则。
 - `src/adapters/lark-im/transport.mjs` 承载 `lark-cli` 调用、JSON 解析、retry、命令脱敏和 transient failure 分类。
 - `src/adapters/lark-im/adapter.mjs` 承载 Lark IM API shape normalization 和业务组合。
+- `src/adapters/lark-im/name-resolver.mjs` 承载 contact、chat member、application 和 chat bot fallback 名称解析。
 - `src/adapters/lark-im/message-record.mjs` 承载 Lark message payload 解释、名称解析辅助和 record 映射。
 - `src/adapters/lark-im/core.mjs` 保留为兼容门面和 Lark IM 同步规则组合层。
 - `dist/core` 是运行时入口，继续遵守 no runtime TypeScript loader。
@@ -123,6 +124,11 @@ v0 质量验收已经完成并固化到 `docs/v0-baseline.md`。
 消息过滤、按人/会话/关键词查询等 `messages` 阅读体验增强暂不进入近期计划。当前 `messages` 只承担“查看最近同步事实”的验收入口。
 
 ## 执行记录
+
+### 2026-06-19
+
+- `lark-cli` 从 `1.0.53` 升级到 `1.0.56`，`doctor --live` 验证仍为 OK。
+- `src/adapters/lark-im/name-resolver.mjs` 从 `adapter.mjs` 拆出，`adapter.mjs` 继续保留对外 facade 和兼容导出。
 
 ### 2026-06-13
 
