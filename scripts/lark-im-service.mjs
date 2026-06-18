@@ -17,7 +17,7 @@ import {
 import { homedir, userInfo } from "node:os";
 import { resolve } from "node:path";
 import { summarizeWorkerEvents } from "./lib/lark-im-worker-core.mjs";
-import { block, compact, kv, list, renderError, section, statusBadge, subtitle, title } from "./lib/terminal.mjs";
+import { block, compact, kv, list, renderError, section, statusBadge, subtitle, table, title } from "./lib/terminal.mjs";
 
 const LABEL = "com.exocortex.lark-im-worker";
 const DEFAULT_LOG_DIR = "logs/lark-im";
@@ -478,11 +478,27 @@ function status(opts) {
             syncStatus.scopes?.received_without_cursor || 0
           } without cursor`,
         ],
+        ["Unsupported scopes", `${syncStatus.scopes?.received_unsupported || 0} total`],
         ["Hot discovery", hotDiscoveryState],
         ["Reconcile", `${reconcileState}, ${syncStatus.reconcile?.cursor?.pages_scanned || 0} pages`],
         ["Locks", syncStatus.locks?.length || 0],
       ]),
     );
+    if (syncStatus.scopes?.unsupported_reasons?.length > 0) {
+      lines.push(
+        table(syncStatus.scopes.unsupported_reasons, [
+          { header: "Reason", render: (row) => row.reason },
+          {
+            header: "Lark CLI",
+            render: (row) =>
+              row.lark_cli_error_message
+                ? `${row.lark_cli_error_code}: ${row.lark_cli_error_message}`
+                : "",
+          },
+          { header: "Count", render: (row) => row.count },
+        ]),
+      );
+    }
   } else {
     lines.push("");
     lines.push(section("Sync"));

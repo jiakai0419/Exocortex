@@ -11,7 +11,7 @@ import {
   healthDetail,
   summarizeHealth,
 } from "./lib/sync-status-core.mjs";
-import { block, kv, list, renderError, section, statusBadge, subtitle, title } from "./lib/terminal.mjs";
+import { block, kv, list, renderError, section, statusBadge, subtitle, table, title } from "./lib/terminal.mjs";
 
 const DEFAULT_DB = "data/exocortex.sqlite";
 
@@ -142,11 +142,26 @@ function buildStatus(dbPath) {
          COUNT(*) AS total,
          SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END) AS enabled,
          SUM(CASE WHEN id LIKE 'lark.im.received.chat.%' AND enabled = 1 THEN 1 ELSE 0 END) AS received_enabled,
-         SUM(CASE WHEN id LIKE 'lark.im.received.chat.%' AND enabled = 1 AND cursor_json IS NULL THEN 1 ELSE 0 END) AS received_without_cursor
+         SUM(CASE WHEN id LIKE 'lark.im.received.chat.%' AND enabled = 1 AND cursor_json IS NULL THEN 1 ELSE 0 END) AS received_without_cursor,
+         SUM(CASE WHEN id LIKE 'lark.im.received.chat.%' AND json_extract(config_json, '$.unsupported_reason') IS NOT NULL THEN 1 ELSE 0 END) AS received_unsupported
        FROM sync_scopes;`,
       "read scope totals",
     ),
     {},
+  );
+  const unsupportedReasons = sqliteJson(
+    dbPath,
+    `SELECT
+       COALESCE(json_extract(config_json, '$.unsupported_reason'), 'unknown') AS reason,
+       MAX(COALESCE(json_extract(config_json, '$.lark_cli_error_code'), '')) AS lark_cli_error_code,
+       MAX(COALESCE(json_extract(config_json, '$.lark_cli_error_message'), '')) AS lark_cli_error_message,
+       COUNT(*) AS count
+     FROM sync_scopes
+     WHERE id LIKE 'lark.im.received.chat.%'
+       AND json_extract(config_json, '$.unsupported_reason') IS NOT NULL
+     GROUP BY reason
+     ORDER BY count DESC, reason;`,
+    "read unsupported scope reasons",
   );
   const discoveryRow = readScopeStatus(
     dbPath,
@@ -201,6 +216,8 @@ function buildStatus(dbPath) {
       enabled: Number(scopeCounts.enabled || 0),
       received_enabled: Number(scopeCounts.received_enabled || 0),
       received_without_cursor: Number(scopeCounts.received_without_cursor || 0),
+      received_unsupported: Number(scopeCounts.received_unsupported || 0),
+      unsupported_reasons: unsupportedReasons,
     },
     discovery: {
       cursor: discoveryCursor,
@@ -290,10 +307,28 @@ function renderText(status) {
         "Received scopes",
         `${status.scopes.received_enabled} enabled, ${status.scopes.received_without_cursor} without cursor`,
       ],
+      ["Unsupported scopes", `${status.scopes.received_unsupported || 0} total`],
       ["Runs", JSON.stringify(status.runs.by_status)],
       ["Locks", status.locks.length],
     ]),
   ];
+  if (status.scopes.unsupported_reasons?.length > 0) {
+    lines.push("");
+    lines.push(section("Unsupported reasons"));
+    lines.push(
+      table(status.scopes.unsupported_reasons, [
+        { header: "Reason", render: (row) => row.reason },
+        {
+          header: "Lark CLI",
+          render: (row) =>
+            row.lark_cli_error_message
+              ? `${row.lark_cli_error_code}: ${row.lark_cli_error_message}`
+              : "",
+        },
+        { header: "Count", render: (row) => row.count },
+      ]),
+    );
+  }
   if (
     status.recovery?.recovered_locks > 0 ||
     status.recovery?.cancelled_runs > 0 ||
