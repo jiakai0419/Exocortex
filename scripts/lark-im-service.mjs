@@ -487,15 +487,16 @@ function status(opts) {
     if (syncStatus.scopes?.unsupported_reasons?.length > 0) {
       lines.push(
         table(syncStatus.scopes.unsupported_reasons, [
-          { header: "Reason", render: (row) => row.reason },
+          { key: "reason", header: "Reason", render: (row) => row.reason },
           {
+            key: "lark_cli",
             header: "Lark CLI",
             render: (row) =>
               row.lark_cli_error_message
                 ? `${row.lark_cli_error_code}: ${row.lark_cli_error_message}`
                 : "",
           },
-          { header: "Count", render: (row) => row.count },
+          { key: "count", header: "Count", render: (row) => row.count },
         ]),
       );
     }
