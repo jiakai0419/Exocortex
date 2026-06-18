@@ -150,6 +150,12 @@ function isRestrictedModeError(error) {
   return /"code"\s*:\s*231203|Restricted Mode|don't allow copying or forwarding messages/i.test(message);
 }
 
+/** @param {unknown} error */
+function isBotUserOutOfChatError(error) {
+  const message = String(error instanceof Error ? error.message : error || "");
+  return /"code"\s*:\s*230002|Bot\/User can NOT be out of the chat/i.test(message);
+}
+
 /** @param {unknown} bot */
 function botName(bot) {
   if (!bot || typeof bot !== "object") return "";
@@ -619,6 +625,7 @@ export {
   firstArray,
   getEnvelope,
   getSelfProfile,
+  isBotUserOutOfChatError,
   isRestrictedModeError,
   isTransientLarkFailure,
   parseJson,

@@ -10,6 +10,7 @@ import {
   fetchChatMessages,
   fetchSentMessages,
   getSelfProfile,
+  isBotUserOutOfChatError,
   isRestrictedModeError,
 } from "../src/adapters/lark-im/adapter.mjs";
 import {
@@ -752,10 +753,17 @@ COMMIT;
  */
 function succeedUnsupportedRun(dbPath, scope, runId, error, reason) {
   const now = new Date().toISOString();
+  const unsupportedError = String(error instanceof Error ? error.message : error).slice(0, 1000);
   const config = {
     unsupported_reason: reason,
     unsupported_at: now,
-    unsupported_error: String(error instanceof Error ? error.message : error).slice(0, 1000),
+    unsupported_error: unsupportedError,
+    ...(reason === "bot_user_out_of_chat"
+      ? {
+          lark_cli_error_code: 230002,
+          lark_cli_error_message: "Bot/User can NOT be out of the chat.",
+        }
+      : {}),
   };
   sqliteExec(
     dbPath,
@@ -805,6 +813,10 @@ function syncReceivedScope(dbPath, opts, scope, selfProfile) {
       if (isRestrictedModeError(error)) {
         succeedUnsupportedRun(dbPath, lockedScope, runId, error, "restricted_mode");
         return { ok: true, skipped: true, reason: "restricted_mode", scanned: 0, records: 0, inserted: 0, updated: 0, duplicate: 0 };
+      }
+      if (isBotUserOutOfChatError(error)) {
+        succeedUnsupportedRun(dbPath, lockedScope, runId, error, "bot_user_out_of_chat");
+        return { ok: true, skipped: true, reason: "bot_user_out_of_chat", scanned: 0, records: 0, inserted: 0, updated: 0, duplicate: 0 };
       }
       throw error;
     }
@@ -919,6 +931,7 @@ export {
   sqliteQuery,
   stableMessageEndMs,
   succeedMessageRun,
+  succeedUnsupportedRun,
 };
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

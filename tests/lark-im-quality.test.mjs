@@ -89,13 +89,22 @@ test("lark im quality report flags missing names, chat names, and invalid bodies
   sqliteExec(
     dbPath,
     `INSERT INTO sync_scopes (id, source_id, name, description, enabled, config_json)
-     VALUES (
+     VALUES
+     (
        'lark.im.received.chat.synthetic',
        'lark.im',
        'received.chat.synthetic',
        'Synthetic received chat scope.',
        1,
        '{"hot_seen_at":"2026-06-13T00:00:00.000Z","unsupported_reason":"restricted_mode"}'
+     ),
+     (
+       'lark.im.received.chat.out_of_chat',
+       'lark.im',
+       'received.chat.out_of_chat',
+       'Synthetic out-of-chat received scope.',
+       0,
+       '{"hot_seen_at":"2026-06-13T00:01:00.000Z","unsupported_reason":"bot_user_out_of_chat","lark_cli_error_code":230002,"lark_cli_error_message":"Bot/User can NOT be out of the chat."}'
      );`,
     "insert synthetic received scope",
   );
@@ -119,9 +128,21 @@ test("lark im quality report flags missing names, chat names, and invalid bodies
   assert.equal(report.quality.invalid_rendered_body, 1);
   assert.equal(report.quality.deleted_or_recalled_body, 1);
   assert.equal(report.scopes.enabled_received_scopes, 1);
-  assert.equal(report.scopes.hot_seen_scopes, 1);
-  assert.equal(report.scopes.unsupported_scopes, 1);
+  assert.equal(report.scopes.hot_seen_scopes, 2);
+  assert.equal(report.scopes.unsupported_scopes, 2);
+  assert.deepEqual(report.unsupported_reasons, [
+    {
+      reason: "bot_user_out_of_chat",
+      lark_cli_error_code: 230002,
+      lark_cli_error_message: "Bot/User can NOT be out of the chat.",
+      count: 1,
+    },
+    { reason: "restricted_mode", lark_cli_error_code: "", lark_cli_error_message: "", count: 1 },
+  ]);
   assert.match(plain(render(report)), /Lark IM data quality NEEDS ATTENTION/);
+  assert.match(plain(render(report)), /Unsupported reasons/);
+  assert.match(plain(render(report)), /230002: Bot\/User can NOT be out of the chat\./);
+  assert.match(plain(render(report)), /restricted_mode/);
 });
 
 test("lark im quality treats senderless system and known unresolved app senders as advisory", (t) => {

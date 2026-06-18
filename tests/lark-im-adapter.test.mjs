@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   createLarkImAdapter,
+  isBotUserOutOfChatError,
   isRestrictedModeError,
   isTransientLarkFailure,
 } from "../src/adapters/lark-im/adapter.mjs";
@@ -330,4 +331,10 @@ test("restricted mode classifier recognizes Lark restricted chat errors", () => 
   assert.equal(isRestrictedModeError(new Error('{"code":231203,"msg":"Restricted Mode"}')), true);
   assert.equal(isRestrictedModeError(new Error("don't allow copying or forwarding messages")), true);
   assert.equal(isRestrictedModeError(new Error("network timeout")), false);
+});
+
+test("out of chat classifier recognizes lark-cli 230002 errors", () => {
+  assert.equal(isBotUserOutOfChatError(new Error('{"code":230002,"message":"Bot/User can NOT be out of the chat"}')), true);
+  assert.equal(isBotUserOutOfChatError(new Error("Bot/User can NOT be out of the chat")), true);
+  assert.equal(isBotUserOutOfChatError(new Error("network timeout")), false);
 });

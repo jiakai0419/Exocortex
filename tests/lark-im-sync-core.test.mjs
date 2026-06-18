@@ -22,6 +22,7 @@ import {
   shouldSkipReconcile,
   sqliteQuery,
   succeedMessageRun,
+  succeedUnsupportedRun,
 } from "../scripts/lark-im-sync.mjs";
 
 function message(id, occurredAtMs, overrides = {}) {
@@ -319,4 +320,35 @@ test("failed runs do not advance the scope cursor", (t) => {
   assert.equal(row.status, "failed");
   assert.equal(row.error_type, "Error");
   assert.match(row.error_message, /network timeout/);
+});
+
+test("unsupported out-of-chat runs disable the scope and keep lark-cli error details", (t) => {
+  const dbPath = tempDb(t);
+  const scope = readScope(dbPath, "lark.im.sent_by_me");
+  const runId = createRun(dbPath, scope);
+
+  succeedUnsupportedRun(
+    dbPath,
+    scope,
+    runId,
+    new Error('{"code":230002,"message":"Bot/User can NOT be out of the chat"}'),
+    "bot_user_out_of_chat",
+  );
+
+  const row = sqliteQuery(
+    dbPath,
+    `SELECT s.enabled, s.config_json, r.status, r.metadata_json
+     FROM sync_scopes s
+     JOIN sync_runs r ON r.id = ${Number(runId)}
+     WHERE s.id = 'lark.im.sent_by_me';`,
+    "read unsupported run",
+  )[0];
+  const config = JSON.parse(row.config_json);
+  const metadata = JSON.parse(row.metadata_json);
+  assert.equal(row.enabled, 0);
+  assert.equal(row.status, "succeeded");
+  assert.equal(config.unsupported_reason, "bot_user_out_of_chat");
+  assert.equal(config.lark_cli_error_code, 230002);
+  assert.equal(config.lark_cli_error_message, "Bot/User can NOT be out of the chat.");
+  assert.equal(metadata.skip_reason, "bot_user_out_of_chat");
 });

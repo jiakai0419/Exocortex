@@ -693,6 +693,21 @@ Cursor 注意事项：
 - `received.chat.<chat_scope_id>` 使用 `+chat-messages-list --order asc`。该接口样本中按 `create_time` 单调递增，适合 per-chat cursor。
 - 两条路径的 `--start` 边界样本中都是包含式，因此 adapter 必须本地过滤严格大于 Cursor 的记录，而不是假设远端支持严格大于。
 
+### Unsupported received chat scopes
+
+某个 `received.chat.<chat_scope_id>` 可能在历史上可同步，之后变成不可同步。处理原则：
+
+- 已同步 records 保留。
+- 不把不可同步 scope 的每轮失败当作 worker 整体故障。
+- 不用 UI 或业务猜测命名原因；按 source adapter 实际观察到的远端/lark-cli 返回记录。
+
+当前 Lark IM adapter 识别的原因：
+
+- `bot_user_out_of_chat`：lark-cli 返回 `230002` / `Bot/User can NOT be out of the chat.`。
+- `restricted_mode`：飞书返回保密模式/不允许复制转发一类错误。
+
+识别后，scope 写入 `config_json.unsupported_reason`、`unsupported_at`、`unsupported_error`，并设置 `enabled = 0`。如果后续需要恢复，应通过显式 recheck/re-enable 流程处理，而不是由 hot discovery 自动打开。
+
 ## 设计原则
 
 1. 核心抽象不由 UI 倒推。

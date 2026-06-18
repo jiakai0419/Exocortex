@@ -153,6 +153,21 @@ function collect(dbPath) {
      LIMIT 5;`,
     "recent failures",
   );
+  const unsupportedReasons = sqliteJson(
+    dbPath,
+    `SELECT
+       COALESCE(json_extract(config_json, '$.unsupported_reason'), 'unknown') AS reason,
+       MAX(COALESCE(json_extract(config_json, '$.lark_cli_error_code'), '')) AS lark_cli_error_code,
+       MAX(COALESCE(json_extract(config_json, '$.lark_cli_error_message'), '')) AS lark_cli_error_message,
+       COUNT(*) AS count
+     FROM sync_scopes
+     WHERE source_id = 'lark.im'
+       AND id LIKE 'lark.im.received.chat.%'
+       AND json_extract(config_json, '$.unsupported_reason') IS NOT NULL
+     GROUP BY reason
+     ORDER BY count DESC, reason;`,
+    "unsupported scope reasons",
+  );
   const latest = sqliteJson(
     dbPath,
     `SELECT direction, occurred_at, json_extract(canonical_json, '$.chat_name') AS chat_name, body
@@ -175,6 +190,7 @@ function collect(dbPath) {
     message_types: byType,
     quality: quality[0] || {},
     scopes: scopes[0] || {},
+    unsupported_reasons: unsupportedReasons,
     recent_failures: recentFailures,
     latest_records: latest,
   };
@@ -215,6 +231,23 @@ function render(report) {
       ["Unsupported", report.scopes.unsupported_scopes || 0],
     ]),
   ];
+  if (report.unsupported_reasons.length > 0) {
+    lines.push("");
+    lines.push(section("Unsupported reasons"));
+    lines.push(
+      table(report.unsupported_reasons, [
+        { header: "Reason", render: (row) => row.reason },
+        {
+          header: "Lark CLI",
+          render: (row) =>
+            row.lark_cli_error_message
+              ? `${row.lark_cli_error_code}: ${row.lark_cli_error_message}`
+              : "",
+        },
+        { header: "Count", render: (row) => row.count },
+      ]),
+    );
+  }
   if (report.message_types.length > 0) {
     lines.push("");
     lines.push(section("Message types"));

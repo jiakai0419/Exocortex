@@ -221,6 +221,17 @@ node scripts/doctor.mjs --live
 
 `doctor --live` / `lark-im-lag-check` 的真实验收使用本机飞书数据，但仓库里的自动化测试只使用 anonymized shape fixtures。它们保留飞书响应字段形状，不保留真实 ID、人名、群名、链接或消息正文。
 
+### Unsupported Chat Scopes
+
+Received chat scope 可能进入 unsupported 状态。它表示同步器已经正确识别到该会话不能继续通过当前 lark-cli 身份同步，后续会暂停这个 scope，但本地已同步的 records 会保留。
+
+当前已知原因：
+
+- `bot_user_out_of_chat`：lark-cli 返回 `230002` / `Bot/User can NOT be out of the chat.`。同步器不推断用户是退群、被移出，还是切换身份；只按 lark-cli 的实际返回记录。
+- `restricted_mode`：飞书返回保密模式/不允许复制转发一类错误。
+
+这些 scope 不应该让 worker 每轮失败。它们会出现在 `node scripts/lark-im-quality.mjs` 的 unsupported reasons 中，用于诊断。
+
 看后台服务：
 
 ```bash
