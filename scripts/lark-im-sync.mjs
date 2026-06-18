@@ -15,6 +15,7 @@ import {
   succeedMessageRun,
 } from "../dist/storage/sqlite/ingestion-store.js";
 import {
+  createSyncRunner,
   prepareChatWindowRecords,
   shouldSkipCompletedDiscovery,
   shouldSkipReconcile,
@@ -46,6 +47,7 @@ const DEFAULT_CHAT_TYPES = "group,p2p";
 const DEFAULT_STABLE_HORIZON_SECONDS = 30;
 const DEFAULT_RETRIES = 4;
 const DEFAULT_RETRY_DELAY_MS = 2000;
+const syncRunner = createSyncRunner();
 
 /**
  * @typedef {"all" | "sent" | "discover" | "received"} SyncScopeOption
@@ -290,13 +292,13 @@ function main() {
   };
 
   if (opts.scope === "all" || opts.scope === "sent") {
-    summary.sent = syncSent(dbPath, opts, /** @type {SelfProfile} */ (requiredSelfProfile));
+    summary.sent = syncRunner.syncSent(dbPath, opts, /** @type {SelfProfile} */ (requiredSelfProfile));
   }
   if (opts.scope === "all" || opts.scope === "discover") {
-    summary.discovery = syncDiscovery(dbPath, opts);
+    summary.discovery = syncRunner.syncDiscovery(dbPath, opts);
   }
   if (opts.scope === "all" || opts.scope === "received") {
-    summary.received = syncReceived(dbPath, opts, /** @type {SelfProfile} */ (requiredSelfProfile));
+    summary.received = syncRunner.syncReceived(dbPath, opts, /** @type {SelfProfile} */ (requiredSelfProfile));
   }
 
   const failures = [
@@ -317,6 +319,7 @@ export {
   bodyFromMessage,
   compareRecordToCursor,
   createRun,
+  createSyncRunner,
   cursorAfter,
   ensureInitialized,
   failRun,

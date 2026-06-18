@@ -187,7 +187,7 @@ docs
 - `adapter.mjs`：Lark IM API shape normalization 和业务组合。
 - `message-record.mjs`：Lark message payload 解释、名称解析辅助和 record 映射。
 - `core.mjs`：兼容门面和 Lark IM 同步规则组合层。
-- `sync-runner.mjs`：Lark IM sent / discovery / received 同步执行层，负责把 adapter、core 和 store 组合成一次可 checkpoint 的同步 run。
+- `sync-runner.mjs`：Lark IM sent / discovery / received 同步执行层，负责把 adapter、core 和 store 组合成一次可 checkpoint 的同步 run；通过 `createSyncRunner(deps)` 支持生产真实依赖和测试 fake deps 分离。
 - sent messages fetch。
 - per-chat received messages fetch。
 - chat discovery。
@@ -342,7 +342,7 @@ node scripts/lark-im-service.mjs status
 - `ingestion-store` 已迁入 `src/storage/sqlite/ingestion-store.mjs`，`scripts/lib/ingestion-store.mjs` 保留为兼容 shim。
 - `lark-im-adapter` 已迁入 `src/adapters/lark-im/adapter.mjs`，`scripts/lib/lark-im-adapter.mjs` 保留为兼容 shim。
 - `lark-im-name-resolver` 已拆入 `src/adapters/lark-im/name-resolver.mjs`，让 sender/contact/member/app 名称解析与消息 fetch facade 分离。
-- `lark-im-sync-runner` 已拆入 `src/adapters/lark-im/sync-runner.mjs`，让 `scripts/lark-im-sync.mjs` 回到 CLI 入口和调度层。
+- `lark-im-sync-runner` 已拆入 `src/adapters/lark-im/sync-runner.mjs`，并增加 `createSyncRunner(deps)` 依赖注入边界，让 `scripts/lark-im-sync.mjs` 回到 CLI 入口和调度层。
 - `lark-im-worker-core` 已迁入 `src/runtime/worker/lark-im-worker-core.mjs`，`scripts/lib/lark-im-worker-core.mjs` 保留为兼容 shim。
 
 目标：
@@ -513,5 +513,5 @@ probe/maintenance scripts mostly JavaScript
 
 1. Phase 3 已经用 `src/core`、`src/terminal`、`src/runtime/worker` 和 `src/storage/sqlite` 验证了 `src/**/*.ts -> dist/**/*.js` 的显式 build。
 2. 同步质量测试已经覆盖 cursor 边界推进、边界重放安全、source time precision、分页完整性、质量报告诊断、scope JSON 解析和失败 run 不污染成功 cursor。
-3. `src/adapters/lark-im/sync-runner.mjs` 已从 `scripts/lark-im-sync.mjs` 拆出；下一步不要急着迁 production CLI 到 TypeScript，先复查 `scripts/lark-im-sync.mjs` 是否已经足够薄，以及 runner 是否需要更细的测试入口。
+3. `src/adapters/lark-im/sync-runner.mjs` 已从 `scripts/lark-im-sync.mjs` 拆出，并有 fake deps 测试覆盖 sent、received unsupported 和 discovery 注入路径；下一步不要急着迁 production CLI 到 TypeScript，先复查 `scripts/lark-im-sync.mjs` 是否已经足够薄，以及 runner 是否还需要更细的失败分支测试。
 4. 继续保持 no runtime loader、不改 LaunchAgent、不改核心三命令。

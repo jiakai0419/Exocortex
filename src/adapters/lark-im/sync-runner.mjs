@@ -88,14 +88,61 @@ import {
  * @property {boolean} has_more
  * @property {string} page_token
  * @property {boolean=} hot
+ *
+ * @typedef {Record<string, any>} SyncRunnerDeps
+ *
+ * @typedef {object} SyncRunner
+ * @property {(dbPath: string, mode?: ReceivedMode) => ScopeRow[]} listReceivedScopes
+ * @property {(dbPath: string, scopeId: string, opts: SyncOptions, worker: (scope: ScopeRow, runId: number) => RunResult) => RunResult} syncScope
+ * @property {(dbPath: string, opts: SyncOptions, selfProfile: SelfProfile) => RunResult} syncSent
+ * @property {(messages: JsonObject[], scopeId: string, cursor: JsonObject | null | undefined, startMs: number, endMs: number, selfOpenId: string, peopleContext: JsonObject, scopeConfig: JsonObject) => JsonObject[]} prepareChatWindowRecords
+ * @property {(scope: ScopeRow, opts: SyncOptions) => DiscoveryResult} discoverChatPages
+ * @property {(opts: SyncOptions) => DiscoveryResult} discoverHotChatPages
+ * @property {(scope: ScopeRow, opts: SyncOptions) => boolean} shouldSkipCompletedDiscovery
+ * @property {(scope: ScopeRow, opts: SyncOptions) => boolean} shouldSkipReconcile
+ * @property {(dbPath: string, opts: SyncOptions) => RunResult} syncDiscovery
+ * @property {(dbPath: string, scope: ScopeRow, runId: number, error: unknown, reason: string) => void} succeedUnsupportedRun
+ * @property {(dbPath: string, opts: SyncOptions, scope: ScopeRow, selfProfile: SelfProfile) => RunResult} syncReceivedScope
+ * @property {(dbPath: string, opts: SyncOptions, selfProfile: SelfProfile) => RunResult[]} syncReceived
  */
+
+/** @type {SyncRunnerDeps} */
+const defaultDeps = {
+  acquireLock,
+  buildPeopleContext,
+  createRun,
+  failRun,
+  fetchChatDiscoveryPage,
+  fetchChatMessages,
+  fetchSentMessages,
+  isBotUserOutOfChatError,
+  isRestrictedModeError,
+  makeSnapshotId: (prefix = "snapshot") => `${prefix}_${Date.now()}_${shortHash(`${process.pid}:${Math.random()}`)}`,
+  nowIso: () => new Date().toISOString(),
+  quoteSql,
+  readScope,
+  releaseLock,
+  sqlJson,
+  sqliteExec,
+  sqliteQuery,
+  succeedMessageRun,
+};
+
+/**
+ * @param {Partial<SyncRunnerDeps>} [deps]
+ * @returns {SyncRunnerDeps}
+ */
+function resolveDeps(deps = {}) {
+  return { ...defaultDeps, ...deps };
+}
 
 /**
  * @param {string} dbPath
  * @param {ReceivedMode} [mode]
+ * @param {SyncRunnerDeps} [deps]
  * @returns {ScopeRow[]}
  */
-function listReceivedScopes(dbPath, mode = "all") {
+function listReceivedScopes(dbPath, mode = "all", deps = defaultDeps) {
   const modeWhere =
     mode === "hot"
       ? "AND json_extract(config_json, '$.hot_seen_at') IS NOT NULL"
@@ -120,11 +167,11 @@ function listReceivedScopes(dbPath, mode = "all") {
        CAST(COALESCE(json_extract(config_json, '$.discovery_rank'), 999999999) AS INTEGER),
        cursor_updated_at,
        id;`;
-  const rows = sqliteQuery(
+  const rows = deps.sqliteQuery(
     dbPath,
     `SELECT id, source_id, name, enabled, config_json, cursor_json
      FROM sync_scopes
-     WHERE source_id = ${quoteSql(SOURCE_ID)}
+     WHERE source_id = ${deps.quoteSql(SOURCE_ID)}
        AND id LIKE 'lark.im.received.chat.%'
        AND enabled = 1
        ${modeWhere}
@@ -146,23 +193,24 @@ function listReceivedScopes(dbPath, mode = "all") {
  * @param {string} scopeId
  * @param {SyncOptions} opts
  * @param {(scope: ScopeRow, runId: number) => RunResult} worker
+ * @param {SyncRunnerDeps} [deps]
  * @returns {RunResult}
  */
-function syncScope(dbPath, scopeId, opts, worker) {
-  const scope = /** @type {ScopeRow} */ (readScope(dbPath, scopeId));
+function syncScope(dbPath, scopeId, opts, worker, deps = defaultDeps) {
+  const scope = /** @type {ScopeRow} */ (deps.readScope(dbPath, scopeId));
   if (!scope.enabled) return { scope_id: scopeId, skipped: true, reason: "scope_disabled" };
-  if (!acquireLock(dbPath, scopeId, opts.lockTtlSeconds)) {
+  if (!deps.acquireLock(dbPath, scopeId, opts.lockTtlSeconds)) {
     return { scope_id: scopeId, skipped: true, reason: "scope_locked" };
   }
-  const runId = createRun(dbPath, scope);
+  const runId = deps.createRun(dbPath, scope);
   try {
     const result = worker(scope, runId);
-    releaseLock(dbPath, scopeId);
+    deps.releaseLock(dbPath, scopeId);
     return { scope_id: scopeId, run_id: runId, ...result };
   } catch (error) {
     const err = error instanceof Error ? error : new Error(String(error));
-    failRun(dbPath, scope, runId, err);
-    releaseLock(dbPath, scopeId);
+    deps.failRun(dbPath, scope, runId, err);
+    deps.releaseLock(dbPath, scopeId);
     return { scope_id: scopeId, run_id: runId, ok: false, error: err.message };
   }
 }
@@ -171,13 +219,14 @@ function syncScope(dbPath, scopeId, opts, worker) {
  * @param {string} dbPath
  * @param {SyncOptions} opts
  * @param {SelfProfile} selfProfile
+ * @param {SyncRunnerDeps} [deps]
  * @returns {RunResult}
  */
-function syncSent(dbPath, opts, selfProfile) {
+function syncSent(dbPath, opts, selfProfile, deps = defaultDeps) {
   return syncScope(dbPath, SENT_SCOPE_ID, opts, (scope, runId) => {
     const { startMs, endMs } = messageWindow(scope, opts);
-    const fetched = fetchSentMessages(selfProfile.open_id, startMs, endMs, opts);
-    const peopleContext = buildPeopleContext(fetched.messages, opts, selfProfile, scope.config);
+    const fetched = deps.fetchSentMessages(selfProfile.open_id, startMs, endMs, opts);
+    const peopleContext = deps.buildPeopleContext(fetched.messages, opts, selfProfile, scope.config);
     const records = prepareRecords(
       fetched.messages,
       scope.id,
@@ -190,7 +239,7 @@ function syncSent(dbPath, opts, selfProfile) {
       scope.config,
     );
     const cursor = cursorAfter(endMs);
-    const effects = succeedMessageRun(dbPath, scope, runId, records, fetched.messages.length, cursor, {
+    const effects = deps.succeedMessageRun(dbPath, scope, runId, records, fetched.messages.length, cursor, {
       adapter: "lark.im.sent_by_me",
       pages: fetched.pages,
       window_start: localIsoFromMs(startMs),
@@ -201,7 +250,7 @@ function syncSent(dbPath, opts, selfProfile) {
       stored_candidate_count: records.length,
     });
     return { ok: true, scanned: fetched.messages.length, records: records.length, ...effects };
-  });
+  }, deps);
 }
 
 /**
@@ -255,9 +304,10 @@ function prepareChatWindowRecords(
 /**
  * @param {ScopeRow} scope
  * @param {SyncOptions} opts
+ * @param {SyncRunnerDeps} [deps]
  * @returns {DiscoveryResult}
  */
-function discoverChatPages(scope, opts) {
+function discoverChatPages(scope, opts, deps = defaultDeps) {
   /** @type {JsonObject[]} */
   const chats = [];
   const seen = new Set();
@@ -266,14 +316,14 @@ function discoverChatPages(scope, opts) {
     cursor.kind === "chat_discovery_cursor/v1" && cursor.has_more === true;
   const snapshotId = activeCursor
     ? String(cursor.snapshot_id)
-    : `snapshot_${Date.now()}_${shortHash(`${process.pid}:${Math.random()}`)}`;
-  const snapshotStartedAt = activeCursor ? String(cursor.snapshot_started_at) : new Date().toISOString();
+    : deps.makeSnapshotId("snapshot");
+  const snapshotStartedAt = activeCursor ? String(cursor.snapshot_started_at) : deps.nowIso();
   let pageToken = activeCursor ? String(cursor.page_token || "") : "";
   let hasMore = false;
   let processedPages = 0;
   const previousPages = activeCursor ? Number(scope.cursor?.pages_scanned || 0) : 0;
   for (let pageIndex = 0; pageIndex < opts.discoveryPagesPerRun; pageIndex += 1) {
-    const page = fetchChatDiscoveryPage(opts, pageToken);
+    const page = deps.fetchChatDiscoveryPage(opts, pageToken);
     processedPages += 1;
     const rankBase = (previousPages + processedPages - 1) * opts.chatPageSize;
     for (const [chatIndex, chat] of page.chats.entries()) {
@@ -303,18 +353,19 @@ function discoverChatPages(scope, opts) {
 
 /**
  * @param {SyncOptions} opts
+ * @param {SyncRunnerDeps} [deps]
  * @returns {DiscoveryResult}
  */
-function discoverHotChatPages(opts) {
+function discoverHotChatPages(opts, deps = defaultDeps) {
   /** @type {JsonObject[]} */
   const chats = [];
   const seen = new Set();
   let pageToken = "";
   let hasMore = false;
   let processedPages = 0;
-  const hotSeenAt = new Date().toISOString();
+  const hotSeenAt = deps.nowIso();
   for (let pageIndex = 0; pageIndex < opts.discoveryPagesPerRun; pageIndex += 1) {
-    const page = fetchChatDiscoveryPage(opts, pageToken);
+    const page = deps.fetchChatDiscoveryPage(opts, pageToken);
     processedPages += 1;
     const rankBase = pageIndex * opts.chatPageSize;
     for (const [chatIndex, chat] of page.chats.entries()) {
@@ -328,7 +379,7 @@ function discoverHotChatPages(opts) {
     if (!hasMore) break;
   }
   return {
-    snapshot_id: `hot_${Date.now()}_${shortHash(`${process.pid}:${Math.random()}`)}`,
+    snapshot_id: deps.makeSnapshotId("hot"),
     snapshot_started_at: hotSeenAt,
     chats,
     pages: processedPages,
@@ -372,16 +423,17 @@ function shouldSkipReconcile(scope, opts) {
 /**
  * @param {string} dbPath
  * @param {SyncOptions} opts
+ * @param {SyncRunnerDeps} [deps]
  * @returns {RunResult}
  */
-function syncDiscovery(dbPath, opts) {
+function syncDiscovery(dbPath, opts, deps = defaultDeps) {
   const scopeId =
     opts.discoveryMode === "hot"
       ? CHAT_HOT_DISCOVERY_SCOPE_ID
       : opts.discoveryMode === "reconcile"
         ? CHAT_RECONCILE_SCOPE_ID
         : CHAT_DISCOVERY_SCOPE_ID;
-  const currentScope = /** @type {ScopeRow} */ (readScope(dbPath, scopeId));
+  const currentScope = /** @type {ScopeRow} */ (deps.readScope(dbPath, scopeId));
   if (shouldSkipReconcile(currentScope, opts)) {
     const cursor = currentScope.cursor || {};
     return {
@@ -399,20 +451,20 @@ function syncDiscovery(dbPath, opts) {
   }
   return syncScope(dbPath, scopeId, opts, (scope, runId) => {
     if (shouldSkipCompletedDiscovery(scope, opts)) {
-      const now = new Date().toISOString();
+      const now = deps.nowIso();
       const cursor = scope.cursor || {};
-      sqliteExec(
+      deps.sqliteExec(
         dbPath,
         `
 UPDATE sync_runs
 SET status = 'succeeded',
-    cursor_after_json = ${sqlJson(cursor)},
-    finished_at = ${quoteSql(now)},
+    cursor_after_json = ${deps.sqlJson(cursor)},
+    finished_at = ${deps.quoteSql(now)},
     scanned_count = 0,
     inserted_count = 0,
     updated_count = 0,
     duplicate_count = 0,
-    metadata_json = ${sqlJson({
+    metadata_json = ${deps.sqlJson({
       adapter: "lark.im.unmuted_chat_discovery",
       discovery_mode: opts.discoveryMode,
       pages: 0,
@@ -435,8 +487,8 @@ WHERE id = ${Number(runId)};
         skipped: true,
       };
     }
-    const discovered = opts.discoveryMode === "hot" ? discoverHotChatPages(opts) : discoverChatPages(scope, opts);
-    const now = new Date().toISOString();
+    const discovered = opts.discoveryMode === "hot" ? discoverHotChatPages(opts, deps) : discoverChatPages(scope, opts, deps);
+    const now = deps.nowIso();
     const fullSnapshotField =
       opts.discoveryMode === "reconcile" ? "last_reconcile_snapshot_id" : "last_discovered_snapshot_id";
     const fullAdapter =
@@ -463,13 +515,13 @@ WHERE id = ${Number(runId)};
         return `
 INSERT INTO sync_scopes (id, source_id, name, description, enabled, config_json, updated_at)
 VALUES (
-  ${quoteSql(id)},
-  ${quoteSql(SOURCE_ID)},
-  ${quoteSql(`received.chat.${shortHash(chat.chat_id)}`)},
+  ${deps.quoteSql(id)},
+  ${deps.quoteSql(SOURCE_ID)},
+  ${deps.quoteSql(`received.chat.${shortHash(chat.chat_id)}`)},
   'Messages received in one non-muted Lark chat.',
   1,
-  ${sqlJson(config)},
-  ${quoteSql(now)}
+  ${deps.sqlJson(config)},
+  ${deps.quoteSql(now)}
 )
 ON CONFLICT(id) DO UPDATE SET
   enabled = CASE
@@ -486,10 +538,10 @@ ON CONFLICT(id) DO UPDATE SET
         ? `
 UPDATE sync_scopes
 SET enabled = 0,
-    updated_at = ${quoteSql(now)}
-WHERE source_id = ${quoteSql(SOURCE_ID)}
+    updated_at = ${deps.quoteSql(now)}
+WHERE source_id = ${deps.quoteSql(SOURCE_ID)}
   AND id LIKE 'lark.im.received.chat.%'
-  AND COALESCE(json_extract(config_json, '$.${fullSnapshotField}'), '') <> ${quoteSql(
+  AND COALESCE(json_extract(config_json, '$.${fullSnapshotField}'), '') <> ${deps.quoteSql(
     discovered.snapshot_id,
   )};
 `
@@ -514,7 +566,7 @@ WHERE source_id = ${quoteSql(SOURCE_ID)}
           pages_scanned: discovered.pages_scanned_total,
           has_more: false,
         };
-    sqliteExec(
+    deps.sqliteExec(
       dbPath,
       `
 BEGIN;
@@ -522,13 +574,13 @@ ${upserts}
 ${disableSql}
 UPDATE sync_runs
 SET status = 'succeeded',
-    cursor_after_json = ${sqlJson(cursor)},
-    finished_at = ${quoteSql(now)},
+    cursor_after_json = ${deps.sqlJson(cursor)},
+    finished_at = ${deps.quoteSql(now)},
     scanned_count = ${Number(discovered.chats.length)},
     inserted_count = 0,
     updated_count = 0,
     duplicate_count = 0,
-      metadata_json = ${sqlJson({
+      metadata_json = ${deps.sqlJson({
       adapter: discovered.hot ? "lark.im.hot_chat_discovery" : fullAdapter,
       discovery_mode: opts.discoveryMode,
       pages: discovered.pages,
@@ -540,11 +592,11 @@ SET status = 'succeeded',
     })}
 WHERE id = ${Number(runId)};
 UPDATE sync_scopes
-SET cursor_json = ${sqlJson(cursor)},
-    cursor_updated_at = ${quoteSql(now)},
+SET cursor_json = ${deps.sqlJson(cursor)},
+    cursor_updated_at = ${deps.quoteSql(now)},
     last_success_run_id = ${Number(runId)},
-    updated_at = ${quoteSql(now)}
-WHERE id = ${quoteSql(scope.id)};
+    updated_at = ${deps.quoteSql(now)}
+WHERE id = ${deps.quoteSql(scope.id)};
 COMMIT;
 `,
       `succeed discovery run ${runId}`,
@@ -557,7 +609,7 @@ COMMIT;
       has_more: discovered.has_more,
       snapshot_id: discovered.snapshot_id,
     };
-  });
+  }, deps);
 }
 
 /**
@@ -566,9 +618,10 @@ COMMIT;
  * @param {number} runId
  * @param {unknown} error
  * @param {string} reason
+ * @param {SyncRunnerDeps} [deps]
  */
-function succeedUnsupportedRun(dbPath, scope, runId, error, reason) {
-  const now = new Date().toISOString();
+function succeedUnsupportedRun(dbPath, scope, runId, error, reason, deps = defaultDeps) {
+  const now = deps.nowIso();
   const unsupportedError = String(error instanceof Error ? error.message : error).slice(0, 1000);
   const config = {
     unsupported_reason: reason,
@@ -581,18 +634,18 @@ function succeedUnsupportedRun(dbPath, scope, runId, error, reason) {
         }
       : {}),
   };
-  sqliteExec(
+  deps.sqliteExec(
     dbPath,
     `
 BEGIN;
 UPDATE sync_runs
 SET status = 'succeeded',
-    finished_at = ${quoteSql(now)},
+    finished_at = ${deps.quoteSql(now)},
     scanned_count = 0,
     inserted_count = 0,
     updated_count = 0,
     duplicate_count = 0,
-    metadata_json = ${sqlJson({
+    metadata_json = ${deps.sqlJson({
       adapter: "lark.im.received_per_chat",
       skipped: true,
       skip_reason: reason,
@@ -600,10 +653,10 @@ SET status = 'succeeded',
 WHERE id = ${Number(runId)};
 UPDATE sync_scopes
 SET enabled = 0,
-    config_json = json_patch(config_json, ${sqlJson(config)}),
+    config_json = json_patch(config_json, ${deps.sqlJson(config)}),
     last_success_run_id = ${Number(runId)},
-    updated_at = ${quoteSql(now)}
-WHERE id = ${quoteSql(scope.id)};
+    updated_at = ${deps.quoteSql(now)}
+WHERE id = ${deps.quoteSql(scope.id)};
 COMMIT;
 `,
     `succeed unsupported run ${runId}`,
@@ -615,29 +668,30 @@ COMMIT;
  * @param {SyncOptions} opts
  * @param {ScopeRow} scope
  * @param {SelfProfile} selfProfile
+ * @param {SyncRunnerDeps} [deps]
  * @returns {RunResult}
  */
-function syncReceivedScope(dbPath, opts, scope, selfProfile) {
+function syncReceivedScope(dbPath, opts, scope, selfProfile, deps = defaultDeps) {
   return syncScope(dbPath, scope.id, opts, (lockedScope, runId) => {
     const chatIdValue = lockedScope.config?.chat_id;
     if (!chatIdValue) throw new Error(`received scope missing config.chat_id: ${lockedScope.id}`);
     const { startMs, endMs } = messageWindow(lockedScope, opts);
     let fetched;
     try {
-      fetched = fetchChatMessages(chatIdValue, startMs, endMs, opts);
+      fetched = deps.fetchChatMessages(chatIdValue, startMs, endMs, opts);
     } catch (error) {
-      if (isRestrictedModeError(error)) {
-        succeedUnsupportedRun(dbPath, lockedScope, runId, error, "restricted_mode");
+      if (deps.isRestrictedModeError(error)) {
+        succeedUnsupportedRun(dbPath, lockedScope, runId, error, "restricted_mode", deps);
         return { ok: true, skipped: true, reason: "restricted_mode", scanned: 0, records: 0, inserted: 0, updated: 0, duplicate: 0 };
       }
-      if (isBotUserOutOfChatError(error)) {
-        succeedUnsupportedRun(dbPath, lockedScope, runId, error, "bot_user_out_of_chat");
+      if (deps.isBotUserOutOfChatError(error)) {
+        succeedUnsupportedRun(dbPath, lockedScope, runId, error, "bot_user_out_of_chat", deps);
         return { ok: true, skipped: true, reason: "bot_user_out_of_chat", scanned: 0, records: 0, inserted: 0, updated: 0, duplicate: 0 };
       }
       throw error;
     }
     const scopeConfig = lockedScope.config || {};
-    const peopleContext = buildPeopleContext(fetched.messages, opts, selfProfile, scopeConfig);
+    const peopleContext = deps.buildPeopleContext(fetched.messages, opts, selfProfile, scopeConfig);
     const records = prepareChatWindowRecords(
       fetched.messages,
       lockedScope.id,
@@ -649,7 +703,7 @@ function syncReceivedScope(dbPath, opts, scope, selfProfile) {
       scopeConfig,
     );
     const cursor = cursorAfter(endMs);
-    const effects = succeedMessageRun(dbPath, lockedScope, runId, records, fetched.messages.length, cursor, {
+    const effects = deps.succeedMessageRun(dbPath, lockedScope, runId, records, fetched.messages.length, cursor, {
       adapter: "lark.im.received_per_chat",
       pages: fetched.pages,
       window_start: localIsoFromMs(startMs),
@@ -661,23 +715,54 @@ function syncReceivedScope(dbPath, opts, scope, selfProfile) {
       chat_scope_id: lockedScope.id,
     });
     return { ok: true, scanned: fetched.messages.length, records: records.length, ...effects };
-  });
+  }, deps);
 }
 
 /**
  * @param {string} dbPath
  * @param {SyncOptions} opts
  * @param {SelfProfile} selfProfile
+ * @param {SyncRunnerDeps} [deps]
  * @returns {RunResult[]}
  */
-function syncReceived(dbPath, opts, selfProfile) {
-  const allScopes = listReceivedScopes(dbPath, opts.receivedMode);
+function syncReceived(dbPath, opts, selfProfile, deps = defaultDeps) {
+  const allScopes = listReceivedScopes(dbPath, opts.receivedMode, deps);
   const scopes =
     opts.receivedScopesPerRun > 0 ? allScopes.slice(0, opts.receivedScopesPerRun) : allScopes;
-  return scopes.map((scope) => syncReceivedScope(dbPath, opts, scope, selfProfile));
+  return scopes.map((scope) => syncReceivedScope(dbPath, opts, scope, selfProfile, deps));
+}
+
+/**
+ * Create a sync runner bound to a concrete adapter/store dependency set.
+ *
+ * Production uses the default Lark CLI and SQLite dependencies. Tests can pass
+ * fake dependencies to exercise runner behavior without touching Lark or disk.
+ *
+ * @param {Partial<SyncRunnerDeps>} [deps]
+ * @returns {SyncRunner}
+ */
+function createSyncRunner(deps = {}) {
+  const resolvedDeps = resolveDeps(deps);
+  return {
+    listReceivedScopes: (dbPath, mode = "all") => listReceivedScopes(dbPath, mode, resolvedDeps),
+    syncScope: (dbPath, scopeId, opts, worker) => syncScope(dbPath, scopeId, opts, worker, resolvedDeps),
+    syncSent: (dbPath, opts, selfProfile) => syncSent(dbPath, opts, selfProfile, resolvedDeps),
+    prepareChatWindowRecords,
+    discoverChatPages: (scope, opts) => discoverChatPages(scope, opts, resolvedDeps),
+    discoverHotChatPages: (opts) => discoverHotChatPages(opts, resolvedDeps),
+    shouldSkipCompletedDiscovery,
+    shouldSkipReconcile,
+    syncDiscovery: (dbPath, opts) => syncDiscovery(dbPath, opts, resolvedDeps),
+    succeedUnsupportedRun: (dbPath, scope, runId, error, reason) =>
+      succeedUnsupportedRun(dbPath, scope, runId, error, reason, resolvedDeps),
+    syncReceivedScope: (dbPath, opts, scope, selfProfile) =>
+      syncReceivedScope(dbPath, opts, scope, selfProfile, resolvedDeps),
+    syncReceived: (dbPath, opts, selfProfile) => syncReceived(dbPath, opts, selfProfile, resolvedDeps),
+  };
 }
 
 export {
+  createSyncRunner,
   discoverChatPages,
   discoverHotChatPages,
   listReceivedScopes,
