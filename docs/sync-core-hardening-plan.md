@@ -131,7 +131,7 @@ v0 质量验收已经完成并固化到 `docs/v0-baseline.md`。
 - `lark-cli` 从 `1.0.53` 升级到 `1.0.56`，`doctor --live` 验证仍为 OK。
 - `src/adapters/lark-im/name-resolver.mjs` 从 `adapter.mjs` 拆出，`adapter.mjs` 继续保留对外 facade 和兼容导出。
 - `src/adapters/lark-im/sync-runner.mjs` 从 `scripts/lark-im-sync.mjs` 拆出，承载 `syncSent`、`syncDiscovery`、`syncReceived` 等同步执行函数。
-- `sync-runner` 增加 `createSyncRunner(deps)` 依赖注入边界，新增 fake deps 测试覆盖 sent 成功写入、received unsupported 分类和 discovery fetcher/clock/snapshot 注入。
+- `sync-runner` 增加 `createSyncRunner(deps)` 依赖注入边界，新增 fake deps 测试覆盖 sent 成功写入、sent 失败不 checkpoint、scope locked/disabled skip、received unsupported 分类、received batch limit 和 discovery fetcher/clock/snapshot/分页异常路径。
 - `scripts/lark-im-sync.mjs` 现在只保留参数解析、初始化、自身身份解析、默认 runner 调度、JSON summary 输出和兼容测试导出。
 
 ### 2026-06-13

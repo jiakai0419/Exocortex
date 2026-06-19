@@ -184,3 +184,245 @@ test("createSyncRunner injects discovery fetcher, clock, and snapshot ids", () =
     ],
   );
 });
+
+test("syncSent failure fails the run, releases the lock, and does not checkpoint", () => {
+  const calls = [];
+  const scope = {
+    id: "lark.im.sent_by_me",
+    source_id: "lark.im",
+    enabled: 1,
+    config: {},
+    cursor: null,
+  };
+  let failed = null;
+  let checkpointed = false;
+  const runner = createSyncRunner({
+    readScope: () => scope,
+    acquireLock: () => {
+      calls.push("lock");
+      return true;
+    },
+    createRun: () => {
+      calls.push("run");
+      return 501;
+    },
+    fetchSentMessages: () => {
+      calls.push("fetch");
+      throw new Error("temporary lark failure");
+    },
+    failRun: (_dbPath, failedScope, runId, error) => {
+      calls.push("fail");
+      failed = { scope: failedScope, runId, message: error.message };
+    },
+    releaseLock: (_dbPath, scopeId) => calls.push(`release:${scopeId}`),
+    succeedMessageRun: () => {
+      checkpointed = true;
+      return { inserted: 0, updated: 0, duplicate: 0 };
+    },
+  });
+
+  const result = runner.syncSent("fake.sqlite", syncOptions(), { open_id: "ou_self", name: "Me" });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.run_id, 501);
+  assert.equal(result.scope_id, "lark.im.sent_by_me");
+  assert.match(result.error, /temporary lark failure/);
+  assert.deepEqual(failed, {
+    scope,
+    runId: 501,
+    message: "temporary lark failure",
+  });
+  assert.equal(checkpointed, false);
+  assert.deepEqual(calls, ["lock", "run", "fetch", "fail", "release:lark.im.sent_by_me"]);
+});
+
+test("syncSent skips locked scopes before creating a run or calling the adapter", () => {
+  const calls = [];
+  const runner = createSyncRunner({
+    readScope: () => ({
+      id: "lark.im.sent_by_me",
+      source_id: "lark.im",
+      enabled: 1,
+      config: {},
+      cursor: null,
+    }),
+    acquireLock: () => {
+      calls.push("lock");
+      return false;
+    },
+    createRun: () => calls.push("run"),
+    fetchSentMessages: () => calls.push("fetch"),
+    failRun: () => calls.push("fail"),
+    releaseLock: () => calls.push("release"),
+  });
+
+  const result = runner.syncSent("fake.sqlite", syncOptions(), { open_id: "ou_self", name: "Me" });
+
+  assert.deepEqual(result, {
+    scope_id: "lark.im.sent_by_me",
+    skipped: true,
+    reason: "scope_locked",
+  });
+  assert.deepEqual(calls, ["lock"]);
+});
+
+test("syncSent skips disabled scopes before locking or calling the adapter", () => {
+  const calls = [];
+  const runner = createSyncRunner({
+    readScope: () => ({
+      id: "lark.im.sent_by_me",
+      source_id: "lark.im",
+      enabled: 0,
+      config: {},
+      cursor: null,
+    }),
+    acquireLock: () => calls.push("lock"),
+    createRun: () => calls.push("run"),
+    fetchSentMessages: () => calls.push("fetch"),
+    failRun: () => calls.push("fail"),
+    releaseLock: () => calls.push("release"),
+  });
+
+  const result = runner.syncSent("fake.sqlite", syncOptions(), { open_id: "ou_self", name: "Me" });
+
+  assert.deepEqual(result, {
+    scope_id: "lark.im.sent_by_me",
+    skipped: true,
+    reason: "scope_disabled",
+  });
+  assert.deepEqual(calls, []);
+});
+
+test("syncDiscovery fails and avoids checkpointing on unsafe pagination", () => {
+  const calls = [];
+  const scope = {
+    id: "lark.im.unmuted_chat_discovery",
+    source_id: "lark.im",
+    enabled: 1,
+    config: {},
+    cursor: null,
+  };
+  let failed = null;
+  const runner = createSyncRunner({
+    readScope: () => scope,
+    acquireLock: () => {
+      calls.push("lock");
+      return true;
+    },
+    createRun: () => {
+      calls.push("run");
+      return 601;
+    },
+    fetchChatDiscoveryPage: () => {
+      calls.push("fetch-discovery");
+      return {
+        chats: [{ chat_id: "oc_unsafe", chat_type: "group", chat_name: "Unsafe" }],
+        has_more: true,
+        page_token: "",
+      };
+    },
+    failRun: (_dbPath, failedScope, runId, error) => {
+      calls.push("fail");
+      failed = { scope: failedScope, runId, message: error.message };
+    },
+    releaseLock: (_dbPath, scopeId) => calls.push(`release:${scopeId}`),
+    sqliteExec: () => calls.push("checkpoint"),
+  });
+
+  const result = runner.syncDiscovery("fake.sqlite", syncOptions());
+
+  assert.equal(result.ok, false);
+  assert.equal(result.run_id, 601);
+  assert.match(result.error, /has_more without page_token/);
+  assert.deepEqual(failed, {
+    scope,
+    runId: 601,
+    message: "chat-list returned has_more without page_token",
+  });
+  assert.deepEqual(calls, [
+    "lock",
+    "run",
+    "fetch-discovery",
+    "fail",
+    "release:lark.im.unmuted_chat_discovery",
+  ]);
+});
+
+test("syncReceived honors receivedScopesPerRun batch limits", () => {
+  const chatIds = [];
+  const scopeRows = [
+    {
+      id: "lark.im.received.chat.a",
+      source_id: "lark.im",
+      enabled: 1,
+      config_json: JSON.stringify({ chat_id: "oc_a", chat_type: "group", chat_name: "A" }),
+      cursor_json: null,
+    },
+    {
+      id: "lark.im.received.chat.b",
+      source_id: "lark.im",
+      enabled: 1,
+      config_json: JSON.stringify({ chat_id: "oc_b", chat_type: "group", chat_name: "B" }),
+      cursor_json: null,
+    },
+    {
+      id: "lark.im.received.chat.c",
+      source_id: "lark.im",
+      enabled: 1,
+      config_json: JSON.stringify({ chat_id: "oc_c", chat_type: "group", chat_name: "C" }),
+      cursor_json: null,
+    },
+  ];
+  const scopes = new Map(
+    scopeRows.map((row) => [
+      row.id,
+      {
+        id: row.id,
+        source_id: row.source_id,
+        enabled: row.enabled,
+        config: JSON.parse(row.config_json),
+        cursor: null,
+      },
+    ]),
+  );
+  const runner = createSyncRunner({
+    sqliteQuery: () => scopeRows,
+    quoteSql: (value) => `'${String(value)}'`,
+    readScope: (_dbPath, scopeId) => scopes.get(scopeId),
+    acquireLock: () => true,
+    createRun: (_dbPath, scope) => Number(scope.id.at(-1).charCodeAt(0)),
+    releaseLock: () => {},
+    failRun: () => {},
+    fetchChatMessages: (chatId) => {
+      chatIds.push(chatId);
+      return {
+        messages: [
+          message(`om_${chatId}`, BASE_MS, {
+            chatId,
+            senderId: "ou_other",
+            senderName: "Other",
+            content: `from ${chatId}`,
+          }),
+        ],
+        pages: 1,
+      };
+    },
+    buildPeopleContext: (_messages, _opts, selfProfile) => peopleContext(selfProfile),
+    succeedMessageRun: (_dbPath, _scope, _runId, records) => ({
+      inserted: records.length,
+      updated: 0,
+      duplicate: 0,
+    }),
+  });
+
+  const results = runner.syncReceived(
+    "fake.sqlite",
+    syncOptions({ receivedScopesPerRun: 2 }),
+    { open_id: "ou_self", name: "Me" },
+  );
+
+  assert.deepEqual(chatIds, ["oc_a", "oc_b"]);
+  assert.equal(results.length, 2);
+  assert.deepEqual(results.map((result) => result.ok), [true, true]);
+  assert.deepEqual(results.map((result) => result.records), [1, 1]);
+});
