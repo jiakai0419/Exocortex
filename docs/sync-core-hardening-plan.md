@@ -117,6 +117,7 @@ v0 质量验收已经完成并固化到 `docs/v0-baseline.md`。
 - `src/adapters/lark-im/message-record.mjs` 承载 Lark message payload 解释、名称解析辅助和 record 映射。
 - `src/adapters/lark-im/core.mjs` 保留为兼容门面和 Lark IM 同步规则组合层。
 - `src/adapters/lark-im/sync-runner.mjs` 承载 sent / discovery / received 同步执行，并通过 `createSyncRunner(deps)` 支持 fake deps 测试；`scripts/lark-im-sync.mjs` 保持为 CLI 入口。
+- `src/cli/lark-im-sync-command.mjs` 承载 `lark-im-sync` 参数解析、help、summary 输出和 exit-code 规则；`scripts/lark-im-sync.mjs` 保持为稳定入口和兼容 re-export。
 - `dist/core` 是运行时入口，继续遵守 no runtime TypeScript loader。
 - core 级测试覆盖 cursor 比较、窗口过滤、source time precision 和分页完整性。
 
@@ -126,13 +127,20 @@ v0 质量验收已经完成并固化到 `docs/v0-baseline.md`。
 
 ## 执行记录
 
+### 2026-06-20
+
+- `src/cli/lark-im-sync-command.mjs` 从 `scripts/lark-im-sync.mjs` 拆出，承载 `lark-im-sync` CLI 参数解析、help 文本、同步执行 summary 和 stdout/stderr/exit-code 处理。
+- `scripts/lark-im-sync.mjs` 现在只保留稳定入口和兼容测试导出。
+- `npm run check` 已覆盖 `src/cli/*.mjs`。
+- 新增 `tests/lark-im-sync-command.test.mjs`，使用 fake deps 覆盖 help、sent scope 调度、依赖错误和 explicit end 解析。
+
 ### 2026-06-19
 
 - `lark-cli` 从 `1.0.53` 升级到 `1.0.56`，`doctor --live` 验证仍为 OK。
 - `src/adapters/lark-im/name-resolver.mjs` 从 `adapter.mjs` 拆出，`adapter.mjs` 继续保留对外 facade 和兼容导出。
 - `src/adapters/lark-im/sync-runner.mjs` 从 `scripts/lark-im-sync.mjs` 拆出，承载 `syncSent`、`syncDiscovery`、`syncReceived` 等同步执行函数。
 - `sync-runner` 增加 `createSyncRunner(deps)` 依赖注入边界，新增 fake deps 测试覆盖 sent 成功写入、sent 失败不 checkpoint、scope locked/disabled skip、received unsupported 分类、received batch limit 和 discovery fetcher/clock/snapshot/分页异常路径。
-- `scripts/lark-im-sync.mjs` 现在只保留参数解析、初始化、自身身份解析、默认 runner 调度、JSON summary 输出和兼容测试导出。
+- `scripts/lark-im-sync.mjs` 当时只保留参数解析、初始化、自身身份解析、默认 runner 调度、JSON summary 输出和兼容测试导出；该 CLI 行为已在 2026-06-20 继续拆入 `src/cli/lark-im-sync-command.mjs`。
 
 ### 2026-06-13
 
