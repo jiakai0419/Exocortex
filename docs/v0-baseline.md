@@ -191,7 +191,8 @@ src/core                    通用同步规则，包含 cursor/window/pagination
 src/storage/sqlite          本地持久化、run、record、lock、recovery
 src/adapters/lark-im        飞书 IM adapter、消息解释、名称解析、sync runner
 src/runtime/worker          worker cycle 纯逻辑
-src/terminal                terminal 渲染 helper
+src/terminal                terminal 渲染 helper 和 source-specific view
+src/diagnostics             doctor、sync status、quality、live lag 等诊断逻辑
 src/cli                     production CLI command implementation
 scripts                     稳定用户入口和兼容 wrapper
 ```

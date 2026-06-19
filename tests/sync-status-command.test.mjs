@@ -3,11 +3,11 @@ import test from "node:test";
 
 import { plain } from "../dist/terminal/index.js";
 import {
-  buildStatus,
   parseArgs,
-  renderText,
   runSyncStatusCli,
 } from "../src/cli/sync-status-command.mjs";
+import { buildStatus } from "../src/diagnostics/sync-status-report.mjs";
+import { renderSyncStatusText as renderText } from "../src/terminal/sync-status-view.mjs";
 
 function memoryWriter() {
   let text = "";

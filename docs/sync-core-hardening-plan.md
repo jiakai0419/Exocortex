@@ -118,7 +118,9 @@ v0 质量验收已经完成并固化到 `docs/v0-baseline.md`。
 - `src/adapters/lark-im/core.mjs` 保留为兼容门面和 Lark IM 同步规则组合层。
 - `src/adapters/lark-im/sync-runner.mjs` 承载 sent / discovery / received 同步执行，并通过 `createSyncRunner(deps)` 支持 fake deps 测试。
 - `src/cli/lark-im-sync-command.mjs` 承载 `lark-im-sync` 参数解析、help、summary 输出和 exit-code 规则；`scripts/lark-im-sync.mjs` 保持为稳定入口和兼容 re-export。
-- `src/cli/sync-status-command.mjs` 承载 `sync-status` 参数解析、状态读取、text/json 渲染和 exit-code 规则；`scripts/sync-status.mjs` 保持为稳定入口和兼容 re-export。
+- `src/diagnostics/sync-status-report.mjs` 承载 `sync-status` 状态读取和 report 组装。
+- `src/terminal/sync-status-view.mjs` 承载 `sync-status` terminal text 渲染。
+- `src/cli/sync-status-command.mjs` 承载 `sync-status` 参数解析、json/text 输出选择和 exit-code 规则；`scripts/sync-status.mjs` 保持为稳定入口和兼容 re-export。
 - `dist/core` 是运行时入口，继续遵守 no runtime TypeScript loader。
 - core 级测试覆盖 cursor 比较、窗口过滤、source time precision 和分页完整性。
 
@@ -133,6 +135,7 @@ v0 质量验收已经完成并固化到 `docs/v0-baseline.md`。
 - `src/cli/lark-im-sync-command.mjs` 从 `scripts/lark-im-sync.mjs` 拆出，承载 `lark-im-sync` CLI 参数解析、help 文本、同步执行 summary 和 stdout/stderr/exit-code 处理。
 - `scripts/lark-im-sync.mjs` 现在只保留稳定入口和兼容测试导出。
 - `src/cli/sync-status-command.mjs` 从 `scripts/sync-status.mjs` 拆出，承载状态组装、text/json 输出和终端错误渲染。
+- `sync-status` 随后继续拆成 `src/diagnostics/sync-status-report.mjs`、`src/terminal/sync-status-view.mjs` 和 `src/cli/sync-status-command.mjs` 三层，让 report 组装、terminal 渲染和 CLI exit 语义分离。
 - `scripts/sync-status.mjs` 现在只保留稳定入口和兼容测试导出。
 - `npm run check` 已覆盖 `src/cli/*.mjs`。
 - 新增 `tests/lark-im-sync-command.test.mjs`，使用 fake deps 覆盖 help、sent scope 调度、依赖错误和 explicit end 解析。
