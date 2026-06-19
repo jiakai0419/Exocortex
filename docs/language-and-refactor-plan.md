@@ -434,7 +434,7 @@ node scripts/lark-im-service.mjs status
 
 ### Phase 4: 迁移 production CLI
 
-状态：已开始。`lark-im-sync` 已先行迁入 `src/cli/lark-im-sync-command.mjs`，因为它的同步执行层已经通过 `sync-runner` 独立出来并补齐成功/失败路径测试。
+状态：已开始。`lark-im-sync` 已先行迁入 `src/cli/lark-im-sync-command.mjs`，因为它的同步执行层已经通过 `sync-runner` 独立出来并补齐成功/失败路径测试。`sync-status` 也已迁入 `src/cli/sync-status-command.mjs`，因为它是只读状态入口，适合作为低风险 CLI extraction。
 
 目标：
 
@@ -443,7 +443,7 @@ node scripts/lark-im-service.mjs status
 
 原建议迁移顺序：
 
-1. `sync-status`
+1. `sync-status`：已完成 JS CLI command 抽取
 2. `doctor`
 3. `lark-im-worker`
 4. `lark-im-sync`：已完成第一版 JS CLI command 抽取
@@ -530,5 +530,5 @@ probe/maintenance scripts mostly JavaScript
 1. Phase 3 已经用 `src/core`、`src/terminal`、`src/runtime/worker` 和 `src/storage/sqlite` 验证了 `src/**/*.ts -> dist/**/*.js` 的显式 build。
 2. 同步质量测试已经覆盖 cursor 边界推进、边界重放安全、source time precision、分页完整性、质量报告诊断、scope JSON 解析和失败 run 不污染成功 cursor。
 3. `src/adapters/lark-im/sync-runner.mjs` 已从 `scripts/lark-im-sync.mjs` 拆出，并有 fake deps 测试覆盖 sent 成功/失败、scope locked/disabled、received unsupported、received batch limit 和 discovery 注入/分页异常路径。
-4. `src/cli/lark-im-sync-command.mjs` 已承载 `lark-im-sync` CLI 行为；下一步先观察 worker 和 CI，再考虑是否继续迁 `sync-status` 或 `doctor`，不要急着做 TypeScript production CLI rewrite。
+4. `src/cli/lark-im-sync-command.mjs` 已承载 `lark-im-sync` CLI 行为；`src/cli/sync-status-command.mjs` 已承载 `sync-status` CLI 行为；下一步先观察 worker 和 CI，再考虑是否继续迁 `doctor`，不要急着做 TypeScript production CLI rewrite。
 5. 继续保持 no runtime loader、不改 LaunchAgent、不改核心三命令。
