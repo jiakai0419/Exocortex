@@ -25,8 +25,9 @@ TypeScript on Node.js
 
 - 后台 Lark IM worker 已经通过 macOS LaunchAgent 长期运行。
 - 本地 SQLite schema 已经沉淀出 Source / Scope / Cursor / Record / Run / Lock。
-- `scripts/lib` 已经拆出 core、adapter、store、worker-core、doctor-core、terminal 等边界。
-- CI 已经运行 `npm run check` 和 `npm test`。
+- `src/` 已经承载 core、SQLite store、Lark IM adapter、worker core、terminal helper 和 CLI command 边界。
+- `scripts/` 继续保留稳定用户入口和兼容 wrapper。
+- CI 已经运行 `npm run check`、`npm run typecheck`、`npm run build:check` 和 `npm test`。
 - Terminal-first 已经成为长期交互原则。
 - public-safe 已经成为仓库原则。
 
@@ -34,11 +35,14 @@ TypeScript on Node.js
 
 ## 为什么要现在规划
 
-现在代码还足够小，重构成本可控；但复杂度已经开始出现：
+现在代码还足够小，重构成本可控；早期复杂度已经被逐步拆出边界：
 
-- `scripts/lark-im-sync.mjs` 仍然承担较多编排职责。
-- 生产入口、诊断入口、研究 probe、维护脚本都在 `scripts/` 下。
-- 一些核心契约目前只靠约定表达，例如 Cursor shape、Record shape、adapter result shape。
+- `scripts/lark-im-sync.mjs` 已收敛为稳定入口和兼容 re-export。
+- `src/cli/lark-im-sync-command.mjs` 已承载 `lark-im-sync` CLI 编排。
+- `src/adapters/lark-im/sync-runner.mjs` 已承载 sent / discovery / received 同步执行。
+- 用户入口仍在 `scripts/` 下，但 production CLI implementation 已开始迁入 `src/cli`。
+- 诊断入口、研究 probe、维护脚本仍有继续迁移和分层空间。
+- 一些核心契约仍只靠约定或局部类型表达，例如部分 adapter result shape、diagnostics result shape、CLI summary shape。
 - 未来接入 docs、calendar、mail、browser、filesystem、semantic layer 后，弱类型边界会快速变成维护成本。
 
 因此现在应该开始规划语言和模块边界，避免未来在第二个 Source 或语义层出现后再被迫大拆。
@@ -437,7 +441,7 @@ node scripts/lark-im-service.mjs status
 - 把 `lark-im-sync`、`lark-im-worker`、`sync-status`、`doctor` 的实现迁移到 typed CLI layer。
 - `scripts/*.mjs` 继续作为薄 wrapper。
 
-迁移顺序：
+原建议迁移顺序：
 
 1. `sync-status`
 2. `doctor`
@@ -449,6 +453,8 @@ node scripts/lark-im-service.mjs status
 - `sync-status` / `doctor` 风险较低，能先验证 typed CLI pattern。
 - `lark-im-worker` 涉及长期运行，但业务逻辑较少。
 - `lark-im-sync` 是核心同步入口，应最后迁移。
+
+实际执行中，`lark-im-sync` 先完成 JS CLI command 抽取，是因为它的 sync runner、adapter 和 store 边界已经先被拆出，并补齐了成功/失败路径测试。后续不应据此默认继续高风险入口迁移；每一步仍以运行稳定性优先。
 
 验收：
 

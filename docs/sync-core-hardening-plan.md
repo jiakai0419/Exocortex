@@ -10,7 +10,7 @@
 - 本地 SQLite schema 已经有 Source / Scope / Record / Run / Lock。
 - Terminal-first 已经成为交互原则。
 - `npm test` 已经覆盖了一部分 cursor 和事务语义。
-- 但 `scripts/lark-im-sync.mjs` 仍然过大，混合了 CLI adapter、同步编排、SQLite store、消息转换和错误处理。
+- `scripts/lark-im-sync.mjs` 已收敛为稳定入口和兼容 re-export；CLI command、sync runner、adapter、store、core、worker 和 diagnostics 已有清晰边界。
 
 因此下一阶段目标是：
 
@@ -116,7 +116,7 @@ v0 质量验收已经完成并固化到 `docs/v0-baseline.md`。
 - `src/adapters/lark-im/name-resolver.mjs` 承载 contact、chat member、application 和 chat bot fallback 名称解析。
 - `src/adapters/lark-im/message-record.mjs` 承载 Lark message payload 解释、名称解析辅助和 record 映射。
 - `src/adapters/lark-im/core.mjs` 保留为兼容门面和 Lark IM 同步规则组合层。
-- `src/adapters/lark-im/sync-runner.mjs` 承载 sent / discovery / received 同步执行，并通过 `createSyncRunner(deps)` 支持 fake deps 测试；`scripts/lark-im-sync.mjs` 保持为 CLI 入口。
+- `src/adapters/lark-im/sync-runner.mjs` 承载 sent / discovery / received 同步执行，并通过 `createSyncRunner(deps)` 支持 fake deps 测试。
 - `src/cli/lark-im-sync-command.mjs` 承载 `lark-im-sync` 参数解析、help、summary 输出和 exit-code 规则；`scripts/lark-im-sync.mjs` 保持为稳定入口和兼容 re-export。
 - `dist/core` 是运行时入口，继续遵守 no runtime TypeScript loader。
 - core 级测试覆盖 cursor 比较、窗口过滤、source time precision 和分页完整性。

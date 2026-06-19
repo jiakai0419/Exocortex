@@ -1,4 +1,4 @@
-# Exocortex V0 Baseline
+# Exocortex V0 / V0.1 Baseline
 
 ## 结论
 
@@ -14,18 +14,41 @@
 可靠同步我发出的飞书消息，以及我收到的非免打扰会话消息到本地。
 ```
 
+截至 2026-06-20，v0.1 runtime baseline 也已完成：
+
+```text
+同步入口、同步执行、adapter、store、worker、诊断和 terminal 输出已经拆出稳定边界；
+后台服务通过 LaunchAgent 长期运行；
+CLI、测试、CI 和 live probe 都能验证当前事实流健康。
+```
+
+v0.1 仍然不是完整衍我，也不是 UI 或语义层起点。它代表：
+
+```text
+飞书消息事实流已经进入可维护、可诊断、可恢复的 runtime baseline。
+```
+
 ## 当前验收结果
 
-最近一次验收命令结果：
+最近一次 v0.1 验收命令结果：
 
 ```text
 npm run check                           passed
 npm run build:check                     passed
+npm run typecheck                       passed
 npm test                                passed
 node scripts/doctor.mjs                 fresh / syncing only when worker is active
 node scripts/doctor.mjs --live          healthy in a shell with keychain access
 node scripts/lark-im-quality.mjs        OK
 node scripts/lark-im-service.mjs status ACTIVE
+```
+
+仓库文档不记录真实消息数量、真实会话规模、真实人员、真实群名或真实链接。需要查看当前私有运行指标时，在本机运行：
+
+```bash
+node scripts/lark-im-service.mjs status
+node scripts/doctor.mjs
+node scripts/doctor.mjs --live
 ```
 
 当前本地同步状态应满足：
@@ -157,6 +180,50 @@ system senderless messages  -> 飞书系统事件允许无 sender，不影响 do
 unresolved app sender names -> 保留 unresolved 标记，不猜错名字，不影响 doctor
 ```
 
+## V0.1 Runtime Architecture
+
+v0.1 的重点是把已经验证过的同步能力整理成可维护 runtime 边界。
+
+当前核心边界：
+
+```text
+src/core                    通用同步规则，包含 cursor/window/pagination 语义
+src/storage/sqlite          本地持久化、run、record、lock、recovery
+src/adapters/lark-im        飞书 IM adapter、消息解释、名称解析、sync runner
+src/runtime/worker          worker cycle 纯逻辑
+src/terminal                terminal 渲染 helper
+src/cli                     production CLI command implementation
+scripts                     稳定用户入口和兼容 wrapper
+```
+
+`scripts/lark-im-sync.mjs` 当前只保留稳定入口和兼容测试导出；实际 CLI 行为在：
+
+```text
+src/cli/lark-im-sync-command.mjs
+```
+
+同步执行在：
+
+```text
+src/adapters/lark-im/sync-runner.mjs
+```
+
+它通过 `createSyncRunner(deps)` 支持 fake deps 测试，因此成功路径和失败路径都能在不访问真实飞书、不访问真实 SQLite 的情况下验证。
+
+当前测试重点覆盖：
+
+- cursor 边界推进和同分钟重放。
+- 分页完整性和 unsafe pagination failure。
+- records 幂等写入。
+- failed run 不推进 cursor。
+- lock / stale lock / stale run recovery。
+- Lark transport retry 和命令脱敏。
+- sender/app/chat name resolution fallback。
+- sync runner 成功、失败、locked、disabled、unsupported、batch limit。
+- worker step 顺序和 cycle summary。
+- doctor/live probe 状态归一化。
+- terminal command catalog 和渲染。
+
 ## V0 不保证
 
 v0 不建模：
@@ -192,12 +259,14 @@ node scripts/lark-im-service.mjs status
 npm run help -- --all
 ```
 
-## V0 验收命令
+## V0 / V0.1 验收命令
 
 需要重新验收时运行：
 
 ```bash
 npm run check
+npm run typecheck
+npm run build:check
 npm test
 node scripts/doctor.mjs
 node scripts/lark-im-quality.mjs
@@ -215,11 +284,11 @@ node scripts/doctor.mjs --live
 
 ## 下一步
 
-v0 baseline 之后，不急于进入 UI、语义层或新信息源。
+v0.1 baseline 之后，不急于进入 UI、语义层或新信息源。
 
 建议顺序：
 
 1. 继续观察 worker 长期运行，定期运行 `doctor --live`。
-2. 从飞书 IM 中抽出更通用的 sync core 模型：Source、Scope、Cursor、Record、Run。
-3. 把 cursor 精度、分页完整性、幂等写入、diagnostics 这些规则沉到通用层。
-4. 再考虑下一信息源或最小语义层。
+2. 不急着做 TypeScript production CLI rewrite；先保持当前 JS CLI command 边界稳定。
+3. 如果继续重构，优先考虑低风险地迁 `sync-status` 或 `doctor` 到 `src/cli`，但每一步都必须保持脚本入口不变。
+4. 等同步、诊断和 CLI 边界继续稳定后，再考虑下一信息源或最小语义层。
