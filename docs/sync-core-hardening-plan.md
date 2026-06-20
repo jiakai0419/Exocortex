@@ -121,7 +121,9 @@ v0 质量验收已经完成并固化到 `docs/v0-baseline.md`。
 - `src/diagnostics/sync-status-report.mjs` 承载 `sync-status` 状态读取和 report 组装。
 - `src/terminal/sync-status-view.mjs` 承载 `sync-status` terminal text 渲染。
 - `src/cli/sync-status-command.mjs` 承载 `sync-status` 参数解析、json/text 输出选择和 exit-code 规则；`scripts/sync-status.mjs` 保持为稳定入口和兼容 re-export。
-- `src/cli/doctor-command.mjs` 承载 `doctor` 参数解析、status/quality/live probe 编排、terminal/json 输出和 exit-code 规则；`scripts/doctor.mjs` 保持为稳定入口和兼容 re-export。
+- `src/diagnostics/doctor-report.mjs` 承载 `doctor` status/quality/live probe 编排和 report 组装。
+- `src/terminal/doctor-view.mjs` 承载 `doctor` terminal text 渲染。
+- `src/cli/doctor-command.mjs` 承载 `doctor` 参数解析、json/text 输出选择和 exit-code 规则；`scripts/doctor.mjs` 保持为稳定入口和兼容 re-export。
 - `dist/core` 是运行时入口，继续遵守 no runtime TypeScript loader。
 - core 级测试覆盖 cursor 比较、窗口过滤、source time precision 和分页完整性。
 
@@ -139,6 +141,7 @@ v0 质量验收已经完成并固化到 `docs/v0-baseline.md`。
 - `sync-status` 随后继续拆成 `src/diagnostics/sync-status-report.mjs`、`src/terminal/sync-status-view.mjs` 和 `src/cli/sync-status-command.mjs` 三层，让 report 组装、terminal 渲染和 CLI exit 语义分离。
 - `scripts/sync-status.mjs` 现在只保留稳定入口和兼容测试导出。
 - `src/cli/doctor-command.mjs` 从 `scripts/doctor.mjs` 拆出，承载 `doctor` CLI 参数解析、本地诊断编排、live probe 编排、text/json 输出和 exit-code 处理。
+- `doctor` 随后继续拆成 `src/diagnostics/doctor-report.mjs`、`src/terminal/doctor-view.mjs` 和 `src/cli/doctor-command.mjs` 三层，让 report 组装、terminal 渲染和 CLI exit 语义分离。
 - `scripts/doctor.mjs` 现在只保留稳定入口和兼容测试导出。
 - `npm run check` 已覆盖 `src/cli/*.mjs`。
 - 新增 `tests/lark-im-sync-command.test.mjs`，使用 fake deps 覆盖 help、sent scope 调度、依赖错误和 explicit end 解析。

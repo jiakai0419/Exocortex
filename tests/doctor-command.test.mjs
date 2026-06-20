@@ -3,11 +3,11 @@ import test from "node:test";
 
 import { plain } from "../dist/terminal/index.js";
 import {
-  buildReport,
   parseArgs,
-  renderDoctorText,
   runDoctorCli,
 } from "../src/cli/doctor-command.mjs";
+import { buildReport } from "../src/diagnostics/doctor-report.mjs";
+import { renderDoctorText } from "../src/terminal/doctor-view.mjs";
 
 function memoryWriter() {
   let text = "";
