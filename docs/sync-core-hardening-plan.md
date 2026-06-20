@@ -137,6 +137,10 @@ v0 质量验收已经完成并固化到 `docs/v0-baseline.md`。
 
 ## 执行记录
 
+### 2026-06-21
+
+- `lark-im-service status` 增加面向人的四层状态模型：`Service` 表示后台是否会继续自动同步，`Health` 表示当前同步事实是否可信，`Activity` 表示 worker 当前是否在执行同步 step，`Freshness` 表示最近 live probe 是否有缓存验证结果；`Next` 动作建议先搁置。
+
 ### 2026-06-20
 
 - `src/cli/lark-im-sync-command.mjs` 从 `scripts/lark-im-sync.mjs` 拆出，承载 `lark-im-sync` CLI 参数解析、help 文本、同步执行 summary 和 stdout/stderr/exit-code 处理。

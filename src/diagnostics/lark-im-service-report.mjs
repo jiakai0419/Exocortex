@@ -30,6 +30,17 @@ import { summarizeWorkerEvents } from "../../dist/runtime/worker/lark-im-worker-
  * @property {(logDir: string) => WorkerLogTail=} readRecentWorkerEvents
  * @property {(events: unknown[], nowMs?: number) => JsonObject=} summarizeWorkerEvents
  * @property {number=} nowMs
+ *
+ * @typedef {"running" | "stopped"} ServiceRuntimeStatus
+ * @typedef {"ok" | "catching_up" | "problem"} ServiceHealthStatus
+ * @typedef {"idle" | "syncing"} ServiceActivityStatus
+ * @typedef {"verified" | "unknown" | "behind"} ServiceFreshnessStatus
+ *
+ * @typedef {object} ServiceOverview
+ * @property {{status: ServiceRuntimeStatus, detail: string}} service
+ * @property {{status: ServiceHealthStatus, detail: string}} health
+ * @property {{status: ServiceActivityStatus, detail: string}} activity
+ * @property {{status: ServiceFreshnessStatus, detail: string}} freshness
  */
 
 /**
@@ -113,6 +124,105 @@ function readRecentWorkerEvents(logDir) {
 }
 
 /**
+ * @param {{loaded?: boolean, state?: unknown, pid?: unknown}} launchd
+ * @returns {{status: ServiceRuntimeStatus, detail: string}}
+ */
+function summarizeServiceRuntime(launchd) {
+  if (!launchd.loaded) return { status: "stopped", detail: "LaunchAgent not loaded" };
+  const state = String(launchd.state || "").toLowerCase();
+  const hasWorkerProcess = Boolean(launchd.pid);
+  if (hasWorkerProcess || state === "running" || state === "active") {
+    return { status: "running", detail: "LaunchAgent loaded, worker process active" };
+  }
+  return { status: "stopped", detail: "LaunchAgent loaded, worker process not running" };
+}
+
+/**
+ * @param {JsonObject | null} syncStatus
+ */
+function isCatchingUp(syncStatus) {
+  if (!syncStatus) return false;
+  return (
+    String(syncStatus.health || "").toLowerCase() === "catching_up" ||
+    Number(syncStatus.scopes?.received_without_cursor || 0) > 0 ||
+    syncStatus.discovery?.cursor?.has_more === true
+  );
+}
+
+/**
+ * @param {{service: {status: ServiceRuntimeStatus}, syncStatus: JsonObject | null, syncErrorText?: string, workerSummary: JsonObject}} input
+ * @returns {{status: ServiceHealthStatus, detail: string}}
+ */
+function summarizeServiceHealth({ service, syncStatus, syncErrorText = "", workerSummary }) {
+  if (service.status !== "running") return { status: "problem", detail: "background service is stopped" };
+  if (!syncStatus) return { status: "problem", detail: syncErrorText || "sync status unavailable" };
+  const rawHealth = String(syncStatus.health || "").toLowerCase();
+  if (["failed", "needs_attention", "problem", "command_failed"].includes(rawHealth)) {
+    return { status: "problem", detail: syncStatus.health_detail || rawHealth };
+  }
+  if (workerSummary.last_cycle?.ok === false && !workerSummary.in_progress) {
+    return { status: "problem", detail: "last worker cycle failed" };
+  }
+  if (isCatchingUp(syncStatus)) {
+    return { status: "catching_up", detail: syncStatus.health_detail || "sync is still catching up" };
+  }
+  if (rawHealth === "syncing") {
+    return { status: "ok", detail: "all known enabled scopes have cursors" };
+  }
+  return { status: "ok", detail: syncStatus.health_detail || "all known enabled scopes have cursors" };
+}
+
+/**
+ * @param {{service: {status: ServiceRuntimeStatus}, syncStatus: JsonObject | null, workerSummary: JsonObject}} input
+ * @returns {{status: ServiceActivityStatus, detail: string}}
+ */
+function summarizeServiceActivity({ service, syncStatus, workerSummary }) {
+  if (workerSummary.in_progress) {
+    const step = workerSummary.last_step?.name ? `: ${workerSummary.last_step.name}` : "";
+    return { status: "syncing", detail: `worker is currently syncing${step}` };
+  }
+  if (String(syncStatus?.health || "").toLowerCase() === "syncing") {
+    return { status: "syncing", detail: "sync lock or run active" };
+  }
+  if (workerSummary.last_cycle) {
+    return { status: "idle", detail: `last cycle #${workerSummary.last_cycle.cycle}` };
+  }
+  if (service.status === "stopped") return { status: "idle", detail: "service stopped" };
+  return { status: "idle", detail: "no worker cycle yet" };
+}
+
+/**
+ * @param {JsonObject | null | undefined} liveProbe
+ * @returns {{status: ServiceFreshnessStatus, detail: string}}
+ */
+function summarizeServiceFreshness(liveProbe) {
+  if (!liveProbe) return { status: "unknown", detail: "no cached live probe" };
+  const status = String(liveProbe.status || "").toLowerCase();
+  if (status === "healthy" || liveProbe.ok === true) {
+    return { status: "verified", detail: "latest live probe found no missing hot messages" };
+  }
+  if (status === "delayed") {
+    const missing = liveProbe.missing_count ?? "?";
+    return { status: "behind", detail: `${missing} remote hot messages missing locally` };
+  }
+  return { status: "unknown", detail: status || "live probe unavailable" };
+}
+
+/**
+ * @param {{launchd: JsonObject, syncStatus: JsonObject | null, syncErrorText?: string, workerSummary: JsonObject, liveProbe?: JsonObject | null}} input
+ * @returns {ServiceOverview}
+ */
+function buildServiceOverview({ launchd, syncStatus, syncErrorText = "", workerSummary, liveProbe = null }) {
+  const service = summarizeServiceRuntime(launchd);
+  return {
+    service,
+    health: summarizeServiceHealth({ service, syncStatus, syncErrorText, workerSummary }),
+    activity: summarizeServiceActivity({ service, syncStatus, workerSummary }),
+    freshness: summarizeServiceFreshness(liveProbe),
+  };
+}
+
+/**
  * @param {ServiceStatusOptions} opts
  * @param {ServiceStatusReportDeps} [deps]
  */
@@ -128,23 +238,31 @@ function buildServiceStatusReport(opts, deps = {}) {
   const workerLog = readWorkerLog(opts.logDir);
   const workerSummary = summarize(workerLog.events, deps.nowMs);
   const serviceState = loaded ? launchdState.state || "loaded" : "not loaded";
+  const launchdReport = {
+    loaded,
+    state: launchdState.state || null,
+    pid: launchdState.pid || null,
+    last_exit_code: launchdState["last exit code"] || null,
+    command_status: launchd.status,
+    stderr: launchd.stderr || "",
+    stdout: launchd.stdout || "",
+  };
+  const syncErrorText = syncStatus ? "" : String(sync.stderr || sync.stdout || "sync status unavailable");
 
   return {
     label: opts.label,
     service_state: serviceState,
-    launchd: {
-      loaded,
-      state: launchdState.state || null,
-      pid: launchdState.pid || null,
-      last_exit_code: launchdState["last exit code"] || null,
-      command_status: launchd.status,
-      stderr: launchd.stderr || "",
-      stdout: launchd.stdout || "",
-    },
+    overview: buildServiceOverview({
+      launchd: launchdReport,
+      syncStatus,
+      syncErrorText,
+      workerSummary,
+    }),
+    launchd: launchdReport,
     sync: {
       status: syncStatus,
       command_status: sync.status,
-      error_text: syncStatus ? "" : String(sync.stderr || sync.stdout || "sync status unavailable"),
+      error_text: syncErrorText,
     },
     worker: {
       log: workerLog,
@@ -154,10 +272,16 @@ function buildServiceStatusReport(opts, deps = {}) {
 }
 
 export {
+  buildServiceOverview,
   buildServiceStatusReport,
+  isCatchingUp,
   parseJsonOutput,
   parseLaunchdState,
   readFileTail,
   readRecentWorkerEvents,
   runCommand,
+  summarizeServiceActivity,
+  summarizeServiceFreshness,
+  summarizeServiceHealth,
+  summarizeServiceRuntime,
 };

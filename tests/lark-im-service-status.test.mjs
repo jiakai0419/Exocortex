@@ -4,6 +4,7 @@ import test from "node:test";
 import { plain } from "../dist/terminal/index.js";
 import {
   buildServiceStatusReport,
+  buildServiceOverview,
   parseJsonOutput,
   parseLaunchdState,
 } from "../src/diagnostics/lark-im-service-report.mjs";
@@ -117,6 +118,10 @@ test("service status report parses launchd, sync status, and worker log summary"
   assert.equal(report.launchd.loaded, true);
   assert.equal(report.launchd.pid, "123");
   assert.equal(report.sync.status.health, "ok_with_history");
+  assert.equal(report.overview.service.status, "running");
+  assert.equal(report.overview.health.status, "ok");
+  assert.equal(report.overview.activity.status, "idle");
+  assert.equal(report.overview.freshness.status, "unknown");
   assert.equal(report.worker.log.exists, true);
   assert.equal(report.worker.summary.last_cycle.cycle, 12);
   assert.deepEqual(calls, [
@@ -149,9 +154,72 @@ test("service status report preserves not-loaded and sync-unavailable states", (
 
   assert.equal(report.service_state, "not loaded");
   assert.equal(report.launchd.loaded, false);
+  assert.equal(report.overview.service.status, "stopped");
+  assert.equal(report.overview.health.status, "problem");
+  assert.equal(report.overview.activity.status, "idle");
   assert.equal(report.sync.status, null);
   assert.match(report.sync.error_text, /sync unavailable/);
   assert.equal(report.worker.log.exists, false);
+});
+
+test("service overview separates service, health, activity, and freshness", () => {
+  const overview = buildServiceOverview({
+    launchd: { loaded: true, state: "running", pid: "123" },
+    syncStatus: syncStatusFixture({
+      health: "syncing",
+      scopes: {
+        received_enabled: 2,
+        received_without_cursor: 0,
+        received_unsupported: 0,
+        unsupported_reasons: [],
+      },
+    }),
+    workerSummary: workerSummaryFixture({
+      in_progress: true,
+      last_step: { cycle: 13, name: "received-hot", ok: true, age_ms: 1000 },
+    }),
+    liveProbe: { status: "healthy", ok: true, missing_count: 0, lag_ms: 0 },
+  });
+
+  assert.equal(overview.service.status, "running");
+  assert.equal(overview.health.status, "ok");
+  assert.equal(overview.health.detail, "all known enabled scopes have cursors");
+  assert.equal(overview.activity.status, "syncing");
+  assert.equal(overview.freshness.status, "verified");
+});
+
+test("service overview keeps catch-up as health, not activity", () => {
+  const overview = buildServiceOverview({
+    launchd: { loaded: true, state: "running", pid: "123" },
+    syncStatus: syncStatusFixture({
+      health: "catching_up",
+      health_detail: "initial catch-up: 1 chat scope needs cursor",
+      scopes: {
+        received_enabled: 2,
+        received_without_cursor: 1,
+        received_unsupported: 0,
+        unsupported_reasons: [],
+      },
+    }),
+    workerSummary: workerSummaryFixture({ in_progress: false }),
+  });
+
+  assert.equal(overview.service.status, "running");
+  assert.equal(overview.health.status, "catching_up");
+  assert.equal(overview.activity.status, "idle");
+  assert.equal(overview.freshness.status, "unknown");
+});
+
+test("service overview can show sync activity from locks without claiming worker log progress", () => {
+  const overview = buildServiceOverview({
+    launchd: { loaded: true, state: "running", pid: "123" },
+    syncStatus: syncStatusFixture({ health: "syncing" }),
+    workerSummary: workerSummaryFixture({ in_progress: false }),
+  });
+
+  assert.equal(overview.health.status, "ok");
+  assert.equal(overview.activity.status, "syncing");
+  assert.equal(overview.activity.detail, "sync lock or run active");
 });
 
 test("service status view renders launchd, sync, unsupported scopes, and worker sections", () => {
@@ -176,6 +244,12 @@ test("service status view renders launchd, sync, unsupported scopes, and worker 
   );
 
   assert.match(output, /Lark IM service/);
+  assert.match(output, /Overview/);
+  assert.match(output, /Service\s+RUNNING/);
+  assert.match(output, /Health\s+OK all known enabled scopes have cursors/);
+  assert.match(output, /Activity\s+IDLE/);
+  assert.match(output, /Freshness\s+UNKNOWN no cached live probe/);
+  assert.doesNotMatch(output, /OK_WITH_HISTORY/);
   assert.match(output, /LaunchAgent/);
   assert.match(output, /Records\s+3 total, 1 sent, 2 received/);
   assert.match(output, /Unsupported scopes\s+1 total/);
@@ -203,7 +277,8 @@ test("service status view renders sync failure and missing worker log", () => {
     }),
   );
 
-  assert.match(output, /NOT LOADED/);
+  assert.match(output, /STOPPED/);
+  assert.match(output, /PROBLEM sync unavailable/);
   assert.match(output, /FAILED sync unavailable/);
   assert.match(output, /no worker events yet/);
   assert.match(output, /logs\/test\/worker\.jsonl \(missing\)/);

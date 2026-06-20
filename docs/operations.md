@@ -36,60 +36,63 @@ node scripts/lark-im-service.mjs status
 npm run help -- --all
 ```
 
-## Health States
+## Status Model
 
-### OK / FRESH
+`lark-im-service status` 的主状态分成四层，避免把进程、同步、实时活动和远端对照混在一起。
 
-本地状态健康。已知范围内的同步 cursor 都已经推进到稳定状态。
+### Service
 
-### SYNCING
+后台是否会继续自动同步。
 
-worker 正在执行某个同步 step。
+`LaunchAgent` 是 macOS 后台服务管理器；`worker` 是真正执行同步的 Node 进程。
 
-这通常是正常状态，不代表故障。可以稍后再看：
+```text
+RUNNING  LaunchAgent 已加载，worker 进程活着。
+STOPPED  LaunchAgent 未加载，或已加载但 worker 进程没起来。
+```
+
+主状态只区分 `RUNNING / STOPPED`。细节里会继续展示 LaunchAgent loaded、PID 和 last exit。
+
+### Health
+
+当前同步事实是否可信。
+
+```text
+OK           已知范围内同步正常。
+CATCHING UP  正在追赶，还不能说完整。
+PROBLEM      当前有需要处理的问题。
+```
+
+`OK_WITH_HISTORY` 只保留为内部诊断事实，不作为 `lark-im-service status` 的主健康状态。历史失败会保留在 `sync_runs`，但只要当前 cursor、worker 和数据质量健康，主状态仍是 `OK`。
+
+### Activity
+
+worker 此刻是否正在执行同步 step。
+
+```text
+IDLE     当前没有同步 step 在跑。
+SYNCING  当前正在执行同步 step。
+```
+
+`SYNCING` 通常是正常活动，不等于故障。
+
+### Freshness
+
+最近远端 live probe 是否确认热消息已经进入本地。
+
+```text
+VERIFIED  最近 live probe 确认没有缺失。
+BEHIND    live probe 发现远端热消息还没全部入库。
+UNKNOWN   没有可用的缓存 live probe 结果。
+```
+
+当前 `lark-im-service status` 不会默认联网跑 live probe，因此第一版通常显示 `UNKNOWN no cached live probe`。需要真实远端对照时，手动运行：
 
 ```bash
-node scripts/lark-im-service.mjs status
+node scripts/doctor.mjs --live
 ```
 
-### CATCHING UP
-
-初始同步还在追历史范围，或者 discovery 还没有扫完所有非免打扰会话。
-
-这也是正常状态。当前阶段最常见的原因是：
-
-```text
-received_without_cursor > 0
-```
-
-也就是还有一些非免打扰会话没有建立初始 cursor。
-
-### UNAVAILABLE
-
-目前只用于 live probe。
-
-典型情况：
-
-```text
-doctor --live 在当前 shell 中读不到 macOS keychain
-```
-
-这不等价于后台同步失败。后台 LaunchAgent 可能仍然能正常访问 `lark-cli` 登录态。
-
-### DELAYED
-
-live probe 发现远端热消息还没有全部进入本地。
-
-如果只是短暂出现，可以等一两个 worker cycle 后再看。如果持续存在，再查日志。
-
-### NEEDS ATTENTION
-
-需要处理。常见原因：
-
-- 本地状态命令失败。
-- 本地质量检查失败。
-- live probe 出现真实远端 API 错误。
-- 数据质量出现 missing user sender name 或 invalid body。
+如果 `doctor --live` 显示 `UNAVAILABLE / keychain_unavailable`，说明当前 shell 读不到 keychain，不等于后台同步失败。
 
 ## Initial Catch-Up Done
 

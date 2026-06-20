@@ -70,14 +70,49 @@ function formatWorkerFailure(summary) {
   )})`;
 }
 
+/** @param {{status?: string, detail?: string} | null | undefined} item */
+function formatOverviewItem(item) {
+  if (!item) return statusBadge("unknown");
+  return `${statusBadge(item.status || "unknown")} ${item.detail || ""}`.trim();
+}
+
 /** @param {JsonObject} report */
 function renderServiceStatusText(report) {
   const syncStatus = report.sync?.status || null;
   const workerLog = report.worker?.log || { exists: false, path: "logs/lark-im/worker.jsonl" };
   const workerSummary = report.worker?.summary || {};
+  const overview = report.overview || {
+    service: {
+      status: report.service_state === "not loaded" ? "stopped" : "running",
+      detail: report.service_state || "unknown",
+    },
+    health: {
+      status: syncStatus ? "ok" : "problem",
+      detail: syncStatus?.health_detail || report.sync?.error_text || "",
+    },
+    activity: {
+      status: workerSummary.in_progress ? "syncing" : "idle",
+      detail: workerSummary.in_progress ? "worker is currently syncing" : "worker is idle",
+    },
+    freshness: {
+      status: "unknown",
+      detail: "no cached live probe",
+    },
+  };
   const lines = [
-    `${title("Lark IM service")} ${statusBadge(report.service_state === "not loaded" ? "not loaded" : report.service_state)}`,
+    `${title("Lark IM service")} ${statusBadge(overview.service?.status || "unknown")}`,
     subtitle(report.label),
+    "",
+    section("Overview"),
+    kv(
+      [
+        ["Service", formatOverviewItem(overview.service)],
+        ["Health", formatOverviewItem(overview.health)],
+        ["Activity", formatOverviewItem(overview.activity)],
+        ["Freshness", formatOverviewItem(overview.freshness)],
+      ],
+      { width: 9 },
+    ),
     "",
     section("LaunchAgent"),
     kv([
@@ -104,7 +139,7 @@ function renderServiceStatusText(report) {
       : "not started";
     lines.push(
       kv([
-        ["Health", `${statusBadge(syncStatus.health)} ${syncStatus.health_detail || ""}`],
+        ["Health", formatOverviewItem(overview.health)],
         [
           "Records",
           `${syncStatus.records?.total || 0} total, ${byDirection.sent?.count || 0} sent, ${
@@ -163,6 +198,7 @@ function renderServiceStatusText(report) {
 
 export {
   ageText,
+  formatOverviewItem,
   formatWorkerCycle,
   formatWorkerEvent,
   formatWorkerFailure,

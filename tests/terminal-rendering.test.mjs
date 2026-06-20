@@ -7,6 +7,12 @@ import { kv, plain, statusBadge, table } from "../dist/terminal/index.js";
 test("terminal rendering exposes plain text for styled status labels", () => {
   assert.equal(plain(statusBadge("catching_up")), "CATCHING UP");
   assert.equal(plain(statusBadge("needs_attention")), "NEEDS ATTENTION");
+  assert.equal(plain(statusBadge("problem")), "PROBLEM");
+  assert.equal(plain(statusBadge("running")), "RUNNING");
+  assert.equal(plain(statusBadge("stopped")), "STOPPED");
+  assert.equal(plain(statusBadge("idle")), "IDLE");
+  assert.equal(plain(statusBadge("verified")), "VERIFIED");
+  assert.equal(plain(statusBadge("behind")), "BEHIND");
   assert.equal(shimPlain(statusBadge("ok")), "OK");
 });
 
