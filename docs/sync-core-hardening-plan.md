@@ -124,6 +124,8 @@ v0 质量验收已经完成并固化到 `docs/v0-baseline.md`。
 - `src/diagnostics/doctor-report.mjs` 承载 `doctor` status/quality/live probe 编排和 report 组装。
 - `src/terminal/doctor-view.mjs` 承载 `doctor` terminal text 渲染。
 - `src/cli/doctor-command.mjs` 承载 `doctor` 参数解析、json/text 输出选择和 exit-code 规则；`scripts/doctor.mjs` 保持为稳定入口和兼容 re-export。
+- `src/diagnostics/lark-im-service-report.mjs` 承载 `lark-im-service status` 的 LaunchAgent、sync status 和 worker log report 组装。
+- `src/terminal/lark-im-service-view.mjs` 承载 `lark-im-service status` terminal text 渲染；`scripts/lark-im-service.mjs` 的 start/stop/restart/install/uninstall 路径保持不变。
 - `dist/core` 是运行时入口，继续遵守 no runtime TypeScript loader。
 - core 级测试覆盖 cursor 比较、窗口过滤、source time precision 和分页完整性。
 
@@ -143,10 +145,12 @@ v0 质量验收已经完成并固化到 `docs/v0-baseline.md`。
 - `src/cli/doctor-command.mjs` 从 `scripts/doctor.mjs` 拆出，承载 `doctor` CLI 参数解析、本地诊断编排、live probe 编排、text/json 输出和 exit-code 处理。
 - `doctor` 随后继续拆成 `src/diagnostics/doctor-report.mjs`、`src/terminal/doctor-view.mjs` 和 `src/cli/doctor-command.mjs` 三层，让 report 组装、terminal 渲染和 CLI exit 语义分离。
 - `scripts/doctor.mjs` 现在只保留稳定入口和兼容测试导出。
+- `lark-im-service status` 拆成 `src/diagnostics/lark-im-service-report.mjs` 和 `src/terminal/lark-im-service-view.mjs`，让服务状态 report 和 terminal 渲染可测试；`scripts/lark-im-service.mjs` 继续承载 LaunchAgent 生命周期命令。
 - `npm run check` 已覆盖 `src/cli/*.mjs`。
 - 新增 `tests/lark-im-sync-command.test.mjs`，使用 fake deps 覆盖 help、sent scope 调度、依赖错误和 explicit end 解析。
 - 新增 `tests/sync-status-command.test.mjs`，使用匿名 shape fixtures 覆盖 help、json 输出、missing DB、text rendering、buildStatus 组装和参数校验。
 - 新增 `tests/doctor-command.test.mjs`，使用匿名 shape fixtures 覆盖 help、本地 json report、live probe、keychain unavailable、needs-attention exit code、dependency error 和 text rendering。
+- 新增 `tests/lark-im-service-status.test.mjs`，使用匿名 shape fixtures 覆盖 launchd 解析、sync status 解析、worker summary 和 terminal rendering。
 
 ### 2026-06-19
 

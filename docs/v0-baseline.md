@@ -211,6 +211,17 @@ src/adapters/lark-im/sync-runner.mjs
 
 它通过 `createSyncRunner(deps)` 支持 fake deps 测试，因此成功路径和失败路径都能在不访问真实飞书、不访问真实 SQLite 的情况下验证。
 
+诊断入口已经按 report / view / command 拆分：
+
+```text
+sync-status    diagnostics report + terminal view + CLI command
+doctor         diagnostics report + terminal view + CLI command
+lark-im-service status
+               diagnostics report + terminal view
+```
+
+`lark-im-service` 的安装、启停、重启和卸载仍在稳定脚本入口中，避免把 LaunchAgent 写路径和纯状态展示混在一次迁移里。
+
 当前测试重点覆盖：
 
 - cursor 边界推进和同分钟重放。
@@ -291,5 +302,5 @@ v0.1 baseline 之后，不急于进入 UI、语义层或新信息源。
 
 1. 继续观察 worker 长期运行，定期运行 `doctor --live`。
 2. 不急着做 TypeScript production CLI rewrite；先保持当前 JS CLI command 边界稳定。
-3. `sync-status` 和 `doctor` 已完成 report / view / command 拆分；如果继续重构，下一步优先观察这两个诊断入口的稳定性，或者再评估 `lark-im-worker` 的低风险拆分。
+3. `sync-status`、`doctor` 和 `lark-im-service status` 已完成 report / view 边界拆分；如果继续重构，下一步优先观察这些诊断入口的稳定性，或者再评估 `lark-im-worker` 的低风险拆分。
 4. 等同步、诊断和 CLI 边界继续稳定后，再考虑下一信息源或最小语义层。

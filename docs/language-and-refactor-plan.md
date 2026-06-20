@@ -240,7 +240,12 @@ CLI command implementation。
 当前状态：
 
 - `src/cli/lark-im-sync-command.mjs` 已承载 `lark-im-sync` 的参数解析、help 文本、同步执行 summary 和 CLI stdout/stderr/exit-code 处理。
+- `src/diagnostics/sync-status-report.mjs`、`src/terminal/sync-status-view.mjs` 和 `src/cli/sync-status-command.mjs` 已承载 `sync-status` 的 report、view 和 CLI 行为。
+- `src/diagnostics/doctor-report.mjs`、`src/terminal/doctor-view.mjs` 和 `src/cli/doctor-command.mjs` 已承载 `doctor` 的 report、view 和 CLI 行为。
+- `src/diagnostics/lark-im-service-report.mjs` 和 `src/terminal/lark-im-service-view.mjs` 已承载 `lark-im-service status` 的 report 和 view。
 - `scripts/lark-im-sync.mjs` 保留为稳定入口和兼容 re-export，不再承载同步 CLI 编排。
+- `scripts/sync-status.mjs` 和 `scripts/doctor.mjs` 保留为稳定入口和兼容 re-export。
+- `scripts/lark-im-service.mjs` 仍承载 LaunchAgent 生命周期命令；只有 `status` 的 report/view 被拆出。
 
 `scripts/*.mjs` 最终应变成很薄的入口：
 
@@ -434,7 +439,7 @@ node scripts/lark-im-service.mjs status
 
 ### Phase 4: 迁移 production CLI
 
-状态：已开始。`lark-im-sync` 已先行迁入 `src/cli/lark-im-sync-command.mjs`，因为它的同步执行层已经通过 `sync-runner` 独立出来并补齐成功/失败路径测试。`sync-status` 也已迁入 `src/cli/sync-status-command.mjs`，并继续拆出 `src/diagnostics/sync-status-report.mjs` 和 `src/terminal/sync-status-view.mjs`，因为它是只读状态入口，适合作为低风险 CLI extraction。`doctor` 已迁入 `src/cli/doctor-command.mjs`，并继续拆出 `src/diagnostics/doctor-report.mjs` 和 `src/terminal/doctor-view.mjs`，保持诊断语义不变。
+状态：已开始。`lark-im-sync` 已先行迁入 `src/cli/lark-im-sync-command.mjs`，因为它的同步执行层已经通过 `sync-runner` 独立出来并补齐成功/失败路径测试。`sync-status` 也已迁入 `src/cli/sync-status-command.mjs`，并继续拆出 `src/diagnostics/sync-status-report.mjs` 和 `src/terminal/sync-status-view.mjs`，因为它是只读状态入口，适合作为低风险 CLI extraction。`doctor` 已迁入 `src/cli/doctor-command.mjs`，并继续拆出 `src/diagnostics/doctor-report.mjs` 和 `src/terminal/doctor-view.mjs`，保持诊断语义不变。`lark-im-service status` 已拆出 `src/diagnostics/lark-im-service-report.mjs` 和 `src/terminal/lark-im-service-view.mjs`；服务安装、启停、重启和卸载仍在原脚本内，避免触碰 LaunchAgent 写路径。
 
 目标：
 
@@ -445,8 +450,9 @@ node scripts/lark-im-service.mjs status
 
 1. `sync-status`：已完成 JS CLI command 抽取，并拆出 diagnostics report 与 terminal view
 2. `doctor`：已完成 JS CLI command 抽取，并拆出 diagnostics report 与 terminal view
-3. `lark-im-worker`
-4. `lark-im-sync`：已完成第一版 JS CLI command 抽取
+3. `lark-im-service status`：已完成 diagnostics report 与 terminal view 抽取；LaunchAgent 生命周期命令未迁移
+4. `lark-im-worker`
+5. `lark-im-sync`：已完成第一版 JS CLI command 抽取
 
 原因：
 
@@ -530,5 +536,5 @@ probe/maintenance scripts mostly JavaScript
 1. Phase 3 已经用 `src/core`、`src/terminal`、`src/runtime/worker` 和 `src/storage/sqlite` 验证了 `src/**/*.ts -> dist/**/*.js` 的显式 build。
 2. 同步质量测试已经覆盖 cursor 边界推进、边界重放安全、source time precision、分页完整性、质量报告诊断、scope JSON 解析和失败 run 不污染成功 cursor。
 3. `src/adapters/lark-im/sync-runner.mjs` 已从 `scripts/lark-im-sync.mjs` 拆出，并有 fake deps 测试覆盖 sent 成功/失败、scope locked/disabled、received unsupported、received batch limit 和 discovery 注入/分页异常路径。
-4. `src/cli/lark-im-sync-command.mjs` 已承载 `lark-im-sync` CLI 行为；`sync-status` 和 `doctor` 已拆成 report / view / command 三层。下一步先观察 worker 和 CI，再考虑是否继续迁 `lark-im-worker`，不要急着做 TypeScript production CLI rewrite。
+4. `src/cli/lark-im-sync-command.mjs` 已承载 `lark-im-sync` CLI 行为；`sync-status` 和 `doctor` 已拆成 report / view / command 三层；`lark-im-service status` 已拆成 report / view 两层。下一步先观察 worker、CI 和这几个诊断入口，再考虑是否继续迁 `lark-im-worker`，不要急着做 TypeScript production CLI rewrite。
 5. 继续保持 no runtime loader、不改 LaunchAgent、不改核心三命令。

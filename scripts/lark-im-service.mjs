@@ -4,20 +4,22 @@
 
 import { spawnSync } from "node:child_process";
 import {
-  closeSync,
   existsSync,
   mkdirSync,
-  openSync,
   readFileSync,
-  readSync,
   rmSync,
-  statSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { resolve } from "node:path";
 import { summarizeWorkerEvents } from "./lib/lark-im-worker-core.mjs";
-import { block, compact, kv, list, renderError, section, statusBadge, subtitle, table, title } from "./lib/terminal.mjs";
+import {
+  buildServiceStatusReport,
+  parseJsonOutput,
+  readRecentWorkerEvents,
+} from "../src/diagnostics/lark-im-service-report.mjs";
+import { renderServiceStatusText } from "../src/terminal/lark-im-service-view.mjs";
+import { block, kv, list, renderError, statusBadge, subtitle, title } from "./lib/terminal.mjs";
 
 const LABEL = "com.exocortex.lark-im-worker";
 const DEFAULT_LOG_DIR = "logs/lark-im";
@@ -47,11 +49,6 @@ const DEFAULT_CHAT_TYPES = "group,p2p";
  * @property {boolean=} allowFailure
  *
  * @typedef {Record<string, any>} JsonObject
- *
- * @typedef {object} WorkerLogTail
- * @property {string} path
- * @property {boolean} exists
- * @property {JsonObject[]} events
  *
  * @typedef {import("node:child_process").SpawnSyncReturns<string>} SpawnResult
  */
@@ -295,85 +292,6 @@ function uninstall() {
   process.stdout.write(`removed ${plistPath()}\n`);
 }
 
-/** @param {string} stdout */
-function parseLaunchdState(stdout) {
-  /** @type {Record<string, string>} */
-  const result = {};
-  for (const line of stdout.split("\n")) {
-    const match = line.trim().match(/^(state|pid|last exit code) = (.+)$/);
-    if (match) result[match[1]] = match[2];
-  }
-  return result;
-}
-
-/**
- * @param {SpawnResult} result
- * @returns {JsonObject | null}
- */
-function parseJsonOutput(result) {
-  try {
-    return JSON.parse(result.stdout.trim());
-  } catch {
-    return null;
-  }
-}
-
-/**
- * @param {string} path
- * @param {number} [maxBytes]
- */
-function readFileTail(path, maxBytes = 512 * 1024) {
-  const stat = statSync(path);
-  const length = Math.min(stat.size, maxBytes);
-  const start = Math.max(0, stat.size - length);
-  const buffer = Buffer.alloc(length);
-  const fd = openSync(path, "r");
-  try {
-    readSync(fd, buffer, 0, length, start);
-  } finally {
-    closeSync(fd);
-  }
-  const text = buffer.toString("utf8");
-  return start > 0 ? text.slice(text.indexOf("\n") + 1) : text;
-}
-
-/**
- * @param {string} logDir
- * @returns {WorkerLogTail}
- */
-function readRecentWorkerEvents(logDir) {
-  const path = resolve(logDir, "worker.jsonl");
-  if (!existsSync(path)) return { path, exists: false, events: [] };
-  const lines = readFileTail(path)
-    .trim()
-    .split("\n")
-    .filter(Boolean)
-    .slice(-200);
-  /** @type {JsonObject[]} */
-  const events = [];
-  for (const line of lines) {
-    try {
-      events.push(JSON.parse(line));
-    } catch {
-      // Ignore partial or non-JSON log lines at the edge of the tail window.
-    }
-  }
-  return { path, exists: true, events };
-}
-
-/** @param {unknown} ms */
-function ageText(ms) {
-  if (ms === null || ms === undefined) return "unknown";
-  const seconds = Math.floor(Number(ms) / 1000);
-  if (seconds < 60) return `${seconds}s ago`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ${seconds % 60}s ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ${minutes % 60}m ago`;
-  const days = Math.floor(hours / 24);
-  return `${days}d ${hours % 24}h ago`;
-}
-
 /** @param {unknown} value */
 function localIso(value) {
   if (!value) return "none";
@@ -390,136 +308,14 @@ function isReadyHealth(value) {
   return ["fresh", "ok", "ok_with_history"].includes(String(value || "").toLowerCase());
 }
 
-/** @param {JsonObject} summary */
-function formatWorkerEvent(summary) {
-  if (!summary.has_events) return "no worker events yet";
-  const eventType = String(summary.last_event_type || "").replace(/^lark_im_worker_/, "");
-  return `${eventType || "event"} ${ageText(summary.last_event_age_ms)}`;
-}
-
-/** @param {JsonObject} summary */
-function formatWorkerCycle(summary) {
-  if (!summary.last_cycle) return "none";
-  return `#${summary.last_cycle.cycle} ${summary.last_cycle.ok ? statusBadge("ok") : statusBadge("failed")} ${localIso(
-    summary.last_cycle.at,
-  )} (${ageText(summary.last_cycle.age_ms)})`;
-}
-
-/** @param {JsonObject} summary */
-function formatWorkerStep(summary) {
-  if (!summary.last_step) return "none";
-  return `cycle #${summary.last_step.cycle} ${summary.last_step.name} ${
-    summary.last_step.ok ? statusBadge("ok") : statusBadge("failed")
-  } (${ageText(summary.last_step.age_ms)})`;
-}
-
-/** @param {JsonObject} summary */
-function formatWorkerFailure(summary) {
-  if (!summary.last_failure) return "none in recent log";
-  if (summary.last_failure.name === "cycle") {
-    return `cycle #${summary.last_failure.cycle} ${statusBadge("failed")} (${ageText(
-      summary.last_failure.age_ms,
-    )})`;
-  }
-  return `cycle #${summary.last_failure.cycle} ${summary.last_failure.name} ${statusBadge("failed")} (${ageText(
-    summary.last_failure.age_ms,
-  )})`;
-}
-
 /** @param {ServiceOptions} opts */
 function status(opts) {
-  const launchd = run("launchctl", ["print", target()], { allowFailure: true });
-  const loaded = launchd.status === 0;
-  const launchdState = loaded ? parseLaunchdState(launchd.stdout) : {};
-  const sync = run(process.execPath, ["scripts/sync-status.mjs", "--format", "json"], { allowFailure: true });
-  const syncStatus = parseJsonOutput(sync);
-  const workerLog = readRecentWorkerEvents(opts.logDir);
-  const workerSummary = summarizeWorkerEvents(workerLog.events);
-  const serviceState = loaded ? launchdState.state || "loaded" : "not loaded";
-  const lines = [
-    `${title("Lark IM service")} ${statusBadge(serviceState === "not loaded" ? "not loaded" : serviceState)}`,
-    subtitle(LABEL),
-    "",
-    section("LaunchAgent"),
-    kv([
-      ["Loaded", loaded ? statusBadge("loaded") : statusBadge("not loaded")],
-      ["State", launchdState.state || "unknown"],
-      ["PID", launchdState.pid || "none"],
-      ["Last exit", launchdState["last exit code"] || "none"],
-    ]),
-  ];
-
-  if (syncStatus) {
-    const byDirection = Object.fromEntries(
-      (syncStatus.records?.by_direction || []).map((row) => [row.direction, row]),
-    );
-    lines.push("");
-    lines.push(section("Sync"));
-    const reconcileState = syncStatus.reconcile?.complete
-      ? "complete"
-      : syncStatus.reconcile?.cursor?.has_more
-        ? "in progress"
-        : "not started";
-    const hotDiscoveryState = syncStatus.hot_discovery?.ran
-      ? `last run ${localIso(syncStatus.hot_discovery.cursor_updated_at)}`
-      : "not started";
-    lines.push(
-      kv([
-        ["Health", `${statusBadge(syncStatus.health)} ${syncStatus.health_detail || ""}`],
-        [
-          "Records",
-          `${syncStatus.records?.total || 0} total, ${byDirection.sent?.count || 0} sent, ${
-            byDirection.received?.count || 0
-          } received`,
-        ],
-        [
-          "Received scopes",
-          `${syncStatus.scopes?.received_enabled || 0} enabled, ${
-            syncStatus.scopes?.received_without_cursor || 0
-          } without cursor`,
-        ],
-        ["Unsupported scopes", `${syncStatus.scopes?.received_unsupported || 0} total`],
-        ["Hot discovery", hotDiscoveryState],
-        ["Reconcile", `${reconcileState}, ${syncStatus.reconcile?.cursor?.pages_scanned || 0} pages`],
-        ["Locks", syncStatus.locks?.length || 0],
-      ]),
-    );
-    if (syncStatus.scopes?.unsupported_reasons?.length > 0) {
-      lines.push(
-        table(syncStatus.scopes.unsupported_reasons, [
-          { key: "reason", header: "Reason", render: (row) => row.reason },
-          {
-            key: "lark_cli",
-            header: "Lark CLI",
-            render: (row) =>
-              row.lark_cli_error_message
-                ? `${row.lark_cli_error_code}: ${row.lark_cli_error_message}`
-                : "",
-          },
-          { key: "count", header: "Count", render: (row) => row.count },
-        ]),
-      );
-    }
-  } else {
-    lines.push("");
-    lines.push(section("Sync"));
-    lines.push(`  ${statusBadge("failed")} ${compact(sync.stderr || sync.stdout || "sync status unavailable", 180)}`);
-  }
-
-  lines.push("");
-  lines.push(section("Worker"));
-  lines.push(
-    kv([
-      ["Last cycle", formatWorkerCycle(workerSummary)],
-      ["Last event", formatWorkerEvent(workerSummary)],
-      ["Last step", formatWorkerStep(workerSummary)],
-      ["In progress", workerSummary.in_progress ? "yes" : "no"],
-      ["Last failure", formatWorkerFailure(workerSummary)],
-      ["Log", workerLog.exists ? workerLog.path : `${workerLog.path} (missing)`],
-    ]),
-  );
-
-  process.stdout.write(`${block(lines)}\n`);
+  const report = buildServiceStatusReport({
+    label: LABEL,
+    target: target(),
+    logDir: opts.logDir,
+  });
+  process.stdout.write(renderServiceStatusText(report));
 }
 
 /** @param {ServiceOptions} opts */
