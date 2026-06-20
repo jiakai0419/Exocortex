@@ -9,7 +9,68 @@ import {
   parseArgs,
   parsePositiveInt,
   plistXml,
+  runServiceCommand,
 } from "../scripts/lark-im-service.mjs";
+
+function memoryWriter() {
+  let text = "";
+  return {
+    stream: {
+      write(chunk) {
+        text += String(chunk);
+      },
+    },
+    text: () => text,
+  };
+}
+
+function spawnResult(overrides = {}) {
+  return {
+    status: 0,
+    stdout: "",
+    stderr: "",
+    ...overrides,
+  };
+}
+
+function fakeServiceDeps(overrides = {}) {
+  const calls = [];
+  const stdout = memoryWriter();
+  const state = {
+    plistExists: true,
+    launchdLoaded: false,
+    run: null,
+    ...overrides,
+  };
+  const deps = {
+    cwd: "/project",
+    homedir: () => "/home/tester",
+    uid: () => 501,
+    execPath: "/usr/local/bin/node",
+    nodePath: "/usr/local/bin/node",
+    workerPath: "/project/scripts/lark-im-worker.mjs",
+    stdout: stdout.stream,
+    resolvePath: (...parts) => parts.join("/"),
+    existsSync: (path) => {
+      calls.push(["exists", path]);
+      return state.plistExists;
+    },
+    mkdirSync: (path, options) => calls.push(["mkdir", path, options]),
+    writeFileSync: (path, data) => calls.push(["write", path, data]),
+    rmSync: (path) => calls.push(["rm", path]),
+    run: (cmd, args, options = {}) => {
+      calls.push(["run", cmd, args, options]);
+      if (state.run) return state.run(cmd, args, options, calls, state);
+      if (cmd === "which") return spawnResult({ stdout: "/usr/local/bin/lark-cli\n" });
+      if (cmd === "launchctl" && args[0] === "print") {
+        return state.launchdLoaded ? spawnResult({ stdout: "state = running\n" }) : spawnResult({ status: 113 });
+      }
+      return spawnResult();
+    },
+    ...overrides.deps,
+  };
+  return { calls, deps, stdout, state };
+}
 
 test("lark im service parseArgs keeps stable defaults for status", () => {
   const opts = parseArgs(["status"]);
@@ -148,6 +209,154 @@ test("plistXml falls back to the default lark-cli path when which returns empty"
 
   assert.deepEqual(calls, [["which", ["lark-cli"], { allowFailure: true }]]);
   assert.match(xml, /<key>LARK_CLI<\/key>\s*<string>\/opt\/homebrew\/bin\/lark-cli<\/string>/);
+});
+
+test("service install writes plist and bootstraps LaunchAgent through injected deps", () => {
+  const { calls, deps, stdout } = fakeServiceDeps();
+
+  runServiceCommand(parseArgs(["install", "--log-dir", "logs/test", "--interval-seconds", "15"]), deps);
+
+  assert.match(stdout.text(), /installed com\.exocortex\.lark-im-worker/);
+  assert.deepEqual(
+    calls.filter((call) => call[0] === "mkdir").map((call) => call.slice(1)),
+    [
+      ["/home/tester/Library/LaunchAgents", { recursive: true }],
+      ["logs/test", { recursive: true }],
+    ],
+  );
+  const write = calls.find((call) => call[0] === "write");
+  assert.equal(write[1], "/home/tester/Library/LaunchAgents/com.exocortex.lark-im-worker.plist");
+  assert.match(write[2], /<string>--interval-seconds<\/string>\s*<string>15<\/string>/);
+  assert.deepEqual(
+    calls.filter((call) => call[0] === "run").map((call) => call.slice(1, 4)),
+    [
+      ["which", ["lark-cli"], { allowFailure: true }],
+      ["launchctl", ["bootout", "gui/501/com.exocortex.lark-im-worker"], { allowFailure: true }],
+      [
+        "launchctl",
+        ["bootout", "gui/501", "/home/tester/Library/LaunchAgents/com.exocortex.lark-im-worker.plist"],
+        { allowFailure: true },
+      ],
+      [
+        "launchctl",
+        ["bootstrap", "gui/501", "/home/tester/Library/LaunchAgents/com.exocortex.lark-im-worker.plist"],
+        {},
+      ],
+      ["launchctl", ["kickstart", "-k", "gui/501/com.exocortex.lark-im-worker"], { allowFailure: true }],
+    ],
+  );
+});
+
+test("service start kickstarts when LaunchAgent is already loaded", () => {
+  const { calls, deps, stdout } = fakeServiceDeps({ launchdLoaded: true });
+
+  runServiceCommand(parseArgs(["start"]), deps);
+
+  assert.equal(stdout.text(), "started com.exocortex.lark-im-worker\n");
+  assert.deepEqual(
+    calls.filter((call) => call[0] === "run").map((call) => call.slice(1, 4)),
+    [
+      ["launchctl", ["print", "gui/501/com.exocortex.lark-im-worker"], { allowFailure: true }],
+      ["launchctl", ["kickstart", "-k", "gui/501/com.exocortex.lark-im-worker"], { allowFailure: true }],
+    ],
+  );
+});
+
+test("service start bootstraps when LaunchAgent is installed but not loaded", () => {
+  const { calls, deps, stdout } = fakeServiceDeps({ launchdLoaded: false });
+
+  runServiceCommand(parseArgs(["start"]), deps);
+
+  assert.equal(stdout.text(), "started com.exocortex.lark-im-worker\n");
+  assert.deepEqual(
+    calls.filter((call) => call[0] === "run").map((call) => call.slice(1, 4)),
+    [
+      ["launchctl", ["print", "gui/501/com.exocortex.lark-im-worker"], { allowFailure: true }],
+      [
+        "launchctl",
+        ["bootstrap", "gui/501", "/home/tester/Library/LaunchAgents/com.exocortex.lark-im-worker.plist"],
+        { allowFailure: true },
+      ],
+      ["launchctl", ["kickstart", "-k", "gui/501/com.exocortex.lark-im-worker"], { allowFailure: true }],
+    ],
+  );
+});
+
+test("service stop bootouts both targets and verifies unloaded state", () => {
+  const { calls, deps, stdout } = fakeServiceDeps({ launchdLoaded: false });
+
+  runServiceCommand(parseArgs(["stop"]), deps);
+
+  assert.equal(stdout.text(), "stopped com.exocortex.lark-im-worker\n");
+  assert.deepEqual(
+    calls.filter((call) => call[0] === "run").map((call) => call.slice(1, 4)),
+    [
+      ["launchctl", ["bootout", "gui/501/com.exocortex.lark-im-worker"], { allowFailure: true }],
+      [
+        "launchctl",
+        ["bootout", "gui/501", "/home/tester/Library/LaunchAgents/com.exocortex.lark-im-worker.plist"],
+        { allowFailure: true },
+      ],
+      ["launchctl", ["print", "gui/501/com.exocortex.lark-im-worker"], { allowFailure: true }],
+    ],
+  );
+});
+
+test("service stop reports launchctl details when service remains loaded", () => {
+  const { deps } = fakeServiceDeps({
+    launchdLoaded: true,
+    run: (cmd, args) => {
+      if (cmd === "launchctl" && args[0] === "bootout") {
+        return spawnResult({ status: 1, stderr: `failed ${args[1]}` });
+      }
+      if (cmd === "launchctl" && args[0] === "print") return spawnResult({ stdout: "state = running\n" });
+      return spawnResult();
+    },
+  });
+
+  assert.throws(
+    () => runServiceCommand(parseArgs(["stop"]), deps),
+    /failed to stop com\.exocortex\.lark-im-worker: failed gui\/501\/com\.exocortex\.lark-im-worker; failed gui\/501/,
+  );
+});
+
+test("service uninstall stops and removes the plist when it exists", () => {
+  const { calls, deps, stdout } = fakeServiceDeps({ launchdLoaded: false, plistExists: true });
+
+  runServiceCommand(parseArgs(["uninstall"]), deps);
+
+  assert.match(stdout.text(), /stopped com\.exocortex\.lark-im-worker/);
+  assert.match(stdout.text(), /removed \/home\/tester\/Library\/LaunchAgents\/com\.exocortex\.lark-im-worker\.plist/);
+  assert.deepEqual(calls.filter((call) => call[0] === "rm").map((call) => call[1]), [
+    "/home/tester/Library/LaunchAgents/com.exocortex.lark-im-worker.plist",
+  ]);
+});
+
+test("service restart stops then starts through the same stable wrapper", () => {
+  const { calls, deps, stdout } = fakeServiceDeps({
+    plistExists: true,
+    run: (cmd, args) => {
+      if (cmd === "launchctl" && args[0] === "print") {
+        return spawnResult({ status: 113 });
+      }
+      return spawnResult();
+    },
+  });
+
+  runServiceCommand(parseArgs(["restart"]), deps);
+
+  assert.equal(stdout.text(), "stopped com.exocortex.lark-im-worker\nstarted com.exocortex.lark-im-worker\n");
+  assert.deepEqual(
+    calls.filter((call) => call[0] === "run").map((call) => call.slice(1, 3)),
+    [
+      ["launchctl", ["bootout", "gui/501/com.exocortex.lark-im-worker"]],
+      ["launchctl", ["bootout", "gui/501", "/home/tester/Library/LaunchAgents/com.exocortex.lark-im-worker.plist"]],
+      ["launchctl", ["print", "gui/501/com.exocortex.lark-im-worker"]],
+      ["launchctl", ["print", "gui/501/com.exocortex.lark-im-worker"]],
+      ["launchctl", ["bootstrap", "gui/501", "/home/tester/Library/LaunchAgents/com.exocortex.lark-im-worker.plist"]],
+      ["launchctl", ["kickstart", "-k", "gui/501/com.exocortex.lark-im-worker"]],
+    ],
+  );
 });
 
 test("formatLogLine renders worker cycle and step summaries", () => {

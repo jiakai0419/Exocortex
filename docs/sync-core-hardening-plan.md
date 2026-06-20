@@ -124,8 +124,9 @@ v0 质量验收已经完成并固化到 `docs/v0-baseline.md`。
 - `src/diagnostics/doctor-report.mjs` 承载 `doctor` status/quality/live probe 编排和 report 组装。
 - `src/terminal/doctor-view.mjs` 承载 `doctor` terminal text 渲染。
 - `src/cli/doctor-command.mjs` 承载 `doctor` 参数解析、json/text 输出选择和 exit-code 规则；`scripts/doctor.mjs` 保持为稳定入口和兼容 re-export。
+- `src/cli/lark-im-service-command.mjs` 承载 `lark-im-service` 参数解析、LaunchAgent 生命周期命令、status/wait-ok/tail 和 main；`scripts/lark-im-service.mjs` 保持稳定入口和兼容 re-export。
 - `src/diagnostics/lark-im-service-report.mjs` 承载 `lark-im-service status` 的 LaunchAgent、sync status 和 worker log report 组装。
-- `src/terminal/lark-im-service-view.mjs` 承载 `lark-im-service status` terminal text 渲染；`scripts/lark-im-service.mjs` 的 start/stop/restart/install/uninstall 路径保持不变。
+- `src/terminal/lark-im-service-view.mjs` 承载 `lark-im-service status` terminal text 渲染。
 - `src/cli/lark-im-worker-command.mjs` 承载 `lark-im-worker` 参数解析、step 子命令执行、JSONL log 写入、run loop 和 main；`scripts/lark-im-worker.mjs` 保持稳定入口和兼容 re-export。
 - `dist/core` 是运行时入口，继续遵守 no runtime TypeScript loader。
 - core 级测试覆盖 cursor 比较、窗口过滤、source time precision 和分页完整性。
@@ -148,6 +149,7 @@ v0 质量验收已经完成并固化到 `docs/v0-baseline.md`。
 - `scripts/doctor.mjs` 现在只保留稳定入口和兼容测试导出。
 - `lark-im-service status` 拆成 `src/diagnostics/lark-im-service-report.mjs` 和 `src/terminal/lark-im-service-view.mjs`，让服务状态 report 和 terminal 渲染可测试；`scripts/lark-im-service.mjs` 继续承载 LaunchAgent 生命周期命令。
 - `scripts/lark-im-service.mjs` 增加直接执行保护和非破坏性 helper 导出，用于测试 parse args、LaunchAgent plist 渲染、worker log line rendering 和 `wait-ok` 就绪判断；install/start/stop/restart/uninstall 的真实执行语义不变。
+- `lark-im-service` CLI 外壳随后迁入 `src/cli/lark-im-service-command.mjs`；`scripts/lark-im-service.mjs` 现在只保留稳定入口、错误处理和兼容 re-export，LaunchAgent 路径不变。
 - `scripts/lark-im-worker.mjs` 增加直接执行保护和非破坏性 helper 导出，用于测试 worker 参数解析、`runStep` 子命令拼装、JSONL log 写入、run loop sleep/max-cycles 语义和 CLI help/error exit code；worker core cycle 语义仍由 `src/runtime/worker/lark-im-worker-core.ts` 承载。
 - `lark-im-worker` CLI 外壳随后迁入 `src/cli/lark-im-worker-command.mjs`；`scripts/lark-im-worker.mjs` 现在只保留稳定入口、错误处理和兼容 re-export，LaunchAgent 路径不变。
 - `npm run check` 已覆盖 `src/cli/*.mjs`。
@@ -155,7 +157,7 @@ v0 质量验收已经完成并固化到 `docs/v0-baseline.md`。
 - 新增 `tests/sync-status-command.test.mjs`，使用匿名 shape fixtures 覆盖 help、json 输出、missing DB、text rendering、buildStatus 组装和参数校验。
 - 新增 `tests/doctor-command.test.mjs`，使用匿名 shape fixtures 覆盖 help、本地 json report、live probe、keychain unavailable、needs-attention exit code、dependency error 和 text rendering。
 - 新增 `tests/lark-im-service-status.test.mjs`，使用匿名 shape fixtures 覆盖 launchd 解析、sync status 解析、worker summary 和 terminal rendering。
-- 新增 `tests/lark-im-service-command.test.mjs`，使用匿名 shape fixtures 覆盖服务参数默认值、worker tuning 参数、LaunchAgent plist 参数传递、`lark-cli` fallback、worker log line rendering 和 `wait-ok` readiness。
+- 新增 `tests/lark-im-service-command.test.mjs`，使用匿名 shape fixtures 覆盖服务参数默认值、worker tuning 参数、LaunchAgent plist 参数传递、`lark-cli` fallback、install/start/stop/restart/uninstall、worker log line rendering 和 `wait-ok` readiness。
 - 新增 `tests/lark-im-worker-command.test.mjs`，使用匿名 shape fixtures 覆盖 worker 默认参数、`--once` / `--max-cycles`、worker tuning 参数、`lark-im-sync` 子命令调用、失败 summary、JSONL log 写入和直接 CLI help/error exit code。
 
 ### 2026-06-19

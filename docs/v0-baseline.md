@@ -218,11 +218,12 @@ sync-status    diagnostics report + terminal view + CLI command
 doctor         diagnostics report + terminal view + CLI command
 lark-im-worker CLI command
                src/cli implementation + stable script wrapper
-lark-im-service status
-               diagnostics report + terminal view
+lark-im-service CLI command
+               src/cli implementation + stable script wrapper
+               status diagnostics report + terminal view
 ```
 
-`lark-im-service` 的安装、启停、重启和卸载仍在稳定脚本入口中，避免把 LaunchAgent 写路径和纯状态展示混在一次迁移里。
+`lark-im-service` 的安装、启停、重启和卸载仍通过稳定脚本路径调用；实现已经迁入 `src/cli`，LaunchAgent 路径不变。
 
 当前测试重点覆盖：
 
@@ -237,7 +238,7 @@ lark-im-service status
 - worker step 顺序和 cycle summary。
 - worker CLI 外壳参数、子命令拼装、JSONL log、run loop 和 exit code。
 - doctor/live probe 状态归一化。
-- `lark-im-service` 参数、LaunchAgent plist、worker log rendering 和 `wait-ok` readiness。
+- `lark-im-service` 参数、LaunchAgent plist、生命周期命令、worker log rendering 和 `wait-ok` readiness。
 - terminal command catalog 和渲染。
 
 ## V0 不保证
@@ -306,5 +307,5 @@ v0.1 baseline 之后，不急于进入 UI、语义层或新信息源。
 
 1. 继续观察 worker 长期运行，定期运行 `doctor --live`。
 2. 不急着做 TypeScript production CLI rewrite；先保持当前 JS CLI command 边界稳定。
-3. `sync-status`、`doctor` 和 `lark-im-service status` 已完成 report / view 边界拆分；`lark-im-worker` CLI 外壳已迁入 `src` 并保留稳定脚本入口。如果继续重构，下一步优先观察这些诊断入口和 worker 外壳的稳定性，再评估是否迁移 `lark-im-service` 生命周期命令。
+3. `sync-status`、`doctor`、`lark-im-service` 和 `lark-im-worker` 的 CLI 边界已经迁入 `src`，并保留稳定脚本入口。如果继续重构，下一步优先观察这些入口的稳定性，再评估是否继续做 TypeScript 迁移。
 4. 等同步、诊断和 CLI 边界继续稳定后，再考虑下一信息源或最小语义层。
