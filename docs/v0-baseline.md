@@ -291,5 +291,5 @@ v0.1 baseline 之后，不急于进入 UI、语义层或新信息源。
 
 1. 继续观察 worker 长期运行，定期运行 `doctor --live`。
 2. 不急着做 TypeScript production CLI rewrite；先保持当前 JS CLI command 边界稳定。
-3. `sync-status` 已完成 CLI command 抽取；如果继续重构，下一步优先考虑低风险地迁 `doctor` 到 `src/cli`，但每一步都必须保持脚本入口不变。
+3. `sync-status` 和 `doctor` 已完成 CLI command 抽取；如果继续重构，下一步优先观察这两个诊断入口的稳定性，或者再评估 `lark-im-worker` 的低风险拆分。
 4. 等同步、诊断和 CLI 边界继续稳定后，再考虑下一信息源或最小语义层。
