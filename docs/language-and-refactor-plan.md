@@ -28,6 +28,7 @@ TypeScript on Node.js
 - `src/` 已经承载 core、SQLite store、Lark IM adapter、worker core、terminal helper 和 CLI command 边界。
 - `scripts/` 继续保留稳定用户入口和兼容 wrapper。
 - CI 已经运行 `npm run check`、`npm run typecheck`、`npm run build:check` 和 `npm test`。
+- `tsconfig.json` 已覆盖 `src/cli/*.mjs`、`src/diagnostics/*.mjs` 和 `src/terminal/*.mjs`，新拆出的 runtime 边界会进入 `checkJs`。
 - Terminal-first 已经成为长期交互原则。
 - public-safe 已经成为仓库原则。
 

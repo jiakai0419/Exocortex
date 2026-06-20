@@ -153,6 +153,7 @@ v0 质量验收已经完成并固化到 `docs/v0-baseline.md`。
 - `scripts/lark-im-worker.mjs` 增加直接执行保护和非破坏性 helper 导出，用于测试 worker 参数解析、`runStep` 子命令拼装、JSONL log 写入、run loop sleep/max-cycles 语义和 CLI help/error exit code；worker core cycle 语义仍由 `src/runtime/worker/lark-im-worker-core.ts` 承载。
 - `lark-im-worker` CLI 外壳随后迁入 `src/cli/lark-im-worker-command.mjs`；`scripts/lark-im-worker.mjs` 现在只保留稳定入口、错误处理和兼容 re-export，LaunchAgent 路径不变。
 - `npm run check` 已覆盖 `src/cli/*.mjs`。
+- `npm run typecheck` 已覆盖 `src/cli/*.mjs`、`src/diagnostics/*.mjs` 和 `src/terminal/*.mjs`，让 CLI、report 和 terminal view 边界进入 `checkJs`。
 - 新增 `tests/lark-im-sync-command.test.mjs`，使用 fake deps 覆盖 help、sent scope 调度、依赖错误和 explicit end 解析。
 - 新增 `tests/sync-status-command.test.mjs`，使用匿名 shape fixtures 覆盖 help、json 输出、missing DB、text rendering、buildStatus 组装和参数校验。
 - 新增 `tests/doctor-command.test.mjs`，使用匿名 shape fixtures 覆盖 help、本地 json report、live probe、keychain unavailable、needs-attention exit code、dependency error 和 text rendering。
