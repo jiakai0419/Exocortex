@@ -5,6 +5,7 @@
 import { spawnSync } from "node:child_process";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   compactSummary,
   runCycleWithRunner,
@@ -43,6 +44,28 @@ const DEFAULT_CHAT_TYPES = "group,p2p";
  * @property {string} finished_at
  * @property {JsonObject | null} summary
  * @property {string} stderr
+ *
+ * @typedef {import("node:child_process").SpawnSyncReturns<string>} SpawnResult
+ *
+ * @typedef {object} RunStepDeps
+ * @property {(cmd: string, args: string[], options: JsonObject) => SpawnResult=} spawnSync
+ * @property {string=} execPath
+ * @property {() => Date=} now
+ *
+ * @typedef {object} WriteLogDeps
+ * @property {{write(chunk: string): void}=} stdout
+ * @property {(path: string, options?: {recursive?: boolean}) => void=} mkdirSync
+ * @property {(path: string, data: string) => void=} appendFileSync
+ * @property {(path: string, ...paths: string[]) => string=} resolvePath
+ *
+ * @typedef {object} RunCycleDeps
+ * @property {RunStepDeps=} runStep
+ * @property {WriteLogDeps=} writeLog
+ * @property {() => string=} now
+ *
+ * @typedef {object} RunWorkerDeps
+ * @property {(opts: WorkerOptions, cycle: number) => unknown=} runCycle
+ * @property {(seconds: number) => void=} sleepSeconds
  */
 
 function usage() {
@@ -137,13 +160,16 @@ function sleepSeconds(seconds) {
  * @param {string[]} args
  * @returns {WorkerStepResult}
  */
-function runStep(name, args) {
-  const startedAt = new Date().toISOString();
-  const result = spawnSync(process.execPath, ["scripts/lark-im-sync.mjs", ...args], {
+function runStep(name, args, deps = {}) {
+  const now = deps.now || (() => new Date());
+  const run = deps.spawnSync || spawnSync;
+  const execPath = deps.execPath || process.execPath;
+  const startedAt = now().toISOString();
+  const result = run(execPath, ["scripts/lark-im-sync.mjs", ...args], {
     encoding: "utf8",
     maxBuffer: 100 * 1024 * 1024,
   });
-  const finishedAt = new Date().toISOString();
+  const finishedAt = now().toISOString();
   /** @type {JsonObject | null} */
   let summary = null;
   try {
@@ -166,13 +192,17 @@ function runStep(name, args) {
  * @param {{logDir?: string}} opts
  * @param {JsonObject} payload
  */
-function writeLog(opts, payload) {
+function writeLog(opts, payload, deps = {}) {
   const line = `${JSON.stringify(payload)}\n`;
-  process.stdout.write(line);
+  const stdout = deps.stdout || process.stdout;
+  stdout.write(line);
   if (opts.logDir) {
-    const logDir = resolve(opts.logDir);
-    mkdirSync(logDir, { recursive: true });
-    appendFileSync(resolve(logDir, "worker.jsonl"), line);
+    const resolvePath = deps.resolvePath || resolve;
+    const makeDir = deps.mkdirSync || mkdirSync;
+    const append = deps.appendFileSync || appendFileSync;
+    const logDir = resolvePath(opts.logDir);
+    makeDir(logDir, { recursive: true });
+    append(resolvePath(logDir, "worker.jsonl"), line);
   }
 }
 
@@ -180,25 +210,55 @@ function writeLog(opts, payload) {
  * @param {WorkerOptions} opts
  * @param {number} cycle
  */
-function runCycle(opts, cycle) {
-  return runCycleWithRunner(opts, cycle, runStep, writeLog);
+function runCycle(opts, cycle, deps = {}) {
+  return runCycleWithRunner(
+    opts,
+    cycle,
+    (name, args) => runStep(name, args, deps.runStep),
+    (logOpts, payload) => writeLog(logOpts, payload, deps.writeLog),
+    deps.now,
+  );
 }
 
-function main() {
-  const opts = parseArgs(process.argv.slice(2));
+/**
+ * @param {WorkerOptions} opts
+ * @param {RunWorkerDeps} [deps]
+ */
+function runWorker(opts, deps = {}) {
+  const runOneCycle = deps.runCycle || runCycle;
+  const sleep = deps.sleepSeconds || sleepSeconds;
   let cycle = 0;
   while (opts.maxCycles === null || cycle < opts.maxCycles) {
     cycle += 1;
-    runCycle(opts, cycle);
+    runOneCycle(opts, cycle);
     if (opts.maxCycles !== null && cycle >= opts.maxCycles) break;
-    sleepSeconds(opts.intervalSeconds);
+    sleep(opts.intervalSeconds);
   }
 }
 
-try {
-  main();
-} catch (error) {
-  const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`${message}\n`);
-  process.exit(1);
+function main(argv = process.argv.slice(2)) {
+  const opts = parseArgs(argv);
+  runWorker(opts);
+}
+
+export {
+  main,
+  parseArgs,
+  parsePositiveInt,
+  runCycle,
+  runStep,
+  runWorker,
+  sleepSeconds,
+  usage,
+  writeLog,
+};
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  try {
+    main();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`${message}\n`);
+    process.exit(1);
+  }
 }

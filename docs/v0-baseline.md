@@ -233,6 +233,7 @@ lark-im-service status
 - sender/app/chat name resolution fallback。
 - sync runner 成功、失败、locked、disabled、unsupported、batch limit。
 - worker step 顺序和 cycle summary。
+- worker CLI 外壳参数、子命令拼装、JSONL log、run loop 和 exit code。
 - doctor/live probe 状态归一化。
 - `lark-im-service` 参数、LaunchAgent plist、worker log rendering 和 `wait-ok` readiness。
 - terminal command catalog 和渲染。
@@ -303,5 +304,5 @@ v0.1 baseline 之后，不急于进入 UI、语义层或新信息源。
 
 1. 继续观察 worker 长期运行，定期运行 `doctor --live`。
 2. 不急着做 TypeScript production CLI rewrite；先保持当前 JS CLI command 边界稳定。
-3. `sync-status`、`doctor` 和 `lark-im-service status` 已完成 report / view 边界拆分；`lark-im-service` 非破坏性 helper 已有测试护栏。如果继续重构，下一步优先观察这些诊断入口的稳定性，或者再评估 `lark-im-worker` 的低风险拆分。
+3. `sync-status`、`doctor` 和 `lark-im-service status` 已完成 report / view 边界拆分；`lark-im-service` 和 `lark-im-worker` 非破坏性 helper 已有测试护栏。如果继续重构，下一步优先观察这些诊断入口和 worker 外壳的稳定性，再评估是否把 worker CLI 外壳迁入 `src`。
 4. 等同步、诊断和 CLI 边界继续稳定后，再考虑下一信息源或最小语义层。
