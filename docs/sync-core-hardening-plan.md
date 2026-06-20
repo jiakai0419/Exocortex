@@ -146,11 +146,13 @@ v0 质量验收已经完成并固化到 `docs/v0-baseline.md`。
 - `doctor` 随后继续拆成 `src/diagnostics/doctor-report.mjs`、`src/terminal/doctor-view.mjs` 和 `src/cli/doctor-command.mjs` 三层，让 report 组装、terminal 渲染和 CLI exit 语义分离。
 - `scripts/doctor.mjs` 现在只保留稳定入口和兼容测试导出。
 - `lark-im-service status` 拆成 `src/diagnostics/lark-im-service-report.mjs` 和 `src/terminal/lark-im-service-view.mjs`，让服务状态 report 和 terminal 渲染可测试；`scripts/lark-im-service.mjs` 继续承载 LaunchAgent 生命周期命令。
+- `scripts/lark-im-service.mjs` 增加直接执行保护和非破坏性 helper 导出，用于测试 parse args、LaunchAgent plist 渲染、worker log line rendering 和 `wait-ok` 就绪判断；install/start/stop/restart/uninstall 的真实执行语义不变。
 - `npm run check` 已覆盖 `src/cli/*.mjs`。
 - 新增 `tests/lark-im-sync-command.test.mjs`，使用 fake deps 覆盖 help、sent scope 调度、依赖错误和 explicit end 解析。
 - 新增 `tests/sync-status-command.test.mjs`，使用匿名 shape fixtures 覆盖 help、json 输出、missing DB、text rendering、buildStatus 组装和参数校验。
 - 新增 `tests/doctor-command.test.mjs`，使用匿名 shape fixtures 覆盖 help、本地 json report、live probe、keychain unavailable、needs-attention exit code、dependency error 和 text rendering。
 - 新增 `tests/lark-im-service-status.test.mjs`，使用匿名 shape fixtures 覆盖 launchd 解析、sync status 解析、worker summary 和 terminal rendering。
+- 新增 `tests/lark-im-service-command.test.mjs`，使用匿名 shape fixtures 覆盖服务参数默认值、worker tuning 参数、LaunchAgent plist 参数传递、`lark-cli` fallback、worker log line rendering 和 `wait-ok` readiness。
 
 ### 2026-06-19
 

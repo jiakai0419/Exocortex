@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { summarizeWorkerEvents } from "./lib/lark-im-worker-core.mjs";
 import {
   buildServiceStatusReport,
@@ -47,6 +48,21 @@ const DEFAULT_CHAT_TYPES = "group,p2p";
  *
  * @typedef {object} RunOptions
  * @property {boolean=} allowFailure
+ *
+ * @typedef {object} PlistXmlDeps
+ * @property {string=} cwd
+ * @property {string=} logDir
+ * @property {string=} nodePath
+ * @property {string=} workerPath
+ * @property {string=} larkCli
+ * @property {(path: string, options?: {recursive?: boolean}) => void=} mkdirSync
+ * @property {(cmd: string, args: string[], options?: RunOptions) => SpawnResult=} run
+ *
+ * @typedef {object} WaitOkEvaluation
+ * @property {boolean} ready
+ * @property {boolean} newOkCycle
+ * @property {boolean} healthReady
+ * @property {string} reason
  *
  * @typedef {Record<string, any>} JsonObject
  *
@@ -186,14 +202,20 @@ function run(cmd, args, options = {}) {
   return result;
 }
 
-/** @param {ServiceOptions} opts */
-function plistXml(opts) {
-  const cwd = process.cwd();
-  const logDir = resolve(opts.logDir);
-  const nodePath = process.execPath;
-  const workerPath = resolve("scripts/lark-im-worker.mjs");
-  const larkCli = run("which", ["lark-cli"], { allowFailure: true }).stdout.trim() || "/opt/homebrew/bin/lark-cli";
-  mkdirSync(logDir, { recursive: true });
+/**
+ * @param {ServiceOptions} opts
+ * @param {PlistXmlDeps} [deps]
+ */
+function plistXml(opts, deps = {}) {
+  const cwd = deps.cwd || process.cwd();
+  const logDir = deps.logDir || resolve(opts.logDir);
+  const nodePath = deps.nodePath || process.execPath;
+  const workerPath = deps.workerPath || resolve("scripts/lark-im-worker.mjs");
+  const runCommand = deps.run || run;
+  const larkCli =
+    deps.larkCli || runCommand("which", ["lark-cli"], { allowFailure: true }).stdout.trim() || "/opt/homebrew/bin/lark-cli";
+  const makeDir = deps.mkdirSync || mkdirSync;
+  makeDir(logDir, { recursive: true });
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -308,6 +330,28 @@ function isReadyHealth(value) {
   return ["fresh", "ok", "ok_with_history"].includes(String(value || "").toLowerCase());
 }
 
+/**
+ * @param {number} startedAt
+ * @param {JsonObject | null} syncStatus
+ * @param {JsonObject} workerSummary
+ * @returns {WaitOkEvaluation}
+ */
+function evaluateWaitOkState(startedAt, syncStatus, workerSummary) {
+  const lastCycle = workerSummary.last_cycle;
+  const lastCycleAt = lastCycle?.at ? Date.parse(String(lastCycle.at)) : NaN;
+  const newOkCycle = lastCycle?.ok === true && Number.isFinite(lastCycleAt) && lastCycleAt >= startedAt;
+  const healthReady = syncStatus ? isReadyHealth(syncStatus.health) : false;
+  const ready = Boolean(lastCycle && newOkCycle && !workerSummary.in_progress && healthReady);
+  const reason = [
+    `cycle=${workerSummary.last_cycle?.cycle || "none"}`,
+    `cycle_ok=${workerSummary.last_cycle?.ok ?? "unknown"}`,
+    `cycle_new=${newOkCycle}`,
+    `in_progress=${Boolean(workerSummary.in_progress)}`,
+    `health=${syncStatus?.health || "unavailable"}`,
+  ].join(" ");
+  return { ready, newOkCycle, healthReady, reason };
+}
+
 /** @param {ServiceOptions} opts */
 function status(opts) {
   const report = buildServiceStatusReport({
@@ -347,11 +391,9 @@ function waitOk(opts) {
     const workerLog = readRecentWorkerEvents(opts.logDir);
     const workerSummary = summarizeWorkerEvents(workerLog.events);
     const lastCycle = workerSummary.last_cycle;
-    const lastCycleAt = lastCycle?.at ? Date.parse(String(lastCycle.at)) : NaN;
-    const newOkCycle = lastCycle?.ok === true && Number.isFinite(lastCycleAt) && lastCycleAt >= startedAt;
-    const healthReady = syncStatus ? isReadyHealth(syncStatus.health) : false;
+    const evaluation = evaluateWaitOkState(startedAt, syncStatus, workerSummary);
 
-    if (lastCycle && newOkCycle && !workerSummary.in_progress && healthReady) {
+    if (lastCycle && evaluation.ready) {
       process.stdout.write(
         `${block([
           `${title("Lark IM service")} ${statusBadge("ok")}`,
@@ -365,13 +407,7 @@ function waitOk(opts) {
       return;
     }
 
-    lastReason = [
-      `cycle=${workerSummary.last_cycle?.cycle || "none"}`,
-      `cycle_ok=${workerSummary.last_cycle?.ok ?? "unknown"}`,
-      `cycle_new=${newOkCycle}`,
-      `in_progress=${Boolean(workerSummary.in_progress)}`,
-      `health=${syncStatus?.health || "unavailable"}`,
-    ].join(" ");
+    lastReason = evaluation.reason;
     sleepMs(opts.pollSeconds * 1000);
   }
 
@@ -439,8 +475,8 @@ function formatLogLine(line) {
   return line;
 }
 
-function main() {
-  const opts = parseArgs(process.argv.slice(2));
+function main(argv = process.argv.slice(2)) {
+  const opts = parseArgs(argv);
   if (opts.command === "install") install(opts);
   else if (opts.command === "start") start();
   else if (opts.command === "stop") stop();
@@ -454,9 +490,22 @@ function main() {
   else throw new Error(`Unknown command: ${opts.command}`);
 }
 
-try {
-  main();
-} catch (error) {
-  process.stderr.write(renderError(error));
-  process.exit(1);
+export {
+  evaluateWaitOkState,
+  formatLogLine,
+  isReadyHealth,
+  main,
+  parseArgs,
+  parsePositiveInt,
+  plistXml,
+  usage,
+};
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  try {
+    main();
+  } catch (error) {
+    process.stderr.write(renderError(error));
+    process.exit(1);
+  }
 }
