@@ -216,6 +216,8 @@ src/adapters/lark-im/sync-runner.mjs
 ```text
 sync-status    diagnostics report + terminal view + CLI command
 doctor         diagnostics report + terminal view + CLI command
+lark-im-worker CLI command
+               src/cli implementation + stable script wrapper
 lark-im-service status
                diagnostics report + terminal view
 ```
@@ -304,5 +306,5 @@ v0.1 baseline 之后，不急于进入 UI、语义层或新信息源。
 
 1. 继续观察 worker 长期运行，定期运行 `doctor --live`。
 2. 不急着做 TypeScript production CLI rewrite；先保持当前 JS CLI command 边界稳定。
-3. `sync-status`、`doctor` 和 `lark-im-service status` 已完成 report / view 边界拆分；`lark-im-service` 和 `lark-im-worker` 非破坏性 helper 已有测试护栏。如果继续重构，下一步优先观察这些诊断入口和 worker 外壳的稳定性，再评估是否把 worker CLI 外壳迁入 `src`。
+3. `sync-status`、`doctor` 和 `lark-im-service status` 已完成 report / view 边界拆分；`lark-im-worker` CLI 外壳已迁入 `src` 并保留稳定脚本入口。如果继续重构，下一步优先观察这些诊断入口和 worker 外壳的稳定性，再评估是否迁移 `lark-im-service` 生命周期命令。
 4. 等同步、诊断和 CLI 边界继续稳定后，再考虑下一信息源或最小语义层。
