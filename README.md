@@ -39,22 +39,30 @@ npm run help -- --all
 
 ## Current Status
 
-后台同步通过 macOS LaunchAgent 运行。查看状态：
+当前已经达到 v0.1 runtime baseline：飞书消息事实流能持续进入本地 SQLite，后台 worker 通过 macOS LaunchAgent 长期运行，terminal-first 的查看、诊断和服务状态入口已经有稳定边界与测试覆盖。
+
+查看后台服务、同步健康、live freshness 和最近 24 小时运行稳定性：
 
 ```bash
 node scripts/lark-im-service.mjs status
 ```
 
-查看最近同步到本地的消息：
+查看最近同步到本地的消息事实：
 
 ```bash
 node scripts/messages.mjs --limit 20
 ```
 
-运行综合诊断：
+运行本地综合诊断：
 
 ```bash
 node scripts/doctor.mjs
+```
+
+需要真实远端对照时，在能访问 lark-cli Keychain 的 shell 里运行：
+
+```bash
+node scripts/doctor.mjs --live
 ```
 
 ## Documents

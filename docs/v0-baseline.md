@@ -14,10 +14,10 @@
 可靠同步我发出的飞书消息，以及我收到的非免打扰会话消息到本地。
 ```
 
-截至 2026-06-20，v0.1 runtime baseline 也已完成：
+截至 2026-06-21，v0.1 runtime baseline 也已完成并再次验收：
 
 ```text
-同步入口、同步执行、adapter、store、worker、诊断和 terminal 输出已经拆出稳定边界；
+同步入口、同步执行、adapter、store、worker、诊断、messages 查看和 terminal 输出已经拆出稳定边界；
 后台服务通过 LaunchAgent 长期运行；
 CLI、测试、CI 和 live probe 都能验证当前事实流健康。
 ```
@@ -37,10 +37,11 @@ npm run check                           passed
 npm run build:check                     passed
 npm run typecheck                       passed
 npm test                                passed
-node scripts/doctor.mjs                 fresh / syncing only when worker is active
-node scripts/doctor.mjs --live          healthy in a shell with keychain access
+node scripts/doctor.mjs                 OK, or SYNCING only while worker is actively running
+node scripts/doctor.mjs --live          OK in a shell with keychain access
 node scripts/lark-im-quality.mjs        OK
-node scripts/lark-im-service.mjs status ACTIVE
+node scripts/messages.mjs --limit 5     renders latest local records without exposing internal mechanics
+node scripts/lark-im-service.mjs status RUNNING / Health OK / Freshness VERIFIED
 ```
 
 仓库文档不记录真实消息数量、真实会话规模、真实人员、真实群名或真实链接。需要查看当前私有运行指标时，在本机运行：
@@ -66,7 +67,7 @@ latest live lag is acceptable
 actionable sender gaps = 0
 ```
 
-历史失败仍保留在 `sync_runs` 中，这是事实记录。当前健康状态使用 `OK_WITH_HISTORY` 或 worker 正在跑时的 `SYNCING`，不等于当前故障。
+历史失败仍保留在 `sync_runs` 中，这是事实记录。`OK_WITH_HISTORY` 只作为内部诊断事实存在；`lark-im-service status` 的主健康状态会把当前可用系统展示为 `OK`。worker 正在跑时出现 `SYNCING` 也只是当前活动，不等于当前故障。
 
 当前已知 advisory：
 
@@ -221,7 +222,18 @@ lark-im-worker CLI command
 lark-im-service CLI command
                src/cli implementation + stable script wrapper
                status diagnostics report + terminal view
+messages       diagnostics report + terminal view + CLI command
 ```
+
+`messages` 是日常查看本地消息事实的核心入口。`scripts/messages.mjs` 保持稳定路径，内部已经拆成：
+
+```text
+src/diagnostics/messages-report.mjs
+src/terminal/messages-view.mjs
+src/cli/messages-command.mjs
+```
+
+它不做复杂查询体验，不进入语义层，只负责把最近同步到本地的 records 以可读方式展示。系统消息会显示为 `系统`，不会把 senderless system message 展示成 `unknown`。
 
 `lark-im-service` 的安装、启停、重启和卸载仍通过稳定脚本路径调用；实现已经迁入 `src/cli`，LaunchAgent 路径不变。
 
@@ -239,6 +251,9 @@ lark-im-service CLI command
 - worker CLI 外壳参数、子命令拼装、JSONL log、run loop 和 exit code。
 - doctor/live probe 状态归一化。
 - `lark-im-service` 参数、LaunchAgent plist、生命周期命令、worker log rendering 和 `wait-ok` readiness。
+- `messages` 参数解析、SQLite 查询条件、私聊接收人、系统消息、text/json/error 输出。
+- `live-probe` freshness cache 脱敏摘要。
+- `lark-im-service status` 的 Service / Health / Activity / Freshness 四层状态，以及 Last 24h runtime stability summary。
 - terminal command catalog 和渲染。
 
 ## V0 不保证
@@ -307,5 +322,5 @@ v0.1 baseline 之后，不急于进入 UI、语义层或新信息源。
 
 1. 继续观察 worker 长期运行，定期运行 `doctor --live`。
 2. 不急着做 TypeScript production CLI rewrite；先保持当前 JS CLI command 边界稳定。
-3. `sync-status`、`doctor`、`lark-im-service` 和 `lark-im-worker` 的 CLI 边界已经迁入 `src`，并保留稳定脚本入口。如果继续重构，下一步优先观察这些入口的稳定性，再评估是否继续做 TypeScript 迁移。
+3. `messages`、`sync-status`、`doctor`、`lark-im-service` 和 `lark-im-worker` 的 CLI 边界已经迁入 `src`，并保留稳定脚本入口。如果继续重构，下一步优先观察这些入口的稳定性，再评估是否继续做 TypeScript 迁移。
 4. 等同步、诊断和 CLI 边界继续稳定后，再考虑下一信息源或最小语义层。
