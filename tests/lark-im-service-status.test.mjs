@@ -85,10 +85,12 @@ function workerSummaryFixture(overrides = {}) {
 
 test("service status report parses launchd, sync status, and worker log summary", () => {
   const calls = [];
+  const cachePaths = [];
   const workerEvents = [{ type: "lark_im_worker_cycle", cycle: 12, ok: true }];
   const report = buildServiceStatusReport(
     { label: "com.example.worker", target: "gui/501/com.example.worker", logDir: "logs/test" },
     {
+      nowMs: Date.parse("2026-06-20T00:03:00.000Z"),
       runCommand: (cmd, args) => {
         calls.push([cmd, ...args]);
         if (cmd === "launchctl") {
@@ -106,6 +108,18 @@ test("service status report parses launchd, sync status, and worker log summary"
         exists: true,
         events: workerEvents,
       }),
+      readLiveProbeCache: (path) => {
+        cachePaths.push(path);
+        return {
+          kind: "lark_im_live_probe_cache/v1",
+          checked_at: "2026-06-20T00:02:00.000Z",
+          status: "healthy",
+          ok: true,
+          missing_count: 0,
+          lag_ms: 1000,
+          reason: null,
+        };
+      },
       summarizeWorkerEvents: (events) => {
         assert.deepEqual(events, workerEvents);
         return workerSummaryFixture();
@@ -121,7 +135,10 @@ test("service status report parses launchd, sync status, and worker log summary"
   assert.equal(report.overview.service.status, "running");
   assert.equal(report.overview.health.status, "ok");
   assert.equal(report.overview.activity.status, "idle");
-  assert.equal(report.overview.freshness.status, "unknown");
+  assert.equal(report.overview.freshness.status, "verified");
+  assert.equal(report.overview.freshness.detail, "checked 1m ago, missing 0, lag 1s");
+  assert.match(report.freshness.cache_path, /logs\/test\/live-probe\.json$/);
+  assert.deepEqual(cachePaths, [report.freshness.cache_path]);
   assert.equal(report.worker.log.exists, true);
   assert.equal(report.worker.summary.last_cycle.cycle, 12);
   assert.deepEqual(calls, [
@@ -178,7 +195,14 @@ test("service overview separates service, health, activity, and freshness", () =
       in_progress: true,
       last_step: { cycle: 13, name: "received-hot", ok: true, age_ms: 1000 },
     }),
-    liveProbe: { status: "healthy", ok: true, missing_count: 0, lag_ms: 0 },
+    liveProbe: {
+      checked_at: "2026-06-20T00:01:00.000Z",
+      status: "healthy",
+      ok: true,
+      missing_count: 0,
+      lag_ms: 0,
+    },
+    nowMs: Date.parse("2026-06-20T00:01:00.000Z"),
   });
 
   assert.equal(overview.service.status, "running");
@@ -186,6 +210,7 @@ test("service overview separates service, health, activity, and freshness", () =
   assert.equal(overview.health.detail, "all known enabled scopes have cursors");
   assert.equal(overview.activity.status, "syncing");
   assert.equal(overview.freshness.status, "verified");
+  assert.equal(overview.freshness.detail, "checked 0s ago, missing 0, lag 0s");
 });
 
 test("service overview keeps catch-up as health, not activity", () => {
@@ -208,6 +233,40 @@ test("service overview keeps catch-up as health, not activity", () => {
   assert.equal(overview.health.status, "catching_up");
   assert.equal(overview.activity.status, "idle");
   assert.equal(overview.freshness.status, "unknown");
+});
+
+test("service overview maps delayed and stale live caches to freshness states", () => {
+  const delayed = buildServiceOverview({
+    launchd: { loaded: true, state: "running", pid: "123" },
+    syncStatus: syncStatusFixture(),
+    workerSummary: workerSummaryFixture(),
+    liveProbe: {
+      checked_at: "2026-06-20T00:00:00.000Z",
+      status: "delayed",
+      ok: false,
+      missing_count: 2,
+      lag_ms: 42000,
+    },
+    nowMs: Date.parse("2026-06-20T00:05:00.000Z"),
+  });
+  const stale = buildServiceOverview({
+    launchd: { loaded: true, state: "running", pid: "123" },
+    syncStatus: syncStatusFixture(),
+    workerSummary: workerSummaryFixture(),
+    liveProbe: {
+      checked_at: "2026-06-20T00:00:00.000Z",
+      status: "healthy",
+      ok: true,
+      missing_count: 0,
+      lag_ms: 0,
+    },
+    nowMs: Date.parse("2026-06-22T00:00:01.000Z"),
+  });
+
+  assert.equal(delayed.freshness.status, "behind");
+  assert.equal(delayed.freshness.detail, "checked 5m ago, missing 2, lag 42s");
+  assert.equal(stale.freshness.status, "unknown");
+  assert.equal(stale.freshness.detail, "last live probe stale, checked 2d ago");
 });
 
 test("service overview can show sync activity from locks without claiming worker log progress", () => {

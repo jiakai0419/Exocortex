@@ -10,6 +10,9 @@ import {
 } from "node:fs";
 import { resolve } from "node:path";
 import { summarizeWorkerEvents } from "../../dist/runtime/worker/lark-im-worker-core.js";
+import { readLiveProbeCache } from "./live-probe-cache.mjs";
+
+const DEFAULT_FRESHNESS_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 /**
  * @typedef {Record<string, any>} JsonObject
@@ -29,7 +32,9 @@ import { summarizeWorkerEvents } from "../../dist/runtime/worker/lark-im-worker-
  * @property {(cmd: string, args: string[], options?: {allowFailure?: boolean}) => SpawnResult=} runCommand
  * @property {(logDir: string) => WorkerLogTail=} readRecentWorkerEvents
  * @property {(events: unknown[], nowMs?: number) => JsonObject=} summarizeWorkerEvents
+ * @property {(path: string) => JsonObject | null=} readLiveProbeCache
  * @property {number=} nowMs
+ * @property {number=} freshnessMaxAgeMs
  *
  * @typedef {"running" | "stopped"} ServiceRuntimeStatus
  * @typedef {"ok" | "catching_up" | "problem"} ServiceHealthStatus
@@ -192,33 +197,69 @@ function summarizeServiceActivity({ service, syncStatus, workerSummary }) {
 }
 
 /**
- * @param {JsonObject | null | undefined} liveProbe
- * @returns {{status: ServiceFreshnessStatus, detail: string}}
+ * @param {number} ms
+ * @returns {string}
  */
-function summarizeServiceFreshness(liveProbe) {
-  if (!liveProbe) return { status: "unknown", detail: "no cached live probe" };
-  const status = String(liveProbe.status || "").toLowerCase();
-  if (status === "healthy" || liveProbe.ok === true) {
-    return { status: "verified", detail: "latest live probe found no missing hot messages" };
-  }
-  if (status === "delayed") {
-    const missing = liveProbe.missing_count ?? "?";
-    return { status: "behind", detail: `${missing} remote hot messages missing locally` };
-  }
-  return { status: "unknown", detail: status || "live probe unavailable" };
+function durationText(ms) {
+  const seconds = Math.max(0, Math.floor(Number(ms) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+  const days = Math.floor(hours / 24);
+  return `${days}d`;
 }
 
 /**
- * @param {{launchd: JsonObject, syncStatus: JsonObject | null, syncErrorText?: string, workerSummary: JsonObject, liveProbe?: JsonObject | null}} input
+ * @param {JsonObject | null | undefined} liveProbe
+ * @param {number} [nowMs]
+ * @param {number} [maxAgeMs]
+ * @returns {{status: ServiceFreshnessStatus, detail: string}}
+ */
+function summarizeServiceFreshness(liveProbe, nowMs = Date.now(), maxAgeMs = DEFAULT_FRESHNESS_MAX_AGE_MS) {
+  if (!liveProbe) return { status: "unknown", detail: "no cached live probe" };
+  const checkedAtMs = Date.parse(String(liveProbe.checked_at || ""));
+  if (!Number.isFinite(checkedAtMs)) {
+    return { status: "unknown", detail: "cached live probe has no valid timestamp" };
+  }
+  const ageMs = Math.max(0, nowMs - checkedAtMs);
+  const ageText = `${durationText(ageMs)} ago`;
+  if (ageMs > maxAgeMs) return { status: "unknown", detail: `last live probe stale, checked ${ageText}` };
+  const status = String(liveProbe.status || "").toLowerCase();
+  if (status === "healthy" || liveProbe.ok === true) {
+    const missing = liveProbe.missing_count ?? 0;
+    const lag = liveProbe.lag_ms === null || liveProbe.lag_ms === undefined ? "unknown" : durationText(liveProbe.lag_ms);
+    return { status: "verified", detail: `checked ${ageText}, missing ${missing}, lag ${lag}` };
+  }
+  if (status === "delayed") {
+    const missing = liveProbe.missing_count ?? "?";
+    const lag = liveProbe.lag_ms === null || liveProbe.lag_ms === undefined ? "unknown" : durationText(liveProbe.lag_ms);
+    return { status: "behind", detail: `checked ${ageText}, missing ${missing}, lag ${lag}` };
+  }
+  const reason = liveProbe.reason ? `: ${liveProbe.reason}` : "";
+  return { status: "unknown", detail: `last live probe ${status || "unavailable"} ${ageText}${reason}` };
+}
+
+/**
+ * @param {{launchd: JsonObject, syncStatus: JsonObject | null, syncErrorText?: string, workerSummary: JsonObject, liveProbe?: JsonObject | null, nowMs?: number, freshnessMaxAgeMs?: number}} input
  * @returns {ServiceOverview}
  */
-function buildServiceOverview({ launchd, syncStatus, syncErrorText = "", workerSummary, liveProbe = null }) {
+function buildServiceOverview({
+  launchd,
+  syncStatus,
+  syncErrorText = "",
+  workerSummary,
+  liveProbe = null,
+  nowMs = Date.now(),
+  freshnessMaxAgeMs = DEFAULT_FRESHNESS_MAX_AGE_MS,
+}) {
   const service = summarizeServiceRuntime(launchd);
   return {
     service,
     health: summarizeServiceHealth({ service, syncStatus, syncErrorText, workerSummary }),
     activity: summarizeServiceActivity({ service, syncStatus, workerSummary }),
-    freshness: summarizeServiceFreshness(liveProbe),
+    freshness: summarizeServiceFreshness(liveProbe, nowMs, freshnessMaxAgeMs),
   };
 }
 
@@ -230,13 +271,17 @@ function buildServiceStatusReport(opts, deps = {}) {
   const run = deps.runCommand || runCommand;
   const readWorkerLog = deps.readRecentWorkerEvents || readRecentWorkerEvents;
   const summarize = deps.summarizeWorkerEvents || summarizeWorkerEvents;
+  const readFreshnessCache = deps.readLiveProbeCache || readLiveProbeCache;
+  const nowMs = deps.nowMs || Date.now();
   const launchd = run("launchctl", ["print", opts.target], { allowFailure: true });
   const loaded = launchd.status === 0;
   const launchdState = loaded ? parseLaunchdState(launchd.stdout || "") : {};
   const sync = run(process.execPath, ["scripts/sync-status.mjs", "--format", "json"], { allowFailure: true });
   const syncStatus = parseJsonOutput(sync);
   const workerLog = readWorkerLog(opts.logDir);
-  const workerSummary = summarize(workerLog.events, deps.nowMs);
+  const workerSummary = summarize(workerLog.events, nowMs);
+  const liveProbeCachePath = resolve(opts.logDir, "live-probe.json");
+  const liveProbe = readFreshnessCache(liveProbeCachePath);
   const serviceState = loaded ? launchdState.state || "loaded" : "not loaded";
   const launchdReport = {
     loaded,
@@ -257,6 +302,9 @@ function buildServiceStatusReport(opts, deps = {}) {
       syncStatus,
       syncErrorText,
       workerSummary,
+      liveProbe,
+      nowMs,
+      freshnessMaxAgeMs: deps.freshnessMaxAgeMs,
     }),
     launchd: launchdReport,
     sync: {
@@ -268,12 +316,18 @@ function buildServiceStatusReport(opts, deps = {}) {
       log: workerLog,
       summary: workerSummary,
     },
+    freshness: {
+      cache_path: liveProbeCachePath,
+      cache: liveProbe,
+    },
   };
 }
 
 export {
   buildServiceOverview,
   buildServiceStatusReport,
+  durationText,
+  DEFAULT_FRESHNESS_MAX_AGE_MS,
   isCatchingUp,
   parseJsonOutput,
   parseLaunchdState,

@@ -86,10 +86,24 @@ BEHIND    live probe 发现远端热消息还没全部入库。
 UNKNOWN   没有可用的缓存 live probe 结果。
 ```
 
-当前 `lark-im-service status` 不会默认联网跑 live probe，因此第一版通常显示 `UNKNOWN no cached live probe`。需要真实远端对照时，手动运行：
+`lark-im-service status` 不会默认联网跑 live probe。它只读取本地缓存：
+
+```text
+logs/lark-im/live-probe.json
+```
+
+这个缓存由 `doctor --live` 写入，只保存脱敏摘要：检查时间、状态、缺失数量、lag 和原因。不保存消息 ID、人名、群名、链接或正文。
+
+需要真实远端对照时，手动运行：
 
 ```bash
 node scripts/doctor.mjs --live
+```
+
+运行成功后，`status` 会显示类似：
+
+```text
+Freshness  VERIFIED checked 12m ago, missing 0, lag 0s
 ```
 
 如果 `doctor --live` 显示 `UNAVAILABLE / keychain_unavailable`，说明当前 shell 读不到 keychain，不等于后台同步失败。

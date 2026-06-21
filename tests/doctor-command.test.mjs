@@ -97,6 +97,7 @@ test("doctor command emits fresh local report as json", () => {
   const stdout = memoryWriter();
   const stderr = memoryWriter();
   const calls = [];
+  const cacheWrites = [];
   const exitCode = runDoctorCli(["--db", "custom.sqlite", "--format", "json"], {
     stdout: stdout.stream,
     stderr: stderr.stream,
@@ -104,6 +105,10 @@ test("doctor command emits fresh local report as json", () => {
       resolvePath: (dbPath) => `/abs/${dbPath}`,
       now: () => new Date("2026-06-20T00:00:00.000Z"),
       runJson: fakeRunJson(calls),
+      writeLiveProbeCache: (path, report) => {
+        cacheWrites.push({ path, report });
+        return null;
+      },
     },
   });
 
@@ -119,12 +124,14 @@ test("doctor command emits fresh local report as json", () => {
     "scripts/sync-status.mjs",
     "scripts/lark-im-quality.mjs",
   ]);
+  assert.deepEqual(cacheWrites, []);
 });
 
 test("doctor command runs live probe with tolerated delayed exit status", () => {
   const stdout = memoryWriter();
   const stderr = memoryWriter();
   const calls = [];
+  const cacheWrites = [];
   const exitCode = runDoctorCli(
     [
       "--live",
@@ -144,6 +151,11 @@ test("doctor command runs live probe with tolerated delayed exit status", () => 
         runJson: fakeRunJson(calls, {
           live: { status: "healthy", ok: true, missing_count: 0, lag_ms: 1000 },
         }),
+        liveProbeCachePath: "logs/test/live-probe.json",
+        writeLiveProbeCache: (path, report) => {
+          cacheWrites.push({ path, report });
+          return { status: report.live.status };
+        },
       },
     },
   );
@@ -164,12 +176,16 @@ test("doctor command runs live probe with tolerated delayed exit status", () => 
     "4",
     "--format",
   ]);
+  assert.equal(cacheWrites.length, 1);
+  assert.equal(cacheWrites[0].path, "logs/test/live-probe.json");
+  assert.equal(cacheWrites[0].report.live.status, "healthy");
 });
 
 test("doctor command normalizes live keychain failures without failing local health", () => {
   const stdout = memoryWriter();
   const stderr = memoryWriter();
   const calls = [];
+  const cacheWrites = [];
   const exitCode = runDoctorCli(["--live", "--format", "json"], {
     stdout: stdout.stream,
     stderr: stderr.stream,
@@ -182,6 +198,10 @@ test("doctor command normalizes live keychain failures without failing local hea
           stderr: "keychain Get failed: keychain not initialized",
         },
       }),
+      writeLiveProbeCache: (path, report) => {
+        cacheWrites.push({ path, report });
+        return { status: report.live.status };
+      },
     },
   });
 
@@ -192,6 +212,8 @@ test("doctor command normalizes live keychain failures without failing local hea
   assert.equal(report.live.status, "unavailable");
   assert.equal(report.live.reason, "keychain_unavailable");
   assert.deepEqual(report.findings, ["live lag probe unavailable in this shell"]);
+  assert.equal(cacheWrites.length, 1);
+  assert.equal(cacheWrites[0].report.live.status, "unavailable");
 });
 
 test("doctor command returns exit code 2 when report needs attention", () => {

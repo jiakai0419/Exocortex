@@ -5,6 +5,10 @@ import {
   buildReport,
   runJson,
 } from "../diagnostics/doctor-report.mjs";
+import {
+  DEFAULT_LIVE_PROBE_CACHE_PATH,
+  writeLiveProbeCache,
+} from "../diagnostics/live-probe-cache.mjs";
 import { renderDoctorText } from "../terminal/doctor-view.mjs";
 
 const DEFAULT_DB = "data/exocortex.sqlite";
@@ -26,6 +30,8 @@ const DEFAULT_DB = "data/exocortex.sqlite";
  * @property {(args: string[], okStatuses?: Set<number>) => JsonObject=} runJson
  * @property {(dbPath: string) => string=} resolvePath
  * @property {() => Date=} now
+ * @property {string=} liveProbeCachePath
+ * @property {(path: string, report: JsonObject) => JsonObject | null=} writeLiveProbeCache
  *
  * @typedef {object} CliIo
  * @property {{write: (text: string) => unknown}=} stdout
@@ -94,7 +100,16 @@ function parseArgs(argv) {
  * @param {DoctorCommandDeps} [deps]
  */
 function executeDoctor(opts, deps = {}) {
-  return buildReport(opts, deps);
+  const report = buildReport(opts, deps);
+  if (opts.live) {
+    try {
+      const writeCache = deps.writeLiveProbeCache || writeLiveProbeCache;
+      writeCache(deps.liveProbeCachePath || DEFAULT_LIVE_PROBE_CACHE_PATH, report);
+    } catch {
+      // Freshness cache is best-effort; doctor health must continue to reflect the probe itself.
+    }
+  }
+  return report;
 }
 
 /**
