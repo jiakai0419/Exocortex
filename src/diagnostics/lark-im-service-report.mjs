@@ -13,6 +13,9 @@ import { summarizeWorkerEvents } from "../../dist/runtime/worker/lark-im-worker-
 import { readLiveProbeCache } from "./live-probe-cache.mjs";
 
 const DEFAULT_FRESHNESS_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_STABILITY_WINDOW_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_WORKER_LOG_TAIL_BYTES = 8 * 1024 * 1024;
+const DEFAULT_WORKER_LOG_MAX_EVENTS = 20000;
 
 /**
  * @typedef {Record<string, any>} JsonObject
@@ -35,6 +38,7 @@ const DEFAULT_FRESHNESS_MAX_AGE_MS = 24 * 60 * 60 * 1000;
  * @property {(path: string) => JsonObject | null=} readLiveProbeCache
  * @property {number=} nowMs
  * @property {number=} freshnessMaxAgeMs
+ * @property {number=} stabilityWindowMs
  *
  * @typedef {"running" | "stopped"} ServiceRuntimeStatus
  * @typedef {"ok" | "catching_up" | "problem"} ServiceHealthStatus
@@ -111,11 +115,11 @@ function readFileTail(path, maxBytes = 512 * 1024) {
 function readRecentWorkerEvents(logDir) {
   const path = resolve(logDir, "worker.jsonl");
   if (!existsSync(path)) return { path, exists: false, events: [] };
-  const lines = readFileTail(path)
+  const lines = readFileTail(path, DEFAULT_WORKER_LOG_TAIL_BYTES)
     .trim()
     .split("\n")
     .filter(Boolean)
-    .slice(-200);
+    .slice(-DEFAULT_WORKER_LOG_MAX_EVENTS);
   /** @type {JsonObject[]} */
   const events = [];
   for (const line of lines) {
@@ -126,6 +130,78 @@ function readRecentWorkerEvents(logDir) {
     }
   }
   return { path, exists: true, events };
+}
+
+/**
+ * @param {JsonObject | null | undefined} event
+ * @returns {number | null}
+ */
+function eventTimeMs(event) {
+  const parsed = Date.parse(String(event?.at || event?.finished_at || event?.started_at || ""));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+/**
+ * @param {unknown[]} events
+ * @param {number} [nowMs]
+ * @param {number} [windowMs]
+ */
+function summarizeWorkerStability(events, nowMs = Date.now(), windowMs = DEFAULT_STABILITY_WINDOW_MS) {
+  const windowStartMs = nowMs - windowMs;
+  const normalized = (events || [])
+    .filter((event) => event && typeof event === "object")
+    .map((event) => /** @type {JsonObject} */ (event))
+    .map((event) => ({ event, at_ms: eventTimeMs(event) }))
+    .filter((item) => item.at_ms !== null && item.at_ms >= windowStartMs && item.at_ms <= nowMs)
+    .sort((a, b) => Number(a.at_ms) - Number(b.at_ms));
+  const cycles = normalized.filter((item) => item.event.type === "lark_im_worker_cycle");
+  const successCycles = cycles.filter((item) => item.event.ok === true);
+  const failedCycles = cycles.filter((item) => item.event.ok === false);
+  const failedSteps = normalized.filter(
+    (item) => item.event.type === "lark_im_worker_step" && item.event.ok === false,
+  );
+  /** @type {Record<string, number>} */
+  const failuresByStep = {};
+  for (const item of failedSteps) {
+    const name = String(item.event.name || "unknown");
+    failuresByStep[name] = (failuresByStep[name] || 0) + 1;
+  }
+  const successTimes = successCycles.map((item) => Number(item.at_ms));
+  const lastSuccess = successCycles.at(-1);
+  let longestBetweenSuccessesMs = windowMs;
+  if (successTimes.length > 0) {
+    longestBetweenSuccessesMs = Math.max(0, successTimes[0] - windowStartMs);
+    for (let i = 1; i < successTimes.length; i += 1) {
+      longestBetweenSuccessesMs = Math.max(longestBetweenSuccessesMs, successTimes[i] - successTimes[i - 1]);
+    }
+    longestBetweenSuccessesMs = Math.max(longestBetweenSuccessesMs, nowMs - successTimes[successTimes.length - 1]);
+  }
+
+  return {
+    window_ms: windowMs,
+    window_started_at: new Date(windowStartMs).toISOString(),
+    observed_events: normalized.length,
+    cycles: {
+      total: cycles.length,
+      ok: successCycles.length,
+      failed: failedCycles.length,
+    },
+    last_success: lastSuccess
+      ? {
+          cycle: lastSuccess.event.cycle ?? null,
+          at: new Date(Number(lastSuccess.at_ms)).toISOString(),
+          age_ms: Math.max(0, nowMs - Number(lastSuccess.at_ms)),
+        }
+      : null,
+    longest_between_successes_ms: longestBetweenSuccessesMs,
+    failures: {
+      failed_cycles: failedCycles.length,
+      failed_steps: failedSteps.length,
+      by_step: Object.entries(failuresByStep)
+        .map(([name, count]) => ({ name, count }))
+        .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name)),
+    },
+  };
 }
 
 /**
@@ -280,6 +356,11 @@ function buildServiceStatusReport(opts, deps = {}) {
   const syncStatus = parseJsonOutput(sync);
   const workerLog = readWorkerLog(opts.logDir);
   const workerSummary = summarize(workerLog.events, nowMs);
+  const workerStability = summarizeWorkerStability(
+    workerLog.events,
+    nowMs,
+    deps.stabilityWindowMs || DEFAULT_STABILITY_WINDOW_MS,
+  );
   const liveProbeCachePath = resolve(opts.logDir, "live-probe.json");
   const liveProbe = readFreshnessCache(liveProbeCachePath);
   const serviceState = loaded ? launchdState.state || "loaded" : "not loaded";
@@ -316,6 +397,7 @@ function buildServiceStatusReport(opts, deps = {}) {
       log: workerLog,
       summary: workerSummary,
     },
+    stability: workerStability,
     freshness: {
       cache_path: liveProbeCachePath,
       cache: liveProbe,
@@ -328,7 +410,11 @@ export {
   buildServiceStatusReport,
   durationText,
   DEFAULT_FRESHNESS_MAX_AGE_MS,
+  DEFAULT_STABILITY_WINDOW_MS,
+  DEFAULT_WORKER_LOG_MAX_EVENTS,
+  DEFAULT_WORKER_LOG_TAIL_BYTES,
   isCatchingUp,
+  eventTimeMs,
   parseJsonOutput,
   parseLaunchdState,
   readFileTail,
@@ -338,4 +424,5 @@ export {
   summarizeServiceFreshness,
   summarizeServiceHealth,
   summarizeServiceRuntime,
+  summarizeWorkerStability,
 };

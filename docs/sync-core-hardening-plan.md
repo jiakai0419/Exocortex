@@ -141,6 +141,7 @@ v0 质量验收已经完成并固化到 `docs/v0-baseline.md`。
 
 - `lark-im-service status` 增加面向人的四层状态模型：`Service` 表示后台是否会继续自动同步，`Health` 表示当前同步事实是否可信，`Activity` 表示 worker 当前是否在执行同步 step，`Freshness` 表示最近 live probe 是否有缓存验证结果；`Next` 动作建议先搁置。
 - `doctor --live` 成功运行后写入 `logs/lark-im/live-probe.json` 脱敏缓存；`lark-im-service status` 只读取该缓存展示 `Freshness`，不默认联网跑 live probe。
+- `lark-im-service status` 增加 `Last 24h` 运行证据：cycle 成功/失败数、最近成功 cycle、失败 step 聚合，以及 `Longest between successes`。该指标定义为过去 24 小时内相邻两次成功 worker cycle 之间的最长间隔；窗口开始到第一次成功、最后一次成功到现在也计入。
 
 ### 2026-06-20
 

@@ -21,11 +21,31 @@ function ageText(ms) {
   const seconds = Math.floor(Number(ms) / 1000);
   if (seconds < 60) return `${seconds}s ago`;
   const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ${seconds % 60}s ago`;
+  if (minutes < 60) return seconds % 60 === 0 ? `${minutes}m ago` : `${minutes}m ${seconds % 60}s ago`;
   const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ${minutes % 60}m ago`;
+  if (hours < 24) return minutes % 60 === 0 ? `${hours}h ago` : `${hours}h ${minutes % 60}m ago`;
   const days = Math.floor(hours / 24);
-  return `${days}d ${hours % 24}h ago`;
+  return hours % 24 === 0 ? `${days}d ago` : `${days}d ${hours % 24}h ago`;
+}
+
+/** @param {unknown} ms */
+function durationText(ms) {
+  if (ms === null || ms === undefined) return "unknown";
+  const seconds = Math.max(0, Math.floor(Number(ms) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return seconds % 60 === 0 ? `${minutes}m` : `${minutes}m ${seconds % 60}s`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return minutes % 60 === 0 ? `${hours}h` : `${hours}h ${minutes % 60}m`;
+  const days = Math.floor(hours / 24);
+  return hours % 24 === 0 ? `${days}d` : `${days}d ${hours % 24}h`;
+}
+
+/** @param {unknown} ms */
+function windowText(ms) {
+  const hours = Number(ms) / (60 * 60 * 1000);
+  if (Number.isInteger(hours) && hours <= 72) return `${hours}h`;
+  return durationText(ms);
 }
 
 /** @param {unknown} value */
@@ -76,11 +96,50 @@ function formatOverviewItem(item) {
   return `${statusBadge(item.status || "unknown")} ${item.detail || ""}`.trim();
 }
 
+/** @param {JsonObject | null | undefined} stability */
+function formatStabilityCycles(stability) {
+  if (!stability) return "unknown";
+  const cycles = stability.cycles || {};
+  return `${cycles.ok || 0} ok, ${cycles.failed || 0} failed, ${cycles.total || 0} total`;
+}
+
+/** @param {JsonObject | null | undefined} stability */
+function formatStabilityLastSuccess(stability) {
+  if (!stability) return "unknown";
+  if (!stability.last_success) {
+    return stability.observed_events > 0 ? "none in window" : "no worker events in window";
+  }
+  const cycle = stability.last_success.cycle === null || stability.last_success.cycle === undefined
+    ? ""
+    : `#${stability.last_success.cycle} `;
+  return `${cycle}${ageText(stability.last_success.age_ms)}`.trim();
+}
+
+/** @param {JsonObject | null | undefined} stability */
+function formatStabilityFailures(stability) {
+  if (!stability) return "unknown";
+  const failures = stability.failures || {};
+  const parts = [];
+  if (Number(failures.failed_cycles || 0) > 0) {
+    parts.push(`${failures.failed_cycles} failed cycle${failures.failed_cycles === 1 ? "" : "s"}`);
+  }
+  for (const item of (failures.by_step || []).slice(0, 3)) {
+    parts.push(`${item.name || "unknown"} x${item.count || 0}`);
+  }
+  return parts.length > 0 ? parts.join(", ") : "none";
+}
+
+/** @param {JsonObject | null | undefined} stability */
+function stabilitySectionTitle(stability) {
+  return `Last ${windowText(stability?.window_ms || 24 * 60 * 60 * 1000)}`;
+}
+
 /** @param {JsonObject} report */
 function renderServiceStatusText(report) {
   const syncStatus = report.sync?.status || null;
   const workerLog = report.worker?.log || { exists: false, path: "logs/lark-im/worker.jsonl" };
   const workerSummary = report.worker?.summary || {};
+  const stability = report.stability || null;
   const overview = report.overview || {
     service: {
       status: report.service_state === "not loaded" ? "stopped" : "running",
@@ -113,6 +172,14 @@ function renderServiceStatusText(report) {
       ],
       { width: 9 },
     ),
+    "",
+    section(stabilitySectionTitle(stability)),
+    kv([
+      ["Cycles", formatStabilityCycles(stability)],
+      ["Last success", formatStabilityLastSuccess(stability)],
+      ["Longest between successes", durationText(stability?.longest_between_successes_ms)],
+      ["Failures", formatStabilityFailures(stability)],
+    ]),
     "",
     section("LaunchAgent"),
     kv([
@@ -198,7 +265,11 @@ function renderServiceStatusText(report) {
 
 export {
   ageText,
+  durationText,
   formatOverviewItem,
+  formatStabilityCycles,
+  formatStabilityFailures,
+  formatStabilityLastSuccess,
   formatWorkerCycle,
   formatWorkerEvent,
   formatWorkerFailure,

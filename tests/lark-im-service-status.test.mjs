@@ -7,6 +7,7 @@ import {
   buildServiceOverview,
   parseJsonOutput,
   parseLaunchdState,
+  summarizeWorkerStability,
 } from "../src/diagnostics/lark-im-service-report.mjs";
 import { renderServiceStatusText } from "../src/terminal/lark-im-service-view.mjs";
 
@@ -83,14 +84,54 @@ function workerSummaryFixture(overrides = {}) {
   };
 }
 
+function stabilityFixture(overrides = {}) {
+  return {
+    window_ms: 24 * 60 * 60 * 1000,
+    window_started_at: "2026-06-19T00:00:00.000Z",
+    observed_events: 20,
+    cycles: {
+      total: 12,
+      ok: 11,
+      failed: 1,
+    },
+    last_success: {
+      cycle: 12,
+      at: "2026-06-20T00:02:00.000Z",
+      age_ms: 60000,
+    },
+    longest_between_successes_ms: 41 * 60 * 1000,
+    failures: {
+      failed_cycles: 1,
+      failed_steps: 2,
+      by_step: [{ name: "received-catchup", count: 2 }],
+    },
+    ...overrides,
+  };
+}
+
 test("service status report parses launchd, sync status, and worker log summary", () => {
   const calls = [];
   const cachePaths = [];
-  const workerEvents = [{ type: "lark_im_worker_cycle", cycle: 12, ok: true }];
+  const workerEvents = [
+    {
+      type: "lark_im_worker_step",
+      cycle: 12,
+      name: "received-catchup",
+      ok: true,
+      at: "2026-06-20T00:01:30.000Z",
+    },
+    {
+      type: "lark_im_worker_cycle",
+      cycle: 12,
+      ok: true,
+      at: "2026-06-20T00:02:00.000Z",
+    },
+  ];
   const report = buildServiceStatusReport(
     { label: "com.example.worker", target: "gui/501/com.example.worker", logDir: "logs/test" },
     {
       nowMs: Date.parse("2026-06-20T00:03:00.000Z"),
+      stabilityWindowMs: 10 * 60 * 1000,
       runCommand: (cmd, args) => {
         calls.push([cmd, ...args]);
         if (cmd === "launchctl") {
@@ -141,10 +182,61 @@ test("service status report parses launchd, sync status, and worker log summary"
   assert.deepEqual(cachePaths, [report.freshness.cache_path]);
   assert.equal(report.worker.log.exists, true);
   assert.equal(report.worker.summary.last_cycle.cycle, 12);
+  assert.equal(report.stability.cycles.ok, 1);
+  assert.equal(report.stability.last_success.cycle, 12);
+  assert.equal(report.stability.last_success.age_ms, 60000);
   assert.deepEqual(calls, [
     ["launchctl", "print", "gui/501/com.example.worker"],
     [process.execPath, "scripts/sync-status.mjs", "--format", "json"],
   ]);
+});
+
+test("worker stability measures the longest time between successful cycles including window edges", () => {
+  const nowMs = Date.parse("2026-06-20T10:50:00.000Z");
+  const windowMs = 60 * 60 * 1000;
+  const successTimes = ["10:00", "10:01", "10:02", "10:43", "10:44"];
+  const events = successTimes.map((time, index) => ({
+    type: "lark_im_worker_cycle",
+    cycle: index + 1,
+    ok: true,
+    at: `2026-06-20T${time}:00.000Z`,
+  }));
+  events.push({
+    type: "lark_im_worker_step",
+    cycle: 6,
+    name: "received-catchup",
+    ok: false,
+    at: "2026-06-20T10:45:00.000Z",
+  });
+
+  const stability = summarizeWorkerStability(events, nowMs, windowMs);
+
+  assert.equal(stability.cycles.ok, 5);
+  assert.equal(stability.cycles.failed, 0);
+  assert.equal(stability.last_success.cycle, 5);
+  assert.equal(stability.longest_between_successes_ms, 41 * 60 * 1000);
+  assert.deepEqual(stability.failures.by_step, [{ name: "received-catchup", count: 1 }]);
+});
+
+test("worker stability reports the whole window when no successful cycle exists", () => {
+  const stability = summarizeWorkerStability(
+    [
+      {
+        type: "lark_im_worker_cycle",
+        cycle: 1,
+        ok: false,
+        at: "2026-06-20T10:10:00.000Z",
+      },
+    ],
+    Date.parse("2026-06-20T10:50:00.000Z"),
+    60 * 60 * 1000,
+  );
+
+  assert.equal(stability.cycles.total, 1);
+  assert.equal(stability.cycles.ok, 0);
+  assert.equal(stability.cycles.failed, 1);
+  assert.equal(stability.last_success, null);
+  assert.equal(stability.longest_between_successes_ms, 60 * 60 * 1000);
 });
 
 test("service status report preserves not-loaded and sync-unavailable states", () => {
@@ -299,6 +391,7 @@ test("service status view renders launchd, sync, unsupported scopes, and worker 
         log: { path: "logs/test/worker.jsonl", exists: true, events: [] },
         summary: workerSummaryFixture(),
       },
+      stability: stabilityFixture(),
     }),
   );
 
@@ -309,6 +402,11 @@ test("service status view renders launchd, sync, unsupported scopes, and worker 
   assert.match(output, /Activity\s+IDLE/);
   assert.match(output, /Freshness\s+UNKNOWN no cached live probe/);
   assert.doesNotMatch(output, /OK_WITH_HISTORY/);
+  assert.match(output, /Last 24h/);
+  assert.match(output, /Cycles\s+11 ok, 1 failed, 12 total/);
+  assert.match(output, /Last success\s+#12 1m ago/);
+  assert.match(output, /Longest between successes\s+41m/);
+  assert.match(output, /Failures\s+1 failed cycle, received-catchup x2/);
   assert.match(output, /LaunchAgent/);
   assert.match(output, /Records\s+3 total, 1 sent, 2 received/);
   assert.match(output, /Unsupported scopes\s+1 total/);
