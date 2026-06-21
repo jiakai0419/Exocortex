@@ -144,6 +144,7 @@ v0 质量验收已经完成并固化到 `docs/v0-baseline.md`。
 - `lark-im-service status` 增加 `Last 24h` 运行证据：cycle 成功/失败数、最近成功 cycle、失败 step 聚合，以及 `Longest between successes`。该指标定义为过去 24 小时内相邻两次成功 worker cycle 之间的最长间隔；窗口开始到第一次成功、最后一次成功到现在也计入。
 - `messages` 日常入口拆成 `src/diagnostics/messages-report.mjs`、`src/terminal/messages-view.mjs` 和 `src/cli/messages-command.mjs`；`scripts/messages.mjs` 保持稳定 wrapper。新增匿名 shape tests 覆盖参数解析、SQL 条件、私聊接收人、系统消息、text/json/error 输出，并把 senderless system message 展示为 `系统` 而不是 `unknown`。
 - `lark-im-quality` 诊断入口拆成 `src/diagnostics/lark-im-quality-report.mjs`、`src/terminal/lark-im-quality-view.mjs` 和 `src/cli/lark-im-quality-command.mjs`；`scripts/lark-im-quality.mjs` 保持稳定 wrapper。新增 CLI tests 覆盖 text/json/help/error 输出，原有 SQLite fixture 继续覆盖 actionable sender gaps、system senderless、unresolved app sender、missing chat name、invalid body 和 unsupported reasons。
+- `lark-im-lag-check` live probe 入口拆成 `src/diagnostics/lark-im-lag-report.mjs`、`src/terminal/lark-im-lag-view.mjs` 和 `src/cli/lark-im-lag-command.mjs`；`scripts/lark-im-lag-check.mjs` 保持稳定 wrapper。新增匿名 shape/fake deps tests 覆盖 healthy、delayed、restricted unsupported chat、remote probe error、text/json/help/error 输出和 keychain unavailable 错误路径。真实 live probe 仍只作为本机验收，不进入 CI。
 
 ### 2026-06-20
 
