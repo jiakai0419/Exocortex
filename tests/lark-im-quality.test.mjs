@@ -5,7 +5,12 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { plain } from "../dist/terminal/index.js";
-import { collect, parseArgs, render } from "../scripts/lark-im-quality.mjs";
+import {
+  parseArgs,
+  runQualityCli,
+} from "../src/cli/lark-im-quality-command.mjs";
+import { collectQualityReport } from "../src/diagnostics/lark-im-quality-report.mjs";
+import { renderQualityText } from "../src/terminal/lark-im-quality-view.mjs";
 import {
   createRun,
   ensureInitialized,
@@ -14,6 +19,18 @@ import {
   succeedMessageRun,
 } from "../dist/storage/sqlite/ingestion-store.js";
 import { cursorAfter, recordFromMessage } from "../scripts/lark-im-sync.mjs";
+
+function memoryWriter() {
+  let text = "";
+  return {
+    stream: {
+      write(chunk) {
+        text += String(chunk);
+      },
+    },
+    text: () => text,
+  };
+}
 
 function tempDb(t) {
   const dir = mkdtempSync(join(tmpdir(), "exocortex-quality-test-"));
@@ -109,7 +126,7 @@ test("lark im quality report flags missing names, chat names, and invalid bodies
     "insert synthetic received scope",
   );
 
-  const report = collect(dbPath);
+  const report = collectQualityReport(dbPath);
 
   assert.deepEqual(report.messages, {
     total: 3,
@@ -139,10 +156,10 @@ test("lark im quality report flags missing names, chat names, and invalid bodies
     },
     { reason: "restricted_mode", lark_cli_error_code: "", lark_cli_error_message: "", count: 1 },
   ]);
-  assert.match(plain(render(report)), /Lark IM data quality NEEDS ATTENTION/);
-  assert.match(plain(render(report)), /Unsupported reasons/);
-  assert.match(plain(render(report)), /230002: Bot\/User can NOT be out of the chat\./);
-  assert.match(plain(render(report)), /restricted_mode/);
+  assert.match(plain(renderQualityText(report)), /Lark IM data quality NEEDS ATTENTION/);
+  assert.match(plain(renderQualityText(report)), /Unsupported reasons/);
+  assert.match(plain(renderQualityText(report)), /230002: Bot\/User can NOT be out of the chat\./);
+  assert.match(plain(renderQualityText(report)), /restricted_mode/);
 });
 
 test("lark im quality treats senderless system and known unresolved app senders as advisory", (t) => {
@@ -187,7 +204,7 @@ test("lark im quality treats senderless system and known unresolved app senders 
     "mark unresolved app sender",
   );
 
-  const report = collect(dbPath);
+  const report = collectQualityReport(dbPath);
 
   assert.equal(report.quality.missing_sender_name, 2);
   assert.equal(report.quality.missing_user_sender_name, 0);
@@ -195,7 +212,7 @@ test("lark im quality treats senderless system and known unresolved app senders 
   assert.equal(report.quality.unresolved_app_sender_name, 1);
   assert.equal(report.quality.missing_system_sender_name, 1);
   assert.equal(report.quality.actionable_missing_sender_name, 0);
-  assert.match(plain(render(report)), /Lark IM data quality OK/);
+  assert.match(plain(renderQualityText(report)), /Lark IM data quality OK/);
 });
 
 test("lark im quality argument parsing keeps json output explicit", () => {
@@ -204,4 +221,75 @@ test("lark im quality argument parsing keeps json output explicit", () => {
     format: "json",
   });
   assert.throws(() => parseArgs(["--format", "xml"]), /--format must be text or json/);
+});
+
+test("lark im quality command renders text, json, help, and dependency errors", () => {
+  const report = {
+    messages: { total: 3, sent: 1, received: 2, latest_at: "2026-06-20T00:00:00.000Z" },
+    message_types: [{ msg_type: "text", count: 3 }],
+    quality: {
+      actionable_missing_sender_name: 0,
+      missing_sender_name: 1,
+      missing_user_sender_name: 0,
+      missing_app_sender_name: 1,
+      unresolved_app_sender_name: 1,
+      missing_system_sender_name: 0,
+      missing_chat_name: 0,
+      invalid_rendered_body: 0,
+      deleted_or_recalled_body: 0,
+      app_sender_records: 1,
+    },
+    scopes: {
+      enabled_received_scopes: 2,
+      total_received_scopes: 2,
+      enabled_without_cursor: 0,
+      hot_seen_scopes: 1,
+      unsupported_scopes: 0,
+    },
+    unsupported_reasons: [],
+    recent_failures: [],
+    latest_records: [],
+  };
+  const stdout = memoryWriter();
+  const stderr = memoryWriter();
+  const exitText = runQualityCli([], {
+    stdout: stdout.stream,
+    stderr: stderr.stream,
+    deps: {
+      resolvePath: (dbPath) => `/abs/${dbPath}`,
+      existsSync: () => true,
+      collect: () => report,
+    },
+  });
+
+  assert.equal(exitText, 0);
+  assert.equal(stderr.text(), "");
+  assert.match(plain(stdout.text()), /Lark IM data quality OK/);
+
+  const jsonOut = memoryWriter();
+  const exitJson = runQualityCli(["--format", "json"], {
+    stdout: jsonOut.stream,
+    deps: {
+      resolvePath: (dbPath) => `/abs/${dbPath}`,
+      existsSync: () => true,
+      collect: () => report,
+    },
+  });
+  assert.equal(exitJson, 0);
+  assert.equal(JSON.parse(jsonOut.text()).messages.total, 3);
+
+  const helpOut = memoryWriter();
+  assert.equal(runQualityCli(["--help"], { stdout: helpOut.stream }), 0);
+  assert.match(helpOut.text(), /Usage: node scripts\/lark-im-quality\.mjs/);
+
+  const errorOut = memoryWriter();
+  const exitError = runQualityCli(["--db", "missing.sqlite"], {
+    stderr: errorOut.stream,
+    deps: {
+      resolvePath: (dbPath) => `/abs/${dbPath}`,
+      existsSync: () => false,
+    },
+  });
+  assert.equal(exitError, 1);
+  assert.match(plain(errorOut.text()), /database not found/);
 });
