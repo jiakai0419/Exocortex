@@ -131,6 +131,17 @@ const COMMANDS = [
   },
   {
     group: "maintenance",
+    command: "node scripts/maintenance-check.mjs",
+    file: "scripts/maintenance-check.mjs",
+    summary: "Run the release/maintenance validation flow.",
+    examples: [
+      "node scripts/maintenance-check.mjs",
+      "node scripts/maintenance-check.mjs --live",
+      "node scripts/maintenance-check.mjs --no-restart",
+    ],
+  },
+  {
+    group: "maintenance",
     command: "node scripts/lark-im-enrich-records.mjs",
     file: "scripts/lark-im-enrich-records.mjs",
     summary: "Backfill display names and normalized message bodies for existing records.",

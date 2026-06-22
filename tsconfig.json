@@ -16,6 +16,7 @@
     "scripts/doctor.mjs",
     "scripts/sync-status.mjs",
     "scripts/messages.mjs",
+    "scripts/maintenance-check.mjs",
     "scripts/lark-im-service.mjs",
     "scripts/lark-im-worker.mjs",
     "scripts/lark-im-sync.mjs",

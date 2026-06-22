@@ -233,6 +233,48 @@ node scripts/lark-im-service.mjs status
 
 如果只修改文档、测试或不会被 worker import 的旁路工具，可以不暂停 worker。但一旦不确定，就按上面的维护流程处理。
 
+### Maintenance Check Command
+
+为了避免每次维护后靠人记住一串验收命令，项目提供一个非日常维护入口：
+
+```bash
+node scripts/maintenance-check.mjs
+```
+
+它不会进入默认三命令，只出现在完整命令目录：
+
+```bash
+npm run help -- --all
+```
+
+默认流程：
+
+```text
+git status
+npm run check
+npm run build:check
+npm run typecheck
+npm test
+node scripts/lark-im-service.mjs restart
+node scripts/lark-im-service.mjs wait-ok
+node scripts/doctor.mjs
+node scripts/lark-im-service.mjs status
+```
+
+`git status` 只提示工作区是否干净，不作为失败；本地检查、服务重启、`wait-ok`、`doctor` 和最终 `status` 是验收步骤。前置必需步骤失败后，后续步骤会跳过，避免在代码没通过检查时重启服务。
+
+需要真实远端对照时加：
+
+```bash
+node scripts/maintenance-check.mjs --live
+```
+
+`--live` 会额外运行 `node scripts/doctor.mjs --live`，需要当前 shell 能访问 `lark-cli` auth/keychain。只想跑检查和诊断、不重启后台服务时：
+
+```bash
+node scripts/maintenance-check.mjs --no-restart
+```
+
 ## When Something Looks Wrong
 
 先看总状态：
