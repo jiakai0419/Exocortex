@@ -290,6 +290,39 @@ node scripts/maintenance-check.mjs --live
 
 这样可以把“验收失败”和“修复动作”分开，避免后台验收命令悄悄写入私有运行数据。
 
+## Public-Safe Command Output
+
+这个仓库按 public 项目维护，但本地 runtime 数据是私有记忆。因此 terminal 输出分两类：
+
+```text
+product output      为本机使用者展示真实消息，例如 messages。
+diagnostic output   为维护、验收、排障展示系统状态。
+```
+
+`node scripts/messages.mjs --limit 20` 是产品阅读命令，会显示本地消息内容、群名和人员名。它的输出默认不适合复制到公开 issue、文档或 CI 日志。
+
+维护和诊断命令默认应该 public-safe，只展示状态、计数、时间、脱敏原因和必要摘要，不展示真实 chat id、人名、群名、应用名、链接或消息正文。当前这类命令包括：
+
+```bash
+node scripts/doctor.mjs
+node scripts/doctor.mjs --live
+node scripts/lark-im-service.mjs status
+node scripts/lark-im-quality.mjs
+node scripts/lark-im-lag-check.mjs
+node scripts/lark-im-enrich-records.mjs
+node scripts/lark-im-enrich-scopes.mjs
+node scripts/maintenance-check.mjs
+```
+
+少数命令支持显式打开本地明细：
+
+```bash
+node scripts/lark-im-lag-check.mjs --unsafe-details
+node scripts/lark-im-enrich-records.mjs --unsafe-details
+```
+
+`--unsafe-details` 的含义是：输出可能包含真实本地 ID、群名、人名、应用名、消息片段或远端错误细节，只能用于本机临时排障，不要复制进公开仓库、CI artifact 或聊天记录。
+
 ## When Something Looks Wrong
 
 先看总状态：

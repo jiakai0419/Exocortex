@@ -157,6 +157,17 @@ test("lark-im-enrich-records fills sent group chat names from known local chat m
     },
     occurred_at_ms: 1800000060000,
   });
+  insertRecord(dbPath, {
+    external_id: "om_shape_app_named",
+    canonical: {
+      message_id: "om_shape_app_named",
+      sender_id: "cli_shape_private_app",
+      sender_name: "Private Shape App",
+      sender_type: "app",
+      chat_name: "Shape Hiring Group",
+    },
+    occurred_at_ms: 1800000120000,
+  });
 
   const result = spawnSync(
     process.execPath,
@@ -173,6 +184,9 @@ test("lark-im-enrich-records fills sent group chat names from known local chat m
   const summary = JSON.parse(result.stdout);
   assert.equal(summary.ok, true);
   assert.equal(summary.updated, 1);
+  assert.equal(result.stdout.includes("cli_shape_private_app"), false);
+  assert.equal(result.stdout.includes("Private Shape App"), false);
+  assert.equal(result.stdout.includes("Shape Hiring Group"), false);
 
   const rows = sqliteJson(
     dbPath,
@@ -182,4 +196,19 @@ test("lark-im-enrich-records fills sent group chat names from known local chat m
     "read enriched sent record",
   );
   assert.deepEqual(rows, [{ chat_name: "Shape Hiring Group" }]);
+
+  const unsafe = spawnSync(
+    process.execPath,
+    ["scripts/lark-im-enrich-records.mjs", "--db", dbPath, "--limit", "10", "--unsafe-details"],
+    {
+      cwd: process.cwd(),
+      env: { ...process.env, LARK_CLI: fakeLarkCli },
+      encoding: "utf8",
+      maxBuffer: 10 * 1024 * 1024,
+    },
+  );
+
+  assert.equal(unsafe.status, 0, unsafe.stderr);
+  assert.equal(unsafe.stdout.includes("cli_shape_private_app"), true);
+  assert.equal(unsafe.stdout.includes("Private Shape App"), true);
 });

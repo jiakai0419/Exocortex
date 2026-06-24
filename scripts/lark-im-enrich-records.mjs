@@ -13,6 +13,7 @@ Options:
   --db <path>       SQLite database path. Default: ${DEFAULT_DB}
   --limit <n>       Max records to scan. Default: 1000
   --probe-apps      Re-check all app senders with the Application API.
+  --unsafe-details  Include local IDs, names, and detailed lookup results in stdout.
   --help            Show this help.
 `;
 }
@@ -24,7 +25,7 @@ function parsePositiveInt(value, name) {
 }
 
 function parseArgs(argv) {
-  const opts = { db: DEFAULT_DB, limit: 1000, probeApps: false };
+  const opts = { db: DEFAULT_DB, limit: 1000, probeApps: false, unsafeDetails: false };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--help" || arg === "-h") {
@@ -33,6 +34,10 @@ function parseArgs(argv) {
     }
     if (arg === "--probe-apps") {
       opts.probeApps = true;
+      continue;
+    }
+    if (arg === "--unsafe-details") {
+      opts.unsafeDetails = true;
       continue;
     }
     const next = argv[i + 1];
@@ -450,6 +455,22 @@ function loadKnownChatNames(dbPath) {
   return names;
 }
 
+function scalarDiagnostics(diagnostics) {
+  return {
+    contact_ids_requested: diagnostics.contact_ids_requested,
+    contact_lookup_failures: diagnostics.contact_lookup_failures,
+    app_ids_requested: diagnostics.app_ids_requested,
+    app_lookup_successes: diagnostics.app_lookup_successes,
+    app_lookup_failures: diagnostics.app_lookup_failures,
+    app_lookup_permission_denied: diagnostics.app_lookup_permission_denied,
+    app_lookup_other_failures: diagnostics.app_lookup_other_failures,
+    app_fallback_chats_requested: diagnostics.app_fallback_chats_requested,
+    app_fallback_names: diagnostics.app_fallback_names,
+    app_fallback_failures: diagnostics.app_fallback_failures,
+    app_fallback_ambiguous: diagnostics.app_fallback_ambiguous,
+  };
+}
+
 function main() {
   const opts = parseArgs(process.argv.slice(2));
   const dbPath = resolve(opts.db);
@@ -627,34 +648,37 @@ function main() {
         status: opts.probeApps ? "not_requested" : "not_probed",
       }),
     }));
-  process.stdout.write(
-    `${JSON.stringify(
-      {
-        ok: true,
-        scanned: rows.length,
-        updated,
-        contact_names: contactNames.size,
-        group_member_names: memberNames.size,
-        app_names: appNames.size,
-        app_records: [...appStats.values()].reduce((sum, stat) => sum + stat.records, 0),
-        app_distinct_ids: appStats.size,
-        app_probe: {
-          enabled: opts.probeApps,
-          requested: diagnostics.app_ids_requested,
-          resolved: diagnostics.app_lookup_successes,
-          permission_denied: diagnostics.app_lookup_permission_denied,
-          other_failures: diagnostics.app_lookup_other_failures,
-          fallback_names: diagnostics.app_fallback_names,
-          fallback_ambiguous: diagnostics.app_fallback_ambiguous,
-          fallback_failures: diagnostics.app_fallback_failures,
-          results: appResults,
-        },
-        ...diagnostics,
-      },
-      null,
-      2,
-    )}\n`,
-  );
+  const output = {
+    ok: true,
+    scanned: rows.length,
+    updated,
+    contact_names: contactNames.size,
+    group_member_names: memberNames.size,
+    app_names: appNames.size,
+    app_records: [...appStats.values()].reduce((sum, stat) => sum + stat.records, 0),
+    app_distinct_ids: appStats.size,
+    app_probe: {
+      enabled: opts.probeApps,
+      requested: diagnostics.app_ids_requested,
+      resolved: diagnostics.app_lookup_successes,
+      permission_denied: diagnostics.app_lookup_permission_denied,
+      other_failures: diagnostics.app_lookup_other_failures,
+      fallback_names: diagnostics.app_fallback_names,
+      fallback_ambiguous: diagnostics.app_fallback_ambiguous,
+      fallback_failures: diagnostics.app_fallback_failures,
+    },
+    ...scalarDiagnostics(diagnostics),
+  };
+  if (opts.unsafeDetails) {
+    output.app_probe.results = appResults;
+    output.unsafe_details = {
+      contact_lookup_errors: diagnostics.contact_lookup_errors,
+      app_lookup_errors: diagnostics.app_lookup_errors,
+      app_lookup_results: diagnostics.app_lookup_results,
+      app_fallback_errors: diagnostics.app_fallback_errors,
+    };
+  }
+  process.stdout.write(`${JSON.stringify(output, null, 2)}\n`);
 }
 
 try {

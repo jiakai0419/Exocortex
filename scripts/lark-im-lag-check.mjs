@@ -28,6 +28,7 @@ import {
   render,
   runLagCheckCli,
   runLark,
+  sanitizeLagReportForPublicOutput,
   sqliteJson,
   usage,
 } from "../src/cli/lark-im-lag-command.mjs";
@@ -57,6 +58,7 @@ export {
   render,
   runLagCheckCli,
   runLark,
+  sanitizeLagReportForPublicOutput,
   sqliteJson,
   usage,
 };

@@ -39,6 +39,7 @@ const DEFAULT_MESSAGES_PER_CHAT = 5;
  * @property {number} startMs
  * @property {number} endMs
  * @property {LagFormat} format
+ * @property {boolean} unsafeDetails
  * @property {boolean=} help
  *
  * @typedef {Record<string, any>} JsonObject
@@ -66,6 +67,7 @@ Options:
   --start <iso>              Probe start time. Default: today 00:00 local time.
   --end <iso>                Probe end time. Default: now.
   --format <fmt>             text | json. Default: text
+  --unsafe-details           Include local IDs, chat names, sender names, and message excerpts.
   --help                     Show this help.
 `;
 }
@@ -116,10 +118,15 @@ function parseArgs(argv, deps = {}) {
     startMs: 0,
     endMs: 0,
     format: "text",
+    unsafeDetails: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--help" || arg === "-h") return { ...opts, help: true };
+    if (arg === "--unsafe-details") {
+      opts.unsafeDetails = true;
+      continue;
+    }
     const next = argv[i + 1];
     if (!next || next.startsWith("--")) throw new Error(`${arg} requires a value`);
     if (arg === "--db") opts.db = next;
@@ -153,6 +160,42 @@ function executeLagCheck(opts, deps = {}) {
   return collect(dbPath, opts);
 }
 
+/** @param {JsonObject | null | undefined} item */
+function redactedRemote(item) {
+  if (!item) return null;
+  return {
+    created_at: item.created_at,
+    chat_name: "<redacted>",
+    sender_name: "<redacted>",
+    body: "<redacted>",
+    exists_locally: item.exists_locally,
+  };
+}
+
+/** @param {JsonObject | null | undefined} item */
+function redactedLocal(item) {
+  if (!item) return null;
+  return {
+    created_at: item.created_at,
+    chat_name: "<redacted>",
+    direction: item.direction,
+  };
+}
+
+/** @param {JsonObject} report */
+function sanitizeLagReportForPublicOutput(report) {
+  return {
+    ...report,
+    latest_remote: redactedRemote(report.latest_remote),
+    latest_local: redactedLocal(report.latest_local),
+    missing: Array.isArray(report.missing) ? report.missing.map(redactedRemote) : [],
+    unsupported_chats: Array.isArray(report.unsupported_chats)
+      ? report.unsupported_chats.map((chat) => ({ reason: chat.reason || "unsupported" }))
+      : [],
+    probe_errors: Array.isArray(report.probe_errors) ? report.probe_errors.map(() => ({ error: "<redacted>" })) : [],
+  };
+}
+
 /**
  * @param {string[]} argv
  * @param {CliIo} [io]
@@ -167,8 +210,9 @@ function runLagCheckCli(argv, io = {}) {
       return 0;
     }
     const report = executeLagCheck(opts, io.deps || {});
-    if (opts.format === "json") stdout.write(`${JSON.stringify(report, null, 2)}\n`);
-    else stdout.write(renderLagText(report));
+    const outputReport = opts.unsafeDetails ? report : sanitizeLagReportForPublicOutput(report);
+    if (opts.format === "json") stdout.write(`${JSON.stringify(outputReport, null, 2)}\n`);
+    else stdout.write(renderLagText(outputReport));
     return exitCodeForReport(report);
   } catch (error) {
     stderr.write(renderError(error));
@@ -206,6 +250,7 @@ export {
   renderLagText as render,
   runLagCheckCli,
   runLark,
+  sanitizeLagReportForPublicOutput,
   sqliteJson,
   usage,
 };

@@ -70,12 +70,14 @@ function renderLagText(report) {
   if (report.unsupported_chats.length > 0) {
     lines.push("");
     lines.push(section("Unsupported chats"));
-    lines.push(list(report.unsupported_chats.map((chat) => `${chat.chat_name}: ${chat.reason}`)));
+    lines.push(list(report.unsupported_chats.map((chat) => `${chat.chat_name || "<redacted>"}: ${chat.reason}`)));
   }
   if (report.probe_errors.length > 0) {
     lines.push("");
     lines.push(section("Probe errors"));
-    lines.push(list(report.probe_errors.map((error) => `${error.chat_name}: ${compactText(error.error, 180)}`)));
+    lines.push(
+      list(report.probe_errors.map((error) => `${error.chat_name || "<redacted>"}: ${compactText(error.error, 180)}`)),
+    );
   }
   return `${block(lines)}\n`;
 }

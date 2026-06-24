@@ -5,6 +5,7 @@ import { plain } from "../dist/terminal/index.js";
 import {
   parseArgs,
   runLagCheckCli,
+  sanitizeLagReportForPublicOutput,
 } from "../src/cli/lark-im-lag-command.mjs";
 import { collectLagReport } from "../src/diagnostics/lark-im-lag-report.mjs";
 import { renderLagText } from "../src/terminal/lark-im-lag-view.mjs";
@@ -67,7 +68,7 @@ function healthyReport(overrides = {}) {
       created_at: new Date(1800000060000).toISOString(),
       chat_name: "Shape Group B",
       sender_name: "Shape App",
-      body: "<redacted card title>",
+      body: "Private shape card title",
       exists_locally: true,
     },
     latest_local: {
@@ -110,6 +111,8 @@ test("lag command parseArgs keeps explicit time windows stable", () => {
   assert.equal(parsed.startMs, 1800000000000);
   assert.equal(parsed.endMs, 1800000300000);
   assert.equal(parsed.format, "json");
+  assert.equal(parsed.unsafeDetails, false);
+  assert.equal(parseArgs(["--unsafe-details"]).unsafeDetails, true);
   assert.equal(parseArgs(["--help"]).help, true);
   assert.throws(() => parseArgs(["--hot-chats", "0"]), /hot-chats must be positive/);
   assert.throws(() => parseArgs(["--format", "yaml"]), /--format must be text or json/);
@@ -198,6 +201,23 @@ test("lag check CLI renders text, json, help, and dependency errors", () => {
   assert.equal(exitText, 0);
   assert.equal(stderr.text(), "");
   assert.match(plain(stdout.text()), /Lark IM lag check OK/);
+  assert.doesNotMatch(plain(stdout.text()), /Shape Group B/);
+  assert.doesNotMatch(plain(stdout.text()), /Shape App/);
+  assert.doesNotMatch(plain(stdout.text()), /Private shape card title/);
+
+  const unsafeOut = memoryWriter();
+  const exitUnsafe = runLagCheckCli(["--start", opts().start, "--end", opts().end, "--unsafe-details"], {
+    stdout: unsafeOut.stream,
+    deps: {
+      resolvePath: (dbPath) => `/abs/${dbPath}`,
+      existsSync: () => true,
+      collect: () => healthyReport(),
+    },
+  });
+  assert.equal(exitUnsafe, 0);
+  assert.match(plain(unsafeOut.text()), /Shape Group B/);
+  assert.match(plain(unsafeOut.text()), /Shape App/);
+  assert.match(plain(unsafeOut.text()), /Private shape card title/);
 
   const delayed = healthyReport({ ok: false, status: "delayed", missing_count: 1 });
   const jsonOut = memoryWriter();
@@ -210,7 +230,12 @@ test("lag check CLI renders text, json, help, and dependency errors", () => {
     },
   });
   assert.equal(exitJson, 2);
-  assert.equal(JSON.parse(jsonOut.text()).status, "delayed");
+  const jsonReport = JSON.parse(jsonOut.text());
+  assert.equal(jsonReport.status, "delayed");
+  assert.equal(jsonReport.latest_remote.chat_name, "<redacted>");
+  assert.equal(jsonReport.latest_remote.sender_name, "<redacted>");
+  assert.equal(jsonReport.latest_remote.body, "<redacted>");
+  assert.equal(jsonOut.text().includes("Shape Group B"), false);
 
   const helpOut = memoryWriter();
   assert.equal(runLagCheckCli(["--help"], { stdout: helpOut.stream }), 0);
@@ -238,4 +263,30 @@ test("lag check CLI renders text, json, help, and dependency errors", () => {
     },
   }), 1);
   assert.match(plain(keychain.text()), /keychain Get failed/);
+});
+
+test("lag public sanitizer removes local metadata and message excerpts", () => {
+  const report = sanitizeLagReportForPublicOutput(healthyReport({
+    missing: [
+      {
+        message_id: "om_private",
+        created_at: new Date(1800000060000).toISOString(),
+        chat_name: "Private Group",
+        sender_name: "Private Sender",
+        body: "Private missing body",
+      },
+    ],
+    unsupported_chats: [{ chat_id: "oc_private", chat_name: "Private Group", reason: "restricted_mode" }],
+    probe_errors: [{ chat_id: "oc_private", chat_name: "Private Group", error: "private API detail" }],
+  }));
+
+  const text = JSON.stringify(report);
+  assert.equal(text.includes("om_private"), false);
+  assert.equal(text.includes("oc_private"), false);
+  assert.equal(text.includes("Private Group"), false);
+  assert.equal(text.includes("Private Sender"), false);
+  assert.equal(text.includes("Private missing body"), false);
+  assert.equal(text.includes("private API detail"), false);
+  assert.equal(report.missing[0].created_at, new Date(1800000060000).toISOString());
+  assert.equal(report.unsupported_chats[0].reason, "restricted_mode");
 });
