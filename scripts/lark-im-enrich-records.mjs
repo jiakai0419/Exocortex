@@ -418,6 +418,38 @@ function loadRows(dbPath, limit) {
   );
 }
 
+function loadKnownChatNames(dbPath) {
+  const rows = sqliteJson(
+    dbPath,
+    `SELECT chat_id, chat_name
+     FROM (
+       SELECT
+         json_extract(config_json, '$.chat_id') AS chat_id,
+         json_extract(config_json, '$.chat_name') AS chat_name,
+         0 AS priority
+       FROM sync_scopes
+       WHERE source_id = 'lark.im'
+       UNION ALL
+       SELECT
+         json_extract(canonical_json, '$.chat_id') AS chat_id,
+         json_extract(canonical_json, '$.chat_name') AS chat_name,
+         1 AS priority
+       FROM records
+       WHERE source_id = 'lark.im'
+         AND record_type = 'lark.im.message'
+     )
+     WHERE COALESCE(chat_id, '') <> ''
+       AND COALESCE(chat_name, '') <> ''
+     ORDER BY priority;`,
+    "load known chat names",
+  );
+  const names = new Map();
+  for (const row of rows) {
+    if (!names.has(row.chat_id)) names.set(row.chat_id, row.chat_name);
+  }
+  return names;
+}
+
 function main() {
   const opts = parseArgs(process.argv.slice(2));
   const dbPath = resolve(opts.db);
@@ -429,6 +461,7 @@ function main() {
     raw: parseMaybeJson(row.raw_json) || {},
     config: parseMaybeJson(row.scope_config_json) || {},
   }));
+  const knownChatNames = loadKnownChatNames(dbPath);
 
   const self = getSelfProfile();
   const seed = new Map();
@@ -504,7 +537,7 @@ function main() {
     const next = { ...row.canonical };
     const cid = chatId(row.raw, row, row.canonical, row.config);
     const ctype = chatType(row.raw, row.canonical, row.config);
-    const cname = chatName(row.raw, row.canonical, row.config);
+    const cname = chatName(row.raw, row.canonical, row.config) || knownChatNames.get(cid) || "";
     const sid = senderId(row.raw, row, row.canonical);
     const isAppSender = senderType(row.raw, row.canonical) === "app" || String(sid || "").startsWith("cli_");
     const existingSenderName = senderName(row.raw, row.canonical);
