@@ -275,6 +275,21 @@ node scripts/maintenance-check.mjs --live
 node scripts/maintenance-check.mjs --no-restart
 ```
 
+`maintenance-check` 是验收命令，不会自动修改本地消息库。若它因为 data quality 失败，先显式运行对应 maintenance repair，例如：
+
+```bash
+node scripts/lark-im-enrich-scopes.mjs --limit 100
+node scripts/lark-im-enrich-records.mjs --limit 3000 --probe-apps
+```
+
+然后重新运行：
+
+```bash
+node scripts/maintenance-check.mjs --live
+```
+
+这样可以把“验收失败”和“修复动作”分开，避免后台验收命令悄悄写入私有运行数据。
+
 ## When Something Looks Wrong
 
 先看总状态：

@@ -137,6 +137,13 @@ v0 质量验收已经完成并固化到 `docs/v0-baseline.md`。
 
 ## 执行记录
 
+### 2026-06-24
+
+- 24 小时维护验收发现同步主链路健康，但新进入的消息 metadata 出现可修复缺口：`sent_by_me` 先写入的群消息可能缺 `chat_name`，而本地同 `chat_id` 的 received scope 或其他 records 已经知道该名称。
+- `scripts/lark-im-enrich-records.mjs` 增加本地已知 chat metadata repair：回填 records 时先建立 `chat_id -> chat_name` 索引，优先使用 scope 中的已知名称，再使用 records 中的已知名称，补齐缺失的 `canonical_json.chat_name`。
+- 新增 `tests/lark-im-enrich-records.test.mjs`，用临时 SQLite 和 fake `lark-cli` 覆盖该边界，不使用真实消息、真实群名或真实人员。
+- `maintenance-check` 继续只做验收，不自动修复本地数据库。data quality 失败时，先显式运行 `lark-im-enrich-scopes` / `lark-im-enrich-records`，再重跑 `maintenance-check --live`。
+
 ### 2026-06-21
 
 - `lark-im-service status` 增加面向人的四层状态模型：`Service` 表示后台是否会继续自动同步，`Health` 表示当前同步事实是否可信，`Activity` 表示 worker 当前是否在执行同步 step，`Freshness` 表示最近 live probe 是否有缓存验证结果；`Next` 动作建议先搁置。
