@@ -2,6 +2,7 @@
 
 import { spawnSync } from "node:child_process";
 import { recoverStaleSyncState } from "../../dist/storage/sqlite/ingestion-store.js";
+import { classifyLarkFailure } from "../adapters/lark-im/transport.mjs";
 import {
   countBy,
   healthDetail,
@@ -211,7 +212,15 @@ function buildStatus(dbPath, deps = {}) {
     },
     runs: {
       by_status: countBy(runCounts, "status", "count"),
-      recent: recentRuns,
+      recent: recentRuns.map((run) => {
+        const classification = classifyLarkFailure(run.error_message || "");
+        return {
+          ...run,
+          failure_kind: run.status === "succeeded" ? "" : classification.kind,
+          transient: run.status === "succeeded" ? false : classification.transient,
+          error_code: run.status === "succeeded" ? null : classification.code,
+        };
+      }),
     },
     locks,
     recovery,

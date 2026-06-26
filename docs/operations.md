@@ -121,6 +121,25 @@ Failures                     过去 24 小时内失败 cycle 数，以及失败 
 
 `Longest between successes` 衡量的是“成功之间的最大断档”，不是“这段时间完全没有发生同步”。例如成功时间是 `10:00, 10:01, 10:02, 10:43, 10:44`，中间的最大断档是 `10:02 -> 10:43`，显示为 `41m`。
 
+### Transient Lark Failures
+
+飞书 OpenAPI 偶尔会返回瞬时失败。当前已明确按 transient 处理的类型包括：
+
+```text
+network_timeout
+internal_error
+rate_limited
+```
+
+其中 `rate_limited` 对应 lark-cli 返回的 `9499 / too many request`。同步器会对这类失败做有限次指数退避重试；只有重试预算耗尽后，才会留下 failed run。failed run 不会推进 cursor，后续 cycle 会从旧 cursor 继续，因此单次已恢复的 `rate_limited` 记录不等于当前同步故障。
+
+可以用下面命令查看最近历史失败的分类：
+
+```bash
+node scripts/lark-im-quality.mjs
+node scripts/sync-status.mjs
+```
+
 ## Initial Catch-Up Done
 
 第一阶段同步基线完成，需要满足：

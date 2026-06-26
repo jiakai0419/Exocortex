@@ -118,7 +118,9 @@ function renderSyncStatusText(status) {
     lines.push(
       list(
         recentProblems.map((run) =>
-          `#${run.id} ${statusBadge(run.status)} ${run.scope_id}: ${run.error_type || ""}`,
+          `#${run.id} ${statusBadge(run.status)} [${
+            run.failure_kind || "unknown"
+          }] ${run.scope_id}: ${run.error_type || ""}`,
         ),
       ),
     );

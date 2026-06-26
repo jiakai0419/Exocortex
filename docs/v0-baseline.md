@@ -280,7 +280,7 @@ src/cli/messages-command.mjs
 - records 幂等写入。
 - failed run 不推进 cursor。
 - lock / stale lock / stale run recovery。
-- Lark transport retry 和命令脱敏。
+- Lark transport retry、rate limit backoff 和命令脱敏。
 - sender/app/chat name resolution fallback。
 - sync runner 成功、失败、locked、disabled、unsupported、batch limit。
 - worker step 顺序和 cycle summary。

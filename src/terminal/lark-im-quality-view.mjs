@@ -83,7 +83,10 @@ function renderQualityText(report) {
     lines.push(
       list(
         report.recent_failures.map(
-          (row) => `#${row.id} ${row.scope_id}: ${row.error_type || "Error"} ${compact(row.error_message, 140)}`,
+          (row) =>
+            `#${row.id} [${row.failure_kind || "unknown"}] ${row.scope_id}: ${
+              row.error_type || "Error"
+            } ${compact(row.error_message, 140)}`,
         ),
       ),
     );

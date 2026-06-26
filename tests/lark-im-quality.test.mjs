@@ -14,6 +14,7 @@ import { renderQualityText } from "../src/terminal/lark-im-quality-view.mjs";
 import {
   createRun,
   ensureInitialized,
+  failRun,
   readScope,
   sqliteExec,
   succeedMessageRun,
@@ -213,6 +214,29 @@ test("lark im quality treats senderless system and known unresolved app senders 
   assert.equal(report.quality.missing_system_sender_name, 1);
   assert.equal(report.quality.actionable_missing_sender_name, 0);
   assert.match(plain(renderQualityText(report)), /Lark IM data quality OK/);
+});
+
+test("lark im quality classifies historical Lark rate limits", (t) => {
+  const dbPath = tempDb(t);
+  const scope = readScope(dbPath, "lark.im.sent_by_me");
+  const runId = createRun(dbPath, scope, { runner: "tests/lark-im-quality.test.mjs" });
+  failRun(
+    dbPath,
+    scope,
+    runId,
+    new Error(
+      'lark-cli im +messages-search --sender <redacted> failed: {"ok":false,"error":{"type":"api","code":9499,"message":"too many request"}}',
+    ),
+  );
+
+  const report = collectQualityReport(dbPath);
+  const output = plain(renderQualityText(report));
+
+  assert.equal(report.recent_failures[0].failure_kind, "rate_limited");
+  assert.equal(report.recent_failures[0].transient, true);
+  assert.equal(report.recent_failures[0].error_code, 9499);
+  assert.match(output, /\[rate_limited\]/);
+  assert.doesNotMatch(output, /ou_secret/);
 });
 
 test("lark im quality argument parsing keeps json output explicit", () => {

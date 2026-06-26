@@ -1,6 +1,7 @@
 // @ts-check
 
 import { spawnSync } from "node:child_process";
+import { classifyLarkFailure } from "../adapters/lark-im/transport.mjs";
 
 /**
  * @typedef {Record<string, any>} JsonObject
@@ -134,7 +135,7 @@ function collectQualityReport(dbPath, deps = {}) {
   );
   const recentFailures = queryJson(
     dbPath,
-    `SELECT id, scope_id, error_type, substr(error_message, 1, 240) AS error_message
+    `SELECT id, scope_id, error_type, error_message
      FROM sync_runs
      WHERE status = 'failed'
      ORDER BY id DESC
@@ -179,7 +180,16 @@ function collectQualityReport(dbPath, deps = {}) {
     quality: quality[0] || {},
     scopes: scopes[0] || {},
     unsupported_reasons: unsupportedReasons,
-    recent_failures: recentFailures,
+    recent_failures: recentFailures.map((row) => {
+      const classification = classifyLarkFailure(row.error_message || "");
+      return {
+        ...row,
+        failure_kind: classification.kind,
+        transient: classification.transient,
+        error_code: classification.code,
+        error_message: String(row.error_message || "").slice(0, 240),
+      };
+    }),
     latest_records: latest,
   };
 }

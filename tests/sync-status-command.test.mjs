@@ -66,7 +66,13 @@ function statusFixture(overrides = {}) {
     runs: {
       by_status: { failed: 1, succeeded: 8 },
       recent: [
-        { id: 12, scope_id: "lark.im.received.chat.1", status: "failed", error_type: "api" },
+        {
+          id: 12,
+          scope_id: "lark.im.received.chat.1",
+          status: "failed",
+          error_type: "api",
+          failure_kind: "rate_limited",
+        },
         { id: 11, scope_id: "lark.im.sent", status: "succeeded" },
       ],
     },
@@ -153,7 +159,7 @@ test("renderText shows summary, unsupported reasons, recovery, and recent failur
   assert.match(output, /230002: Bot\/User can NOT be out of the chat\./);
   assert.match(output, /Recovery/);
   assert.match(output, /Recent non-success runs/);
-  assert.match(output, /#12 FAILED lark\.im\.received\.chat\.1: api/);
+  assert.match(output, /#12 FAILED \[rate_limited\] lark\.im\.received\.chat\.1: api/);
 });
 
 test("buildStatus assembles sqlite rows, recovery, and health detail", () => {
@@ -212,7 +218,14 @@ test("buildStatus assembles sqlite rows, recovery, and health detail", () => {
         return [{ status: "failed", count: 1 }];
       }
       if (label === "read recent runs") {
-        return [{ id: 12, scope_id: "scope", status: "failed" }];
+        return [
+          {
+            id: 12,
+            scope_id: "scope",
+            status: "failed",
+            error_message: '{"error":{"type":"api","code":9499,"message":"too many request"}}',
+          },
+        ];
       }
       if (label === "read locks") return [];
       throw new Error(`unexpected query: ${label}`);
@@ -225,6 +238,9 @@ test("buildStatus assembles sqlite rows, recovery, and health detail", () => {
   assert.equal(status.reconcile.complete, false);
   assert.equal(status.health, "catching_up");
   assert.equal(status.health_detail, "initial catch-up: 1 chat scopes need cursors");
+  assert.equal(status.runs.recent[0].failure_kind, "rate_limited");
+  assert.equal(status.runs.recent[0].transient, true);
+  assert.equal(status.runs.recent[0].error_code, 9499);
   assert.deepEqual(calls[0], ["recover", "/abs/db.sqlite"]);
 });
 
