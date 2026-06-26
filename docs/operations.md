@@ -344,6 +344,43 @@ node scripts/lark-im-enrich-records.mjs --unsafe-details
 
 `--unsafe-details` 的含义是：输出可能包含真实本地 ID、群名、人名、应用名、消息片段或远端错误细节，只能用于本机临时排障，不要复制进公开仓库、CI artifact 或聊天记录。
 
+## SQLite Private Durability
+
+本地 SQLite 是当前衍我的私有记忆库。同步链路健康之后，需要定期确认它本身没有损坏，并且能生成可验证的本地备份。
+
+这不是日常三命令，也不进入默认 help。需要时从完整目录查看：
+
+```bash
+npm run help -- --all
+```
+
+当前维护入口：
+
+```bash
+node scripts/sqlite-maintenance.mjs check
+node scripts/sqlite-maintenance.mjs backup
+node scripts/sqlite-maintenance.mjs verify --latest
+```
+
+`check` 会检查：
+
+```text
+PRAGMA quick_check
+PRAGMA foreign_key_check
+关键表是否存在
+关键表聚合计数
+```
+
+`backup` 使用 SQLite 自身的一致性备份机制生成本地私有备份，而不是直接复制正在使用的数据库文件。默认位置：
+
+```text
+backups/private/
+```
+
+该目录必须保持 git ignored。备份里包含完整个人消息库，只能留在本机私有环境。
+
+`verify --latest` 会打开最新备份，重新跑 integrity check，并和当前数据库比较关键表计数。输出只包含状态、相对路径、计数和校验结果，不展示消息内容、人名、群名、链接或 raw payload。
+
 ## When Something Looks Wrong
 
 先看总状态：

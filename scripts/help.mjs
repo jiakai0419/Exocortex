@@ -142,6 +142,17 @@ const COMMANDS = [
   },
   {
     group: "maintenance",
+    command: "node scripts/sqlite-maintenance.mjs check",
+    file: "scripts/sqlite-maintenance.mjs",
+    summary: "Check, back up, and verify the private SQLite memory database.",
+    examples: [
+      "node scripts/sqlite-maintenance.mjs check",
+      "node scripts/sqlite-maintenance.mjs backup",
+      "node scripts/sqlite-maintenance.mjs verify --latest",
+    ],
+  },
+  {
+    group: "maintenance",
     command: "node scripts/lark-im-enrich-records.mjs",
     file: "scripts/lark-im-enrich-records.mjs",
     summary: "Backfill display names and normalized message bodies for existing records.",

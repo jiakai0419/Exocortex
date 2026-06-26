@@ -17,3 +17,4 @@ data/*.db-*
 data/*.bak
 logs/
 lark-im-resources/
+backups/private/
