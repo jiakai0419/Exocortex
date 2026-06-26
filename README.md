@@ -39,7 +39,7 @@ npm run help -- --all
 
 ## Current Status
 
-当前已经达到 v0.1 runtime baseline：飞书消息事实流能持续进入本地 SQLite，后台 worker 通过 macOS LaunchAgent 长期运行，terminal-first 的查看、诊断和服务状态入口已经有稳定边界与测试覆盖。
+当前已经达到 v0.1 closeout：飞书消息事实流能持续进入本地 SQLite，后台 worker 通过 macOS LaunchAgent 长期运行，terminal-first 的查看、诊断、服务状态、维护验收和 SQLite 私有耐久性入口已经有稳定边界与测试覆盖。
 
 查看后台服务、同步健康、live freshness 和最近 24 小时运行稳定性：
 

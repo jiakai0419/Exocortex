@@ -22,6 +22,17 @@
 CLI、测试、CI 和 live probe 都能验证当前事实流健康。
 ```
 
+截至 2026-06-26，v0.1 closeout 完成：
+
+```text
+后台服务运行在最新 main；
+Service / Health / Activity / Freshness 四层状态稳定；
+最近 24 小时运行窗口没有失败 cycle；
+live probe 验证最近远端热消息没有本地缺失；
+SQLite 私有记忆库通过 integrity check，并能生成可验证本地备份；
+public-safe 诊断边界、terminal 命令目录和 CI 都已验收。
+```
+
 v0.1 仍然不是完整衍我，也不是 UI 或语义层起点。它代表：
 
 ```text
@@ -40,6 +51,10 @@ npm test                                passed
 node scripts/doctor.mjs                 OK, or SYNCING only while worker is actively running
 node scripts/doctor.mjs --live          OK in a shell with keychain access
 node scripts/lark-im-quality.mjs        OK
+node scripts/maintenance-check.mjs      OK after local checks and service wait-ok
+node scripts/sqlite-maintenance.mjs check          OK
+node scripts/sqlite-maintenance.mjs backup         OK, writes to ignored private backup dir
+node scripts/sqlite-maintenance.mjs verify --latest OK
 node scripts/messages.mjs --limit 5     renders latest local records without exposing internal mechanics
 node scripts/lark-im-service.mjs status RUNNING / Health OK / Freshness VERIFIED
 ```
@@ -65,6 +80,9 @@ periodic reconcile complete
 latest live probe missing = 0
 latest live lag is acceptable
 actionable sender gaps = 0
+sqlite quick_check = ok
+sqlite foreign key issues = 0
+latest private backup verifies
 ```
 
 历史失败仍保留在 `sync_runs` 中，这是事实记录。`OK_WITH_HISTORY` 只作为内部诊断事实存在；`lark-im-service status` 的主健康状态会把当前可用系统展示为 `OK`。worker 正在跑时出现 `SYNCING` 也只是当前活动，不等于当前故障。
@@ -74,6 +92,22 @@ actionable sender gaps = 0
 - 飞书 system 消息可能天然没有 sender，不算同步故障。
 - 个别 app sender 在官方 Application API 无权限、且会话机器人列表无法唯一匹配时，保持 unresolved，不强行猜名字。
 - `lark-im-quality` 会显示这些 advisory，但只有 actionable sender gaps、缺群名、invalid body 等可修复问题会让 `doctor` 进入 `NEEDS ATTENTION`。
+
+当前 public-safe 要求：
+
+- README、docs、tests、CI artifact 和 Git history 不记录真实消息内容、真实人员、真实群名、真实链接、真实 ID 或真实运行规模。
+- 诊断和维护命令默认只输出状态、计数、相对路径和脱敏原因。
+- 产品阅读命令 `messages` 可以在本机显示真实私有消息，但输出不适合复制进公开仓库。
+- 需要真实本地细节时必须显式使用 `--unsafe-details` 一类参数，并且只用于本机临时排障。
+
+当前 SQLite 私有耐久性要求：
+
+- 本地库能通过 `PRAGMA quick_check`。
+- 本地库能通过 `PRAGMA foreign_key_check`。
+- 关键表存在，且聚合计数可读取。
+- 私有备份使用 SQLite 自身的一致性备份机制生成，不直接复制运行中的数据库文件。
+- 最新备份能被重新打开、重新检查，并与当前库比较关键表计数。
+- 备份目录必须保持 git ignored。
 
 ## V0 保证
 
@@ -223,6 +257,8 @@ lark-im-service CLI command
                src/cli implementation + stable script wrapper
                status diagnostics report + terminal view
 messages       diagnostics report + terminal view + CLI command
+maintenance    release/maintenance validation command
+sqlite         private durability check/backup/verify command
 ```
 
 `messages` 是日常查看本地消息事实的核心入口。`scripts/messages.mjs` 保持稳定路径，内部已经拆成：
@@ -254,6 +290,8 @@ src/cli/messages-command.mjs
 - `messages` 参数解析、SQLite 查询条件、私聊接收人、系统消息、text/json/error 输出。
 - `live-probe` freshness cache 脱敏摘要。
 - `lark-im-service status` 的 Service / Health / Activity / Freshness 四层状态，以及 Last 24h runtime stability summary。
+- `maintenance-check` 的本地检查、服务 restart/wait-ok、doctor/live/status 编排和 public-safe failure summary。
+- `sqlite-maintenance` 的 integrity check、private backup、latest verify、count mismatch failure 和 public-safe 路径输出。
 - terminal command catalog 和渲染。
 
 ## V0 不保证
@@ -302,6 +340,9 @@ npm run build:check
 npm test
 node scripts/doctor.mjs
 node scripts/lark-im-quality.mjs
+node scripts/maintenance-check.mjs --live
+node scripts/sqlite-maintenance.mjs check
+node scripts/sqlite-maintenance.mjs verify --latest
 node scripts/messages.mjs --limit 20
 node scripts/lark-im-service.mjs status
 ```
@@ -314,13 +355,21 @@ node scripts/doctor.mjs --live
 
 如果 `doctor --live` 显示 `UNAVAILABLE / keychain_unavailable`，只说明当前 shell 不能访问 lark-cli Keychain，不等于后台同步失败。
 
-## 下一步
+## Closeout 后的下一步
 
-v0.1 baseline 之后，不急于进入 UI、语义层或新信息源。
+v0.1 closeout 之后，不急于进入 UI、语义层、新信息源或 v0.2。
 
-建议顺序：
+当前进入观察和维护阶段：
 
 1. 继续观察 worker 长期运行，定期运行 `doctor --live`。
-2. 不急着做 TypeScript production CLI rewrite；先保持当前 JS CLI command 边界稳定。
-3. `messages`、`sync-status`、`doctor`、`lark-im-service` 和 `lark-im-worker` 的 CLI 边界已经迁入 `src`，并保留稳定脚本入口。如果继续重构，下一步优先观察这些入口的稳定性，再评估是否继续做 TypeScript 迁移。
-4. 等同步、诊断和 CLI 边界继续稳定后，再考虑下一信息源或最小语义层。
+2. 定期运行 `sqlite-maintenance check`，需要时生成并验证私有备份。
+3. 维护期间使用 `maintenance-check` 做收尾验收，不把修复动作藏进验收命令里。
+4. 保持当前 JS CLI command 边界稳定，不急着做 TypeScript production rewrite。
+5. 只有在 v0.1 运行继续稳定、且下一阶段目标明确后，再讨论 v0.2。
+
+v0.2 之前如果继续做工程工作，优先级应是：
+
+1. 提升现有 terminal 阅读和诊断质量。
+2. 修补真实运行中暴露的小问题。
+3. 继续降低 public repo 隐私泄露风险。
+4. 补齐已存在边界的测试，而不是扩展产品范围。
