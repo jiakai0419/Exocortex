@@ -99,7 +99,7 @@ test("maintenance check runs local checks, service restart, wait-ok, doctor, liv
       ["scripts/lark-im-service.mjs", "wait-ok", "--timeout-seconds", "12", "--poll-seconds", "3"],
     ],
     ["/usr/local/bin/node", ["scripts/doctor.mjs"]],
-    ["/usr/local/bin/node", ["scripts/doctor.mjs", "--live"]],
+    ["/usr/local/bin/node", ["scripts/doctor.mjs", "--live", "--format", "json"]],
     ["/usr/local/bin/node", ["scripts/lark-im-service.mjs", "status"]],
   ]);
   assert.match(plain(renderMaintenanceText(report)), /Exocortex maintenance check OK/);
@@ -138,6 +138,79 @@ test("maintenance check stops later required steps after a local check failure",
   assert.equal(report.steps.find((step) => step.name === "service restart").status, "skipped");
   assert.equal(report.steps.find((step) => step.name === "doctor live").status, "skipped");
   assert.match(plain(renderMaintenanceText(report)), /redacted syntax failure/);
+});
+
+test("maintenance check keeps structured live failure details and still runs service status", () => {
+  const fake = fakeRun({
+    failures: new Map([
+      [
+        "/usr/local/bin/node scripts/doctor.mjs --live --format json",
+        spawnResult({
+          status: 2,
+          stdout: JSON.stringify({
+            ok: false,
+            overall: "needs_attention",
+            db_path: "/private/shape.sqlite",
+            live: {
+              status: "command_failed",
+              reason: "remote_probe_failed",
+              missing_count: null,
+              lag_ms: null,
+              exit_status: 1,
+              stderr: "private remote detail",
+            },
+            findings: ["live lag probe could not run"],
+          }),
+        }),
+      ],
+    ]),
+  });
+  const report = executeMaintenanceCheck(parseArgs(["--live", "--skip-local-checks", "--no-restart"]), {
+    run: fake.run,
+    nowMs: fakeClock(),
+    execPath: "/usr/local/bin/node",
+  });
+  const live = report.steps.find((step) => step.name === "doctor live");
+  const status = report.steps.find((step) => step.name === "service status");
+  const rendered = plain(renderMaintenanceText(report));
+
+  assert.equal(report.ok, false);
+  assert.equal(live.status, "failed");
+  assert.equal(status.status, "ok");
+  assert.equal(live.details.overall, "needs_attention");
+  assert.equal(live.details.live_status, "command_failed");
+  assert.equal(live.details.live_reason, "remote_probe_failed");
+  assert.equal(live.details.live_exit_status, 1);
+  assert.equal(JSON.stringify(live.details).includes("/private/shape.sqlite"), false);
+  assert.equal(JSON.stringify(live.details).includes("private remote detail"), false);
+  assert.match(rendered, /doctor live details:/);
+  assert.match(rendered, /live_status=command_failed/);
+  assert.doesNotMatch(rendered, /private remote detail/);
+});
+
+test("maintenance check still runs service status after local doctor failure", () => {
+  const fake = fakeRun({
+    failures: new Map([
+      [
+        "/usr/local/bin/node scripts/doctor.mjs",
+        spawnResult({ status: 2, stdout: "doctor needs attention\n" }),
+      ],
+    ]),
+  });
+  const report = executeMaintenanceCheck(parseArgs(["--live", "--skip-local-checks", "--no-restart"]), {
+    run: fake.run,
+    nowMs: fakeClock(),
+    execPath: "/usr/local/bin/node",
+  });
+
+  assert.equal(report.ok, false);
+  assert.equal(report.steps.find((step) => step.name === "doctor").status, "failed");
+  assert.equal(report.steps.find((step) => step.name === "doctor live").status, "skipped");
+  assert.equal(report.steps.find((step) => step.name === "service status").status, "ok");
+  assert.deepEqual(fake.calls.slice(-2), [
+    ["/usr/local/bin/node", ["scripts/doctor.mjs"]],
+    ["/usr/local/bin/node", ["scripts/lark-im-service.mjs", "status"]],
+  ]);
 });
 
 test("maintenance check CLI renders text, json, help, and dependency errors", () => {

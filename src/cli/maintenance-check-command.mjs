@@ -43,6 +43,7 @@ const DEFAULT_POLL_SECONDS = 5;
  * @property {string=} reason
  * @property {string=} stdout_tail
  * @property {string=} stderr_tail
+ * @property {Record<string, any>=} details
  *
  * @typedef {object} MaintenanceReport
  * @property {boolean} ok
@@ -151,6 +152,27 @@ function changedFileCount(lines) {
 }
 
 /**
+ * @param {string} cmd
+ * @param {string[]} args
+ * @param {MaintenanceDeps} deps
+ * @returns {SpawnResult}
+ */
+function runProgram(cmd, args, deps = {}) {
+  const run = deps.run || ((program, programArgs) => {
+    const result = spawnSync(program, programArgs, {
+      encoding: "utf8",
+      maxBuffer: 80 * 1024 * 1024,
+    });
+    return {
+      status: result.status,
+      stdout: String(result.stdout || ""),
+      stderr: String(result.stderr || ""),
+    };
+  });
+  return run(cmd, args);
+}
+
+/**
  * @param {string} name
  * @param {string} command
  * @param {boolean} required
@@ -173,18 +195,7 @@ function skippedStep(name, command, required, reason) {
 function runStep(name, command, cmd, args, required, deps = {}) {
   const nowMs = deps.nowMs || Date.now;
   const started = nowMs();
-  const run = deps.run || ((program, programArgs) => {
-    const result = spawnSync(program, programArgs, {
-      encoding: "utf8",
-      maxBuffer: 80 * 1024 * 1024,
-    });
-    return {
-      status: result.status,
-      stdout: String(result.stdout || ""),
-      stderr: String(result.stderr || ""),
-    };
-  });
-  const result = run(cmd, args);
+  const result = runProgram(cmd, args, deps);
   const status = result.status === 0 ? "ok" : "failed";
   return {
     name,
@@ -195,6 +206,66 @@ function runStep(name, command, cmd, args, required, deps = {}) {
     stdout_tail: tailText(result.stdout),
     stderr_tail: tailText(result.stderr),
   };
+}
+
+/** @param {string} value */
+function parseJsonObject(value) {
+  try {
+    const parsed = JSON.parse(String(value || ""));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Keep only public-safe fields. Do not include db_path, message samples, ids,
+ * raw stdout/stderr, people, chats, links, or local filesystem paths.
+ *
+ * @param {Record<string, any>} report
+ * @param {number | null} commandExitStatus
+ */
+function doctorLiveDetails(report, commandExitStatus) {
+  const live = report.live && typeof report.live === "object" ? report.live : {};
+  return {
+    overall: report.overall || null,
+    live_status: live.status || null,
+    live_reason: live.reason || null,
+    live_missing_count: live.missing_count ?? null,
+    live_lag_ms: live.lag_ms ?? null,
+    live_exit_status: live.exit_status ?? live._command_status ?? null,
+    command_exit_status: commandExitStatus,
+    findings: Array.isArray(report.findings) ? report.findings : [],
+  };
+}
+
+/**
+ * @param {string} name
+ * @param {string} command
+ * @param {string} cmd
+ * @param {string[]} args
+ * @param {MaintenanceDeps} deps
+ * @returns {MaintenanceStep}
+ */
+function runDoctorLiveStep(name, command, cmd, args, deps = {}) {
+  const nowMs = deps.nowMs || Date.now;
+  const started = nowMs();
+  const result = runProgram(cmd, args, deps);
+  /** @type {StepStatus} */
+  const status = result.status === 0 ? "ok" : "failed";
+  const parsed = parseJsonObject(result.stdout.trim());
+  /** @type {MaintenanceStep} */
+  const step = {
+    name,
+    command,
+    status,
+    required: true,
+    duration_ms: Math.max(0, nowMs() - started),
+    stdout_tail: parsed ? "" : tailText(result.stdout),
+    stderr_tail: tailText(result.stderr),
+  };
+  if (parsed) step.details = doctorLiveDetails(parsed, result.status);
+  return step;
 }
 
 /**
@@ -269,14 +340,35 @@ function executeMaintenanceCheck(opts, deps = {}) {
 
   runRequired("doctor", "node scripts/doctor.mjs", execPath, ["scripts/doctor.mjs"]);
   if (opts.live) {
-    runRequired("doctor live", "node scripts/doctor.mjs --live", execPath, ["scripts/doctor.mjs", "--live"]);
+    if (stopped) {
+      steps.push(skippedStep("doctor live", "node scripts/doctor.mjs --live --format json", true, "previous required step failed"));
+    } else {
+      const step = runDoctorLiveStep(
+        "doctor live",
+        "node scripts/doctor.mjs --live --format json",
+        execPath,
+        ["scripts/doctor.mjs", "--live", "--format", "json"],
+        deps,
+      );
+      steps.push(step);
+      if (step.status === "failed") stopped = true;
+    }
   } else {
-    steps.push(skippedStep("doctor live", "node scripts/doctor.mjs --live", true, "--live not requested"));
+    steps.push(skippedStep("doctor live", "node scripts/doctor.mjs --live --format json", true, "--live not requested"));
   }
-  runRequired("service status", "node scripts/lark-im-service.mjs status", execPath, [
-    "scripts/lark-im-service.mjs",
-    "status",
-  ]);
+  const diagnosticFailure = steps.some(
+    (step) => ["doctor", "doctor live"].includes(step.name) && step.status === "failed",
+  );
+  if (stopped && !diagnosticFailure) {
+    steps.push(skippedStep("service status", "node scripts/lark-im-service.mjs status", true, "previous required step failed"));
+  } else {
+    const step = runStep("service status", "node scripts/lark-im-service.mjs status", execPath, [
+      "scripts/lark-im-service.mjs",
+      "status",
+    ], true, deps);
+    steps.push(step);
+    if (step.status === "failed") stopped = true;
+  }
 
   const failedRequired = steps.some((step) => step.required && step.status === "failed");
   return {
@@ -305,6 +397,26 @@ function formatDuration(ms) {
   if (!Number.isFinite(ms)) return "";
   if (ms < 1000) return `${Math.round(ms)}ms`;
   return `${Math.round(ms / 1000)}s`;
+}
+
+/** @param {Record<string, any> | null | undefined} details */
+function renderStepDetails(details) {
+  if (!details || typeof details !== "object") return "";
+  const fields = [
+    ["overall", details.overall],
+    ["live_status", details.live_status],
+    ["live_reason", details.live_reason],
+    ["missing", details.live_missing_count],
+    ["lag_ms", details.live_lag_ms],
+    ["live_exit", details.live_exit_status],
+    ["command_exit", details.command_exit_status],
+  ]
+    .filter(([, value]) => value !== null && value !== undefined && value !== "")
+    .map(([key, value]) => `${key}=${value}`);
+  if (Array.isArray(details.findings) && details.findings.length > 0) {
+    fields.push(`findings=${details.findings.join("; ")}`);
+  }
+  return fields.join(", ");
 }
 
 /** @param {MaintenanceReport} report */
@@ -347,8 +459,11 @@ function renderMaintenanceText(report) {
     lines.push("");
     lines.push(section("Failed output"));
     for (const step of failed) {
-      const output = compact(step.stderr_tail || step.stdout_tail || "(no output)", 500);
-      lines.push(`  - ${step.name}: ${output}`);
+      const details = renderStepDetails(step.details);
+      const output = compact(step.stderr_tail || step.stdout_tail || "", 500);
+      if (details) lines.push(`  - ${step.name} details: ${details}`);
+      if (output) lines.push(`  - ${step.name}: ${output}`);
+      if (!details && !output) lines.push(`  - ${step.name}: (no output)`);
     }
   }
 

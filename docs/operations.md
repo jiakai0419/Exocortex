@@ -275,6 +275,27 @@ node scripts/maintenance-check.mjs --live
 node scripts/maintenance-check.mjs --no-restart
 ```
 
+`maintenance-check --live` 内部使用 JSON 形式读取 live doctor 结果，只保留 public-safe 的结构化摘要，例如：
+
+```text
+overall
+live_status
+live_reason
+live_missing_count
+live_lag_ms
+live_exit_status
+```
+
+它不会把完整 live probe JSON、消息样本、群名、人名、链接、原始 stderr 或本地数据库路径写进失败摘要。
+
+如果 `doctor` 或 `doctor --live` 失败，`maintenance-check` 仍会继续运行最后的：
+
+```bash
+node scripts/lark-im-service.mjs status
+```
+
+这样可以区分“后台同步服务已经坏了”和“诊断/live probe 本身失败”。本命令目前不对 live probe 自动重试；如果失败，需要先看结构化原因，再决定是否重跑或修复。
+
 `maintenance-check` 是验收命令，不会自动修改本地消息库。若它因为 data quality 失败，先显式运行对应 maintenance repair，例如：
 
 ```bash
