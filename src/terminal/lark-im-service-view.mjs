@@ -126,6 +126,9 @@ function formatStabilityFailures(stability) {
   for (const item of (failures.by_step || []).slice(0, 3)) {
     parts.push(`${item.name || "unknown"} x${item.count || 0}`);
   }
+  for (const item of (failures.by_kind || []).slice(0, 3)) {
+    parts.push(`${item.kind || "unknown"} x${item.count || 0}`);
+  }
   return parts.length > 0 ? parts.join(", ") : "none";
 }
 

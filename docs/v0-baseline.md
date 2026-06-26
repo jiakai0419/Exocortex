@@ -289,7 +289,7 @@ src/cli/messages-command.mjs
 - `lark-im-service` 参数、LaunchAgent plist、生命周期命令、worker log rendering 和 `wait-ok` readiness。
 - `messages` 参数解析、SQLite 查询条件、私聊接收人、系统消息、text/json/error 输出。
 - `live-probe` freshness cache 脱敏摘要。
-- `lark-im-service status` 的 Service / Health / Activity / Freshness 四层状态，以及 Last 24h runtime stability summary。
+- `lark-im-service status` 的 Service / Health / Activity / Freshness 四层状态、Last 24h runtime stability summary 和失败原因分类聚合。
 - `maintenance-check` 的本地检查、服务 restart/wait-ok、doctor/live/status 编排和 public-safe failure summary。
 - `sqlite-maintenance` 的 integrity check、private backup、latest verify、count mismatch failure 和 public-safe 路径输出。
 - terminal command catalog 和渲染。

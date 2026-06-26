@@ -5,6 +5,7 @@ import { plain } from "../dist/terminal/index.js";
 import {
   buildServiceStatusReport,
   buildServiceOverview,
+  collectRecentFailureKinds,
   parseJsonOutput,
   parseLaunchdState,
   summarizeWorkerStability,
@@ -104,6 +105,7 @@ function stabilityFixture(overrides = {}) {
       failed_cycles: 1,
       failed_steps: 2,
       by_step: [{ name: "received-catchup", count: 2 }],
+      by_kind: [{ kind: "rate_limited", count: 1 }],
     },
     ...overrides,
   };
@@ -161,6 +163,14 @@ test("service status report parses launchd, sync status, and worker log summary"
           reason: null,
         };
       },
+      sqliteJson: (_dbPath, _sql, label) => {
+        assert.equal(label, "read recent failed run kinds");
+        return [
+          {
+            error_message: '{"error":{"type":"api","code":9499,"message":"too many request"}}',
+          },
+        ];
+      },
       summarizeWorkerEvents: (events) => {
         assert.deepEqual(events, workerEvents);
         return workerSummaryFixture();
@@ -185,6 +195,7 @@ test("service status report parses launchd, sync status, and worker log summary"
   assert.equal(report.stability.cycles.ok, 1);
   assert.equal(report.stability.last_success.cycle, 12);
   assert.equal(report.stability.last_success.age_ms, 60000);
+  assert.deepEqual(report.stability.failures.by_kind, [{ kind: "rate_limited", count: 1 }]);
   assert.deepEqual(calls, [
     ["launchctl", "print", "gui/501/com.example.worker"],
     [process.execPath, "scripts/sync-status.mjs", "--format", "json"],
@@ -258,6 +269,7 @@ test("service status report preserves not-loaded and sync-unavailable states", (
         has_events: false,
         in_progress: false,
       }),
+      sqliteJson: () => [],
     },
   );
 
@@ -406,13 +418,42 @@ test("service status view renders launchd, sync, unsupported scopes, and worker 
   assert.match(output, /Cycles\s+11 ok, 1 failed, 12 total/);
   assert.match(output, /Last success\s+#12 1m ago/);
   assert.match(output, /Longest between successes\s+41m/);
-  assert.match(output, /Failures\s+1 failed cycle, received-catchup x2/);
+  assert.match(output, /Failures\s+1 failed cycle, received-catchup x2, rate_limited x1/);
   assert.match(output, /LaunchAgent/);
   assert.match(output, /Records\s+3 total, 1 sent, 2 received/);
   assert.match(output, /Unsupported scopes\s+1 total/);
   assert.match(output, /restricted_mode/);
   assert.match(output, /Worker/);
   assert.match(output, /received-catchup/);
+});
+
+test("service status recent failure kind aggregation is public-safe", () => {
+  const kinds = collectRecentFailureKinds(
+    "/abs/db.sqlite",
+    Date.parse("2026-06-20T12:00:00.000Z"),
+    24 * 60 * 60 * 1000,
+    {
+      sqliteJson: (dbPath, sql, label) => {
+        assert.equal(dbPath, "/abs/db.sqlite");
+        assert.equal(label, "read recent failed run kinds");
+        assert.match(sql, /started_at >= '2026-06-19T12:00:00\.000Z'/);
+        return [
+          { error_message: '{"error":{"type":"api","code":9499,"message":"too many request"}}' },
+          { error_message: "TLS handshake timeout" },
+          { error_message: "permission denied" },
+        ];
+      },
+    },
+  );
+
+  assert.deepEqual(kinds, {
+    failed_runs: 3,
+    by_kind: [
+      { kind: "network_timeout", count: 1 },
+      { kind: "rate_limited", count: 1 },
+      { kind: "unknown", count: 1 },
+    ],
+  });
 });
 
 test("service status view renders sync failure and missing worker log", () => {

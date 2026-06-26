@@ -116,7 +116,7 @@ Freshness  VERIFIED checked 12m ago, missing 0, lag 0s
 Cycles                       过去 24 小时内 worker cycle 的成功/失败/总数。
 Last success                 最近一次成功 cycle，按 cycle 序号和距现在多久展示。
 Longest between successes    过去 24 小时内，相邻两次成功 worker cycle 之间的最长间隔；如果窗口开始到第一次成功、或最后一次成功到现在更长，也计入。
-Failures                     过去 24 小时内失败 cycle 数，以及失败 step 的聚合计数。
+Failures                     过去 24 小时内失败 cycle 数、失败 step 聚合计数，以及可分类的失败原因聚合计数。
 ```
 
 `Longest between successes` 衡量的是“成功之间的最大断档”，不是“这段时间完全没有发生同步”。例如成功时间是 `10:00, 10:01, 10:02, 10:43, 10:44`，中间的最大断档是 `10:02 -> 10:43`，显示为 `41m`。
@@ -136,6 +136,7 @@ rate_limited
 可以用下面命令查看最近历史失败的分类：
 
 ```bash
+node scripts/lark-im-service.mjs status
 node scripts/lark-im-quality.mjs
 node scripts/sync-status.mjs
 ```

@@ -10,12 +10,14 @@ import {
 } from "node:fs";
 import { resolve } from "node:path";
 import { summarizeWorkerEvents } from "../../dist/runtime/worker/lark-im-worker-core.js";
+import { classifyLarkFailure } from "../adapters/lark-im/transport.mjs";
 import { readLiveProbeCache } from "./live-probe-cache.mjs";
 
 const DEFAULT_FRESHNESS_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_STABILITY_WINDOW_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_WORKER_LOG_TAIL_BYTES = 8 * 1024 * 1024;
 const DEFAULT_WORKER_LOG_MAX_EVENTS = 20000;
+const DEFAULT_DB = "data/exocortex.sqlite";
 
 /**
  * @typedef {Record<string, any>} JsonObject
@@ -30,12 +32,14 @@ const DEFAULT_WORKER_LOG_MAX_EVENTS = 20000;
  * @property {string} label
  * @property {string} target
  * @property {string} logDir
+ * @property {string=} db
  *
  * @typedef {object} ServiceStatusReportDeps
  * @property {(cmd: string, args: string[], options?: {allowFailure?: boolean}) => SpawnResult=} runCommand
  * @property {(logDir: string) => WorkerLogTail=} readRecentWorkerEvents
  * @property {(events: unknown[], nowMs?: number) => JsonObject=} summarizeWorkerEvents
  * @property {(path: string) => JsonObject | null=} readLiveProbeCache
+ * @property {(dbPath: string, sql: string, label: string) => JsonObject[]=} sqliteJson
  * @property {number=} nowMs
  * @property {number=} freshnessMaxAgeMs
  * @property {number=} stabilityWindowMs
@@ -64,6 +68,23 @@ function runCommand(cmd, args, options = {}) {
     throw new Error(`${cmd} ${args.join(" ")} failed: ${result.stderr.trim() || result.stdout.trim()}`);
   }
   return result;
+}
+
+/**
+ * @param {string} dbPath
+ * @param {string} sql
+ * @param {string} label
+ * @returns {JsonObject[]}
+ */
+function sqliteJson(dbPath, sql, label) {
+  const result = spawnSync("sqlite3", ["-json", dbPath], {
+    input: `.timeout 5000\n${sql}`,
+    encoding: "utf8",
+    maxBuffer: 20 * 1024 * 1024,
+  });
+  if (result.status !== 0) throw new Error(`${label} failed: ${result.stderr.trim() || `exit ${result.status}`}`);
+  const trimmed = result.stdout.trim();
+  return trimmed ? JSON.parse(trimmed) : [];
 }
 
 /** @param {string} stdout */
@@ -201,6 +222,43 @@ function summarizeWorkerStability(events, nowMs = Date.now(), windowMs = DEFAULT
         .map(([name, count]) => ({ name, count }))
         .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name)),
     },
+  };
+}
+
+/** @param {unknown} value */
+function quoteSql(value) {
+  return `'${String(value).replaceAll("'", "''")}'`;
+}
+
+/**
+ * @param {string} dbPath
+ * @param {number} nowMs
+ * @param {number} windowMs
+ * @param {ServiceStatusReportDeps} [deps]
+ */
+function collectRecentFailureKinds(dbPath, nowMs, windowMs, deps = {}) {
+  const query = deps.sqliteJson || sqliteJson;
+  const windowStart = new Date(nowMs - windowMs).toISOString();
+  const rows = query(
+    dbPath,
+    `SELECT error_message
+     FROM sync_runs
+     WHERE status = 'failed'
+       AND started_at >= ${quoteSql(windowStart)}
+     ORDER BY id DESC;`,
+    "read recent failed run kinds",
+  );
+  /** @type {Record<string, number>} */
+  const byKind = {};
+  for (const row of rows) {
+    const kind = classifyLarkFailure(row.error_message || "").kind;
+    byKind[kind] = (byKind[kind] || 0) + 1;
+  }
+  return {
+    failed_runs: rows.length,
+    by_kind: Object.entries(byKind)
+      .map(([kind, count]) => ({ kind, count }))
+      .sort((a, b) => b.count - a.count || a.kind.localeCompare(b.kind)),
   };
 }
 
@@ -361,6 +419,16 @@ function buildServiceStatusReport(opts, deps = {}) {
     nowMs,
     deps.stabilityWindowMs || DEFAULT_STABILITY_WINDOW_MS,
   );
+  try {
+    workerStability.failures.by_kind = collectRecentFailureKinds(
+      opts.db || DEFAULT_DB,
+      nowMs,
+      deps.stabilityWindowMs || DEFAULT_STABILITY_WINDOW_MS,
+      deps,
+    ).by_kind;
+  } catch {
+    workerStability.failures.by_kind = [];
+  }
   const liveProbeCachePath = resolve(opts.logDir, "live-probe.json");
   const liveProbe = readFreshnessCache(liveProbeCachePath);
   const serviceState = loaded ? launchdState.state || "loaded" : "not loaded";
@@ -408,7 +476,9 @@ function buildServiceStatusReport(opts, deps = {}) {
 export {
   buildServiceOverview,
   buildServiceStatusReport,
+  collectRecentFailureKinds,
   durationText,
+  DEFAULT_DB,
   DEFAULT_FRESHNESS_MAX_AGE_MS,
   DEFAULT_STABILITY_WINDOW_MS,
   DEFAULT_WORKER_LOG_MAX_EVENTS,
@@ -420,6 +490,7 @@ export {
   readFileTail,
   readRecentWorkerEvents,
   runCommand,
+  sqliteJson,
   summarizeServiceActivity,
   summarizeServiceFreshness,
   summarizeServiceHealth,
