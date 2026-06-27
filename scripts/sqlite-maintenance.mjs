@@ -6,6 +6,7 @@ import { pathToFileURL } from "node:url";
 import {
   DEFAULT_BACKUP_DIR,
   DEFAULT_DB,
+  DEFAULT_PRUNE_RUNS_RETENTION_DAYS,
   TRACKED_TABLES,
   compareCounts,
   databaseCheck,
@@ -13,6 +14,7 @@ import {
   latestBackupPath,
   main,
   parseArgs,
+  pruneNoopSuccessfulRuns,
   publicPath,
   renderSqliteMaintenanceText,
   runSqliteMaintenanceCli,
@@ -23,6 +25,7 @@ import {
 export {
   DEFAULT_BACKUP_DIR,
   DEFAULT_DB,
+  DEFAULT_PRUNE_RUNS_RETENTION_DAYS,
   TRACKED_TABLES,
   compareCounts,
   databaseCheck,
@@ -30,6 +33,7 @@ export {
   latestBackupPath,
   main,
   parseArgs,
+  pruneNoopSuccessfulRuns,
   publicPath,
   renderSqliteMaintenanceText,
   runSqliteMaintenanceCli,

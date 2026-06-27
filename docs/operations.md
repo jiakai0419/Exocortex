@@ -380,6 +380,7 @@ npm run help -- --all
 node scripts/sqlite-maintenance.mjs check
 node scripts/sqlite-maintenance.mjs backup
 node scripts/sqlite-maintenance.mjs verify --latest
+node scripts/sqlite-maintenance.mjs prune-runs
 ```
 
 `check` 会检查：
@@ -400,6 +401,28 @@ backups/private/
 该目录必须保持 git ignored。备份里包含完整个人消息库，只能留在本机私有环境。
 
 `verify --latest` 会打开最新备份，重新跑 integrity check，并和当前数据库比较关键表计数。输出只包含状态、相对路径、计数和校验结果，不展示消息内容、人名、群名、链接或 raw payload。
+
+`prune-runs` 用来控制 `sync_runs` 的长期增长。规则保持简单：
+
+```text
+删除 14 天前的 succeeded no-op runs。
+```
+
+也就是只处理没有扫描、没有写入、没有更新、没有重复记录、且没有被任何 scope 当作 `last_success_run_id` 引用的旧成功 run。它不删除 `running`、`failed`、`cancelled`、有实际数据变化的成功 run，或当前 scope 引用的最新成功 run。
+
+默认只 dry-run：
+
+```bash
+node scripts/sqlite-maintenance.mjs prune-runs
+```
+
+确认候选数量合理后，才显式执行：
+
+```bash
+node scripts/sqlite-maintenance.mjs prune-runs --apply
+```
+
+`prune-runs --apply` 只删除运行日志，不删除 `records` 消息事实，也不推进或修改 cursor。它不会自动 `VACUUM`；如果之后需要实际缩小 SQLite 文件，再单独安排维护窗口处理。
 
 ## When Something Looks Wrong
 

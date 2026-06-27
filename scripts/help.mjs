@@ -149,6 +149,7 @@ const COMMANDS = [
       "node scripts/sqlite-maintenance.mjs check",
       "node scripts/sqlite-maintenance.mjs backup",
       "node scripts/sqlite-maintenance.mjs verify --latest",
+      "node scripts/sqlite-maintenance.mjs prune-runs",
     ],
   },
   {

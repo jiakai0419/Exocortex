@@ -25,10 +25,11 @@ import {
 
 const DEFAULT_DB = "data/exocortex.sqlite";
 const DEFAULT_BACKUP_DIR = "backups/private";
+const DEFAULT_PRUNE_RUNS_RETENTION_DAYS = 14;
 const TRACKED_TABLES = ["sources", "sync_scopes", "records", "sync_runs", "sync_locks"];
 
 /**
- * @typedef {"check" | "backup" | "verify"} SqliteMaintenanceAction
+ * @typedef {"check" | "backup" | "verify" | "prune-runs"} SqliteMaintenanceAction
  * @typedef {"text" | "json"} SqliteMaintenanceFormat
  *
  * @typedef {object} SqliteMaintenanceOptions
@@ -38,6 +39,7 @@ const TRACKED_TABLES = ["sources", "sync_scopes", "records", "sync_runs", "sync_
  * @property {string | null} backup
  * @property {boolean} latest
  * @property {SqliteMaintenanceFormat} format
+ * @property {boolean} dryRun
  * @property {boolean=} help
  *
  * @typedef {Record<string, any>} JsonObject
@@ -58,13 +60,15 @@ const TRACKED_TABLES = ["sources", "sync_scopes", "records", "sync_runs", "sync_
  */
 
 function usage() {
-  return `Usage: node scripts/sqlite-maintenance.mjs <check|backup|verify> [options]
+  return `Usage: node scripts/sqlite-maintenance.mjs <check|backup|verify|prune-runs> [options]
 
 Options:
   --db <path>           SQLite database path. Default: ${DEFAULT_DB}
   --backup-dir <path>   Private backup directory. Default: ${DEFAULT_BACKUP_DIR}
   --backup <path>       Backup file to verify.
   --latest              Verify the newest backup in --backup-dir.
+  --dry-run             For prune-runs: report only. This is the default.
+  --apply               For prune-runs: actually delete eligible old no-op runs.
   --format <fmt>        text | json. Default: text
   --help                Show this help.
 `;
@@ -78,8 +82,8 @@ function quoteSql(value) {
 
 /** @param {string} value */
 function normalizeAction(value) {
-  if (["check", "backup", "verify"].includes(value)) return /** @type {SqliteMaintenanceAction} */ (value);
-  throw new Error("action must be check, backup, or verify");
+  if (["check", "backup", "verify", "prune-runs"].includes(value)) return /** @type {SqliteMaintenanceAction} */ (value);
+  throw new Error("action must be check, backup, verify, or prune-runs");
 }
 
 /** @param {string[]} argv */
@@ -93,6 +97,7 @@ function parseArgs(argv) {
       backup: null,
       latest: false,
       format: "text",
+      dryRun: true,
       help: true,
     };
     return opts;
@@ -106,6 +111,7 @@ function parseArgs(argv) {
     backup: null,
     latest: false,
     format: "text",
+    dryRun: true,
   };
 
   for (let i = 1; i < argv.length; i += 1) {
@@ -113,6 +119,16 @@ function parseArgs(argv) {
     if (arg === "--help" || arg === "-h") return { ...opts, help: true };
     if (arg === "--latest") {
       opts.latest = true;
+      continue;
+    }
+    if (arg === "--dry-run") {
+      if (opts.action !== "prune-runs") throw new Error("--dry-run is only supported for prune-runs");
+      opts.dryRun = true;
+      continue;
+    }
+    if (arg === "--apply") {
+      if (opts.action !== "prune-runs") throw new Error("--apply is only supported for prune-runs");
+      opts.dryRun = false;
       continue;
     }
     const next = argv[i + 1];
@@ -130,6 +146,14 @@ function parseArgs(argv) {
     throw new Error("use either --latest or --backup, not both");
   }
   return opts;
+}
+
+/**
+ * @param {Date} date
+ * @param {number} days
+ */
+function subtractDays(date, days) {
+  return new Date(date.getTime() - days * 24 * 60 * 60 * 1000);
 }
 
 /**
@@ -222,6 +246,61 @@ function databaseCheck(dbPath, deps = {}) {
     missing_tables: missingTables,
     counts,
     size_bytes: Number(stat.size || 0),
+  };
+}
+
+/**
+ * Old no-op success runs are diagnostic noise, not durable memory. Keep failures,
+ * running/cancelled runs, non-empty successes, and each scope's current success.
+ * @param {string} dbPath
+ * @param {string} cutoffAt
+ * @param {boolean} dryRun
+ * @param {SqliteMaintenanceDeps} [deps]
+ */
+function pruneNoopSuccessfulRuns(dbPath, cutoffAt, dryRun, deps = {}) {
+  const eligibleWhere = `
+    r.status = 'succeeded'
+    AND r.started_at < ${quoteSql(cutoffAt)}
+    AND r.scanned_count = 0
+    AND r.inserted_count = 0
+    AND r.updated_count = 0
+    AND r.duplicate_count = 0
+    AND NOT EXISTS (
+      SELECT 1
+      FROM sync_scopes s
+      WHERE s.last_success_run_id = r.id
+    )
+  `;
+  const rows = sqliteJson(
+    dbPath,
+    `SELECT COUNT(*) AS count
+     FROM sync_runs r
+     WHERE ${eligibleWhere};`,
+    "count pruneable sync runs",
+    deps,
+  );
+  const candidateCount = Number(firstCell(rows) || 0);
+  if (!dryRun && candidateCount > 0) {
+    sqliteExec(
+      dbPath,
+      `BEGIN IMMEDIATE;
+       DELETE FROM sync_runs
+       WHERE id IN (
+         SELECT r.id
+         FROM sync_runs r
+         WHERE ${eligibleWhere}
+       );
+       COMMIT;`,
+      "prune sync runs",
+      deps,
+    );
+  }
+  return {
+    retention_days: DEFAULT_PRUNE_RUNS_RETENTION_DAYS,
+    cutoff_at: cutoffAt,
+    dry_run: dryRun,
+    candidate_count: candidateCount,
+    deleted_count: dryRun ? 0 : candidateCount,
   };
 }
 
@@ -321,6 +400,32 @@ function executeSqliteMaintenance(opts, deps = {}) {
     };
   }
 
+  if (opts.action === "prune-runs") {
+    const source = databaseCheck(dbPath, deps);
+    if (!source.ok) {
+      return {
+        ok: false,
+        status: "failed",
+        action: opts.action,
+        checked_at: checkedAt,
+        db_path: publicPath(cwd, dbPath),
+        source_check: source,
+      };
+    }
+    const cutoffAt = subtractDays(now(), DEFAULT_PRUNE_RUNS_RETENTION_DAYS).toISOString();
+    const prune = pruneNoopSuccessfulRuns(dbPath, cutoffAt, opts.dryRun, deps);
+    const check = opts.dryRun ? source : databaseCheck(dbPath, deps);
+    return {
+      ok: check.ok,
+      status: check.ok ? "ok" : "failed",
+      action: opts.action,
+      checked_at: checkedAt,
+      db_path: publicPath(cwd, dbPath),
+      check,
+      prune,
+    };
+  }
+
   if (!opts.latest && !opts.backup) throw new Error("verify requires --latest or --backup <path>");
   const backupPath = resolve(opts.backup || latestBackupPath(backupDir, deps));
   const source = databaseCheck(dbPath, deps);
@@ -354,6 +459,17 @@ function renderSqliteMaintenanceText(report) {
       ["Counts match", report.counts_match === undefined ? "" : report.counts_match ? "yes" : "no"],
     ]),
   ];
+  if (report.prune) {
+    lines.push("");
+    lines.push(section("Run retention"));
+    lines.push(kv([
+      ["Mode", report.prune.dry_run ? "dry-run" : "apply"],
+      ["Rule", `delete succeeded no-op runs older than ${report.prune.retention_days} days`],
+      ["Cutoff", report.prune.cutoff_at],
+      ["Candidates", report.prune.candidate_count],
+      ["Deleted", report.prune.deleted_count],
+    ]));
+  }
   const check = report.backup_check || report.check || report.source_check;
   if (check) {
     lines.push("");
@@ -407,6 +523,7 @@ function main(argv = process.argv.slice(2)) {
 export {
   DEFAULT_BACKUP_DIR,
   DEFAULT_DB,
+  DEFAULT_PRUNE_RUNS_RETENTION_DAYS,
   TRACKED_TABLES,
   compareCounts,
   databaseCheck,
@@ -414,6 +531,7 @@ export {
   latestBackupPath,
   main,
   parseArgs,
+  pruneNoopSuccessfulRuns,
   publicPath,
   renderSqliteMaintenanceText,
   runSqliteMaintenanceCli,

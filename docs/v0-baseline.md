@@ -292,6 +292,7 @@ src/cli/messages-command.mjs
 - `lark-im-service status` 的 Service / Health / Activity / Freshness 四层状态、Last 24h runtime stability summary 和失败原因分类聚合。
 - `maintenance-check` 的本地检查、服务 restart/wait-ok、doctor/live/status 编排和 public-safe failure summary。
 - `sqlite-maintenance` 的 integrity check、private backup、latest verify、count mismatch failure 和 public-safe 路径输出。
+- `sqlite-maintenance prune-runs` 的 dry-run 默认行为、旧 succeeded no-op run 清理规则，以及不删除 failed/running/current success 的边界。
 - terminal command catalog 和渲染。
 
 ## V0 不保证
