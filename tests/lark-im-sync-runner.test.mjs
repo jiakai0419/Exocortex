@@ -58,6 +58,13 @@ function peopleContext(selfProfile) {
   };
 }
 
+function createTestRunner(deps) {
+  return createSyncRunner({
+    isMaintenanceLocked: () => false,
+    ...deps,
+  });
+}
+
 test("createSyncRunner lets sent sync run against injected adapter and store deps", () => {
   const calls = [];
   const selfProfile = { open_id: "ou_self", name: "Me" };
@@ -69,7 +76,7 @@ test("createSyncRunner lets sent sync run against injected adapter and store dep
     cursor: null,
   };
   let written = null;
-  const runner = createSyncRunner({
+  const runner = createTestRunner({
     readScope: (_dbPath, scopeId) => ({ ...sentScope, id: scopeId }),
     acquireLock: (_dbPath, scopeId) => {
       calls.push(["lock", scopeId]);
@@ -123,7 +130,7 @@ test("createSyncRunner classifies unsupported received scopes through injected d
     cursor: null,
   };
   let unsupportedSql = "";
-  const runner = createSyncRunner({
+  const runner = createTestRunner({
     readScope: () => scope,
     acquireLock: () => true,
     createRun: () => 77,
@@ -154,7 +161,7 @@ test("createSyncRunner classifies unsupported received scopes through injected d
 });
 
 test("createSyncRunner injects discovery fetcher, clock, and snapshot ids", () => {
-  const runner = createSyncRunner({
+  const runner = createTestRunner({
     nowIso: () => "2026-06-18T08:00:00.000Z",
     makeSnapshotId: (prefix) => `${prefix}_fixed`,
     fetchChatDiscoveryPage: (_opts, pageToken) => {
@@ -196,7 +203,7 @@ test("syncSent failure fails the run, releases the lock, and does not checkpoint
   };
   let failed = null;
   let checkpointed = false;
-  const runner = createSyncRunner({
+  const runner = createTestRunner({
     readScope: () => scope,
     acquireLock: () => {
       calls.push("lock");
@@ -238,7 +245,7 @@ test("syncSent failure fails the run, releases the lock, and does not checkpoint
 
 test("syncSent skips locked scopes before creating a run or calling the adapter", () => {
   const calls = [];
-  const runner = createSyncRunner({
+  const runner = createTestRunner({
     readScope: () => ({
       id: "lark.im.sent_by_me",
       source_id: "lark.im",
@@ -266,9 +273,74 @@ test("syncSent skips locked scopes before creating a run or calling the adapter"
   assert.deepEqual(calls, ["lock"]);
 });
 
+test("syncSent skips maintenance lock without creating a failed run", () => {
+  const calls = [];
+  const runner = createTestRunner({
+    readScope: () => ({
+      id: "lark.im.sent_by_me",
+      source_id: "lark.im",
+      enabled: 1,
+      config: {},
+      cursor: null,
+    }),
+    isMaintenanceLocked: () => {
+      calls.push("maintenance");
+      return true;
+    },
+    acquireLock: () => calls.push("lock"),
+    createRun: () => calls.push("run"),
+    fetchSentMessages: () => calls.push("fetch"),
+    failRun: () => calls.push("fail"),
+    releaseLock: () => calls.push("release"),
+  });
+
+  const result = runner.syncSent("fake.sqlite", syncOptions(), { open_id: "ou_self", name: "Me" });
+
+  assert.deepEqual(result, {
+    scope_id: "lark.im.sent_by_me",
+    skipped: true,
+    reason: "maintenance_lock",
+  });
+  assert.deepEqual(calls, ["maintenance"]);
+});
+
+test("syncSent reports maintenance lock when acquireLock is blocked by a race", () => {
+  const calls = [];
+  const runner = createTestRunner({
+    readScope: () => ({
+      id: "lark.im.sent_by_me",
+      source_id: "lark.im",
+      enabled: 1,
+      config: {},
+      cursor: null,
+    }),
+    isMaintenanceLocked: () => {
+      calls.push("maintenance");
+      return calls.length > 1;
+    },
+    acquireLock: () => {
+      calls.push("lock");
+      return false;
+    },
+    createRun: () => calls.push("run"),
+    fetchSentMessages: () => calls.push("fetch"),
+    failRun: () => calls.push("fail"),
+    releaseLock: () => calls.push("release"),
+  });
+
+  const result = runner.syncSent("fake.sqlite", syncOptions(), { open_id: "ou_self", name: "Me" });
+
+  assert.deepEqual(result, {
+    scope_id: "lark.im.sent_by_me",
+    skipped: true,
+    reason: "maintenance_lock",
+  });
+  assert.deepEqual(calls, ["maintenance", "lock", "maintenance"]);
+});
+
 test("syncSent skips disabled scopes before locking or calling the adapter", () => {
   const calls = [];
-  const runner = createSyncRunner({
+  const runner = createTestRunner({
     readScope: () => ({
       id: "lark.im.sent_by_me",
       source_id: "lark.im",
@@ -303,7 +375,7 @@ test("syncDiscovery fails and avoids checkpointing on unsafe pagination", () => 
     cursor: null,
   };
   let failed = null;
-  const runner = createSyncRunner({
+  const runner = createTestRunner({
     readScope: () => scope,
     acquireLock: () => {
       calls.push("lock");
@@ -385,7 +457,7 @@ test("syncReceived honors receivedScopesPerRun batch limits", () => {
       },
     ]),
   );
-  const runner = createSyncRunner({
+  const runner = createTestRunner({
     sqliteQuery: () => scopeRows,
     quoteSql: (value) => `'${String(value)}'`,
     readScope: (_dbPath, scopeId) => scopes.get(scopeId),

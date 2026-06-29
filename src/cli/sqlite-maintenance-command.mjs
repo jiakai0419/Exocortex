@@ -22,11 +22,15 @@ import {
   table,
   title,
 } from "../../dist/terminal/index.js";
+import {
+  acquireMaintenanceLock,
+  releaseMaintenanceLock,
+} from "../../dist/storage/sqlite/ingestion-store.js";
 
 const DEFAULT_DB = "data/exocortex.sqlite";
 const DEFAULT_BACKUP_DIR = "backups/private";
 const DEFAULT_PRUNE_RUNS_RETENTION_DAYS = 14;
-const TRACKED_TABLES = ["sources", "sync_scopes", "records", "sync_runs", "sync_locks"];
+const TRACKED_TABLES = ["sources", "sync_scopes", "records", "sync_runs", "sync_locks", "maintenance_locks"];
 
 /**
  * @typedef {"check" | "backup" | "verify" | "prune-runs"} SqliteMaintenanceAction
@@ -40,7 +44,6 @@ const TRACKED_TABLES = ["sources", "sync_scopes", "records", "sync_runs", "sync_
  * @property {boolean} latest
  * @property {SqliteMaintenanceFormat} format
  * @property {boolean} dryRun
- * @property {boolean} allowRunningWorker
  * @property {boolean=} help
  *
  * @typedef {Record<string, any>} JsonObject
@@ -52,7 +55,8 @@ const TRACKED_TABLES = ["sources", "sync_scopes", "records", "sync_runs", "sync_
  * @property {(path: string) => {size?: number, mtimeMs?: number}=} statSync
  * @property {(cmd: string, args: string[], options: JsonObject) => {status: number | null, stdout?: string, stderr?: string}=} spawnSync
  * @property {() => Date=} now
- * @property {() => boolean=} isLarkImWorkerLoaded
+ * @property {(dbPath: string, options: JsonObject) => {acquired: boolean, reason?: string, active_sync_locks?: number, lock_owner?: string | null}=} acquireMaintenanceLock
+ * @property {(dbPath: string, owner: string) => void=} releaseMaintenanceLock
  * @property {string=} cwd
  *
  * @typedef {object} CliIo
@@ -71,8 +75,6 @@ Options:
   --latest              Verify the newest backup in --backup-dir.
   --dry-run             For prune-runs: report only. This is the default.
   --apply               For prune-runs: actually delete eligible old no-op runs.
-  --allow-running-worker
-                        For prune-runs --apply: skip the worker-stopped guard. Not recommended.
   --format <fmt>        text | json. Default: text
   --help                Show this help.
 `;
@@ -102,7 +104,6 @@ function parseArgs(argv) {
       latest: false,
       format: "text",
       dryRun: true,
-      allowRunningWorker: false,
       help: true,
     };
     return opts;
@@ -117,7 +118,6 @@ function parseArgs(argv) {
     latest: false,
     format: "text",
     dryRun: true,
-    allowRunningWorker: false,
   };
 
   for (let i = 1; i < argv.length; i += 1) {
@@ -135,11 +135,6 @@ function parseArgs(argv) {
     if (arg === "--apply") {
       if (opts.action !== "prune-runs") throw new Error("--apply is only supported for prune-runs");
       opts.dryRun = false;
-      continue;
-    }
-    if (arg === "--allow-running-worker") {
-      if (opts.action !== "prune-runs") throw new Error("--allow-running-worker is only supported for prune-runs");
-      opts.allowRunningWorker = true;
       continue;
     }
     const next = argv[i + 1];
@@ -167,35 +162,38 @@ function subtractDays(date, days) {
   return new Date(date.getTime() - days * 24 * 60 * 60 * 1000);
 }
 
-/** @param {SqliteMaintenanceDeps} [deps] */
-function isLarkImWorkerLoaded(deps = {}) {
-  if (deps.isLarkImWorkerLoaded) return deps.isLarkImWorkerLoaded();
-  const run = deps.spawnSync || spawnSync;
-  const uid = typeof process.getuid === "function" ? process.getuid() : null;
-  if (uid === null) return false;
-  const result = run("launchctl", ["print", `gui/${uid}/com.exocortex.lark-im-worker`], {
-    encoding: "utf8",
-    maxBuffer: 1024 * 1024,
+/**
+ * @param {string} dbPath
+ * @param {SqliteMaintenanceDeps} [deps]
+ */
+function acquireSqliteMaintenanceLock(dbPath, deps = {}) {
+  const owner = `pid:${process.pid}:sqlite-maintenance`;
+  const acquire = deps.acquireMaintenanceLock || acquireMaintenanceLock;
+  const result = acquire(dbPath, {
+    owner,
+    ttlSeconds: 1800,
+    reason: "sqlite-maintenance prune-runs",
   });
-  return result.status === 0;
+  if (result.acquired) return owner;
+  if (result.reason === "sync_locks_active") {
+    throw new Error(
+      `maintenance lock unavailable: ${result.active_sync_locks || 0} active sync lock(s); retry shortly or stop the worker`,
+    );
+  }
+  throw new Error(
+    `maintenance lock unavailable: held by ${result.lock_owner || "another maintenance command"}`,
+  );
 }
 
 /**
- * @param {SqliteMaintenanceOptions} opts
+ * @param {string} dbPath
+ * @param {string | null} owner
  * @param {SqliteMaintenanceDeps} [deps]
  */
-function assertWorkerStoppedForWrite(opts, deps = {}) {
-  if (opts.allowRunningWorker || opts.dryRun) return;
-  if (!isLarkImWorkerLoaded(deps)) return;
-  throw new Error(
-    [
-      "refusing to prune sync runs while the Lark IM worker is running",
-      "run: node scripts/lark-im-service.mjs stop",
-      "then: node scripts/sqlite-maintenance.mjs prune-runs --apply",
-      "then: node scripts/lark-im-service.mjs start && node scripts/lark-im-service.mjs wait-ok",
-      "or pass --allow-running-worker if you intentionally accept SQLite lock risk",
-    ].join("\n"),
-  );
+function releaseSqliteMaintenanceLock(dbPath, owner, deps = {}) {
+  if (!owner) return;
+  const release = deps.releaseMaintenanceLock || releaseMaintenanceLock;
+  release(dbPath, owner);
 }
 
 /**
@@ -443,30 +441,36 @@ function executeSqliteMaintenance(opts, deps = {}) {
   }
 
   if (opts.action === "prune-runs") {
-    assertWorkerStoppedForWrite(opts, deps);
-    const source = databaseCheck(dbPath, deps);
-    if (!source.ok) {
+    let lockOwner = null;
+    try {
+      if (!opts.dryRun) lockOwner = acquireSqliteMaintenanceLock(dbPath, deps);
+      const source = databaseCheck(dbPath, deps);
+      if (!source.ok) {
+        return {
+          ok: false,
+          status: "failed",
+          action: opts.action,
+          checked_at: checkedAt,
+          db_path: publicPath(cwd, dbPath),
+          source_check: source,
+        };
+      }
+      const cutoffAt = subtractDays(now(), DEFAULT_PRUNE_RUNS_RETENTION_DAYS).toISOString();
+      const prune = pruneNoopSuccessfulRuns(dbPath, cutoffAt, opts.dryRun, deps);
+      const check = opts.dryRun ? source : databaseCheck(dbPath, deps);
       return {
-        ok: false,
-        status: "failed",
+        ok: check.ok,
+        status: check.ok ? "ok" : "failed",
         action: opts.action,
         checked_at: checkedAt,
         db_path: publicPath(cwd, dbPath),
-        source_check: source,
+        check,
+        prune,
+        maintenance_lock: lockOwner ? "acquired" : "not_required",
       };
+    } finally {
+      releaseSqliteMaintenanceLock(dbPath, lockOwner, deps);
     }
-    const cutoffAt = subtractDays(now(), DEFAULT_PRUNE_RUNS_RETENTION_DAYS).toISOString();
-    const prune = pruneNoopSuccessfulRuns(dbPath, cutoffAt, opts.dryRun, deps);
-    const check = opts.dryRun ? source : databaseCheck(dbPath, deps);
-    return {
-      ok: check.ok,
-      status: check.ok ? "ok" : "failed",
-      action: opts.action,
-      checked_at: checkedAt,
-      db_path: publicPath(cwd, dbPath),
-      check,
-      prune,
-    };
   }
 
   if (!opts.latest && !opts.backup) throw new Error("verify requires --latest or --backup <path>");
@@ -568,16 +572,16 @@ export {
   DEFAULT_DB,
   DEFAULT_PRUNE_RUNS_RETENTION_DAYS,
   TRACKED_TABLES,
-  assertWorkerStoppedForWrite,
+  acquireSqliteMaintenanceLock,
   compareCounts,
   databaseCheck,
   executeSqliteMaintenance,
   latestBackupPath,
-  isLarkImWorkerLoaded,
   main,
   parseArgs,
   pruneNoopSuccessfulRuns,
   publicPath,
+  releaseSqliteMaintenanceLock,
   renderSqliteMaintenanceText,
   runSqliteMaintenanceCli,
   timestampForFile,

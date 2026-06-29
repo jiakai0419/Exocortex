@@ -12,6 +12,7 @@ import {
   acquireLock,
   createRun,
   failRun,
+  isMaintenanceLocked,
   quoteSql,
   readScope,
   releaseLock,
@@ -115,6 +116,7 @@ const defaultDeps = {
   fetchChatDiscoveryPage,
   fetchChatMessages,
   fetchSentMessages,
+  isMaintenanceLocked,
   isBotUserOutOfChatError,
   isRestrictedModeError,
   makeSnapshotId: (prefix = "snapshot") => `${prefix}_${Date.now()}_${shortHash(`${process.pid}:${Math.random()}`)}`,
@@ -199,8 +201,12 @@ function listReceivedScopes(dbPath, mode = "all", deps = defaultDeps) {
 function syncScope(dbPath, scopeId, opts, worker, deps = defaultDeps) {
   const scope = /** @type {ScopeRow} */ (deps.readScope(dbPath, scopeId));
   if (!scope.enabled) return { scope_id: scopeId, skipped: true, reason: "scope_disabled" };
+  if (deps.isMaintenanceLocked(dbPath)) {
+    return { scope_id: scopeId, skipped: true, reason: "maintenance_lock" };
+  }
   if (!deps.acquireLock(dbPath, scopeId, opts.lockTtlSeconds)) {
-    return { scope_id: scopeId, skipped: true, reason: "scope_locked" };
+    const reason = deps.isMaintenanceLocked(dbPath) ? "maintenance_lock" : "scope_locked";
+    return { scope_id: scopeId, skipped: true, reason };
   }
   const runId = deps.createRun(dbPath, scope);
   try {

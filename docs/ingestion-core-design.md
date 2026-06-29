@@ -215,7 +215,7 @@ has_more=false -> 该 snapshot 已完成
 
 ### 锁和 running Run 必须可回收
 
-`sync_locks` 只表示“可能有 worker 正在处理这个 Scope”，不能成为永久状态。
+`sync_locks` 只表示“可能有 worker 正在处理这个 Scope”，不能成为永久状态。写库维护使用独立的全局 `maintenance_locks`，不复用 per-scope lock。
 
 要求：
 
@@ -223,6 +223,14 @@ has_more=false -> 该 snapshot 已完成
 - 新 worker 抢锁时必须清理过期锁。
 - 旧进程已不存在时，stale lock 和对应 running Run 必须能被标记为 cancelled 或 failed。
 - 健康状态应区分“真实正在同步”和“疑似 stale lock”。
+
+维护锁规则保持简单：
+
+- 只允许一个全局维护锁：`name = global`。
+- 维护锁存在时，worker sync step 跳过本轮，不创建 failed Run。
+- 维护命令获取维护锁时，如果已有 active `sync_locks`，直接失败并提示稍后重试或手动停止 worker。
+- 维护锁只用于写库维护，例如 enrichment、repair、`prune-runs --apply`；只读诊断不需要锁。
+- 不引入队列、优先级或多种 lock mode。
 
 ### 恢复优先级
 
@@ -469,6 +477,22 @@ expires_at
 ```
 
 用于防止同一个 Scope 被多个 worker 同时同步。
+
+### `maintenance_locks`
+
+```text
+name
+owner
+acquired_at
+expires_at
+reason
+```
+
+用于防止写库维护和后台同步同时写 SQLite。当前只使用一个全局锁：
+
+```text
+name = global
+```
 
 ## Source Adapter 接口
 

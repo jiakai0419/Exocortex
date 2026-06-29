@@ -84,6 +84,13 @@ function installSchema(dbPath) {
      CREATE TABLE sync_locks (
        scope_id TEXT PRIMARY KEY REFERENCES sync_scopes(id)
      );
+     CREATE TABLE maintenance_locks (
+       name TEXT PRIMARY KEY,
+       owner TEXT NOT NULL,
+       acquired_at TEXT NOT NULL,
+       expires_at TEXT NOT NULL,
+       reason TEXT NOT NULL DEFAULT ''
+     );
      INSERT INTO sources (id) VALUES ('shape.source');
      INSERT INTO sync_scopes (id, source_id) VALUES ('shape.scope', 'shape.source');
      INSERT INTO records (source_id, first_seen_scope_id) VALUES ('shape.source', 'shape.scope');
@@ -103,11 +110,9 @@ test("sqlite maintenance parseArgs keeps public maintenance commands explicit", 
     latest: false,
     format: "text",
     dryRun: true,
-    allowRunningWorker: false,
   });
   assert.equal(parseArgs(["prune-runs", "--apply"]).dryRun, false);
   assert.equal(parseArgs(["prune-runs", "--dry-run"]).dryRun, true);
-  assert.equal(parseArgs(["prune-runs", "--apply", "--allow-running-worker"]).allowRunningWorker, true);
   assert.deepEqual(parseArgs(["verify", "--latest", "--format", "json"]), {
     action: "verify",
     db: "data/exocortex.sqlite",
@@ -116,12 +121,10 @@ test("sqlite maintenance parseArgs keeps public maintenance commands explicit", 
     latest: true,
     format: "json",
     dryRun: true,
-    allowRunningWorker: false,
   });
   assert.equal(parseArgs(["--help"]).help, true);
   assert.throws(() => parseArgs(["repair"]), /action must be check, backup, verify, or prune-runs/);
   assert.throws(() => parseArgs(["check", "--apply"]), /--apply is only supported for prune-runs/);
-  assert.throws(() => parseArgs(["check", "--allow-running-worker"]), /--allow-running-worker is only supported for prune-runs/);
   assert.throws(() => parseArgs(["verify", "--latest", "--backup", "x.sqlite"]), /use either --latest or --backup/);
 });
 
@@ -219,10 +222,10 @@ test("sqlite maintenance prune-runs only removes old succeeded no-op runs when a
   const applied = executeSqliteMaintenance(parseArgs(["prune-runs", "--apply", "--db", dbPath]), {
     cwd: dir,
     now,
-    isLarkImWorkerLoaded: () => false,
   });
   const remainingIds = sqliteJson(dbPath, "SELECT id FROM sync_runs ORDER BY id;", "read remaining run ids").map((row) => row.id);
   assert.equal(applied.ok, true);
+  assert.equal(applied.maintenance_lock, "acquired");
   assert.equal(applied.prune.dry_run, false);
   assert.equal(applied.prune.candidate_count, 1);
   assert.equal(applied.prune.deleted_count, 1);
@@ -230,7 +233,31 @@ test("sqlite maintenance prune-runs only removes old succeeded no-op runs when a
   assert.deepEqual(remainingIds, [1, 3, 4, 5, 6, 7]);
 });
 
-test("sqlite maintenance prune-runs apply refuses while worker is running by default", (t) => {
+test("sqlite maintenance prune-runs apply uses the maintenance lock", (t) => {
+  const dir = tempDir(t);
+  const dbPath = join(dir, "shape.sqlite");
+  installSchema(dbPath);
+
+  const calls = [];
+  const report = executeSqliteMaintenance(parseArgs(["prune-runs", "--apply", "--db", dbPath]), {
+    cwd: dir,
+    now: () => new Date("2027-01-15T08:00:00.000Z"),
+    acquireMaintenanceLock: (_path, opts) => {
+      calls.push(["acquire", opts.reason]);
+      return { acquired: true };
+    },
+    releaseMaintenanceLock: (_path, owner) => calls.push(["release", owner]),
+  });
+
+  assert.equal(report.ok, true);
+  assert.equal(report.maintenance_lock, "acquired");
+  assert.deepEqual(calls, [
+    ["acquire", "sqlite-maintenance prune-runs"],
+    ["release", `pid:${process.pid}:sqlite-maintenance`],
+  ]);
+});
+
+test("sqlite maintenance prune-runs apply refuses active sync locks", (t) => {
   const dir = tempDir(t);
   const dbPath = join(dir, "shape.sqlite");
   installSchema(dbPath);
@@ -240,21 +267,10 @@ test("sqlite maintenance prune-runs apply refuses while worker is running by def
       executeSqliteMaintenance(parseArgs(["prune-runs", "--apply", "--db", dbPath]), {
         cwd: dir,
         now: () => new Date("2027-01-15T08:00:00.000Z"),
-        isLarkImWorkerLoaded: () => true,
+        acquireMaintenanceLock: () => ({ acquired: false, reason: "sync_locks_active", active_sync_locks: 2 }),
       }),
-    /refusing to prune sync runs while the Lark IM worker is running/,
+    /maintenance lock unavailable: 2 active sync lock\(s\)/,
   );
-
-  const report = executeSqliteMaintenance(
-    parseArgs(["prune-runs", "--apply", "--allow-running-worker", "--db", dbPath]),
-    {
-      cwd: dir,
-      now: () => new Date("2027-01-15T08:00:00.000Z"),
-      isLarkImWorkerLoaded: () => true,
-    },
-  );
-  assert.equal(report.ok, true);
-  assert.equal(report.prune.deleted_count, 0);
 });
 
 test("sqlite maintenance CLI renders text, json, help, and errors", (t) => {

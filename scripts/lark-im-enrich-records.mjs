@@ -3,6 +3,10 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
+import {
+  acquireMaintenanceLock,
+  releaseMaintenanceLock,
+} from "../dist/storage/sqlite/ingestion-store.js";
 
 const DEFAULT_DB = "data/exocortex.sqlite";
 
@@ -90,6 +94,16 @@ function runLark(args) {
   if (result.status !== 0) throw new Error(result.stderr.trim() || `${bin} ${args.join(" ")} failed`);
   const trimmed = result.stdout.trim();
   return trimmed ? JSON.parse(trimmed) : null;
+}
+
+function acquireWriteMaintenanceLock(dbPath, reason) {
+  const owner = `pid:${process.pid}:lark-im-enrich-records`;
+  const result = acquireMaintenanceLock(dbPath, { owner, ttlSeconds: 1800, reason });
+  if (result.acquired) return owner;
+  if (result.reason === "sync_locks_active") {
+    throw new Error(`maintenance lock unavailable: ${result.active_sync_locks || 0} active sync lock(s); retry shortly`);
+  }
+  throw new Error(`maintenance lock unavailable: held by ${result.lock_owner || "another maintenance command"}`);
 }
 
 function firstArray(...values) {
@@ -623,7 +637,14 @@ function main() {
     }
   }
 
-  if (updates.length > 0) sqliteExec(dbPath, `BEGIN;\n${updates.join("\n")}\nCOMMIT;`, "update records");
+  if (updates.length > 0) {
+    const lockOwner = acquireWriteMaintenanceLock(dbPath, "lark-im-enrich-records");
+    try {
+      sqliteExec(dbPath, `BEGIN;\n${updates.join("\n")}\nCOMMIT;`, "update records");
+    } finally {
+      releaseMaintenanceLock(dbPath, lockOwner);
+    }
+  }
   const appFallbacksById = new Map();
   for (const [key, fallback] of appFallbackNames.entries()) {
     const separatorIndex = key.lastIndexOf(":");

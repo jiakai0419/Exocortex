@@ -253,7 +253,7 @@ node scripts/lark-im-service.mjs status
 
 如果只修改文档、测试或不会被 worker import 的旁路工具，可以不暂停 worker。但一旦不确定，就按上面的维护流程处理。
 
-写入 SQLite 私有库的维护动作也必须暂停 worker，避免维护命令和后台同步同时写库，制造 `database is locked` 的瞬时失败。典型写库维护包括：
+写入 SQLite 私有库的维护动作必须通过全局 maintenance lock，避免维护命令和后台同步同时写库，制造 `database is locked` 的瞬时失败。典型写库维护包括：
 
 ```bash
 node scripts/lark-im-enrich-scopes.mjs --limit 100
@@ -261,7 +261,19 @@ node scripts/lark-im-enrich-records.mjs --limit 3000 --probe-apps
 node scripts/sqlite-maintenance.mjs prune-runs --apply
 ```
 
-推荐流程：
+这些命令会在写库前获取全局维护锁。维护锁存在时，worker 的 sync step 会跳过本轮而不是创建 failed run；如果维护命令启动时已经有 active sync lock，它会失败并提示稍后重试。
+
+常规流程可以不手动停止 worker：
+
+```bash
+node scripts/sqlite-maintenance.mjs backup
+node scripts/sqlite-maintenance.mjs verify --latest
+node scripts/sqlite-maintenance.mjs prune-runs --apply
+node scripts/sqlite-maintenance.mjs check
+node scripts/doctor.mjs
+```
+
+如果连续遇到 active sync lock，或者要执行较长时间的 repair，再使用保守流程：
 
 ```bash
 node scripts/lark-im-service.mjs stop
@@ -284,7 +296,7 @@ node scripts/lark-im-service.mjs wait-ok
 node scripts/doctor.mjs
 ```
 
-`prune-runs --apply` 默认会拒绝在 worker 运行时执行。`--allow-running-worker` 只用于临时库或明确接受 SQLite lock 风险的特殊排障，不用于真实本地记忆库。
+全局维护锁有 TTL。正常退出会释放；异常退出后，后续维护或 worker 会在 TTL 过期后回收。
 
 ### Maintenance Check Command
 
@@ -455,7 +467,7 @@ node scripts/sqlite-maintenance.mjs prune-runs
 node scripts/sqlite-maintenance.mjs prune-runs --apply
 ```
 
-`prune-runs --apply` 只删除运行日志，不删除 `records` 消息事实，也不推进或修改 cursor。它默认要求后台 worker 已停止，避免和同步进程同时写库。它不会自动 `VACUUM`；如果之后需要实际缩小 SQLite 文件，再单独安排维护窗口处理。
+`prune-runs --apply` 只删除运行日志，不删除 `records` 消息事实，也不推进或修改 cursor。它会通过全局 maintenance lock 和后台同步写入互斥；如果正好有 active sync lock，稍后重试即可。它不会自动 `VACUUM`；如果之后需要实际缩小 SQLite 文件，再单独安排维护窗口处理。
 
 ## When Something Looks Wrong
 

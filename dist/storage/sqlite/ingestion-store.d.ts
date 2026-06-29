@@ -31,6 +31,18 @@ type WriteEffects = {
     updated: number;
     duplicate: number;
 };
+type MaintenanceLockOptions = {
+    owner?: string;
+    ttlSeconds?: number;
+    reason?: string;
+    now?: Date;
+};
+type MaintenanceLockResult = {
+    acquired: boolean;
+    reason?: "sync_locks_active" | "maintenance_locked";
+    active_sync_locks?: number;
+    lock_owner?: string | null;
+};
 type OwnerState = "alive" | "dead" | "unknown";
 type RecoveryOptions = {
     scopeId?: string | null;
@@ -50,6 +62,9 @@ declare function recoverStaleSyncState(dbPath: string, options?: RecoveryOptions
 };
 declare function ensureInitialized(dbPath: string): void;
 declare function readScope(dbPath: string, scopeId: string): SyncScope;
+declare function isMaintenanceLocked(dbPath: string, now?: Date): boolean;
+declare function acquireMaintenanceLock(dbPath: string, options?: MaintenanceLockOptions): MaintenanceLockResult;
+declare function releaseMaintenanceLock(dbPath: string, owner?: string): void;
 declare function acquireLock(dbPath: string, scopeId: string, ttlSeconds: number, owner?: string): boolean;
 declare function releaseLock(dbPath: string, scopeId: string, owner?: string): void;
 declare function createRun(dbPath: string, scope: SyncScope, metadata?: JsonObject): any;
@@ -59,4 +74,4 @@ declare function upsertRecordsSql(records: StoredRecord[]): string;
 declare function countWriteEffects(dbPath: string, sourceId: string, records: StoredRecord[]): WriteEffects;
 declare function succeedRecordRun(dbPath: string, scope: SyncScope, runId: number, records: StoredRecord[], scannedCount: number, cursor: JsonObject | null, metadata: JsonObject): WriteEffects;
 declare const succeedMessageRun: typeof succeedRecordRun;
-export { acquireLock, countWriteEffects, createRun, ensureInitialized, existingRecordMap, failRun, recoverStaleSyncState, quoteSql, readScope, releaseLock, sqlJson, sqliteExec, sqliteQuery, succeedMessageRun, succeedRecordRun, upsertRecordsSql, };
+export { acquireLock, acquireMaintenanceLock, countWriteEffects, createRun, ensureInitialized, existingRecordMap, failRun, isMaintenanceLocked, recoverStaleSyncState, quoteSql, readScope, releaseLock, releaseMaintenanceLock, sqlJson, sqliteExec, sqliteQuery, succeedMessageRun, succeedRecordRun, upsertRecordsSql, };

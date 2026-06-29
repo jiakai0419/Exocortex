@@ -39,6 +39,20 @@ type WriteEffects = {
   duplicate: number;
 };
 
+type MaintenanceLockOptions = {
+  owner?: string;
+  ttlSeconds?: number;
+  reason?: string;
+  now?: Date;
+};
+
+type MaintenanceLockResult = {
+  acquired: boolean;
+  reason?: "sync_locks_active" | "maintenance_locked";
+  active_sync_locks?: number;
+  lock_owner?: string | null;
+};
+
 type OwnerState = "alive" | "dead" | "unknown";
 
 type RecoveryOptions = {
@@ -245,22 +259,101 @@ function readScope(dbPath: string, scopeId: string): SyncScope {
   };
 }
 
+function maintenanceOwner(owner = `pid:${process.pid}`) {
+  return owner;
+}
+
+function isMaintenanceLocked(dbPath: string, now = new Date()) {
+  try {
+    const rows = sqliteQuery(
+      dbPath,
+      `SELECT COUNT(*) AS count
+       FROM maintenance_locks
+       WHERE name = 'global'
+         AND expires_at > ${quoteSql(now.toISOString())};`,
+      "read maintenance lock",
+    );
+    return Number(rows[0]?.count || 0) > 0;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/no such table: maintenance_locks/.test(message)) return false;
+    throw error;
+  }
+}
+
+function acquireMaintenanceLock(dbPath: string, options: MaintenanceLockOptions = {}): MaintenanceLockResult {
+  const now = options.now || new Date();
+  const owner = maintenanceOwner(options.owner);
+  const ttlSeconds = options.ttlSeconds ?? 1800;
+  const reason = options.reason || "maintenance";
+  const nowIso = now.toISOString();
+  const expiresIso = new Date(now.getTime() + ttlSeconds * 1000).toISOString();
+  const rows = sqliteQuery(
+    dbPath,
+    `
+BEGIN IMMEDIATE;
+DELETE FROM maintenance_locks
+WHERE expires_at <= ${quoteSql(nowIso)};
+INSERT OR IGNORE INTO maintenance_locks (name, owner, acquired_at, expires_at, reason)
+SELECT 'global', ${quoteSql(owner)}, ${quoteSql(nowIso)}, ${quoteSql(expiresIso)}, ${quoteSql(reason)}
+WHERE NOT EXISTS (SELECT 1 FROM sync_locks);
+SELECT
+  changes() AS changed,
+  (SELECT COUNT(*) FROM sync_locks) AS active_sync_locks,
+  (SELECT owner FROM maintenance_locks WHERE name = 'global') AS lock_owner;
+COMMIT;
+`,
+    "acquire maintenance lock",
+  );
+  const row = rows[0] || {};
+  if (Number(row.changed || 0) > 0) return { acquired: true };
+  const activeSyncLocks = Number(row.active_sync_locks || 0);
+  if (activeSyncLocks > 0) {
+    return { acquired: false, reason: "sync_locks_active", active_sync_locks: activeSyncLocks };
+  }
+  return {
+    acquired: false,
+    reason: "maintenance_locked",
+    active_sync_locks: 0,
+    lock_owner: row.lock_owner || null,
+  };
+}
+
+function releaseMaintenanceLock(dbPath: string, owner = `pid:${process.pid}`) {
+  sqliteExec(
+    dbPath,
+    `DELETE FROM maintenance_locks
+     WHERE name = 'global'
+       AND owner = ${quoteSql(owner)};`,
+    "release maintenance lock",
+  );
+}
+
 function acquireLock(dbPath: string, scopeId: string, ttlSeconds: number, owner = `pid:${process.pid}`) {
   const now = new Date();
   const expires = new Date(now.getTime() + ttlSeconds * 1000);
   recoverStaleSyncState(dbPath, { scopeId, now });
   try {
-    sqliteExec(
+    const rows = sqliteQuery(
       dbPath,
       `
 BEGIN IMMEDIATE;
+DELETE FROM maintenance_locks
+WHERE expires_at <= ${quoteSql(now.toISOString())};
 INSERT INTO sync_locks (scope_id, locked_by, locked_at, expires_at)
-VALUES (${quoteSql(scopeId)}, ${quoteSql(owner)}, ${quoteSql(now.toISOString())}, ${quoteSql(expires.toISOString())});
+SELECT ${quoteSql(scopeId)}, ${quoteSql(owner)}, ${quoteSql(now.toISOString())}, ${quoteSql(expires.toISOString())}
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM maintenance_locks
+  WHERE name = 'global'
+    AND expires_at > ${quoteSql(now.toISOString())}
+);
+SELECT changes() AS changed;
 COMMIT;
 `,
       `acquire lock ${scopeId}`,
     );
-    return true;
+    return Number(rows[0]?.changed || 0) > 0;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (/UNIQUE constraint failed: sync_locks\.scope_id/.test(message)) return false;
@@ -444,15 +537,18 @@ const succeedMessageRun = succeedRecordRun;
 
 export {
   acquireLock,
+  acquireMaintenanceLock,
   countWriteEffects,
   createRun,
   ensureInitialized,
   existingRecordMap,
   failRun,
+  isMaintenanceLocked,
   recoverStaleSyncState,
   quoteSql,
   readScope,
   releaseLock,
+  releaseMaintenanceLock,
   sqlJson,
   sqliteExec,
   sqliteQuery,

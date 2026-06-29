@@ -6,12 +6,15 @@ import test from "node:test";
 
 import {
   acquireLock,
+  acquireMaintenanceLock,
   createRun,
   ensureInitialized,
   failRun,
+  isMaintenanceLocked,
   readScope,
   recoverStaleSyncState,
   releaseLock,
+  releaseMaintenanceLock,
   sqliteExec,
   sqliteQuery,
   succeedRecordRun,
@@ -106,6 +109,73 @@ test("scope locks reject competing owners and release only by owner", (t) => {
   releaseLock(dbPath, scopeId, "worker:b");
   const rows = sqliteQuery(dbPath, "SELECT COUNT(*) AS count FROM sync_locks;", "count locks");
   assert.equal(rows[0].count, 0);
+});
+
+test("maintenance lock coordinates with scope locks", (t) => {
+  const dbPath = tempDb(t);
+  const scopeId = "lark.im.sent_by_me";
+
+  const maintenance = acquireMaintenanceLock(dbPath, {
+    owner: "maintenance:a",
+    now: new Date("2099-06-13T00:00:00.000Z"),
+    ttlSeconds: 600,
+    reason: "test maintenance",
+  });
+  assert.deepEqual(maintenance, { acquired: true });
+  assert.equal(isMaintenanceLocked(dbPath, new Date("2099-06-13T00:01:00.000Z")), true);
+  assert.equal(acquireLock(dbPath, scopeId, 60, "worker:a"), false);
+
+  releaseMaintenanceLock(dbPath, "maintenance:a");
+  assert.equal(isMaintenanceLocked(dbPath, new Date("2099-06-13T00:01:00.000Z")), false);
+  assert.equal(acquireLock(dbPath, scopeId, 60, "worker:a"), true);
+
+  const blocked = acquireMaintenanceLock(dbPath, {
+    owner: "maintenance:b",
+    now: new Date("2099-06-13T00:02:00.000Z"),
+    ttlSeconds: 600,
+    reason: "test maintenance",
+  });
+  assert.equal(blocked.acquired, false);
+  assert.equal(blocked.reason, "sync_locks_active");
+  assert.equal(blocked.active_sync_locks, 1);
+
+  releaseLock(dbPath, scopeId, "worker:a");
+  assert.deepEqual(
+    acquireMaintenanceLock(dbPath, {
+      owner: "maintenance:b",
+      now: new Date("2099-06-13T00:03:00.000Z"),
+      ttlSeconds: 600,
+      reason: "test maintenance",
+    }),
+    { acquired: true },
+  );
+  releaseMaintenanceLock(dbPath, "maintenance:b");
+});
+
+test("expired maintenance locks are recoverable", (t) => {
+  const dbPath = tempDb(t);
+
+  assert.deepEqual(
+    acquireMaintenanceLock(dbPath, {
+      owner: "maintenance:expired",
+      now: new Date("2026-06-13T00:00:00.000Z"),
+      ttlSeconds: 60,
+      reason: "expired maintenance",
+    }),
+    { acquired: true },
+  );
+
+  assert.deepEqual(
+    acquireMaintenanceLock(dbPath, {
+      owner: "maintenance:new",
+      now: new Date("2026-06-13T00:02:00.000Z"),
+      ttlSeconds: 60,
+      reason: "new maintenance",
+    }),
+    { acquired: true },
+  );
+  const rows = sqliteQuery(dbPath, "SELECT owner FROM maintenance_locks;", "read maintenance lock");
+  assert.deepEqual(rows, [{ owner: "maintenance:new" }]);
 });
 
 test("stale lock recovery cancels runs owned by dead workers", (t) => {

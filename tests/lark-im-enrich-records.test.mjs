@@ -61,6 +61,16 @@ function installSchema(dbPath) {
        source_id TEXT NOT NULL,
        config_json TEXT NOT NULL
      );
+     CREATE TABLE sync_locks (
+       scope_id TEXT PRIMARY KEY
+     );
+     CREATE TABLE maintenance_locks (
+       name TEXT PRIMARY KEY,
+       owner TEXT NOT NULL,
+       acquired_at TEXT NOT NULL,
+       expires_at TEXT NOT NULL,
+       reason TEXT NOT NULL DEFAULT ''
+     );
      CREATE TABLE records (
        id INTEGER PRIMARY KEY,
        source_id TEXT NOT NULL,

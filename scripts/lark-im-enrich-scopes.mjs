@@ -3,6 +3,10 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
+import {
+  acquireMaintenanceLock,
+  releaseMaintenanceLock,
+} from "../dist/storage/sqlite/ingestion-store.js";
 
 const DEFAULT_DB = "data/exocortex.sqlite";
 
@@ -82,6 +86,16 @@ function runLark(args) {
   return JSON.parse(result.stdout);
 }
 
+function acquireWriteMaintenanceLock(dbPath, reason) {
+  const owner = `pid:${process.pid}:lark-im-enrich-scopes`;
+  const result = acquireMaintenanceLock(dbPath, { owner, ttlSeconds: 1800, reason });
+  if (result.acquired) return owner;
+  if (result.reason === "sync_locks_active") {
+    throw new Error(`maintenance lock unavailable: ${result.active_sync_locks || 0} active sync lock(s); retry shortly`);
+  }
+  throw new Error(`maintenance lock unavailable: held by ${result.lock_owner || "another maintenance command"}`);
+}
+
 function loadScopes(dbPath, limit) {
   return sqliteJson(
     dbPath,
@@ -106,37 +120,42 @@ function main() {
   const dbPath = resolve(opts.db);
   if (!existsSync(dbPath)) throw new Error(`database not found: ${dbPath}`);
   const scopes = loadScopes(dbPath, opts.limit);
+  const lockOwner = scopes.length > 0 ? acquireWriteMaintenanceLock(dbPath, "lark-im-enrich-scopes") : null;
   let updated = 0;
   let failed = 0;
-  for (const scope of scopes) {
-    if (!scope.config.chat_id) continue;
-    try {
-      const json = runLark([
-        "im",
-        "chats",
-        "get",
-        "--as",
-        "user",
-        "--params",
-        JSON.stringify({ chat_id: scope.config.chat_id }),
-        "--format",
-        "json",
-      ]);
-      const chatName = chatNameFromResponse(json);
-      if (!chatName) continue;
-      const nextConfig = { ...scope.config, chat_name: chatName };
-      sqliteExec(
-        dbPath,
-        `UPDATE sync_scopes
-         SET config_json = ${sqlJson(nextConfig)},
-             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-         WHERE id = ${quoteSql(scope.id)};`,
-        `update ${scope.id}`,
-      );
-      updated += 1;
-    } catch {
-      failed += 1;
+  try {
+    for (const scope of scopes) {
+      if (!scope.config.chat_id) continue;
+      try {
+        const json = runLark([
+          "im",
+          "chats",
+          "get",
+          "--as",
+          "user",
+          "--params",
+          JSON.stringify({ chat_id: scope.config.chat_id }),
+          "--format",
+          "json",
+        ]);
+        const chatName = chatNameFromResponse(json);
+        if (!chatName) continue;
+        const nextConfig = { ...scope.config, chat_name: chatName };
+        sqliteExec(
+          dbPath,
+          `UPDATE sync_scopes
+           SET config_json = ${sqlJson(nextConfig)},
+               updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+           WHERE id = ${quoteSql(scope.id)};`,
+          `update ${scope.id}`,
+        );
+        updated += 1;
+      } catch {
+        failed += 1;
+      }
     }
+  } finally {
+    if (lockOwner) releaseMaintenanceLock(dbPath, lockOwner);
   }
   process.stdout.write(`${JSON.stringify({ ok: true, scanned: scopes.length, updated, failed }, null, 2)}\n`);
 }
