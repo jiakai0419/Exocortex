@@ -103,9 +103,11 @@ test("sqlite maintenance parseArgs keeps public maintenance commands explicit", 
     latest: false,
     format: "text",
     dryRun: true,
+    allowRunningWorker: false,
   });
   assert.equal(parseArgs(["prune-runs", "--apply"]).dryRun, false);
   assert.equal(parseArgs(["prune-runs", "--dry-run"]).dryRun, true);
+  assert.equal(parseArgs(["prune-runs", "--apply", "--allow-running-worker"]).allowRunningWorker, true);
   assert.deepEqual(parseArgs(["verify", "--latest", "--format", "json"]), {
     action: "verify",
     db: "data/exocortex.sqlite",
@@ -114,10 +116,12 @@ test("sqlite maintenance parseArgs keeps public maintenance commands explicit", 
     latest: true,
     format: "json",
     dryRun: true,
+    allowRunningWorker: false,
   });
   assert.equal(parseArgs(["--help"]).help, true);
   assert.throws(() => parseArgs(["repair"]), /action must be check, backup, verify, or prune-runs/);
   assert.throws(() => parseArgs(["check", "--apply"]), /--apply is only supported for prune-runs/);
+  assert.throws(() => parseArgs(["check", "--allow-running-worker"]), /--allow-running-worker is only supported for prune-runs/);
   assert.throws(() => parseArgs(["verify", "--latest", "--backup", "x.sqlite"]), /use either --latest or --backup/);
 });
 
@@ -212,7 +216,11 @@ test("sqlite maintenance prune-runs only removes old succeeded no-op runs when a
   assert.match(rendered, /Run retention/);
   assert.match(rendered, /dry-run/);
 
-  const applied = executeSqliteMaintenance(parseArgs(["prune-runs", "--apply", "--db", dbPath]), { cwd: dir, now });
+  const applied = executeSqliteMaintenance(parseArgs(["prune-runs", "--apply", "--db", dbPath]), {
+    cwd: dir,
+    now,
+    isLarkImWorkerLoaded: () => false,
+  });
   const remainingIds = sqliteJson(dbPath, "SELECT id FROM sync_runs ORDER BY id;", "read remaining run ids").map((row) => row.id);
   assert.equal(applied.ok, true);
   assert.equal(applied.prune.dry_run, false);
@@ -220,6 +228,33 @@ test("sqlite maintenance prune-runs only removes old succeeded no-op runs when a
   assert.equal(applied.prune.deleted_count, 1);
   assert.equal(applied.check.counts.sync_runs, 6);
   assert.deepEqual(remainingIds, [1, 3, 4, 5, 6, 7]);
+});
+
+test("sqlite maintenance prune-runs apply refuses while worker is running by default", (t) => {
+  const dir = tempDir(t);
+  const dbPath = join(dir, "shape.sqlite");
+  installSchema(dbPath);
+
+  assert.throws(
+    () =>
+      executeSqliteMaintenance(parseArgs(["prune-runs", "--apply", "--db", dbPath]), {
+        cwd: dir,
+        now: () => new Date("2027-01-15T08:00:00.000Z"),
+        isLarkImWorkerLoaded: () => true,
+      }),
+    /refusing to prune sync runs while the Lark IM worker is running/,
+  );
+
+  const report = executeSqliteMaintenance(
+    parseArgs(["prune-runs", "--apply", "--allow-running-worker", "--db", dbPath]),
+    {
+      cwd: dir,
+      now: () => new Date("2027-01-15T08:00:00.000Z"),
+      isLarkImWorkerLoaded: () => true,
+    },
+  );
+  assert.equal(report.ok, true);
+  assert.equal(report.prune.deleted_count, 0);
 });
 
 test("sqlite maintenance CLI renders text, json, help, and errors", (t) => {

@@ -40,6 +40,7 @@ const TRACKED_TABLES = ["sources", "sync_scopes", "records", "sync_runs", "sync_
  * @property {boolean} latest
  * @property {SqliteMaintenanceFormat} format
  * @property {boolean} dryRun
+ * @property {boolean} allowRunningWorker
  * @property {boolean=} help
  *
  * @typedef {Record<string, any>} JsonObject
@@ -51,6 +52,7 @@ const TRACKED_TABLES = ["sources", "sync_scopes", "records", "sync_runs", "sync_
  * @property {(path: string) => {size?: number, mtimeMs?: number}=} statSync
  * @property {(cmd: string, args: string[], options: JsonObject) => {status: number | null, stdout?: string, stderr?: string}=} spawnSync
  * @property {() => Date=} now
+ * @property {() => boolean=} isLarkImWorkerLoaded
  * @property {string=} cwd
  *
  * @typedef {object} CliIo
@@ -69,6 +71,8 @@ Options:
   --latest              Verify the newest backup in --backup-dir.
   --dry-run             For prune-runs: report only. This is the default.
   --apply               For prune-runs: actually delete eligible old no-op runs.
+  --allow-running-worker
+                        For prune-runs --apply: skip the worker-stopped guard. Not recommended.
   --format <fmt>        text | json. Default: text
   --help                Show this help.
 `;
@@ -98,6 +102,7 @@ function parseArgs(argv) {
       latest: false,
       format: "text",
       dryRun: true,
+      allowRunningWorker: false,
       help: true,
     };
     return opts;
@@ -112,6 +117,7 @@ function parseArgs(argv) {
     latest: false,
     format: "text",
     dryRun: true,
+    allowRunningWorker: false,
   };
 
   for (let i = 1; i < argv.length; i += 1) {
@@ -129,6 +135,11 @@ function parseArgs(argv) {
     if (arg === "--apply") {
       if (opts.action !== "prune-runs") throw new Error("--apply is only supported for prune-runs");
       opts.dryRun = false;
+      continue;
+    }
+    if (arg === "--allow-running-worker") {
+      if (opts.action !== "prune-runs") throw new Error("--allow-running-worker is only supported for prune-runs");
+      opts.allowRunningWorker = true;
       continue;
     }
     const next = argv[i + 1];
@@ -154,6 +165,37 @@ function parseArgs(argv) {
  */
 function subtractDays(date, days) {
   return new Date(date.getTime() - days * 24 * 60 * 60 * 1000);
+}
+
+/** @param {SqliteMaintenanceDeps} [deps] */
+function isLarkImWorkerLoaded(deps = {}) {
+  if (deps.isLarkImWorkerLoaded) return deps.isLarkImWorkerLoaded();
+  const run = deps.spawnSync || spawnSync;
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  if (uid === null) return false;
+  const result = run("launchctl", ["print", `gui/${uid}/com.exocortex.lark-im-worker`], {
+    encoding: "utf8",
+    maxBuffer: 1024 * 1024,
+  });
+  return result.status === 0;
+}
+
+/**
+ * @param {SqliteMaintenanceOptions} opts
+ * @param {SqliteMaintenanceDeps} [deps]
+ */
+function assertWorkerStoppedForWrite(opts, deps = {}) {
+  if (opts.allowRunningWorker || opts.dryRun) return;
+  if (!isLarkImWorkerLoaded(deps)) return;
+  throw new Error(
+    [
+      "refusing to prune sync runs while the Lark IM worker is running",
+      "run: node scripts/lark-im-service.mjs stop",
+      "then: node scripts/sqlite-maintenance.mjs prune-runs --apply",
+      "then: node scripts/lark-im-service.mjs start && node scripts/lark-im-service.mjs wait-ok",
+      "or pass --allow-running-worker if you intentionally accept SQLite lock risk",
+    ].join("\n"),
+  );
 }
 
 /**
@@ -401,6 +443,7 @@ function executeSqliteMaintenance(opts, deps = {}) {
   }
 
   if (opts.action === "prune-runs") {
+    assertWorkerStoppedForWrite(opts, deps);
     const source = databaseCheck(dbPath, deps);
     if (!source.ok) {
       return {
@@ -525,10 +568,12 @@ export {
   DEFAULT_DB,
   DEFAULT_PRUNE_RUNS_RETENTION_DAYS,
   TRACKED_TABLES,
+  assertWorkerStoppedForWrite,
   compareCounts,
   databaseCheck,
   executeSqliteMaintenance,
   latestBackupPath,
+  isLarkImWorkerLoaded,
   main,
   parseArgs,
   pruneNoopSuccessfulRuns,

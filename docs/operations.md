@@ -253,6 +253,39 @@ node scripts/lark-im-service.mjs status
 
 如果只修改文档、测试或不会被 worker import 的旁路工具，可以不暂停 worker。但一旦不确定，就按上面的维护流程处理。
 
+写入 SQLite 私有库的维护动作也必须暂停 worker，避免维护命令和后台同步同时写库，制造 `database is locked` 的瞬时失败。典型写库维护包括：
+
+```bash
+node scripts/lark-im-enrich-scopes.mjs --limit 100
+node scripts/lark-im-enrich-records.mjs --limit 3000 --probe-apps
+node scripts/sqlite-maintenance.mjs prune-runs --apply
+```
+
+推荐流程：
+
+```bash
+node scripts/lark-im-service.mjs stop
+```
+
+执行写库维护和检查：
+
+```bash
+node scripts/sqlite-maintenance.mjs backup
+node scripts/sqlite-maintenance.mjs verify --latest
+node scripts/sqlite-maintenance.mjs prune-runs --apply
+node scripts/sqlite-maintenance.mjs check
+```
+
+然后恢复并等待一个新成功 cycle：
+
+```bash
+node scripts/lark-im-service.mjs start
+node scripts/lark-im-service.mjs wait-ok
+node scripts/doctor.mjs
+```
+
+`prune-runs --apply` 默认会拒绝在 worker 运行时执行。`--allow-running-worker` 只用于临时库或明确接受 SQLite lock 风险的特殊排障，不用于真实本地记忆库。
+
 ### Maintenance Check Command
 
 为了避免每次维护后靠人记住一串验收命令，项目提供一个非日常维护入口：
@@ -422,7 +455,7 @@ node scripts/sqlite-maintenance.mjs prune-runs
 node scripts/sqlite-maintenance.mjs prune-runs --apply
 ```
 
-`prune-runs --apply` 只删除运行日志，不删除 `records` 消息事实，也不推进或修改 cursor。它不会自动 `VACUUM`；如果之后需要实际缩小 SQLite 文件，再单独安排维护窗口处理。
+`prune-runs --apply` 只删除运行日志，不删除 `records` 消息事实，也不推进或修改 cursor。它默认要求后台 worker 已停止，避免和同步进程同时写库。它不会自动 `VACUUM`；如果之后需要实际缩小 SQLite 文件，再单独安排维护窗口处理。
 
 ## When Something Looks Wrong
 
