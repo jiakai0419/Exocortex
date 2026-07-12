@@ -8,6 +8,7 @@ import {
   statusBadge,
   subtitle,
   title,
+  value,
 } from "../../dist/terminal/index.js";
 
 /**
@@ -28,10 +29,10 @@ function renderMessagesText(messages) {
         message.display.scene,
       )}`,
     );
-    lines.push(`  ${key("发送人")}  ${message.display.sender}`);
-    if (message.display.recipient) lines.push(`  ${key("接收人")}  ${message.display.recipient}`);
-    if (message.display.chat) lines.push(`  ${key("群")}      ${message.display.chat}`);
-    lines.push(`  ${key("类型")}    ${message.display.sender_type} / ${message.display.message_type}`);
+    lines.push(`  ${key("发送人")}  ${value(message.display.sender)}`);
+    if (message.display.recipient) lines.push(`  ${key("接收人")}  ${value(message.display.recipient)}`);
+    if (message.display.chat) lines.push(`  ${key("群")}      ${value(message.display.chat)}`);
+    lines.push(`  ${key("类型")}    ${value(message.display.sender_type)} / ${value(message.display.message_type)}`);
     lines.push(`  ${key("消息")}    ${compact(message.display.body)}`);
     lines.push("");
   }

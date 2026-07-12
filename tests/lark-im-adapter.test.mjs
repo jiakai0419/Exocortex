@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   createLarkImAdapter,
+  getEnvelope,
   isBotUserOutOfChatError,
   isRestrictedModeError,
   isTransientLarkFailure,
@@ -40,11 +41,11 @@ test("fetchSentMessages builds user search commands and follows page tokens", ()
       assert.equal(args[1], "+messages-search");
       assert.equal(commandValue(args, "--sender"), "ou_self");
       if (commandValue(args, "--page-token") === "p2") {
-        return { messages: [{ message_id: "om_2" }], has_more: false };
+        return { messages: [{ message_id: "om_2", create_time: "2" }], has_more: false };
       }
       return {
         data: {
-          messages: [{ message_id: "om_1" }],
+          messages: [{ message_id: "om_1", create_time: "1" }],
           has_more: true,
           page_token: "p2",
         },
@@ -76,7 +77,6 @@ test("fetchChatDiscoveryPage normalizes non-muted chat-list output", () => {
               chat_mode: "thread",
               i18n_names: { zh_cn: "Thread Group", en_us: "Thread Group EN" },
             },
-            { name: "missing id" },
           ],
           has_more: true,
           page_token: "after",
@@ -96,6 +96,54 @@ test("fetchChatDiscoveryPage normalizes non-muted chat-list output", () => {
     has_more: true,
     page_token: "after",
   });
+});
+
+test("getEnvelope rejects missing or malformed successful response fields", () => {
+  assert.throws(() => getEnvelope({}, "messages"), /missing a valid messages array/);
+  assert.throws(
+    () => getEnvelope({ messages: {}, has_more: false }, "messages"),
+    /missing a valid messages array/,
+  );
+  assert.throws(
+    () => getEnvelope({ messages: [], has_more: "false" }, "messages"),
+    /boolean has_more/,
+  );
+  assert.throws(
+    () => getEnvelope({ messages: [], has_more: false, page_token: 123 }, "messages"),
+    /non-string page_token/,
+  );
+  assert.throws(
+    () => getEnvelope({ messages: [], has_more: false, data: { has_more: true } }, "messages"),
+    /conflicting has_more/,
+  );
+  assert.deepEqual(getEnvelope({ data: { items: [], has_more: false } }, "messages"), {
+    items: [],
+    has_more: false,
+    page_token: "",
+  });
+});
+
+test("message and chat pages fail closed instead of dropping malformed items", () => {
+  for (const badMessage of [
+    { create_time: "1", content: "missing id" },
+    { message_id: "om_bad_time", create_time: "not-a-time", content: "bad time" },
+  ]) {
+    const adapter = createLarkImAdapter({
+      run: () => ({ messages: [badMessage], has_more: false }),
+    });
+    assert.throws(
+      () => adapter.fetchSentMessages("ou_self", 1000, 2000, adapterOpts()),
+      /missing a valid message_id|invalid create_time/,
+    );
+  }
+
+  const adapter = createLarkImAdapter({
+    run: () => ({ chats: [{ name: "missing id" }], has_more: false }),
+  });
+  assert.throws(
+    () => adapter.fetchChatDiscoveryPage(adapterOpts(), ""),
+    /missing a valid chat_id/,
+  );
 });
 
 test("transient classifier retries Lark internal API errors", () => {
@@ -329,12 +377,16 @@ test("buildPeopleContext uses bot app_id matches even when a chat has multiple b
 
 test("restricted mode classifier recognizes Lark restricted chat errors", () => {
   assert.equal(isRestrictedModeError(new Error('{"code":231203,"msg":"Restricted Mode"}')), true);
+  assert.equal(isRestrictedModeError(new Error("kind=unknown code=231203")), true);
+  assert.equal(isRestrictedModeError(new Error("kind=restricted_mode")), true);
   assert.equal(isRestrictedModeError(new Error("don't allow copying or forwarding messages")), true);
   assert.equal(isRestrictedModeError(new Error("network timeout")), false);
 });
 
 test("out of chat classifier recognizes lark-cli 230002 errors", () => {
   assert.equal(isBotUserOutOfChatError(new Error('{"code":230002,"message":"Bot/User can NOT be out of the chat"}')), true);
+  assert.equal(isBotUserOutOfChatError(new Error("kind=unknown code=230002")), true);
+  assert.equal(isBotUserOutOfChatError(new Error("kind=bot_user_out_of_chat")), true);
   assert.equal(isBotUserOutOfChatError(new Error("Bot/User can NOT be out of the chat")), true);
   assert.equal(isBotUserOutOfChatError(new Error("network timeout")), false);
 });

@@ -1,6 +1,6 @@
-function buildCycleStepSpecs(opts) {
+function buildCycleStepSpecs(opts, cycle = 1) {
     const chatTypes = opts.chatTypes || "group,p2p";
-    return [
+    const steps = [
         {
             name: "sent",
             args: ["--db", opts.db, "--scope", "sent"],
@@ -72,19 +72,28 @@ function buildCycleStepSpecs(opts) {
             ],
         },
         {
-            name: "received-catchup",
+            name: "received-fair",
             args: [
                 "--db",
                 opts.db,
                 "--scope",
                 "received",
                 "--received-mode",
-                "catchup",
+                "all",
                 "--received-scopes-per-run",
                 String(opts.receivedScopesPerCycle),
             ],
         },
     ];
+    const retentionEveryCycles = Number(opts.retentionEveryCycles || 1440);
+    if (retentionEveryCycles > 0 && cycle % retentionEveryCycles === 0) {
+        steps.push({
+            name: "retention",
+            command: "maintenance",
+            args: ["prune-runs", "--db", opts.db, "--apply", "--format", "json"],
+        });
+    }
+    return steps;
 }
 function compactRun(run) {
     if (!run)
@@ -146,13 +155,14 @@ function cyclePayload(cycle, steps, now = () => new Date().toISOString()) {
         cycle,
         ok: steps.every((step) => step.ok),
         at: now(),
-        steps,
+        step_count: steps.length,
+        failed_steps: steps.filter((step) => !step.ok).map((step) => step.name || "unknown"),
     };
 }
 function runCycleWithRunner(opts, cycle, runStep, writeLog, now = () => new Date().toISOString()) {
     const steps = [];
-    for (const spec of buildCycleStepSpecs(opts)) {
-        const step = runStep(spec.name, spec.args);
+    for (const spec of buildCycleStepSpecs(opts, cycle)) {
+        const step = runStep(spec.name, spec.args, spec.command || "sync");
         steps.push(step);
         writeLog(opts, { type: "lark_im_worker_step", cycle, ...step });
     }

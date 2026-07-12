@@ -140,6 +140,27 @@ test("messages view renders system sender without unknown", () => {
   assert.doesNotMatch(output, /发送人\s+unknown/);
 });
 
+test("messages text rendering neutralizes remote terminal controls", () => {
+  const hostile = "safe\u001b[31m-red\u001b[0m\u001b]52;c;Y2xpcGJvYXJk\u0007\u202E-end";
+  const message = enrichRow(row({
+    external_id: `om_${hostile}`,
+    body: hostile,
+    canonical_json: JSON.stringify({
+      chat_type: "group",
+      chat_name: hostile,
+      msg_type: hostile,
+      sender_id: "ou_sender",
+      sender_name: hostile,
+      sender_type: "user",
+    }),
+  }));
+
+  const output = renderMessagesText([message]);
+  assert.doesNotMatch(output, /\u001b\]52|Y2xpcGJvYXJk|\u202E/);
+  assert.doesNotMatch(output, /[\u0000-\u0009\u000B-\u001F\u007F-\u009F]/);
+  assert.match(plain(output), /safe-red-end/);
+});
+
 test("messages CLI renders text, json, help, and dependency errors", () => {
   const message = enrichRow(row({
     canonical_json: JSON.stringify({

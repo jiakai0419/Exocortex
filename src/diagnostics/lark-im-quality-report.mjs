@@ -2,6 +2,15 @@
 
 import { spawnSync } from "node:child_process";
 import { classifyLarkFailure } from "../adapters/lark-im/transport.mjs";
+import {
+  diagnosticSubprocessError,
+  publicCommandFailureReason,
+  publicErrorCode,
+  publicFailureKind,
+  publicMessageTypes,
+  publicTimestamp,
+  publicUnsupportedReasons,
+} from "./public-safe.mjs";
 
 /**
  * @typedef {Record<string, any>} JsonObject
@@ -21,9 +30,11 @@ function sqliteJson(dbPath, sql, label) {
     input: `.timeout 5000\n${sql}`,
     encoding: "utf8",
     maxBuffer: 50 * 1024 * 1024,
+    timeout: 30_000,
+    killSignal: "SIGKILL",
   });
-  if (result.status !== 0) throw new Error(`${label} failed: ${result.stderr.trim()}`);
-  const trimmed = result.stdout.trim();
+  if (result.status !== 0 || result.error) throw diagnosticSubprocessError(result, label);
+  const trimmed = String(result.stdout || "").trim();
   return trimmed ? JSON.parse(trimmed) : [];
 }
 
@@ -34,6 +45,70 @@ function sqliteJson(dbPath, sql, label) {
  */
 function one(rows, key, fallback = 0) {
   return rows[0]?.[key] ?? fallback;
+}
+
+const QUALITY_FIELDS = [
+  "missing_sender_name",
+  "missing_user_sender_name",
+  "missing_app_sender_name",
+  "unresolved_app_sender_name",
+  "missing_system_sender_name",
+  "missing_non_actionable_sender_name",
+  "actionable_missing_sender_name",
+  "app_sender_records",
+  "missing_chat_name",
+  "invalid_rendered_body",
+  "deleted_or_recalled_body",
+];
+
+/**
+ * @param {JsonObject} report
+ * @returns {JsonObject}
+ */
+function sanitizeQualityReportForPublicOutput(report) {
+  if (report?.status === "command_failed") {
+    return {
+      ok: false,
+      status: "command_failed",
+      reason: publicCommandFailureReason(`${report.reason || ""}\n${report.stderr || ""}\n${report.stdout || ""}`),
+      exit_status: Number(report.exit_status || 1),
+    };
+  }
+  const quality = Object.fromEntries(
+    QUALITY_FIELDS.map((field) => [field, Math.max(0, Number(report?.quality?.[field] || 0))]),
+  );
+  return {
+    messages: {
+      total: Math.max(0, Number(report?.messages?.total || 0)),
+      sent: Math.max(0, Number(report?.messages?.sent || 0)),
+      received: Math.max(0, Number(report?.messages?.received || 0)),
+      latest_at: publicTimestamp(report?.messages?.latest_at),
+    },
+    message_types: publicMessageTypes(report?.message_types),
+    quality,
+    scopes: {
+      total_received_scopes: Math.max(0, Number(report?.scopes?.total_received_scopes || 0)),
+      enabled_received_scopes: Math.max(0, Number(report?.scopes?.enabled_received_scopes || 0)),
+      enabled_without_cursor: Math.max(0, Number(report?.scopes?.enabled_without_cursor || 0)),
+      unsupported_scopes: Math.max(0, Number(report?.scopes?.unsupported_scopes || 0)),
+      hot_seen_scopes: Math.max(0, Number(report?.scopes?.hot_seen_scopes || 0)),
+    },
+    unsupported_reasons: publicUnsupportedReasons(report?.unsupported_reasons),
+    recent_failures: (Array.isArray(report?.recent_failures) ? report.recent_failures : []).map((row) => {
+      const classification = row.failure_kind
+        ? {
+            kind: publicFailureKind(row.failure_kind),
+            transient: row.transient === true,
+            code: publicErrorCode(row.error_code),
+          }
+        : classifyLarkFailure(row.error_message || "");
+      return {
+        failure_kind: classification.kind,
+        transient: classification.transient === true,
+        error_code: publicErrorCode(classification.code),
+      };
+    }),
+  };
 }
 
 /**
@@ -135,7 +210,7 @@ function collectQualityReport(dbPath, deps = {}) {
   );
   const recentFailures = queryJson(
     dbPath,
-    `SELECT id, scope_id, error_type, error_message
+    `SELECT error_message
      FROM sync_runs
      WHERE status = 'failed'
      ORDER BY id DESC
@@ -147,7 +222,6 @@ function collectQualityReport(dbPath, deps = {}) {
     `SELECT
        COALESCE(json_extract(config_json, '$.unsupported_reason'), 'unknown') AS reason,
        MAX(COALESCE(json_extract(config_json, '$.lark_cli_error_code'), '')) AS lark_cli_error_code,
-       MAX(COALESCE(json_extract(config_json, '$.lark_cli_error_message'), '')) AS lark_cli_error_message,
        COUNT(*) AS count
      FROM sync_scopes
      WHERE source_id = 'lark.im'
@@ -157,19 +231,8 @@ function collectQualityReport(dbPath, deps = {}) {
      ORDER BY count DESC, reason;`,
     "unsupported scope reasons",
   );
-  const latest = queryJson(
-    dbPath,
-    `SELECT direction, occurred_at, json_extract(canonical_json, '$.chat_name') AS chat_name, body
-     FROM records
-     WHERE source_id = 'lark.im'
-       AND record_type = 'lark.im.message'
-     ORDER BY occurred_at_ms DESC, external_id DESC
-     LIMIT 5;`,
-    "latest records",
-  );
-
   const countRow = counts[0] || {};
-  return {
+  return sanitizeQualityReportForPublicOutput({
     messages: {
       total: countRow.total || 0,
       sent: countRow.sent || 0,
@@ -183,15 +246,12 @@ function collectQualityReport(dbPath, deps = {}) {
     recent_failures: recentFailures.map((row) => {
       const classification = classifyLarkFailure(row.error_message || "");
       return {
-        ...row,
         failure_kind: classification.kind,
         transient: classification.transient,
         error_code: classification.code,
-        error_message: String(row.error_message || "").slice(0, 240),
       };
     }),
-    latest_records: latest,
-  };
+  });
 }
 
 /** @param {JsonObject} report */
@@ -207,5 +267,6 @@ export {
   collectQualityReport,
   hasQualityIssues,
   one,
+  sanitizeQualityReportForPublicOutput,
   sqliteJson,
 };

@@ -49,12 +49,18 @@ type RecoveryOptions = {
     now?: Date;
     ownerState?: (owner: string) => OwnerState;
     orphanRunSeconds?: number;
+    hardLeaseSeconds?: number;
 };
 type SqliteRow = Record<string, any>;
+declare const DEFAULT_HARD_LEASE_SECONDS: number;
 declare function quoteSql(value: unknown): string;
 declare function sqlJson(value: unknown): string;
+declare function secureDatabasePaths(dbPath: string): string;
 declare function sqliteExec(dbPath: string, sql: string, label: string): string;
 declare function sqliteQuery(dbPath: string, sql: string, label: string): SqliteRow[];
+declare function ownerPid(owner: string): number | null;
+declare function ownerStartedAtMs(owner: string): number | null;
+declare function defaultOwnerState(owner: string): OwnerState;
 declare function recoverStaleSyncState(dbPath: string, options?: RecoveryOptions): {
     recovered_locks: number;
     cancelled_runs: number;
@@ -67,11 +73,13 @@ declare function acquireMaintenanceLock(dbPath: string, options?: MaintenanceLoc
 declare function releaseMaintenanceLock(dbPath: string, owner?: string): void;
 declare function acquireLock(dbPath: string, scopeId: string, ttlSeconds: number, owner?: string): boolean;
 declare function releaseLock(dbPath: string, scopeId: string, owner?: string): void;
-declare function createRun(dbPath: string, scope: SyncScope, metadata?: JsonObject): any;
-declare function failRun(dbPath: string, scope: SyncScope, runId: number, error: Error): void;
+declare function createRun(dbPath: string, scope: SyncScope, metadata?: JsonObject, owner?: string): number;
+declare function failRun(dbPath: string, scope: SyncScope, runId: number, error: Error): boolean;
 declare function existingRecordMap(dbPath: string, sourceId: string, records: StoredRecord[]): Map<any, any>;
+declare function normalizeExternalVersion(value: unknown): string | null;
+declare function normalizeStoredRecords(records: StoredRecord[], sourceId?: string): StoredRecord[];
 declare function upsertRecordsSql(records: StoredRecord[]): string;
 declare function countWriteEffects(dbPath: string, sourceId: string, records: StoredRecord[]): WriteEffects;
 declare function succeedRecordRun(dbPath: string, scope: SyncScope, runId: number, records: StoredRecord[], scannedCount: number, cursor: JsonObject | null, metadata: JsonObject): WriteEffects;
 declare const succeedMessageRun: typeof succeedRecordRun;
-export { acquireLock, acquireMaintenanceLock, countWriteEffects, createRun, ensureInitialized, existingRecordMap, failRun, isMaintenanceLocked, recoverStaleSyncState, quoteSql, readScope, releaseLock, releaseMaintenanceLock, sqlJson, sqliteExec, sqliteQuery, succeedMessageRun, succeedRecordRun, upsertRecordsSql, };
+export { DEFAULT_HARD_LEASE_SECONDS, acquireLock, acquireMaintenanceLock, countWriteEffects, createRun, ensureInitialized, existingRecordMap, failRun, isMaintenanceLocked, normalizeExternalVersion, normalizeStoredRecords, ownerPid, ownerStartedAtMs, defaultOwnerState, recoverStaleSyncState, quoteSql, readScope, releaseLock, releaseMaintenanceLock, secureDatabasePaths, sqlJson, sqliteExec, sqliteQuery, succeedMessageRun, succeedRecordRun, upsertRecordsSql, };

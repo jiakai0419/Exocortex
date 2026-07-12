@@ -10,6 +10,7 @@ import {
   table,
   title,
 } from "../../dist/terminal/index.js";
+import { sanitizeStatusReportForPublicOutput } from "../diagnostics/sync-status-report.mjs";
 
 /**
  * @typedef {Record<string, any>} JsonObject
@@ -27,8 +28,9 @@ function localIso(value) {
   return new Date(String(value)).toLocaleString();
 }
 
-/** @param {JsonObject} status */
-function renderSyncStatusText(status) {
+/** @param {JsonObject} input */
+function renderSyncStatusText(input) {
+  const status = sanitizeStatusReportForPublicOutput(input);
   const byDirection = Object.fromEntries(
     status.records.by_direction.map((row) => [row.direction, row]),
   );
@@ -85,10 +87,7 @@ function renderSyncStatusText(status) {
         {
           key: "lark_cli",
           header: "Lark CLI",
-          render: (row) =>
-            row.lark_cli_error_message
-              ? `${row.lark_cli_error_code}: ${row.lark_cli_error_message}`
-              : "",
+          render: (row) => row.error_code == null ? "" : `code ${row.error_code}`,
         },
         { key: "count", header: "Count", render: (row) => row.count },
       ]),
@@ -117,11 +116,11 @@ function renderSyncStatusText(status) {
     lines.push(section("Recent non-success runs"));
     lines.push(
       list(
-        recentProblems.map((run) =>
-          `#${run.id} ${statusBadge(run.status)} [${
-            run.failure_kind || "unknown"
-          }] ${run.scope_id}: ${run.error_type || ""}`,
-        ),
+        recentProblems.map((run) => {
+          const at = run.finished_at || run.started_at;
+          const code = run.error_code == null ? "" : ` code=${run.error_code}`;
+          return `${at || "recent"} ${statusBadge(run.status)} [${run.failure_kind || "unknown"}]${code}`;
+        }),
       ),
     );
   }

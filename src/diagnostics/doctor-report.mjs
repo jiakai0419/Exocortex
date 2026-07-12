@@ -1,12 +1,20 @@
 // @ts-check
 
 import { spawnSync } from "node:child_process";
-import { resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   buildFindings,
   normalizeLiveResult,
   overallStatus,
 } from "./doctor-core.mjs";
+import { sanitizeLagReportForPublicOutput } from "./lark-im-lag-core.mjs";
+import { sanitizeQualityReportForPublicOutput } from "./lark-im-quality-report.mjs";
+import { publicCommandFailureReason } from "./public-safe.mjs";
+import { sanitizeStatusReportForPublicOutput } from "./sync-status-report.mjs";
+
+const PROJECT_ROOT = fileURLToPath(new URL("../../", import.meta.url));
+const DEFAULT_DOCTOR_CHILD_TIMEOUT_MS = 180_000;
 
 /**
  * @typedef {Record<string, any>} JsonObject
@@ -21,7 +29,6 @@ import {
  * @property {boolean} ok
  * @property {string} overall
  * @property {string} checked_at
- * @property {string} db_path
  * @property {JsonObject} status
  * @property {JsonObject} quality
  * @property {JsonObject | null} live
@@ -31,29 +38,47 @@ import {
  * @property {(args: string[], okStatuses?: Set<number>) => JsonObject=} runJson
  * @property {(dbPath: string) => string=} resolvePath
  * @property {() => Date=} now
+ *
+ * @typedef {object} RunJsonDeps
+ * @property {(cmd: string, args: string[], options: JsonObject) => JsonObject=} spawnSync
+ * @property {string=} execPath
+ * @property {string=} projectRoot
+ * @property {number=} timeoutMs
  */
 
 /**
  * @param {string[]} args
  * @param {Set<number>} [okStatuses]
+ * @param {RunJsonDeps} [deps]
  * @returns {JsonObject}
  */
-function runJson(args, okStatuses = new Set([0])) {
-  const result = spawnSync("node", args, {
+function runJson(args, okStatuses = new Set([0]), deps = {}) {
+  const run = deps.spawnSync || spawnSync;
+  const projectRoot = deps.projectRoot || PROJECT_ROOT;
+  const script = args[0];
+  if (!script) throw new Error("diagnostic command is missing its script path");
+  const scriptPath = isAbsolute(script) ? script : resolve(projectRoot, script);
+  const timeoutMs = Number.isSafeInteger(deps.timeoutMs) && Number(deps.timeoutMs) > 0
+    ? Number(deps.timeoutMs)
+    : DEFAULT_DOCTOR_CHILD_TIMEOUT_MS;
+  const result = run(deps.execPath || process.execPath, [scriptPath, ...args.slice(1)], {
+    cwd: projectRoot,
     encoding: "utf8",
     maxBuffer: 100 * 1024 * 1024,
+    timeout: timeoutMs,
+    killSignal: "SIGKILL",
   });
   const status = result.status ?? 1;
-  const stdout = result.stdout.trim();
+  const stdout = String(result.stdout || "").trim();
+  const stderr = String(result.stderr || "").trim();
   if (stdout) {
     try {
       const json = JSON.parse(stdout);
       if (!okStatuses.has(status)) json._command_status = status;
       return json;
-    } catch (error) {
+    } catch {
       if (okStatuses.has(status)) {
-        const message = error instanceof Error ? error.message : String(error);
-        throw new Error(`${args.join(" ")} returned non-JSON output: ${message}`);
+        throw new Error("diagnostic command returned invalid JSON");
       }
     }
   }
@@ -61,10 +86,10 @@ function runJson(args, okStatuses = new Set([0])) {
     return {
       ok: false,
       status: "command_failed",
-      command: ["node", ...args].join(" "),
       exit_status: status,
-      stderr: result.stderr.trim(),
-      stdout,
+      reason: publicCommandFailureReason(
+        `${result.error?.code || ""}\n${result.error?.message || ""}\n${stderr}\n${stdout}`,
+      ),
     };
   }
   return {};
@@ -76,26 +101,38 @@ function runJson(args, okStatuses = new Set([0])) {
  * @returns {DoctorReport}
  */
 function buildReport(opts, deps = {}) {
-  const dbPath = (deps.resolvePath || resolve)(opts.db);
+  const resolvePath = deps.resolvePath || ((path) => isAbsolute(path) ? path : resolve(PROJECT_ROOT, path));
+  const dbPath = resolvePath(opts.db);
   const readJson = deps.runJson || runJson;
   const now = deps.now || (() => new Date());
-  const status = readJson(["scripts/sync-status.mjs", "--db", dbPath, "--format", "json"]);
-  const quality = readJson(["scripts/lark-im-quality.mjs", "--db", dbPath, "--format", "json"]);
+  const status = sanitizeStatusReportForPublicOutput(
+    readJson(["scripts/sync-status.mjs", "--db", dbPath, "--format", "json"]),
+  );
+  const quality = sanitizeQualityReportForPublicOutput(
+    readJson(
+      ["scripts/lark-im-quality.mjs", "--db", dbPath, "--format", "json"],
+      new Set([0, 2]),
+    ),
+  );
   const live = opts.live
-    ? normalizeLiveResult(readJson(
-        [
-          "scripts/lark-im-lag-check.mjs",
-          "--db",
-          dbPath,
-          "--hot-chats",
-          String(opts.hotChats),
-          "--messages-per-chat",
-          String(opts.messagesPerChat),
-          "--format",
-          "json",
-        ],
-        new Set([0, 2]),
-      ))
+    ? normalizeLiveResult(
+        sanitizeLagReportForPublicOutput(
+          readJson(
+            [
+              "scripts/lark-im-lag-check.mjs",
+              "--db",
+              dbPath,
+              "--hot-chats",
+              String(opts.hotChats),
+              "--messages-per-chat",
+              String(opts.messagesPerChat),
+              "--format",
+              "json",
+            ],
+            new Set([0, 2]),
+          ),
+        ),
+      )
     : null;
 
   const findings = buildFindings({ status, quality, live });
@@ -105,7 +142,6 @@ function buildReport(opts, deps = {}) {
     ok: ["fresh", "syncing", "catching_up"].includes(overall),
     overall,
     checked_at: now().toISOString(),
-    db_path: dbPath,
     status,
     quality,
     live,
@@ -114,6 +150,8 @@ function buildReport(opts, deps = {}) {
 }
 
 export {
+  DEFAULT_DOCTOR_CHILD_TIMEOUT_MS,
+  PROJECT_ROOT,
   buildReport,
   runJson,
 };

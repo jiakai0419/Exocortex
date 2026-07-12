@@ -2,7 +2,6 @@
 
 import {
   block,
-  compact,
   kv,
   list,
   section,
@@ -10,14 +9,18 @@ import {
   table,
   title,
 } from "../../dist/terminal/index.js";
-import { hasQualityIssues } from "../diagnostics/lark-im-quality-report.mjs";
+import {
+  hasQualityIssues,
+  sanitizeQualityReportForPublicOutput,
+} from "../diagnostics/lark-im-quality-report.mjs";
 
 /**
  * @typedef {Record<string, any>} JsonObject
  */
 
-/** @param {JsonObject} report */
-function renderQualityText(report) {
+/** @param {JsonObject} input */
+function renderQualityText(input) {
+  const report = sanitizeQualityReportForPublicOutput(input);
   const hasIssues = hasQualityIssues(report);
   const lines = [
     `${title("Lark IM data quality")} ${statusBadge(hasIssues ? "needs_attention" : "ok")}`,
@@ -58,10 +61,7 @@ function renderQualityText(report) {
         {
           key: "lark_cli",
           header: "Lark CLI",
-          render: (row) =>
-            row.lark_cli_error_message
-              ? `${row.lark_cli_error_code}: ${row.lark_cli_error_message}`
-              : "",
+          render: (row) => row.error_code == null ? "" : `code ${row.error_code}`,
         },
         { key: "count", header: "Count", render: (row) => row.count },
       ]),
@@ -82,12 +82,10 @@ function renderQualityText(report) {
     lines.push(section("Historical failed runs"));
     lines.push(
       list(
-        report.recent_failures.map(
-          (row) =>
-            `#${row.id} [${row.failure_kind || "unknown"}] ${row.scope_id}: ${
-              row.error_type || "Error"
-            } ${compact(row.error_message, 140)}`,
-        ),
+        report.recent_failures.map((row) => {
+          const code = row.error_code == null ? "" : ` code ${row.error_code}`;
+          return `[${row.failure_kind || "unknown"}]${code}${row.transient ? " transient" : ""}`;
+        }),
       ),
     );
   }

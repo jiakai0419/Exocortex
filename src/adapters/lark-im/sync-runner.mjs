@@ -29,12 +29,15 @@ import {
   SOURCE_ID,
   chatScopeId,
   cursorAfter,
+  fetchMessageWindowWithBisection,
   hash,
   localIsoFromMs,
   messageWindow,
   prepareRecords,
   shortHash,
 } from "./core.mjs";
+
+const RUN_FENCE_HARD_LEASE_SECONDS = 20 * 60;
 
 /**
  * @typedef {"cursor" | "hot" | "reconcile"} DiscoveryMode
@@ -138,6 +141,31 @@ function resolveDeps(deps = {}) {
   return { ...defaultDeps, ...deps };
 }
 
+/** @param {ScopeRow} scope @param {string} key */
+function numericScopeRank(scope, key) {
+  const value = Number(scope.config?.[key]);
+  return Number.isFinite(value) ? value : Number.MAX_SAFE_INTEGER;
+}
+
+/** @param {ScopeRow} left @param {ScopeRow} right @param {ReceivedMode} mode */
+function compareReceivedScopes(left, right, mode) {
+  if (mode === "hot") {
+    const rank = numericScopeRank(left, "hot_rank") - numericScopeRank(right, "hot_rank");
+    if (rank !== 0) return rank;
+  } else {
+    const leftHasCursor = left.cursor !== null && left.cursor !== undefined;
+    const rightHasCursor = right.cursor !== null && right.cursor !== undefined;
+    if (leftHasCursor !== rightHasCursor) return leftHasCursor ? 1 : -1;
+    if (!leftHasCursor) {
+      const rank = numericScopeRank(left, "discovery_rank") - numericScopeRank(right, "discovery_rank");
+      if (rank !== 0) return rank;
+    }
+  }
+  const updated = String(left.cursor_updated_at || "").localeCompare(String(right.cursor_updated_at || ""));
+  if (updated !== 0) return updated;
+  return left.id.localeCompare(right.id);
+}
+
 /**
  * @param {string} dbPath
  * @param {ReceivedMode} [mode]
@@ -148,9 +176,7 @@ function listReceivedScopes(dbPath, mode = "all", deps = defaultDeps) {
   const modeWhere =
     mode === "hot"
       ? "AND json_extract(config_json, '$.hot_seen_at') IS NOT NULL"
-      : mode === "catchup"
-        ? "AND cursor_json IS NULL"
-        : "";
+      : "";
   const orderBy =
     mode === "hot"
       ? `
@@ -158,20 +184,18 @@ function listReceivedScopes(dbPath, mode = "all", deps = defaultDeps) {
        CAST(COALESCE(json_extract(config_json, '$.hot_rank'), 999999999) AS INTEGER),
        cursor_updated_at,
        id;`
-      : mode === "catchup"
-        ? `
+      : `
      ORDER BY
-       CAST(COALESCE(json_extract(config_json, '$.discovery_rank'), 999999999) AS INTEGER),
-       id;`
-        : `
-     ORDER BY
-       cursor_updated_at IS NOT NULL,
-       CAST(COALESCE(json_extract(config_json, '$.discovery_rank'), 999999999) AS INTEGER),
+       cursor_json IS NOT NULL,
+       CASE WHEN cursor_json IS NULL
+         THEN CAST(COALESCE(json_extract(config_json, '$.discovery_rank'), 999999999) AS INTEGER)
+         ELSE NULL
+       END,
        cursor_updated_at,
        id;`;
   const rows = deps.sqliteQuery(
     dbPath,
-    `SELECT id, source_id, name, enabled, config_json, cursor_json
+    `SELECT id, source_id, name, enabled, config_json, cursor_json, cursor_updated_at
      FROM sync_scopes
      WHERE source_id = ${deps.quoteSql(SOURCE_ID)}
        AND id LIKE 'lark.im.received.chat.%'
@@ -187,7 +211,7 @@ function listReceivedScopes(dbPath, mode = "all", deps = defaultDeps) {
       config: scope.config_json ? JSON.parse(scope.config_json) : {},
       cursor: scope.cursor_json ? JSON.parse(scope.cursor_json) : null,
     };
-  });
+  }).sort((left, right) => compareReceivedScopes(left, right, mode));
 }
 
 /**
@@ -199,8 +223,8 @@ function listReceivedScopes(dbPath, mode = "all", deps = defaultDeps) {
  * @returns {RunResult}
  */
 function syncScope(dbPath, scopeId, opts, worker, deps = defaultDeps) {
-  const scope = /** @type {ScopeRow} */ (deps.readScope(dbPath, scopeId));
-  if (!scope.enabled) return { scope_id: scopeId, skipped: true, reason: "scope_disabled" };
+  const initialScope = /** @type {ScopeRow} */ (deps.readScope(dbPath, scopeId));
+  if (!initialScope.enabled) return { scope_id: scopeId, skipped: true, reason: "scope_disabled" };
   if (deps.isMaintenanceLocked(dbPath)) {
     return { scope_id: scopeId, skipped: true, reason: "maintenance_lock" };
   }
@@ -208,17 +232,114 @@ function syncScope(dbPath, scopeId, opts, worker, deps = defaultDeps) {
     const reason = deps.isMaintenanceLocked(dbPath) ? "maintenance_lock" : "scope_locked";
     return { scope_id: scopeId, skipped: true, reason };
   }
-  const runId = deps.createRun(dbPath, scope);
+
+  /** @type {RunResult | null} */
+  let outcome = null;
+  /** @type {Error | null} */
+  let infrastructureError = null;
+  /** @type {Error | null} */
+  let releaseError = null;
   try {
-    const result = worker(scope, runId);
-    deps.releaseLock(dbPath, scopeId);
-    return { scope_id: scopeId, run_id: runId, ...result };
+    // Another contender may have advanced or disabled the scope while this
+    // process waited for the lock. Only the post-lock snapshot is authoritative.
+    const scope = /** @type {ScopeRow} */ (deps.readScope(dbPath, scopeId));
+    if (!scope.enabled) {
+      outcome = { scope_id: scopeId, skipped: true, reason: "scope_disabled" };
+    } else {
+      const runId = deps.createRun(dbPath, scope);
+      try {
+        const result = worker(scope, runId);
+        outcome = { scope_id: scopeId, run_id: runId, ...result };
+      } catch (error) {
+        const err = error instanceof Error ? error : new Error(String(error));
+        let failError = null;
+        try {
+          const failed = deps.failRun(dbPath, scope, runId, err);
+          if (failed === false) failError = new Error("run failure update was rejected by the active run fence");
+        } catch (failure) {
+          failError = failure instanceof Error ? failure : new Error(String(failure));
+        }
+        outcome = {
+          scope_id: scopeId,
+          run_id: runId,
+          ok: false,
+          error: failError ? `${err.message}; additionally failed to persist run failure: ${failError.message}` : err.message,
+          ...(failError ? { fail_run_error: failError.message } : {}),
+        };
+      }
+    }
   } catch (error) {
-    const err = error instanceof Error ? error : new Error(String(error));
-    deps.failRun(dbPath, scope, runId, err);
-    deps.releaseLock(dbPath, scopeId);
-    return { scope_id: scopeId, run_id: runId, ok: false, error: err.message };
+    infrastructureError = error instanceof Error ? error : new Error(String(error));
+  } finally {
+    try {
+      deps.releaseLock(dbPath, scopeId);
+    } catch (error) {
+      releaseError = error instanceof Error ? error : new Error(String(error));
+    }
   }
+
+  if (infrastructureError) {
+    if (releaseError) {
+      throw new AggregateError(
+        [infrastructureError, releaseError],
+        `${infrastructureError.message}; additionally failed to release scope lock: ${releaseError.message}`,
+      );
+    }
+    throw infrastructureError;
+  }
+  if (releaseError) {
+    const message = `scope lock release failed after run completion: ${releaseError.message}`;
+    return {
+      ...(outcome || { scope_id: scopeId }),
+      ok: false,
+      error: outcome?.error ? `${outcome.error}; ${message}` : message,
+      lock_release_error: releaseError.message,
+    };
+  }
+  return outcome || { scope_id: scopeId, ok: false, error: "scope sync produced no result" };
+}
+
+/**
+ * Every non-record success path must use the same run/lock/cursor fence as the
+ * ingestion store. The assertion row deliberately violates a CHECK constraint
+ * when the fence is absent so `.bail on` rolls the whole transaction back
+ * before scope discovery/disable mutations can commit.
+ *
+ * @param {ScopeRow} scope
+ * @param {number} runId
+ * @param {string} finishedAtIso
+ * @param {SyncRunnerDeps} deps
+ */
+function runFenceGuardSql(scope, runId, finishedAtIso, deps) {
+  const id = Number(runId);
+  if (!Number.isSafeInteger(id) || id <= 0) throw new Error(`invalid run id: ${String(runId)}`);
+  const finishedAtMs = Date.parse(finishedAtIso);
+  if (!Number.isFinite(finishedAtMs)) throw new Error(`invalid run finish time: ${finishedAtIso}`);
+  const hardLeaseCutoff = new Date(
+    finishedAtMs - RUN_FENCE_HARD_LEASE_SECONDS * 1000,
+  ).toISOString();
+  return `
+CREATE TEMP TABLE __lark_run_fence_guard (allowed INTEGER PRIMARY KEY);
+INSERT INTO __lark_run_fence_guard (allowed)
+SELECT 1
+FROM sync_runs r
+JOIN sync_scopes s ON s.id = r.scope_id AND s.source_id = r.source_id
+JOIN sync_locks l ON l.scope_id = r.scope_id
+WHERE r.id = ${id}
+  AND r.status = 'running'
+  AND r.scope_id = ${deps.quoteSql(scope.id)}
+  AND r.source_id = ${deps.quoteSql(scope.source_id)}
+  AND l.locked_by = json_extract(r.metadata_json, '$.__run_fence.owner')
+  AND l.locked_at = json_extract(r.metadata_json, '$.__run_fence.locked_at')
+  AND julianday(l.locked_at) IS NOT NULL
+  AND l.locked_at > ${deps.quoteSql(hardLeaseCutoff)}
+  AND s.cursor_json IS r.cursor_before_json;
+CREATE TEMP TABLE __lark_run_fence_assert (
+  allowed INTEGER NOT NULL CHECK (allowed = 1)
+);
+INSERT INTO __lark_run_fence_assert (allowed)
+VALUES (CASE WHEN EXISTS (SELECT 1 FROM __lark_run_fence_guard) THEN 1 ELSE 0 END);
+`;
 }
 
 /**
@@ -230,8 +351,14 @@ function syncScope(dbPath, scopeId, opts, worker, deps = defaultDeps) {
  */
 function syncSent(dbPath, opts, selfProfile, deps = defaultDeps) {
   return syncScope(dbPath, SENT_SCOPE_ID, opts, (scope, runId) => {
-    const { startMs, endMs } = messageWindow(scope, opts);
-    const fetched = deps.fetchSentMessages(selfProfile.open_id, startMs, endMs, opts);
+    const { startMs, endMs: targetEndMs } = messageWindow(scope, opts);
+    const fetched = fetchMessageWindowWithBisection(
+      (windowStartMs, windowEndMs) =>
+        deps.fetchSentMessages(selfProfile.open_id, windowStartMs, windowEndMs, opts),
+      startMs,
+      targetEndMs,
+    );
+    const completedEndMs = Number(fetched.window_end_ms);
     const peopleContext = deps.buildPeopleContext(fetched.messages, opts, selfProfile, scope.config);
     const records = prepareRecords(
       fetched.messages,
@@ -239,18 +366,20 @@ function syncSent(dbPath, opts, selfProfile, deps = defaultDeps) {
       "sent",
       scope.cursor,
       opts.startMs,
-      endMs,
+      completedEndMs,
       null,
       /** @type {any} */ (peopleContext),
       scope.config,
     );
-    const cursor = cursorAfter(endMs);
+    const cursor = cursorAfter(completedEndMs);
     const effects = deps.succeedMessageRun(dbPath, scope, runId, records, fetched.messages.length, cursor, {
       adapter: "lark.im.sent_by_me",
       pages: fetched.pages,
       window_start: localIsoFromMs(startMs),
-      window_end: localIsoFromMs(endMs),
+      window_end: localIsoFromMs(completedEndMs),
       requested_window_end: localIsoFromMs(opts.endMs),
+      bounded_window_target: localIsoFromMs(targetEndMs),
+      window_bisections: fetched.window_bisections,
       stable_horizon_seconds: opts.endExplicit ? 0 : opts.stableHorizonSeconds,
       fetched_count: fetched.messages.length,
       stored_candidate_count: records.length,
@@ -307,6 +436,26 @@ function prepareChatWindowRecords(
   ].sort((a, b) => a.occurred_at_ms - b.occurred_at_ms || a.external_id.localeCompare(b.external_id));
 }
 
+/** @param {unknown} value @param {string} label */
+function assertValidDiscoveryPage(value, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} must be an object`);
+  }
+  const page = /** @type {JsonObject} */ (value);
+  if (!Array.isArray(page.chats)) throw new Error(`${label} is missing a chats array`);
+  if (typeof page.has_more !== "boolean") throw new Error(`${label} is missing a boolean has_more`);
+  if (typeof page.page_token !== "string") throw new Error(`${label} has a non-string page_token`);
+  page.chats.forEach((chat, index) => {
+    if (!chat || typeof chat !== "object" || Array.isArray(chat)) {
+      throw new Error(`${label} chat at index ${index} must be an object`);
+    }
+    if (typeof chat.chat_id !== "string" || !chat.chat_id.trim()) {
+      throw new Error(`${label} chat at index ${index} is missing a valid chat_id`);
+    }
+  });
+  return page;
+}
+
 /**
  * @param {ScopeRow} scope
  * @param {SyncOptions} opts
@@ -329,11 +478,14 @@ function discoverChatPages(scope, opts, deps = defaultDeps) {
   let processedPages = 0;
   const previousPages = activeCursor ? Number(scope.cursor?.pages_scanned || 0) : 0;
   for (let pageIndex = 0; pageIndex < opts.discoveryPagesPerRun; pageIndex += 1) {
-    const page = deps.fetchChatDiscoveryPage(opts, pageToken);
+    const page = assertValidDiscoveryPage(
+      deps.fetchChatDiscoveryPage(opts, pageToken),
+      `chat discovery page ${processedPages + 1}`,
+    );
     processedPages += 1;
     const rankBase = (previousPages + processedPages - 1) * opts.chatPageSize;
     for (const [chatIndex, chat] of page.chats.entries()) {
-      if (!chat?.chat_id || seen.has(chat.chat_id)) continue;
+      if (seen.has(chat.chat_id)) continue;
       seen.add(chat.chat_id);
       chats.push({ ...chat, discovery_rank: rankBase + chatIndex });
     }
@@ -371,11 +523,14 @@ function discoverHotChatPages(opts, deps = defaultDeps) {
   let processedPages = 0;
   const hotSeenAt = deps.nowIso();
   for (let pageIndex = 0; pageIndex < opts.discoveryPagesPerRun; pageIndex += 1) {
-    const page = deps.fetchChatDiscoveryPage(opts, pageToken);
+    const page = assertValidDiscoveryPage(
+      deps.fetchChatDiscoveryPage(opts, pageToken),
+      `hot chat discovery page ${processedPages + 1}`,
+    );
     processedPages += 1;
     const rankBase = pageIndex * opts.chatPageSize;
     for (const [chatIndex, chat] of page.chats.entries()) {
-      if (!chat?.chat_id || seen.has(chat.chat_id)) continue;
+      if (seen.has(chat.chat_id)) continue;
       seen.add(chat.chat_id);
       chats.push({ ...chat, hot_rank: rankBase + chatIndex, hot_seen_at: hotSeenAt });
     }
@@ -462,6 +617,8 @@ function syncDiscovery(dbPath, opts, deps = defaultDeps) {
       deps.sqliteExec(
         dbPath,
         `
+BEGIN;
+${runFenceGuardSql(scope, runId, now, deps)}
 UPDATE sync_runs
 SET status = 'succeeded',
     cursor_after_json = ${deps.sqlJson(cursor)},
@@ -479,7 +636,9 @@ SET status = 'succeeded',
       has_more: false,
       skipped_reason: "already_complete",
     })}
-WHERE id = ${Number(runId)};
+WHERE id = ${Number(runId)}
+  AND EXISTS (SELECT 1 FROM __lark_run_fence_guard);
+COMMIT;
 `,
         `skip completed discovery run ${runId}`,
       );
@@ -552,6 +711,24 @@ WHERE source_id = ${deps.quoteSql(SOURCE_ID)}
   )};
 `
         : "";
+    const clearStaleHotSql = discovered.hot
+      ? `
+UPDATE sync_scopes
+SET config_json = json_remove(
+      config_json,
+      '$.hot_rank',
+      '$.hot_seen_at',
+      '$.last_hot_snapshot_id'
+    ),
+    updated_at = ${deps.quoteSql(now)}
+WHERE source_id = ${deps.quoteSql(SOURCE_ID)}
+  AND id LIKE 'lark.im.received.chat.%'
+  AND json_extract(config_json, '$.hot_seen_at') IS NOT NULL
+  AND COALESCE(json_extract(config_json, '$.last_hot_snapshot_id'), '') <> ${deps.quoteSql(
+    discovered.snapshot_id,
+  )};
+`
+      : "";
     const cursor = discovered.hot
       ? scope.cursor || null
       : discovered.has_more
@@ -576,7 +753,9 @@ WHERE source_id = ${deps.quoteSql(SOURCE_ID)}
       dbPath,
       `
 BEGIN;
+${runFenceGuardSql(scope, runId, now, deps)}
 ${upserts}
+${clearStaleHotSql}
 ${disableSql}
 UPDATE sync_runs
 SET status = 'succeeded',
@@ -596,13 +775,15 @@ SET status = 'succeeded',
       snapshot_id: discovered.snapshot_id,
       has_more: discovered.has_more,
     })}
-WHERE id = ${Number(runId)};
+WHERE id = ${Number(runId)}
+  AND EXISTS (SELECT 1 FROM __lark_run_fence_guard);
 UPDATE sync_scopes
 SET cursor_json = ${deps.sqlJson(cursor)},
     cursor_updated_at = ${deps.quoteSql(now)},
     last_success_run_id = ${Number(runId)},
     updated_at = ${deps.quoteSql(now)}
-WHERE id = ${deps.quoteSql(scope.id)};
+WHERE id = ${deps.quoteSql(scope.id)}
+  AND EXISTS (SELECT 1 FROM __lark_run_fence_guard);
 COMMIT;
 `,
       `succeed discovery run ${runId}`,
@@ -628,11 +809,10 @@ COMMIT;
  */
 function succeedUnsupportedRun(dbPath, scope, runId, error, reason, deps = defaultDeps) {
   const now = deps.nowIso();
-  const unsupportedError = String(error instanceof Error ? error.message : error).slice(0, 1000);
   const config = {
     unsupported_reason: reason,
     unsupported_at: now,
-    unsupported_error: unsupportedError,
+    unsupported_error: `${reason} (remote details redacted)`,
     ...(reason === "bot_user_out_of_chat"
       ? {
           lark_cli_error_code: 230002,
@@ -644,6 +824,7 @@ function succeedUnsupportedRun(dbPath, scope, runId, error, reason, deps = defau
     dbPath,
     `
 BEGIN;
+${runFenceGuardSql(scope, runId, now, deps)}
 UPDATE sync_runs
 SET status = 'succeeded',
     finished_at = ${deps.quoteSql(now)},
@@ -656,13 +837,15 @@ SET status = 'succeeded',
       skipped: true,
       skip_reason: reason,
     })}
-WHERE id = ${Number(runId)};
+WHERE id = ${Number(runId)}
+  AND EXISTS (SELECT 1 FROM __lark_run_fence_guard);
 UPDATE sync_scopes
 SET enabled = 0,
     config_json = json_patch(config_json, ${deps.sqlJson(config)}),
     last_success_run_id = ${Number(runId)},
     updated_at = ${deps.quoteSql(now)}
-WHERE id = ${deps.quoteSql(scope.id)};
+WHERE id = ${deps.quoteSql(scope.id)}
+  AND EXISTS (SELECT 1 FROM __lark_run_fence_guard);
 COMMIT;
 `,
     `succeed unsupported run ${runId}`,
@@ -681,10 +864,15 @@ function syncReceivedScope(dbPath, opts, scope, selfProfile, deps = defaultDeps)
   return syncScope(dbPath, scope.id, opts, (lockedScope, runId) => {
     const chatIdValue = lockedScope.config?.chat_id;
     if (!chatIdValue) throw new Error(`received scope missing config.chat_id: ${lockedScope.id}`);
-    const { startMs, endMs } = messageWindow(lockedScope, opts);
+    const { startMs, endMs: targetEndMs } = messageWindow(lockedScope, opts);
     let fetched;
     try {
-      fetched = deps.fetchChatMessages(chatIdValue, startMs, endMs, opts);
+      fetched = fetchMessageWindowWithBisection(
+        (windowStartMs, windowEndMs) =>
+          deps.fetchChatMessages(chatIdValue, windowStartMs, windowEndMs, opts),
+        startMs,
+        targetEndMs,
+      );
     } catch (error) {
       if (deps.isRestrictedModeError(error)) {
         succeedUnsupportedRun(dbPath, lockedScope, runId, error, "restricted_mode", deps);
@@ -696,6 +884,7 @@ function syncReceivedScope(dbPath, opts, scope, selfProfile, deps = defaultDeps)
       }
       throw error;
     }
+    const completedEndMs = Number(fetched.window_end_ms);
     const scopeConfig = lockedScope.config || {};
     const peopleContext = deps.buildPeopleContext(fetched.messages, opts, selfProfile, scopeConfig);
     const records = prepareChatWindowRecords(
@@ -703,18 +892,20 @@ function syncReceivedScope(dbPath, opts, scope, selfProfile, deps = defaultDeps)
       lockedScope.id,
       lockedScope.cursor,
       opts.startMs,
-      endMs,
+      completedEndMs,
       selfProfile.open_id,
       /** @type {any} */ (peopleContext),
       scopeConfig,
     );
-    const cursor = cursorAfter(endMs);
+    const cursor = cursorAfter(completedEndMs);
     const effects = deps.succeedMessageRun(dbPath, lockedScope, runId, records, fetched.messages.length, cursor, {
       adapter: "lark.im.received_per_chat",
       pages: fetched.pages,
       window_start: localIsoFromMs(startMs),
-      window_end: localIsoFromMs(endMs),
+      window_end: localIsoFromMs(completedEndMs),
       requested_window_end: localIsoFromMs(opts.endMs),
+      bounded_window_target: localIsoFromMs(targetEndMs),
+      window_bisections: fetched.window_bisections,
       stable_horizon_seconds: opts.endExplicit ? 0 : opts.stableHorizonSeconds,
       fetched_count: fetched.messages.length,
       stored_candidate_count: records.length,
@@ -768,6 +959,7 @@ function createSyncRunner(deps = {}) {
 }
 
 export {
+  compareReceivedScopes,
   createSyncRunner,
   discoverChatPages,
   discoverHotChatPages,

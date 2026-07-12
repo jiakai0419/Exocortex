@@ -8,6 +8,7 @@ type WorkerCycleOptions = {
   receivedScopesPerCycle: number;
   maxChatPages: number;
   reconcileIntervalHours: number;
+  retentionEveryCycles?: number;
   chatTypes?: string;
   logDir?: string;
 };
@@ -15,6 +16,7 @@ type WorkerCycleOptions = {
 type WorkerStepSpec = {
   name: string;
   args: string[];
+  command?: "sync" | "maintenance";
 };
 
 type RunSummary = {
@@ -73,15 +75,16 @@ type WorkerCyclePayload = {
   cycle: number;
   ok: boolean;
   at: string;
-  steps: WorkerEvent[];
+  step_count: number;
+  failed_steps: string[];
 };
 
-type WorkerStepRunner = (name: string, args: string[]) => WorkerEvent;
+type WorkerStepRunner = (name: string, args: string[], command?: "sync" | "maintenance") => WorkerEvent;
 type WorkerLogWriter = (opts: WorkerCycleOptions, payload: WorkerEvent | WorkerCyclePayload) => void;
 
-function buildCycleStepSpecs(opts: WorkerCycleOptions): WorkerStepSpec[] {
+function buildCycleStepSpecs(opts: WorkerCycleOptions, cycle = 1): WorkerStepSpec[] {
   const chatTypes = opts.chatTypes || "group,p2p";
-  return [
+  const steps: WorkerStepSpec[] = [
     {
       name: "sent",
       args: ["--db", opts.db, "--scope", "sent"],
@@ -153,19 +156,28 @@ function buildCycleStepSpecs(opts: WorkerCycleOptions): WorkerStepSpec[] {
       ],
     },
     {
-      name: "received-catchup",
+      name: "received-fair",
       args: [
         "--db",
         opts.db,
         "--scope",
         "received",
         "--received-mode",
-        "catchup",
+        "all",
         "--received-scopes-per-run",
         String(opts.receivedScopesPerCycle),
       ],
     },
   ];
+  const retentionEveryCycles = Number(opts.retentionEveryCycles || 1440);
+  if (retentionEveryCycles > 0 && cycle % retentionEveryCycles === 0) {
+    steps.push({
+      name: "retention",
+      command: "maintenance",
+      args: ["prune-runs", "--db", opts.db, "--apply", "--format", "json"],
+    });
+  }
+  return steps;
 }
 
 function compactRun(run: RunSummary | null | undefined) {
@@ -240,7 +252,8 @@ function cyclePayload(
     cycle,
     ok: steps.every((step) => step.ok),
     at: now(),
-    steps,
+    step_count: steps.length,
+    failed_steps: steps.filter((step) => !step.ok).map((step) => step.name || "unknown"),
   };
 }
 
@@ -252,8 +265,8 @@ function runCycleWithRunner(
   now: () => string = () => new Date().toISOString(),
 ) {
   const steps: WorkerEvent[] = [];
-  for (const spec of buildCycleStepSpecs(opts)) {
-    const step = runStep(spec.name, spec.args);
+  for (const spec of buildCycleStepSpecs(opts, cycle)) {
+    const step = runStep(spec.name, spec.args, spec.command || "sync");
     steps.push(step);
     writeLog(opts, { type: "lark_im_worker_step", cycle, ...step });
   }

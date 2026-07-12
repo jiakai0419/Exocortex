@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import {
@@ -35,6 +38,10 @@ test("lark im worker parseArgs keeps stable defaults", () => {
   assert.equal(opts.reconcileIntervalHours, 24);
   assert.equal(opts.chatTypes, "group,p2p");
   assert.equal(opts.logDir, "logs/lark-im");
+  assert.equal(opts.stepTimeoutSeconds, 600);
+  assert.equal(opts.logMaxBytes, 10 * 1024 * 1024);
+  assert.equal(opts.logKeepFiles, 5);
+  assert.equal(opts.retentionEveryCycles, 1440);
   assert.equal(opts.maxCycles, null);
 });
 
@@ -114,13 +121,16 @@ test("runStep invokes lark-im-sync with node and compacts JSON summaries", () =>
     },
   });
 
-  assert.deepEqual(calls, [
-    [
-      "/usr/local/bin/node",
-      ["scripts/lark-im-sync.mjs", "--scope", "sent", "--db", "custom.sqlite"],
-      { encoding: "utf8", maxBuffer: 100 * 1024 * 1024 },
-    ],
-  ]);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], "/usr/local/bin/node");
+  assert.match(calls[0][1][0], /\/scripts\/lark-im-sync\.mjs$/);
+  assert.deepEqual(calls[0][1].slice(1), ["--scope", "sent", "--db", "custom.sqlite"]);
+  assert.deepEqual(calls[0][2], {
+    encoding: "utf8",
+    maxBuffer: 100 * 1024 * 1024,
+    timeout: 600_000,
+    killSignal: "SIGKILL",
+  });
   assert.equal(step.name, "sent");
   assert.equal(step.ok, true);
   assert.equal(step.exit_code, 0);
@@ -160,6 +170,30 @@ test("runStep preserves failures and malformed stdout as null summary", () => {
   assert.equal(step.stderr.length, 4000);
 });
 
+test("runStep fails closed on exit-zero malformed or unhealthy summaries", () => {
+  const malformed = runStep("sent", [], {
+    now: () => new Date("2026-06-20T00:00:00.000Z"),
+    spawnSync: () => spawnResult({ status: 0, stdout: "not-json" }),
+  });
+  assert.equal(malformed.ok, false);
+  assert.equal(malformed.exit_code, 0);
+  assert.match(malformed.stderr, /invalid or empty JSON/);
+
+  const unhealthy = runStep("sent", [], {
+    now: () => new Date("2026-06-20T00:00:00.000Z"),
+    spawnSync: () => spawnResult({ status: 0, stdout: JSON.stringify({ ok: false }) }),
+  });
+  assert.equal(unhealthy.ok, false);
+  assert.deepEqual(unhealthy.summary, {
+    ok: false,
+    window: undefined,
+    sent: null,
+    discovery: null,
+    received: null,
+  });
+  assert.match(unhealthy.stderr, /unhealthy summary/);
+});
+
 test("writeLog writes JSONL to stdout and worker log file when logDir is set", () => {
   let stdout = "";
   const mkdirCalls = [];
@@ -171,14 +205,14 @@ test("writeLog writes JSONL to stdout and worker log file when logDir is set", (
     {
       stdout: { write: (chunk) => { stdout += chunk; } },
       mkdirSync: (path, options) => mkdirCalls.push([path, options]),
-      appendFileSync: (path, data) => appendCalls.push([path, data]),
+      appendFileSync: (path, data, options) => appendCalls.push([path, data, options]),
       resolvePath: (...parts) => parts.join("/"),
     },
   );
 
   assert.equal(stdout, "{\"type\":\"lark_im_worker_cycle\",\"cycle\":1,\"ok\":true}\n");
-  assert.deepEqual(mkdirCalls, [["logs/test", { recursive: true }]]);
-  assert.deepEqual(appendCalls, [["logs/test/worker.jsonl", stdout]]);
+  assert.deepEqual(mkdirCalls, [["logs/test", { recursive: true, mode: 0o700 }]]);
+  assert.deepEqual(appendCalls, [["logs/test/worker.jsonl", stdout, { encoding: "utf8", mode: 0o600 }]]);
 });
 
 test("writeLog can emit stdout without a file log", () => {
@@ -200,6 +234,22 @@ test("writeLog can emit stdout without a file log", () => {
   assert.equal(stdout, "{\"type\":\"event\"}\n");
 });
 
+test("writeLog rotates private worker logs at the configured size", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "exocortex-worker-log-test-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const opts = { logDir: dir, logMaxBytes: 80, logKeepFiles: 2 };
+  const deps = { stdout: { write() {} } };
+  writeLog(opts, { type: "event", payload: "first".repeat(20) }, deps);
+  writeLog(opts, { type: "event", payload: "second".repeat(20) }, deps);
+
+  const current = join(dir, "worker.jsonl");
+  assert.equal(existsSync(`${current}.1`), true);
+  assert.match(readFileSync(current, "utf8"), /second/);
+  assert.match(readFileSync(`${current}.1`, "utf8"), /first/);
+  assert.equal(statSync(dir).mode & 0o777, 0o700);
+  assert.equal(statSync(current).mode & 0o777, 0o600);
+});
+
 test("runWorker honors maxCycles and sleeps only between cycles", () => {
   const calls = [];
   runWorker(
@@ -208,7 +258,10 @@ test("runWorker honors maxCycles and sleeps only between cycles", () => {
       logDir: "",
     },
     {
-      runCycle: (_opts, cycle) => calls.push(["cycle", cycle]),
+      runCycle: (_opts, cycle) => {
+        calls.push(["cycle", cycle]);
+        return true;
+      },
       sleepSeconds: (seconds) => calls.push(["sleep", seconds]),
     },
   );
@@ -220,6 +273,7 @@ test("runWorker honors maxCycles and sleeps only between cycles", () => {
     ["sleep", 9],
     ["cycle", 3],
   ]);
+  assert.equal(runWorker(parseArgs(["--once"]), { runCycle: () => false }), false);
 });
 
 test("lark im worker direct CLI help and argument errors keep exit codes stable", () => {

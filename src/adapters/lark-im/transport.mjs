@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 /**
  * @typedef {Record<string, any>} JsonObject
  *
- * @typedef {"network_timeout" | "rate_limited" | "internal_error" | "unknown"} LarkFailureKind
+ * @typedef {"network_timeout" | "network_error" | "rate_limited" | "service_unavailable" | "internal_error" | "restricted_mode" | "bot_user_out_of_chat" | "command_unavailable" | "spawn_error" | "unknown"} LarkFailureKind
  *
  * @typedef {object} LarkFailureClassification
  * @property {LarkFailureKind} kind
@@ -17,16 +17,20 @@ import { spawnSync } from "node:child_process";
  * @property {string[]=} redactedFlags
  * @property {number=} retries
  * @property {number=} retryDelayMs
+ * @property {number=} timeoutMs
  *
  * @typedef {import("node:child_process").SpawnSyncReturns<string>} SpawnResult
  *
  * @typedef {object} TransportDeps
  * @property {string=} bin
- * @property {(cmd: string, args: string[], options: {encoding: BufferEncoding, maxBuffer: number}) => SpawnResult} [spawn]
+ * @property {number=} timeoutMs
+ * @property {(cmd: string, args: string[], options: {encoding: BufferEncoding, maxBuffer: number, timeout: number, killSignal: NodeJS.Signals}) => SpawnResult} [spawn]
  * @property {(ms: number) => void} [sleep]
  *
  * @typedef {(args: string[], options?: AdapterRunOptions) => JsonObject | null} LarkRunner
  */
+
+const DEFAULT_LARK_CLI_TIMEOUT_MS = 120_000;
 
 /**
  * @param {string} stdout
@@ -85,7 +89,19 @@ function parseLarkError(stderr) {
 /** @param {unknown} stderr */
 function classifyLarkFailure(stderr) {
   const text = String(stderr || "");
-  if (/TLS handshake timeout|Client\.Timeout|timeout awaiting response headers|i\/o timeout/i.test(text)) {
+  const publicKind = text.match(
+    /\bkind=(network_timeout|network_error|rate_limited|service_unavailable|internal_error|restricted_mode|bot_user_out_of_chat|command_unavailable|spawn_error|unknown)\b/,
+  )?.[1];
+  const publicCode = text.match(/\bcode=(\d+)\b/)?.[1];
+  if (publicKind) {
+    return {
+      kind: /** @type {LarkFailureKind} */ (publicKind),
+      transient: ["network_timeout", "network_error", "rate_limited", "service_unavailable", "internal_error"].includes(publicKind),
+      code: publicCode ? Number(publicCode) : null,
+      message: publicKind.replaceAll("_", " "),
+    };
+  }
+  if (/TLS handshake timeout|Client\.Timeout|timeout awaiting response headers|i\/o timeout|\bETIMEDOUT\b/i.test(text)) {
     return {
       kind: /** @type {LarkFailureKind} */ ("network_timeout"),
       transient: true,
@@ -96,12 +112,36 @@ function classifyLarkFailure(stderr) {
   const error = parseLarkError(stderr);
   const code = Number.isFinite(Number(error?.code)) ? Number(error?.code) : null;
   const message = String(error?.message || "");
+  if (code === 231203 || /Restricted Mode|don't allow copying or forwarding messages/i.test(text)) {
+    return {
+      kind: /** @type {LarkFailureKind} */ ("restricted_mode"),
+      transient: false,
+      code,
+      message: "restricted mode",
+    };
+  }
+  if (code === 230002 || /Bot\/User can NOT be out of the chat/i.test(text)) {
+    return {
+      kind: /** @type {LarkFailureKind} */ ("bot_user_out_of_chat"),
+      transient: false,
+      code,
+      message: "bot or user is not in the chat",
+    };
+  }
   if (error?.type === "network" && error?.subtype === "timeout") {
     return {
       kind: /** @type {LarkFailureKind} */ ("network_timeout"),
       transient: true,
       code,
       message,
+    };
+  }
+  if (/\b(?:ECONNRESET|ECONNREFUSED|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH)\b|socket hang up|connection reset|unexpected EOF/i.test(text)) {
+    return {
+      kind: /** @type {LarkFailureKind} */ ("network_error"),
+      transient: true,
+      code,
+      message: "network error",
     };
   }
   if (error?.type === "api" && (code === 9499 || /too many request/i.test(message))) {
@@ -112,12 +152,16 @@ function classifyLarkFailure(stderr) {
       message,
     };
   }
-  if (error?.type === "api" && code === 2200 && /Internal Error/i.test(message)) {
+  if (
+    (error?.type === "api" && (code === 2200 || code === 1663) && /Internal Error/i.test(message)) ||
+    /\b(?:502|503|504)\b|Bad Gateway|Service Unavailable|Gateway Timeout|temporarily unavailable/i.test(text)
+  ) {
+    const serviceUnavailable = !(error?.type === "api" && (code === 2200 || code === 1663));
     return {
-      kind: /** @type {LarkFailureKind} */ ("internal_error"),
+      kind: /** @type {LarkFailureKind} */ (serviceUnavailable ? "service_unavailable" : "internal_error"),
       transient: true,
       code,
-      message,
+      message: serviceUnavailable ? "service unavailable" : message || "internal error",
     };
   }
   return {
@@ -126,6 +170,32 @@ function classifyLarkFailure(stderr) {
     code,
     message,
   };
+}
+
+/** @param {SpawnResult | null} result */
+function spawnFailureText(result) {
+  if (!result) return "";
+  const spawnError = /** @type {NodeJS.ErrnoException | undefined} */ (result.error);
+  return [String(result.stderr || ""), spawnError?.code || "", spawnError?.message || ""].filter(Boolean).join("\n");
+}
+
+/**
+ * Keep command failures useful without copying remote stderr payloads (which
+ * can contain tenant ids, chat ids, request bodies, or tokens) into run history.
+ *
+ * @param {SpawnResult | null} result
+ * @param {number} timeoutMs
+ */
+function publicFailureDescriptor(result, timeoutMs) {
+  const spawnError = /** @type {NodeJS.ErrnoException | undefined} */ (result?.error);
+  if (spawnError?.code === "ENOENT") return "kind=command_unavailable spawn_code=ENOENT";
+  if (spawnError?.code === "ETIMEDOUT") return `kind=network_timeout timeout_ms=${timeoutMs}`;
+  const classification = classifyLarkFailure(spawnFailureText(result));
+  const parts = [`kind=${classification.kind}`];
+  if (classification.code !== null) parts.push(`code=${classification.code}`);
+  if (spawnError?.code) parts.push(`spawn_code=${spawnError.code}`);
+  if (result?.signal) parts.push(`signal=${result.signal}`);
+  return parts.join(" ");
 }
 
 /** @param {unknown} stderr */
@@ -145,39 +215,53 @@ function retryDelayForAttempt(attempt, baseDelayMs) {
  * @param {TransportDeps} [deps]
  * @returns {LarkRunner}
  */
-function createLarkCliRunner({ bin = process.env.LARK_CLI || "lark-cli", spawn = spawnSync, sleep = sleepMs } = {}) {
+function createLarkCliRunner({
+  bin = process.env.LARK_CLI || "lark-cli",
+  spawn = spawnSync,
+  sleep = sleepMs,
+  timeoutMs: defaultTimeoutMs = DEFAULT_LARK_CLI_TIMEOUT_MS,
+} = {}) {
   return function runLark(args, options = {}) {
     const retries = Number(options.retries ?? 0);
     const retryDelayMs = Number(options.retryDelayMs ?? 1000);
+    const requestedTimeoutMs = Number(options.timeoutMs ?? defaultTimeoutMs);
+    const timeoutMs = Number.isSafeInteger(requestedTimeoutMs) && requestedTimeoutMs > 0
+      ? requestedTimeoutMs
+      : DEFAULT_LARK_CLI_TIMEOUT_MS;
     /** @type {SpawnResult | null} */
     let lastResult = null;
     for (let attempt = 0; attempt <= retries; attempt += 1) {
       const result = spawn(bin, args, {
         encoding: "utf8",
         maxBuffer: 50 * 1024 * 1024,
+        timeout: timeoutMs,
+        killSignal: "SIGKILL",
       });
       lastResult = result;
       if (result.status === 0) return parseJson(result.stdout || "");
-      const stderr = result.stderr.trim();
-      if (attempt < retries && isTransientLarkFailure(stderr)) {
+      const failureText = spawnFailureText(result);
+      if (attempt < retries && isTransientLarkFailure(failureText)) {
         sleep(retryDelayForAttempt(attempt, retryDelayMs));
         continue;
       }
       break;
     }
-    const stderr = lastResult?.stderr?.trim() || "";
-    throw new Error(`${redactCommand(args, options.redactedFlags)} failed: ${stderr}`);
+    throw new Error(
+      `${redactCommand(args, options.redactedFlags)} failed: ${publicFailureDescriptor(lastResult, timeoutMs)}`,
+    );
   };
 }
 
 const runLark = createLarkCliRunner();
 
 export {
+  DEFAULT_LARK_CLI_TIMEOUT_MS,
   classifyLarkFailure,
   createLarkCliRunner,
   isTransientLarkFailure,
   parseLarkError,
   parseJson,
+  publicFailureDescriptor,
   redactCommand,
   retryDelayForAttempt,
   runLark,

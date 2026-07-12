@@ -1,8 +1,17 @@
 // @ts-check
 
 import { spawnSync } from "node:child_process";
-import { appendFileSync, mkdirSync } from "node:fs";
-import { resolve } from "node:path";
+import {
+  appendFileSync,
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+} from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   compactSummary,
   runCycleWithRunner,
@@ -16,6 +25,13 @@ const DEFAULT_HOT_DISCOVERY_PAGES_PER_CYCLE = 5;
 const DEFAULT_MAX_CHAT_PAGES = 300;
 const DEFAULT_RECONCILE_INTERVAL_HOURS = 24;
 const DEFAULT_CHAT_TYPES = "group,p2p";
+const DEFAULT_STEP_TIMEOUT_SECONDS = 600;
+const DEFAULT_LOG_MAX_BYTES = 10 * 1024 * 1024;
+const DEFAULT_LOG_KEEP_FILES = 5;
+const DEFAULT_RETENTION_EVERY_CYCLES = 1440;
+const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+const SYNC_SCRIPT = resolve(PROJECT_ROOT, "scripts/lark-im-sync.mjs");
+const MAINTENANCE_SCRIPT = resolve(PROJECT_ROOT, "scripts/sqlite-maintenance.mjs");
 
 /**
  * @typedef {object} WorkerOptions
@@ -29,6 +45,10 @@ const DEFAULT_CHAT_TYPES = "group,p2p";
  * @property {number} reconcileIntervalHours
  * @property {string} chatTypes
  * @property {string} logDir
+ * @property {number} stepTimeoutSeconds
+ * @property {number} logMaxBytes
+ * @property {number} logKeepFiles
+ * @property {number} retentionEveryCycles
  * @property {number | null} maxCycles
  *
  * @typedef {Record<string, any>} JsonObject
@@ -46,16 +66,24 @@ const DEFAULT_CHAT_TYPES = "group,p2p";
  * @property {number | null} status
  * @property {string} stdout
  * @property {string} stderr
+ * @property {Error=} error
  *
  * @typedef {object} RunStepDeps
  * @property {(cmd: string, args: string[], options: JsonObject) => SpawnResult=} spawnSync
  * @property {string=} execPath
  * @property {() => Date=} now
+ * @property {number=} timeoutSeconds
+ * @property {string=} scriptPath
  *
  * @typedef {object} WriteLogDeps
  * @property {{write(chunk: string): void}=} stdout
  * @property {(path: string, options?: {recursive?: boolean}) => void=} mkdirSync
- * @property {(path: string, data: string) => void=} appendFileSync
+ * @property {(path: string, data: string, options?: JsonObject) => void=} appendFileSync
+ * @property {(path: string) => boolean=} existsSync
+ * @property {(path: string) => {size: number}=} statSync
+ * @property {(oldPath: string, newPath: string) => void=} renameSync
+ * @property {(path: string, options?: JsonObject) => void=} rmSync
+ * @property {(path: string, mode: number) => void=} chmodSync
  * @property {(path: string, ...paths: string[]) => string=} resolvePath
  *
  * @typedef {object} RunCycleDeps
@@ -82,6 +110,10 @@ Options:
   --reconcile-interval-hours <n>      Minimum hours between full reconcile snapshots. Default: ${DEFAULT_RECONCILE_INTERVAL_HOURS}
   --chat-types <types>                Chat types for received discovery. Default: ${DEFAULT_CHAT_TYPES}
   --log-dir <path>                    JSONL log directory. Default: logs/lark-im
+  --step-timeout-seconds <n>          Hard timeout for each sync step. Default: ${DEFAULT_STEP_TIMEOUT_SECONDS}
+  --log-max-bytes <n>                 Rotate worker.jsonl at this size. Default: ${DEFAULT_LOG_MAX_BYTES}
+  --log-keep-files <n>                Rotated worker logs to keep. Default: ${DEFAULT_LOG_KEEP_FILES}
+  --retention-every-cycles <n>        Apply run retention every N cycles. Default: ${DEFAULT_RETENTION_EVERY_CYCLES}
   --max-cycles <n>                    Stop after N cycles. Omit to run forever.
   --once                              Run one cycle and exit.
   --help                              Show this help.
@@ -93,8 +125,10 @@ Options:
  * @param {string} name
  */
 function parsePositiveInt(value, name) {
-  const parsed = Number.parseInt(String(value), 10);
-  if (!Number.isInteger(parsed) || parsed <= 0) throw new Error(`${name} must be positive`);
+  const text = String(value);
+  if (!/^[1-9]\d*$/.test(text)) throw new Error(`${name} must be positive integer`);
+  const parsed = Number(text);
+  if (!Number.isSafeInteger(parsed)) throw new Error(`${name} must be a safe positive integer`);
   return parsed;
 }
 
@@ -112,6 +146,10 @@ function parseArgs(argv) {
     reconcileIntervalHours: DEFAULT_RECONCILE_INTERVAL_HOURS,
     chatTypes: DEFAULT_CHAT_TYPES,
     logDir: "logs/lark-im",
+    stepTimeoutSeconds: DEFAULT_STEP_TIMEOUT_SECONDS,
+    logMaxBytes: DEFAULT_LOG_MAX_BYTES,
+    logKeepFiles: DEFAULT_LOG_KEEP_FILES,
+    retentionEveryCycles: DEFAULT_RETENTION_EVERY_CYCLES,
     maxCycles: null,
   };
   for (let i = 0; i < argv.length; i += 1) {
@@ -143,6 +181,12 @@ function parseArgs(argv) {
       opts.reconcileIntervalHours = parsePositiveInt(next, "reconcile-interval-hours");
     else if (arg === "--chat-types") opts.chatTypes = next;
     else if (arg === "--log-dir") opts.logDir = next;
+    else if (arg === "--step-timeout-seconds")
+      opts.stepTimeoutSeconds = parsePositiveInt(next, "step-timeout-seconds");
+    else if (arg === "--log-max-bytes") opts.logMaxBytes = parsePositiveInt(next, "log-max-bytes");
+    else if (arg === "--log-keep-files") opts.logKeepFiles = parsePositiveInt(next, "log-keep-files");
+    else if (arg === "--retention-every-cycles")
+      opts.retentionEveryCycles = parsePositiveInt(next, "retention-every-cycles");
     else if (arg === "--max-cycles") opts.maxCycles = parsePositiveInt(next, "max-cycles");
     else throw new Error(`Unknown option: ${arg}`);
     i += 1;
@@ -166,13 +210,15 @@ function runStep(name, args, deps = {}) {
   const run = deps.spawnSync || spawnSync;
   const execPath = deps.execPath || process.execPath;
   const startedAt = now().toISOString();
-  const result = run(execPath, ["scripts/lark-im-sync.mjs", ...args], {
+  const result = run(execPath, [deps.scriptPath || SYNC_SCRIPT, ...args], {
     encoding: "utf8",
     maxBuffer: 100 * 1024 * 1024,
+    timeout: Number(deps.timeoutSeconds || DEFAULT_STEP_TIMEOUT_SECONDS) * 1000,
+    killSignal: "SIGKILL",
   });
   const finishedAt = now().toISOString();
   const stdout = String(result.stdout || "");
-  const stderr = String(result.stderr || "");
+  const stderr = String(result.stderr || result.error?.message || (result.status === null ? "worker step terminated" : ""));
   /** @type {JsonObject | null} */
   let summary = null;
   try {
@@ -180,19 +226,54 @@ function runStep(name, args, deps = {}) {
   } catch {
     summary = null;
   }
+  const validSummary = Boolean(
+    summary &&
+    typeof summary === "object" &&
+    !Array.isArray(summary) &&
+    summary.ok === true,
+  );
+  const ok = result.status === 0 && validSummary;
+  let failureDetail = stderr.trim();
+  if (result.status === 0 && !validSummary && !failureDetail) {
+    failureDetail = summary && typeof summary === "object"
+      ? "worker step reported an unhealthy summary"
+      : "worker step returned invalid or empty JSON";
+  }
   return {
     name,
-    ok: result.status === 0,
+    ok,
     exit_code: result.status ?? undefined,
     started_at: startedAt,
     finished_at: finishedAt,
     summary: compactSummary(summary),
-    stderr: stderr.trim().slice(0, 4000),
+    stderr: failureDetail.slice(0, 4000),
   };
 }
 
 /**
- * @param {{logDir?: string}} opts
+ * @param {string} path
+ * @param {number} incomingBytes
+ * @param {number} maxBytes
+ * @param {number} keepFiles
+ * @param {WriteLogDeps} deps
+ */
+function rotateLogIfNeeded(path, incomingBytes, maxBytes, keepFiles, deps) {
+  const exists = deps.existsSync || existsSync;
+  const stat = deps.statSync || statSync;
+  if (!exists(path) || Number(stat(path).size || 0) + incomingBytes <= maxBytes) return;
+  const rename = deps.renameSync || renameSync;
+  const remove = deps.rmSync || rmSync;
+  for (let index = keepFiles; index >= 1; index -= 1) {
+    const source = index === 1 ? path : `${path}.${index - 1}`;
+    const destination = `${path}.${index}`;
+    if (!exists(source)) continue;
+    if (exists(destination)) remove(destination, { force: true });
+    rename(source, destination);
+  }
+}
+
+/**
+ * @param {{logDir?: string, logMaxBytes?: number, logKeepFiles?: number}} opts
  * @param {JsonObject} payload
  * @param {WriteLogDeps} [deps]
  */
@@ -204,9 +285,20 @@ function writeLog(opts, payload, deps = {}) {
     const resolvePath = deps.resolvePath || resolve;
     const makeDir = deps.mkdirSync || mkdirSync;
     const append = deps.appendFileSync || appendFileSync;
+    const chmod = deps.chmodSync || (deps.mkdirSync || deps.appendFileSync ? () => {} : chmodSync);
     const logDir = resolvePath(opts.logDir);
-    makeDir(logDir, { recursive: true });
-    append(resolvePath(logDir, "worker.jsonl"), line);
+    makeDir(logDir, { recursive: true, mode: 0o700 });
+    chmod(logDir, 0o700);
+    const logPath = resolvePath(logDir, "worker.jsonl");
+    rotateLogIfNeeded(
+      logPath,
+      Buffer.byteLength(line),
+      Number(opts.logMaxBytes || DEFAULT_LOG_MAX_BYTES),
+      Number(opts.logKeepFiles || DEFAULT_LOG_KEEP_FILES),
+      deps,
+    );
+    append(logPath, line, { encoding: "utf8", mode: 0o600 });
+    chmod(logPath, 0o600);
   }
 }
 
@@ -219,7 +311,12 @@ function runCycle(opts, cycle, deps = {}) {
   return runCycleWithRunner(
     opts,
     cycle,
-    (name, args) => runStep(name, args, deps.runStep),
+    (name, args, command) =>
+      runStep(name, args, {
+        ...deps.runStep,
+        timeoutSeconds: opts.stepTimeoutSeconds,
+        scriptPath: command === "maintenance" ? MAINTENANCE_SCRIPT : SYNC_SCRIPT,
+      }),
     (logOpts, payload) => writeLog(logOpts, payload, deps.writeLog),
     deps.now,
   );
@@ -233,17 +330,19 @@ function runWorker(opts, deps = {}) {
   const runOneCycle = deps.runCycle || runCycle;
   const sleep = deps.sleepSeconds || sleepSeconds;
   let cycle = 0;
+  let ok = true;
   while (opts.maxCycles === null || cycle < opts.maxCycles) {
     cycle += 1;
-    runOneCycle(opts, cycle);
+    ok = Boolean(runOneCycle(opts, cycle)) && ok;
     if (opts.maxCycles !== null && cycle >= opts.maxCycles) break;
     sleep(opts.intervalSeconds);
   }
+  return ok;
 }
 
 function main(argv = process.argv.slice(2)) {
   const opts = parseArgs(argv);
-  runWorker(opts);
+  return runWorker(opts) ? 0 : 2;
 }
 
 export {
@@ -256,4 +355,5 @@ export {
   sleepSeconds,
   usage,
   writeLog,
+  rotateLogIfNeeded,
 };

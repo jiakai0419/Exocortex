@@ -18,7 +18,11 @@ import {
   runLark,
   sqliteJson,
 } from "../diagnostics/lark-im-lag-report.mjs";
-import { exitCodeForReport } from "../diagnostics/lark-im-lag-core.mjs";
+import {
+  exitCodeForReport,
+  sanitizeLagReportForPublicOutput,
+} from "../diagnostics/lark-im-lag-core.mjs";
+import { publicDiagnosticError } from "../diagnostics/public-safe.mjs";
 import { renderLagText } from "../terminal/lark-im-lag-view.mjs";
 
 const DEFAULT_DB = "data/exocortex.sqlite";
@@ -96,8 +100,10 @@ function defaultStartIso(nowMs = Date.now()) {
  * @param {string} name
  */
 function parsePositiveInt(value, name) {
-  const parsed = Number.parseInt(String(value), 10);
-  if (!Number.isInteger(parsed) || parsed <= 0) throw new Error(`${name} must be positive`);
+  const text = String(value);
+  if (!/^[1-9]\d*$/.test(text)) throw new Error(`${name} must be a positive integer`);
+  const parsed = Number(text);
+  if (!Number.isSafeInteger(parsed)) throw new Error(`${name} must be a positive integer`);
   return parsed;
 }
 
@@ -144,6 +150,7 @@ function parseArgs(argv, deps = {}) {
   opts.endMs = parseLarkTimeMs(opts.end);
   if (!Number.isFinite(opts.startMs)) throw new Error(`invalid --start: ${opts.start}`);
   if (!Number.isFinite(opts.endMs)) throw new Error(`invalid --end: ${opts.end}`);
+  if (opts.endMs < opts.startMs) throw new Error("--end must be after --start");
   return opts;
 }
 
@@ -156,44 +163,8 @@ function executeLagCheck(opts, deps = {}) {
   const fileExists = deps.existsSync || existsSync;
   const collect = deps.collect || collectLagReport;
   const dbPath = resolvePath(opts.db);
-  if (!fileExists(dbPath)) throw new Error(`database not found: ${dbPath}`);
+  if (!fileExists(dbPath)) throw new Error("database not found");
   return collect(dbPath, opts);
-}
-
-/** @param {JsonObject | null | undefined} item */
-function redactedRemote(item) {
-  if (!item) return null;
-  return {
-    created_at: item.created_at,
-    chat_name: "<redacted>",
-    sender_name: "<redacted>",
-    body: "<redacted>",
-    exists_locally: item.exists_locally,
-  };
-}
-
-/** @param {JsonObject | null | undefined} item */
-function redactedLocal(item) {
-  if (!item) return null;
-  return {
-    created_at: item.created_at,
-    chat_name: "<redacted>",
-    direction: item.direction,
-  };
-}
-
-/** @param {JsonObject} report */
-function sanitizeLagReportForPublicOutput(report) {
-  return {
-    ...report,
-    latest_remote: redactedRemote(report.latest_remote),
-    latest_local: redactedLocal(report.latest_local),
-    missing: Array.isArray(report.missing) ? report.missing.map(redactedRemote) : [],
-    unsupported_chats: Array.isArray(report.unsupported_chats)
-      ? report.unsupported_chats.map((chat) => ({ reason: chat.reason || "unsupported" }))
-      : [],
-    probe_errors: Array.isArray(report.probe_errors) ? report.probe_errors.map(() => ({ error: "<redacted>" })) : [],
-  };
 }
 
 /**
@@ -215,7 +186,7 @@ function runLagCheckCli(argv, io = {}) {
     else stdout.write(renderLagText(outputReport));
     return exitCodeForReport(report);
   } catch (error) {
-    stderr.write(renderError(error));
+    stderr.write(renderError(publicDiagnosticError(error, "live lag probe failed")));
     return 1;
   }
 }

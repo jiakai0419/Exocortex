@@ -7,6 +7,10 @@ import {
   parseLarkTimeMs,
   senderId,
 } from "../adapters/lark-im/core.mjs";
+import {
+  publicCommandFailureReason,
+  publicTimestamp,
+} from "./public-safe.mjs";
 
 /**
  * @typedef {object} HotChatShape
@@ -147,13 +151,21 @@ function buildLagReport({
       : null;
 
   let status = "healthy";
+  let reason = null;
   if (probeErrors.length > 0) status = "needs_attention";
-  else if (missing.length > 0) status = "delayed";
+  else if (chats.length === 0) {
+    status = "inconclusive";
+    reason = "no_hot_chats";
+  } else if (sortedRemote.length === 0) {
+    status = "inconclusive";
+    reason = "no_usable_remote_messages";
+  } else if (missing.length > 0) status = "delayed";
   else if (latestRemoteIsLocal === false) status = "delayed";
 
   return {
     ok: status === "healthy",
     status,
+    reason: reason || undefined,
     checked_at: checkedAt.toISOString(),
     window: {
       start: localIsoFromMs(opts.startMs),
@@ -199,6 +211,82 @@ function buildLagReport({
   };
 }
 
+/** @param {Record<string, any> | null | undefined} item */
+function redactedRemote(item) {
+  if (!item) return null;
+  return {
+    created_at: publicTimestamp(item.created_at),
+    chat_name: "<redacted>",
+    sender_name: "<redacted>",
+    body: "<redacted>",
+    exists_locally: item.exists_locally === true,
+  };
+}
+
+/** @param {Record<string, any> | null | undefined} item */
+function redactedLocal(item) {
+  if (!item) return null;
+  return {
+    created_at: publicTimestamp(item.created_at),
+    chat_name: "<redacted>",
+    direction: ["sent", "received"].includes(String(item.direction)) ? item.direction : "unknown",
+  };
+}
+
+/**
+ * @param {Record<string, any>} report
+ * @returns {Record<string, any>}
+ */
+function sanitizeLagReportForPublicOutput(report) {
+  if (report?.status === "command_failed") {
+    return {
+      ok: false,
+      status: "command_failed",
+      reason: publicCommandFailureReason(`${report.reason || ""}\n${report.stderr || ""}\n${report.stdout || ""}`),
+      exit_status: Number(report.exit_status || 1),
+    };
+  }
+  const status = ["healthy", "delayed", "needs_attention", "inconclusive", "unavailable"].includes(
+    String(report?.status),
+  )
+    ? String(report.status)
+    : "inconclusive";
+  const safeReasons = new Set(["no_hot_chats", "no_usable_remote_messages", "keychain_unavailable"]);
+  const reason = safeReasons.has(String(report?.reason)) ? String(report.reason) : null;
+  return {
+    ok: status === "healthy",
+    status,
+    reason: reason || undefined,
+    checked_at: publicTimestamp(report?.checked_at),
+    window: {
+      start: publicTimestamp(report?.window?.start),
+      end: publicTimestamp(report?.window?.end),
+    },
+    probe: {
+      hot_chats_requested: Math.max(0, Number(report?.probe?.hot_chats_requested || 0)),
+      hot_chats_found: Math.max(0, Number(report?.probe?.hot_chats_found || 0)),
+      messages_per_chat: Math.max(0, Number(report?.probe?.messages_per_chat || 0)),
+      remote_messages_checked: Math.max(0, Number(report?.probe?.remote_messages_checked || 0)),
+      unsupported_chats: Math.max(0, Number(report?.probe?.unsupported_chats || 0)),
+      probe_errors: Math.max(0, Number(report?.probe?.probe_errors || 0)),
+    },
+    latest_remote: redactedRemote(report?.latest_remote),
+    latest_local: redactedLocal(report?.latest_local),
+    lag_ms:
+      report?.lag_ms !== null && report?.lag_ms !== undefined && Number.isFinite(Number(report.lag_ms))
+        ? Math.max(0, Number(report.lag_ms))
+        : null,
+    missing_count: Math.max(0, Number(report?.missing_count || 0)),
+    missing: (Array.isArray(report?.missing) ? report.missing : []).map(redactedRemote),
+    unsupported_chats: (Array.isArray(report?.unsupported_chats) ? report.unsupported_chats : []).map((chat) => ({
+      reason: chat?.reason === "restricted_mode" ? "restricted_mode" : "unsupported",
+    })),
+    probe_errors: (Array.isArray(report?.probe_errors) ? report.probe_errors : []).map(() => ({
+      error: "<redacted>",
+    })),
+  };
+}
+
 /** @param {{ok?: boolean}} report */
 function exitCodeForReport(report) {
   return report.ok ? 0 : 2;
@@ -208,4 +296,5 @@ export {
   buildLagReport,
   exitCodeForReport,
   normalizeRemoteMessage,
+  sanitizeLagReportForPublicOutput,
 };

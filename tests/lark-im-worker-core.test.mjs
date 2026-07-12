@@ -28,7 +28,7 @@ function argValue(args, flag) {
   return index >= 0 ? args[index + 1] : "";
 }
 
-test("worker cycle runs sent, hot lane, then catch-up lane in a stable order", () => {
+test("worker cycle runs sent, hot lane, then fair steady-state lane in a stable order", () => {
   const specs = buildCycleStepSpecs(opts());
 
   assert.deepEqual(specs.map((spec) => spec.name), [
@@ -37,7 +37,7 @@ test("worker cycle runs sent, hot lane, then catch-up lane in a stable order", (
     "received-hot",
     "discover-catchup",
     "discover-reconcile",
-    "received-catchup",
+    "received-fair",
   ]);
 
   const hotDiscover = specs.find((spec) => spec.name === "discover-hot");
@@ -65,9 +65,14 @@ test("worker cycle runs sent, hot lane, then catch-up lane in a stable order", (
   assert.equal(argValue(reconcileDiscover.args, "--reconcile-interval-hours"), "24");
   assert.equal(argValue(reconcileDiscover.args, "--chat-types"), "group,p2p");
 
-  const catchupReceived = specs.find((spec) => spec.name === "received-catchup");
-  assert.equal(argValue(catchupReceived.args, "--received-mode"), "catchup");
-  assert.equal(argValue(catchupReceived.args, "--received-scopes-per-run"), "50");
+  const fairReceived = specs.find((spec) => spec.name === "received-fair");
+  assert.equal(argValue(fairReceived.args, "--received-mode"), "all");
+  assert.equal(argValue(fairReceived.args, "--received-scopes-per-run"), "50");
+
+  const retention = buildCycleStepSpecs(opts({ retentionEveryCycles: 10 }), 10).at(-1);
+  assert.equal(retention.name, "retention");
+  assert.equal(retention.command, "maintenance");
+  assert.deepEqual(retention.args.slice(0, 2), ["prune-runs", "--db"]);
 });
 
 test("worker cycle logs every step plus one cycle event and reports failure", () => {
@@ -99,7 +104,9 @@ test("worker cycle logs every step plus one cycle event and reports failure", ()
   assert.equal(logs[6].type, "lark_im_worker_cycle");
   assert.equal(logs[6].cycle, 42);
   assert.equal(logs[6].ok, false);
-  assert.equal(logs[6].steps[2].name, "received-hot");
+  assert.equal(logs[6].step_count, 6);
+  assert.deepEqual(logs[6].failed_steps, ["received-hot"]);
+  assert.equal("steps" in logs[6], false);
   assert.equal(argValue(calls[2].args, "--received-scopes-per-run"), "7");
 });
 

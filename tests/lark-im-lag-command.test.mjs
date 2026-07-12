@@ -7,7 +7,10 @@ import {
   runLagCheckCli,
   sanitizeLagReportForPublicOutput,
 } from "../src/cli/lark-im-lag-command.mjs";
-import { collectLagReport } from "../src/diagnostics/lark-im-lag-report.mjs";
+import {
+  collectLagReport,
+  fetchHotChats,
+} from "../src/diagnostics/lark-im-lag-report.mjs";
 import { renderLagText } from "../src/terminal/lark-im-lag-view.mjs";
 import { HOT_CHATS, REMOTE_MESSAGES, SELF_OPEN_ID } from "./fixtures/lark-im-lag-shapes.mjs";
 
@@ -114,8 +117,28 @@ test("lag command parseArgs keeps explicit time windows stable", () => {
   assert.equal(parsed.unsafeDetails, false);
   assert.equal(parseArgs(["--unsafe-details"]).unsafeDetails, true);
   assert.equal(parseArgs(["--help"]).help, true);
-  assert.throws(() => parseArgs(["--hot-chats", "0"]), /hot-chats must be positive/);
+  assert.throws(() => parseArgs(["--hot-chats", "0"]), /hot-chats must be a positive integer/);
+  assert.throws(() => parseArgs(["--hot-chats", "20junk"]), /positive integer/);
+  assert.throws(() => parseArgs(["--messages-per-chat", "4.9"]), /positive integer/);
   assert.throws(() => parseArgs(["--format", "yaml"]), /--format must be text or json/);
+  assert.throws(
+    () => parseArgs(["--start", "2027-01-15T08:05:00Z", "--end", "2027-01-15T08:00:00Z"]),
+    /--end must be after --start/,
+  );
+});
+
+test("lag hot-chat probe covers group and p2p chats", () => {
+  const calls = [];
+  const chats = fetchHotChats(opts(), {
+    runLark: (args) => {
+      calls.push(args);
+      return { chats: [], has_more: false };
+    },
+  });
+
+  assert.deepEqual(chats, []);
+  const typeIndex = calls[0].indexOf("--types");
+  assert.equal(calls[0][typeIndex + 1], "group,p2p");
 });
 
 test("lag report collects healthy anonymized remote messages through fake deps", () => {
@@ -177,7 +200,9 @@ test("lag report separates restricted chats from remote probe errors", () => {
     localLatest: () => null,
   });
 
-  assert.equal(restricted.status, "healthy");
+  assert.equal(restricted.status, "inconclusive");
+  assert.equal(restricted.reason, "no_usable_remote_messages");
+  assert.equal(restricted.ok, false);
   assert.equal(restricted.probe.unsupported_chats, 2);
   assert.equal(restricted.unsupported_chats[0].reason, "restricted_mode");
   assert.equal(failed.status, "needs_attention");
@@ -262,7 +287,8 @@ test("lag check CLI renders text, json, help, and dependency errors", () => {
       },
     },
   }), 1);
-  assert.match(plain(keychain.text()), /keychain Get failed/);
+  assert.match(plain(keychain.text()), /keychain not initialized/);
+  assert.doesNotMatch(keychain.text(), /keychain Get failed/);
 });
 
 test("lag public sanitizer removes local metadata and message excerpts", () => {

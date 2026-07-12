@@ -11,7 +11,7 @@ import { createHash } from "node:crypto";
  * @property {string | number=} create_time
  * @property {string | number=} created_at
  * @property {string | number=} create_time_ms
- * @property {string=} update_time
+ * @property {string | number=} update_time
  * @property {string=} msg_type
  * @property {string=} message_type
  * @property {Record<string, any>=} sender
@@ -109,8 +109,13 @@ function messageId(message) {
 /** @param {unknown} value */
 function parseLarkTimeMs(value) {
   if (value === null || value === undefined || value === "") return NaN;
-  if (typeof value === "number" || /^\d+$/.test(String(value))) {
-    const parsed = Number.parseInt(String(value), 10);
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value) || value < 0) return NaN;
+    return value < 10_000_000_000 ? value * 1000 : value;
+  }
+  if (/^\d+$/.test(String(value))) {
+    const parsed = Number(String(value));
+    if (!Number.isSafeInteger(parsed)) return NaN;
     return parsed < 10_000_000_000 ? parsed * 1000 : parsed;
   }
   const text = String(value);
@@ -119,16 +124,62 @@ function parseLarkTimeMs(value) {
   );
   if (simple) {
     const [, year, month, day, hour, minute, second = "0"] = simple;
-    return new Date(
+    const date = new Date(
       Number(year),
       Number(month) - 1,
       Number(day),
       Number(hour),
       Number(minute),
       Number(second),
-    ).getTime();
+    );
+    if (
+      date.getFullYear() !== Number(year) ||
+      date.getMonth() !== Number(month) - 1 ||
+      date.getDate() !== Number(day) ||
+      date.getHours() !== Number(hour) ||
+      date.getMinutes() !== Number(minute) ||
+      date.getSeconds() !== Number(second)
+    ) {
+      return NaN;
+    }
+    return date.getTime();
   }
   return Date.parse(text);
+}
+
+/**
+ * Treat one malformed item as a malformed page. Silently dropping it would let
+ * the caller advance the page/window cursor past a message that was never
+ * stored.
+ *
+ * @param {unknown} value
+ * @param {string} [label]
+ * @returns {asserts value is LarkMessage}
+ */
+function assertValidLarkMessage(value, label = "lark message") {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} must be an object`);
+  }
+  const message = /** @type {LarkMessage} */ (value);
+  const id = messageId(message);
+  if (typeof id !== "string" || !id.trim()) {
+    throw new Error(`${label} is missing a valid message_id`);
+  }
+  const occurredAtMs = parseLarkTimeMs(message.create_time ?? message.created_at ?? message.create_time_ms);
+  if (!Number.isFinite(occurredAtMs)) {
+    throw new Error(`${label} has an invalid create_time`);
+  }
+  if (message.update_time !== null && message.update_time !== undefined && message.update_time !== "") {
+    if (!Number.isFinite(parseLarkTimeMs(message.update_time))) {
+      throw new Error(`${label} has an invalid update_time`);
+    }
+  }
+}
+
+/** @param {LarkMessage} message */
+function externalVersion(message) {
+  if (message.update_time === null || message.update_time === undefined || message.update_time === "") return null;
+  return String(parseLarkTimeMs(message.update_time));
 }
 
 /** @param {number} ms */
@@ -235,8 +286,11 @@ function lookupDisplayName(context, id, chatIdValue) {
  * @returns {LocalRecord}
  */
 function recordFromMessage(message, scopeId, direction, context = {}, scopeConfig = {}) {
+  assertValidLarkMessage(message);
   const externalId = messageId(message);
   const occurredAtMs = parseLarkTimeMs(message?.create_time ?? message?.created_at ?? message?.create_time_ms);
+  const version = externalVersion(message);
+  const updatedAtMs = version === null ? null : Number(version);
   const actorId = senderId(message);
   const containerId = chatId(message) || scopeConfig.chat_id || "";
   const sender = message?.sender && typeof message.sender === "object" ? message.sender : {};
@@ -256,6 +310,8 @@ function recordFromMessage(message, scopeId, direction, context = {}, scopeConfi
     msg_type: message?.msg_type || message?.message_type || null,
     create_time: message?.create_time ?? null,
     create_time_ms: occurredAtMs,
+    update_time: message?.update_time ?? null,
+    update_time_ms: updatedAtMs,
     sender_id: actorId,
     sender_name: senderDisplayName || null,
     sender_name_source: senderDisplayName ? senderNameDetails?.source || null : null,
@@ -282,7 +338,7 @@ function recordFromMessage(message, scopeId, direction, context = {}, scopeConfi
     source_id: SOURCE_ID,
     first_seen_scope_id: scopeId,
     external_id: externalId,
-    external_version: message?.update_time ? String(message.update_time) : null,
+    external_version: version,
     record_type: "lark.im.message",
     occurred_at: occurredAtIso(occurredAtMs),
     occurred_at_ms: occurredAtMs,
@@ -299,6 +355,7 @@ function recordFromMessage(message, scopeId, direction, context = {}, scopeConfi
 
 export {
   SOURCE_ID,
+  assertValidLarkMessage,
   bodyFromContent,
   bodyFromMessage,
   chatId,
@@ -307,6 +364,7 @@ export {
   lookupDisplayName,
   messageId,
   occurredAtIso,
+  externalVersion,
   parseLarkTimeMs,
   recordFromMessage,
   senderId,

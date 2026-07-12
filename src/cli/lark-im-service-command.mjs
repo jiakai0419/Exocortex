@@ -2,14 +2,17 @@
 
 import { spawnSync } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, userInfo } from "node:os";
-import { resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { summarizeWorkerEvents } from "../../dist/runtime/worker/lark-im-worker-core.js";
 import {
   buildServiceStatusReport,
@@ -32,6 +35,12 @@ const DEFAULT_LOG_DIR = "logs/lark-im";
 const DEFAULT_MAX_CHAT_PAGES = 300;
 const DEFAULT_RECONCILE_INTERVAL_HOURS = 24;
 const DEFAULT_CHAT_TYPES = "group,p2p";
+const DEFAULT_STEP_TIMEOUT_SECONDS = 600;
+const DEFAULT_LOG_MAX_BYTES = 10 * 1024 * 1024;
+const DEFAULT_LOG_KEEP_FILES = 5;
+const DEFAULT_RETENTION_EVERY_CYCLES = 1440;
+const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+const SYNC_STATUS_SCRIPT = resolve(PROJECT_ROOT, "scripts/sync-status.mjs");
 
 /**
  * @typedef {"install" | "start" | "stop" | "restart" | "status" | "wait-ok" | "tail" | "uninstall" | string} ServiceCommand
@@ -50,6 +59,10 @@ const DEFAULT_CHAT_TYPES = "group,p2p";
  * @property {number} lines
  * @property {number} timeoutSeconds
  * @property {number} pollSeconds
+ * @property {number} stepTimeoutSeconds
+ * @property {number} logMaxBytes
+ * @property {number} logKeepFiles
+ * @property {number} retentionEveryCycles
  *
  * @typedef {object} RunOptions
  * @property {boolean=} allowFailure
@@ -58,6 +71,7 @@ const DEFAULT_CHAT_TYPES = "group,p2p";
  * @property {number | null} status
  * @property {string} stdout
  * @property {string} stderr
+ * @property {Error=} error
  *
  * @typedef {object} PlistXmlDeps
  * @property {string=} cwd
@@ -84,7 +98,8 @@ const DEFAULT_CHAT_TYPES = "group,p2p";
  * @property {(path: string, options?: {recursive?: boolean}) => void=} mkdirSync
  * @property {(path: string, encoding: BufferEncoding) => string=} readFileSync
  * @property {(path: string) => void=} rmSync
- * @property {(path: string, data: string) => void=} writeFileSync
+ * @property {(path: string, data: string, options?: JsonObject) => void=} writeFileSync
+ * @property {(path: string, mode: number) => void=} chmodSync
  * @property {() => string=} homedir
  * @property {() => {uid: number}=} userInfo
  * @property {() => number=} uid
@@ -133,6 +148,10 @@ Options:
   --lines <n>                         Lines for tail. Default: 20
   --timeout-seconds <n>               Timeout for wait-ok. Default: 180
   --poll-seconds <n>                  Poll interval for wait-ok. Default: 5
+  --step-timeout-seconds <n>          Hard timeout for each sync step. Default: ${DEFAULT_STEP_TIMEOUT_SECONDS}
+  --log-max-bytes <n>                 Rotate worker.jsonl at this size. Default: ${DEFAULT_LOG_MAX_BYTES}
+  --log-keep-files <n>                Rotated worker logs to keep. Default: ${DEFAULT_LOG_KEEP_FILES}
+  --retention-every-cycles <n>        Apply run retention every N cycles. Default: ${DEFAULT_RETENTION_EVERY_CYCLES}
   --help                              Show this help.
 `;
 }
@@ -142,8 +161,10 @@ Options:
  * @param {string} name
  */
 function parsePositiveInt(value, name) {
-  const parsed = Number.parseInt(String(value), 10);
-  if (!Number.isInteger(parsed) || parsed <= 0) throw new Error(`${name} must be positive`);
+  const text = String(value);
+  if (!/^[1-9]\d*$/.test(text)) throw new Error(`${name} must be positive integer`);
+  const parsed = Number(text);
+  if (!Number.isSafeInteger(parsed)) throw new Error(`${name} must be a safe positive integer`);
   return parsed;
 }
 
@@ -169,6 +190,10 @@ function parseArgs(argv) {
     lines: 20,
     timeoutSeconds: 180,
     pollSeconds: 5,
+    stepTimeoutSeconds: DEFAULT_STEP_TIMEOUT_SECONDS,
+    logMaxBytes: DEFAULT_LOG_MAX_BYTES,
+    logKeepFiles: DEFAULT_LOG_KEEP_FILES,
+    retentionEveryCycles: DEFAULT_RETENTION_EVERY_CYCLES,
   };
   for (let i = 0; i < rest.length; i += 1) {
     const arg = rest[i];
@@ -196,6 +221,12 @@ function parseArgs(argv) {
     else if (arg === "--lines") opts.lines = parsePositiveInt(next, "lines");
     else if (arg === "--timeout-seconds") opts.timeoutSeconds = parsePositiveInt(next, "timeout-seconds");
     else if (arg === "--poll-seconds") opts.pollSeconds = parsePositiveInt(next, "poll-seconds");
+    else if (arg === "--step-timeout-seconds")
+      opts.stepTimeoutSeconds = parsePositiveInt(next, "step-timeout-seconds");
+    else if (arg === "--log-max-bytes") opts.logMaxBytes = parsePositiveInt(next, "log-max-bytes");
+    else if (arg === "--log-keep-files") opts.logKeepFiles = parsePositiveInt(next, "log-keep-files");
+    else if (arg === "--retention-every-cycles")
+      opts.retentionEveryCycles = parsePositiveInt(next, "retention-every-cycles");
     else throw new Error(`Unknown option: ${arg}`);
     i += 1;
   }
@@ -250,11 +281,23 @@ function run(cmd, args, options = {}, deps = {}) {
     status: result.status,
     stdout: String(result.stdout || ""),
     stderr: String(result.stderr || ""),
+    error: result.error,
   };
   if (normalized.status !== 0 && !options.allowFailure) {
-    throw new Error(`${cmd} ${args.join(" ")} failed: ${normalized.stderr.trim() || normalized.stdout.trim()}`);
+    const detail = normalized.error?.message || normalized.stderr.trim() || normalized.stdout.trim() || `exit ${normalized.status}`;
+    throw new Error(`${cmd} failed: ${detail}`);
   }
   return normalized;
+}
+
+/** @param {unknown} value */
+function xmlEscape(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
 }
 
 /**
@@ -263,28 +306,42 @@ function run(cmd, args, options = {}, deps = {}) {
  */
 function plistXml(opts, deps = {}) {
   const resolvePath = deps.resolvePath || resolve;
-  const cwd = deps.cwd || process.cwd();
-  const logDir = deps.logDir || resolvePath(opts.logDir);
+  const cwd = deps.cwd || PROJECT_ROOT;
+  const logDir = deps.logDir || resolvePath(cwd, opts.logDir);
   const nodePath = deps.nodePath || process.execPath;
-  const workerPath = deps.workerPath || resolvePath("scripts/lark-im-worker.mjs");
+  const workerPath = deps.workerPath || resolvePath(PROJECT_ROOT, "scripts/lark-im-worker.mjs");
   const runCommand = deps.run || ((cmd, args, options) => run(cmd, args, options, deps));
   const larkCli =
     (deps.larkCli || runCommand("which", ["lark-cli"], { allowFailure: true }).stdout.trim()) ||
     "/opt/homebrew/bin/lark-cli";
   const makeDir = deps.mkdirSync || mkdirSync;
   makeDir(logDir, { recursive: true });
+  const chmod = deps.chmodSync || (deps.mkdirSync ? () => {} : chmodSync);
+  chmod(logDir, 0o700);
+  const escaped = Object.fromEntries(
+    Object.entries({
+      label: LABEL,
+      cwd,
+      nodePath,
+      workerPath,
+      chatTypes: opts.chatTypes,
+      logDir,
+      larkCli,
+      stderrPath: resolvePath(logDir, "launchd.err.log"),
+    }).map(([key, value]) => [key, xmlEscape(value)]),
+  );
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>${LABEL}</string>
+  <string>${escaped.label}</string>
   <key>WorkingDirectory</key>
-  <string>${cwd}</string>
+  <string>${escaped.cwd}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${nodePath}</string>
-    <string>${workerPath}</string>
+    <string>${escaped.nodePath}</string>
+    <string>${escaped.workerPath}</string>
     <string>--interval-seconds</string>
     <string>${opts.intervalSeconds}</string>
     <string>--received-scopes-per-cycle</string>
@@ -300,25 +357,35 @@ function plistXml(opts, deps = {}) {
     <string>--reconcile-interval-hours</string>
     <string>${opts.reconcileIntervalHours}</string>
     <string>--chat-types</string>
-    <string>${opts.chatTypes}</string>
+    <string>${escaped.chatTypes}</string>
     <string>--log-dir</string>
-    <string>${logDir}</string>
+    <string>${escaped.logDir}</string>
+    <string>--step-timeout-seconds</string>
+    <string>${opts.stepTimeoutSeconds}</string>
+    <string>--log-max-bytes</string>
+    <string>${opts.logMaxBytes}</string>
+    <string>--log-keep-files</string>
+    <string>${opts.logKeepFiles}</string>
+    <string>--retention-every-cycles</string>
+    <string>${opts.retentionEveryCycles}</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>LARK_CLI</key>
-    <string>${larkCli}</string>
+    <string>${escaped.larkCli}</string>
   </dict>
+  <key>Umask</key>
+  <integer>63</integer>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>${resolvePath(logDir, "launchd.out.log")}</string>
+  <string>/dev/null</string>
   <key>StandardErrorPath</key>
-  <string>${resolvePath(logDir, "launchd.err.log")}</string>
+  <string>${escaped.stderrPath}</string>
 </dict>
 </plist>
 `;
@@ -332,13 +399,52 @@ function install(opts, deps = {}) {
   const resolvePath = deps.resolvePath || resolve;
   const makeDir = deps.mkdirSync || mkdirSync;
   const writeFile = deps.writeFileSync || writeFileSync;
+  const chmod = deps.chmodSync || (deps.writeFileSync || deps.mkdirSync ? () => {} : chmodSync);
   const output = deps.stdout || process.stdout;
-  makeDir(resolvePath((deps.homedir || homedir)(), "Library/LaunchAgents"), { recursive: true });
-  writeFile(plistPath(deps), plistXml(opts, deps));
-  run("launchctl", ["bootout", target(deps)], { allowFailure: true }, deps);
-  run("launchctl", ["bootout", domain(deps), plistPath(deps)], { allowFailure: true }, deps);
-  run("launchctl", ["bootstrap", domain(deps), plistPath(deps)], {}, deps);
-  run("launchctl", ["kickstart", "-k", target(deps)], { allowFailure: true }, deps);
+  const launchAgentsDir = resolvePath((deps.homedir || homedir)(), "Library/LaunchAgents");
+  makeDir(launchAgentsDir, { recursive: true });
+  const path = plistPath(deps);
+  const xml = plistXml(opts, deps);
+  /** @type {string | null} */
+  let previousPlist = null;
+  if (deps.writeFileSync) {
+    writeFile(path, xml, { encoding: "utf8", mode: 0o600 });
+  } else {
+    previousPlist = existsSync(path) ? readFileSync(path, "utf8") : null;
+    const tempPath = `${path}.tmp-${process.pid}`;
+    writeFileSync(tempPath, xml, { encoding: "utf8", mode: 0o600 });
+    try {
+      run("plutil", ["-lint", tempPath], {}, deps);
+      renameSync(tempPath, path);
+    } catch (error) {
+      rmSync(tempPath, { force: true });
+      throw error;
+    }
+  }
+  chmod(path, 0o600);
+  if (!deps.writeFileSync && !deps.mkdirSync) {
+    const logDir = resolvePath(PROJECT_ROOT, opts.logDir);
+    for (const name of ["worker.jsonl", "launchd.out.log", "launchd.err.log"]) {
+      const logPath = resolvePath(logDir, name);
+      if (existsSync(logPath)) chmodSync(logPath, 0o600);
+    }
+  }
+  try {
+    run("launchctl", ["bootout", target(deps)], { allowFailure: true }, deps);
+    run("launchctl", ["bootout", domain(deps), plistPath(deps)], { allowFailure: true }, deps);
+    run("launchctl", ["bootstrap", domain(deps), plistPath(deps)], {}, deps);
+    run("launchctl", ["kickstart", "-k", target(deps)], { allowFailure: true }, deps);
+  } catch (error) {
+    if (!deps.writeFileSync) {
+      if (previousPlist === null) rmSync(path, { force: true });
+      else writeFileSync(path, previousPlist, { encoding: "utf8", mode: 0o600 });
+      if (previousPlist !== null) {
+        run("launchctl", ["bootstrap", domain(deps), path], { allowFailure: true }, deps);
+        run("launchctl", ["kickstart", "-k", target(deps)], { allowFailure: true }, deps);
+      }
+    }
+    throw error;
+  }
   output.write(`installed ${LABEL}\n`);
 }
 
@@ -439,6 +545,7 @@ function status(opts, deps = {}) {
     logDir: opts.logDir,
   });
   output.write(renderText(report));
+  return report;
 }
 
 /**
@@ -452,7 +559,7 @@ function tail(opts, deps = {}) {
   const output = deps.stdout || process.stdout;
   const path = resolvePath(opts.logDir, "worker.jsonl");
   if (!exists(path)) {
-    output.write(`no worker log yet: ${path}\n`);
+    output.write(`no worker log yet: ${basename(path)}\n`);
     return;
   }
   const lines = readFile(path, "utf8").trim().split("\n").filter(Boolean);
@@ -482,7 +589,7 @@ function waitOk(opts, deps = {}) {
   let lastReason = null;
 
   while (nowMs() <= deadline) {
-    const sync = run(execPath, ["scripts/sync-status.mjs", "--format", "json"], { allowFailure: true }, deps);
+    const sync = run(execPath, [SYNC_STATUS_SCRIPT, "--format", "json"], { allowFailure: true }, deps);
     const syncStatus = parseJson(sync);
     const workerLog = readWorkerEvents(opts.logDir);
     const workerSummary = summarize(workerLog.events);
@@ -496,7 +603,7 @@ function waitOk(opts, deps = {}) {
           kv([
             ["Cycle", `#${lastCycle.cycle} ${localIso(lastCycle.at)}`],
             ["Sync", String(syncStatus?.health || "unknown")],
-            ["Log", workerLog.exists ? workerLog.path : `${workerLog.path} (missing)`],
+            ["Log", workerLog.exists ? basename(workerLog.path) : `${basename(workerLog.path)} (missing)`],
           ]),
         ])}\n`,
       );
@@ -582,7 +689,7 @@ function runServiceCommand(opts, deps = {}) {
   else if (opts.command === "restart") {
     stop(deps);
     start(deps);
-  } else if (opts.command === "status") status(opts, deps);
+  } else if (opts.command === "status") return status(opts, deps);
   else if (opts.command === "wait-ok") waitOk(opts, deps);
   else if (opts.command === "tail") tail(opts, deps);
   else if (opts.command === "uninstall") uninstall(deps);
@@ -595,7 +702,7 @@ function runServiceCommand(opts, deps = {}) {
  */
 function main(argv = process.argv.slice(2), deps = {}) {
   const opts = parseArgs(argv);
-  runServiceCommand(opts, deps);
+  return runServiceCommand(opts, deps);
 }
 
 /**
@@ -604,7 +711,10 @@ function main(argv = process.argv.slice(2), deps = {}) {
  */
 function runLarkImServiceCli(argv, deps = {}) {
   try {
-    main(argv, deps);
+    const result = main(argv, deps);
+    if (result?.overview?.service?.status === "stopped" || result?.overview?.health?.status === "problem") {
+      return 2;
+    }
     return 0;
   } catch (error) {
     const render = deps.renderError || renderError;
@@ -638,4 +748,5 @@ export {
   uninstall,
   usage,
   waitOk,
+  xmlEscape,
 };

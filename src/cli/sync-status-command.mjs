@@ -5,8 +5,10 @@ import { resolve } from "node:path";
 import { renderError } from "../../dist/terminal/index.js";
 import {
   buildStatus,
+  sanitizeStatusReportForPublicOutput,
   sqliteJson,
 } from "../diagnostics/sync-status-report.mjs";
+import { publicDiagnosticError } from "../diagnostics/public-safe.mjs";
 import { renderSyncStatusText } from "../terminal/sync-status-view.mjs";
 
 const DEFAULT_DB = "data/exocortex.sqlite";
@@ -69,9 +71,9 @@ function parseArgs(argv) {
 function executeSyncStatus(opts, deps = {}) {
   const dbPath = (deps.resolvePath || resolve)(opts.db);
   const fileExists = deps.existsSync || existsSync;
-  if (!fileExists(dbPath)) throw new Error(`database not found: ${dbPath}`);
+  if (!fileExists(dbPath)) throw new Error("database not found");
   const loadStatus = deps.buildStatus || ((path) => buildStatus(path, deps));
-  return loadStatus(dbPath);
+  return sanitizeStatusReportForPublicOutput(loadStatus(dbPath));
 }
 
 /**
@@ -92,7 +94,7 @@ function runSyncStatusCli(argv, io = {}) {
     else stdout.write(renderSyncStatusText(status));
     return 0;
   } catch (error) {
-    stderr.write(renderError(error));
+    stderr.write(renderError(publicDiagnosticError(error, "sync status check failed")));
     return 1;
   }
 }

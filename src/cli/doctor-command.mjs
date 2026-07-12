@@ -9,6 +9,7 @@ import {
   DEFAULT_LIVE_PROBE_CACHE_PATH,
   writeLiveProbeCache,
 } from "../diagnostics/live-probe-cache.mjs";
+import { publicDiagnosticError } from "../diagnostics/public-safe.mjs";
 import { renderDoctorText } from "../terminal/doctor-view.mjs";
 
 const DEFAULT_DB = "data/exocortex.sqlite";
@@ -57,8 +58,10 @@ Options:
  * @param {string} name
  */
 function parsePositiveInt(value, name) {
-  const parsed = Number.parseInt(String(value), 10);
-  if (!Number.isInteger(parsed) || parsed <= 0) throw new Error(`${name} must be positive`);
+  const text = String(value);
+  if (!/^[1-9]\d*$/.test(text)) throw new Error(`${name} must be a positive integer`);
+  const parsed = Number(text);
+  if (!Number.isSafeInteger(parsed)) throw new Error(`${name} must be a positive integer`);
   return parsed;
 }
 
@@ -130,7 +133,7 @@ function runDoctorCli(argv, io = {}) {
     else stdout.write(renderDoctorText(report));
     return report.ok ? 0 : 2;
   } catch (error) {
-    stderr.write(renderError(error));
+    stderr.write(renderError(publicDiagnosticError(error, "doctor check failed")));
     return 1;
   }
 }

@@ -127,6 +127,8 @@ Failures                     过去 24 小时内失败 cycle 数、失败 step �
 
 ```text
 network_timeout
+network_error
+service_unavailable
 internal_error
 rate_limited
 ```
@@ -174,7 +176,7 @@ node scripts/sync-status.mjs --format json
 正常恢复路径：
 
 1. `sent_by_me` 从自己的 Cursor 继续拉取我在停摆期间发出的消息。
-2. 已知 `received.chat.*` 从各自 Cursor 继续拉取停摆期间收到的消息。
+2. 已知 `received.chat.*` 由公平 steady-state lane 按最旧 Cursor 更新时间轮转，继续拉取停摆期间收到的消息；hot lane 只负责低延迟加速，不能让其他 scope 永久饥饿。
 3. `discover-hot` 继续扫描最近活跃会话，发现新的活跃非免打扰会话。
 4. 未完成的 full discovery snapshot 用持久化 `page_token` 继续扫后续页。
 
@@ -392,6 +394,7 @@ diagnostic output   为维护、验收、排障展示系统状态。
 ```bash
 node scripts/doctor.mjs
 node scripts/doctor.mjs --live
+node scripts/sync-status.mjs
 node scripts/lark-im-service.mjs status
 node scripts/lark-im-quality.mjs
 node scripts/lark-im-lag-check.mjs
@@ -426,6 +429,7 @@ node scripts/sqlite-maintenance.mjs check
 node scripts/sqlite-maintenance.mjs backup
 node scripts/sqlite-maintenance.mjs verify --latest
 node scripts/sqlite-maintenance.mjs prune-runs
+node scripts/sqlite-maintenance.mjs compact
 ```
 
 `check` 会检查：
@@ -445,15 +449,17 @@ backups/private/
 
 该目录必须保持 git ignored。备份里包含完整个人消息库，只能留在本机私有环境。
 
-`verify --latest` 会打开最新备份，重新跑 integrity check，并和当前数据库比较关键表计数。输出只包含状态、相对路径、计数和校验结果，不展示消息内容、人名、群名、链接或 raw payload。
+`backup` 会先取得全局 maintenance lock，生成一致快照，移除快照里的临时 lock，再写入同名的私有 manifest。manifest 记录快照自身的 SHA-256、大小和创建时计数；备份和 manifest 均强制为 `0600`，目录为 `0700`。只有新快照完整通过 integrity、计数和 manifest 校验后才会执行保留清理；失败的新快照会被丢弃，不能挤掉旧的可用恢复点。默认保留最近 7 份且不超过 30 天，可用 `--backup-keep-count` / `--backup-keep-days` 调整。
+
+`verify --latest` 会打开最新备份，重新跑 integrity / foreign-key check，并核对该快照自己的 manifest、SHA-256、大小和计数。它不再把历史快照和持续变化的当前数据库比较，因此当前库后来新增消息不会让有效旧备份误报失败；备份内容即使保持行数不变，只要发生变化也会被 hash 检出。没有 manifest 的旧备份会明确报告为不可验证，而不是冒充验证成功。输出只包含状态、相对路径、计数和校验结果，不展示消息内容、人名、群名、链接或 raw payload。
 
 `prune-runs` 用来控制 `sync_runs` 的长期增长。规则保持简单：
 
 ```text
-删除 14 天前的 succeeded no-op runs。
+删除 14 天前、没有造成 durable record insert/update 的 succeeded runs。
 ```
 
-也就是只处理没有扫描、没有写入、没有更新、没有重复记录、且没有被任何 scope 当作 `last_success_run_id` 引用的旧成功 run。它不删除 `running`、`failed`、`cancelled`、有实际数据变化的成功 run，或当前 scope 引用的最新成功 run。
+也就是处理空轮询和 duplicate-only 轮询，但必须同时满足：没有写入、没有更新，且没有被任何 scope 当作 `last_success_run_id` 引用。它不删除 `running`、`failed`、`cancelled`、有实际数据变化的成功 run，或当前 scope 引用的最新成功 run。后台 worker 默认每 1440 个 cycle 自动执行一次该保留策略，避免运行历史再次无限增长。
 
 默认只 dry-run：
 
@@ -467,7 +473,9 @@ node scripts/sqlite-maintenance.mjs prune-runs
 node scripts/sqlite-maintenance.mjs prune-runs --apply
 ```
 
-`prune-runs --apply` 只删除运行日志，不删除 `records` 消息事实，也不推进或修改 cursor。它会通过全局 maintenance lock 和后台同步写入互斥；如果正好有 active sync lock，稍后重试即可。它不会自动 `VACUUM`；如果之后需要实际缩小 SQLite 文件，再单独安排维护窗口处理。
+`prune-runs --apply` 只删除运行日志，不删除 `records` 消息事实，也不推进或修改 cursor。它会通过全局 maintenance lock 和后台同步写入互斥；如果正好有 active sync lock，稍后重试即可。删除后的空闲页不会自动缩小文件；需要实际回收空间时，显式运行 `node scripts/sqlite-maintenance.mjs compact`，该动作同样受 maintenance lock 保护。
+
+SQLite 数据库、WAL/SHM、备份、worker 日志和 live probe cache 都属于私有运行数据。创建路径会使用 `0700` 目录和 `0600` 文件，并在正常启动/维护时收紧旧文件权限。LaunchAgent 同时配置 `Umask=63`；worker JSONL 按 10 MiB 轮转并默认保留 5 个历史文件，launchd stdout 指向 `/dev/null`，避免和 `worker.jsonl` 重复落盘。
 
 ## When Something Looks Wrong
 

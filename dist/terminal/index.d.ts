@@ -14,7 +14,16 @@ type TableColumn<Row extends Record<string, any> = Record<string, any>> = {
 type ListOptions = {
     empty?: string;
 };
+type SanitizeOptions = {
+    preserveNewlines?: boolean;
+};
 type StyleFormat = Parameters<typeof styleText>[0];
+/**
+ * Normalize text that crosses into terminal rendering. Styling added by this
+ * module is applied only after this function returns, so remote ANSI/CSI/OSC
+ * sequences cannot be confused with trusted presentation escapes.
+ */
+declare function sanitizeTerminalText(value: unknown, options?: SanitizeOptions): string;
 declare function paint(format: StyleFormat, text: unknown, options?: PaintOptions): string;
 declare function plain(value: unknown): string;
 declare function visibleLength(value: unknown): number;
@@ -34,4 +43,4 @@ declare function block(lines: unknown[]): string;
 declare function compact(value: unknown, limit?: number): string;
 declare function json(value: unknown): string;
 declare function renderError(error: unknown): string;
-export { block, command, compact, hint, json, key, kv, list, padRight, paint, plain, renderError, section, statusBadge, subtitle, table, title, value, visibleLength, };
+export { block, command, compact, hint, json, key, kv, list, padRight, paint, plain, renderError, sanitizeTerminalText, section, statusBadge, subtitle, table, title, value, visibleLength, };

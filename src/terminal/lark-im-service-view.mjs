@@ -1,5 +1,7 @@
 // @ts-check
 
+import { basename } from "node:path";
+
 import {
   block,
   compact,
@@ -259,7 +261,7 @@ function renderServiceStatusText(report) {
       ["Last step", formatWorkerStep(workerSummary)],
       ["In progress", workerSummary.in_progress ? "yes" : "no"],
       ["Last failure", formatWorkerFailure(workerSummary)],
-      ["Log", workerLog.exists ? workerLog.path : `${workerLog.path} (missing)`],
+      ["Log", workerLog.exists ? basename(workerLog.path) : `${basename(workerLog.path)} (missing)`],
     ]),
   );
 

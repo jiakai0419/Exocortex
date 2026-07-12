@@ -9,6 +9,7 @@ import {
   parseArgs,
   parsePositiveInt,
   plistXml,
+  runLarkImServiceCli,
   runServiceCommand,
 } from "../scripts/lark-im-service.mjs";
 
@@ -88,6 +89,10 @@ test("lark im service parseArgs keeps stable defaults for status", () => {
   assert.equal(opts.lines, 20);
   assert.equal(opts.timeoutSeconds, 180);
   assert.equal(opts.pollSeconds, 5);
+  assert.equal(opts.stepTimeoutSeconds, 600);
+  assert.equal(opts.logMaxBytes, 10 * 1024 * 1024);
+  assert.equal(opts.logKeepFiles, 5);
+  assert.equal(opts.retentionEveryCycles, 1440);
 });
 
 test("lark im service parseArgs accepts worker tuning options", () => {
@@ -189,8 +194,9 @@ test("plistXml renders LaunchAgent worker arguments without shelling out when la
   assert.match(xml, /<string>--reconcile-interval-hours<\/string>\s*<string>6<\/string>/);
   assert.match(xml, /<string>--chat-types<\/string>\s*<string>group<\/string>/);
   assert.match(xml, /<key>LARK_CLI<\/key>\s*<string>\/usr\/local\/bin\/lark-cli<\/string>/);
-  assert.match(xml, /<key>StandardOutPath<\/key>\s*<string>\/project\/logs\/lark-im\/launchd\.out\.log<\/string>/);
+  assert.match(xml, /<key>StandardOutPath<\/key>\s*<string>\/dev\/null<\/string>/);
   assert.match(xml, /<key>StandardErrorPath<\/key>\s*<string>\/project\/logs\/lark-im\/launchd\.err\.log<\/string>/);
+  assert.match(xml, /<key>Umask<\/key>\s*<integer>63<\/integer>/);
 });
 
 test("plistXml falls back to the default lark-cli path when which returns empty", () => {
@@ -211,6 +217,37 @@ test("plistXml falls back to the default lark-cli path when which returns empty"
   assert.match(xml, /<key>LARK_CLI<\/key>\s*<string>\/opt\/homebrew\/bin\/lark-cli<\/string>/);
 });
 
+test("plistXml escapes untrusted paths and values", () => {
+  const xml = plistXml(parseArgs(["install", "--chat-types", "group&p2p"]), {
+    cwd: "/project/<unsafe>",
+    logDir: "/logs/a&b",
+    nodePath: "/bin/node",
+    workerPath: "/worker\"quoted.mjs",
+    larkCli: "/bin/lark'cli",
+    mkdirSync: () => {},
+  });
+  assert.match(xml, /\/project\/&lt;unsafe&gt;/);
+  assert.match(xml, /\/logs\/a&amp;b/);
+  assert.match(xml, /worker&quot;quoted\.mjs/);
+  assert.match(xml, /group&amp;p2p/);
+  assert.match(xml, /lark&apos;cli/);
+});
+
+test("service status returns semantic unhealthy exit code", () => {
+  const stdout = memoryWriter();
+  const stderr = memoryWriter();
+  const exitCode = runLarkImServiceCli(["status"], {
+    stdout: stdout.stream,
+    stderr: stderr.stream,
+    renderServiceStatusText: () => "STOPPED / PROBLEM\n",
+    buildServiceStatusReport: () => ({
+      overview: { service: { status: "stopped" }, health: { status: "problem" } },
+    }),
+  });
+  assert.equal(exitCode, 2);
+  assert.equal(stderr.text(), "");
+});
+
 test("service install writes plist and bootstraps LaunchAgent through injected deps", () => {
   const { calls, deps, stdout } = fakeServiceDeps();
 
@@ -221,7 +258,7 @@ test("service install writes plist and bootstraps LaunchAgent through injected d
     calls.filter((call) => call[0] === "mkdir").map((call) => call.slice(1)),
     [
       ["/home/tester/Library/LaunchAgents", { recursive: true }],
-      ["logs/test", { recursive: true }],
+      ["/project/logs/test", { recursive: true }],
     ],
   );
   const write = calls.find((call) => call[0] === "write");

@@ -8,6 +8,8 @@ node_modules/
 *.p12
 
 reports/**/*.json
+# Local reviewer reports can contain machine-specific runtime metadata.
+reviews/
 data/*.sqlite
 data/*.sqlite-*
 data/*.sqlite3

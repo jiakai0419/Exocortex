@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import {
+  existsSync,
   mkdtempSync,
+  readdirSync,
   rmSync,
+  statSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -110,6 +113,8 @@ test("sqlite maintenance parseArgs keeps public maintenance commands explicit", 
     latest: false,
     format: "text",
     dryRun: true,
+    backupKeepCount: 7,
+    backupKeepDays: 30,
   });
   assert.equal(parseArgs(["prune-runs", "--apply"]).dryRun, false);
   assert.equal(parseArgs(["prune-runs", "--dry-run"]).dryRun, true);
@@ -121,9 +126,11 @@ test("sqlite maintenance parseArgs keeps public maintenance commands explicit", 
     latest: true,
     format: "json",
     dryRun: true,
+    backupKeepCount: 7,
+    backupKeepDays: 30,
   });
   assert.equal(parseArgs(["--help"]).help, true);
-  assert.throws(() => parseArgs(["repair"]), /action must be check, backup, verify, or prune-runs/);
+  assert.throws(() => parseArgs(["repair"]), /action must be check, backup, verify, prune-runs, or compact/);
   assert.throws(() => parseArgs(["check", "--apply"]), /--apply is only supported for prune-runs/);
   assert.throws(() => parseArgs(["verify", "--latest", "--backup", "x.sqlite"]), /use either --latest or --backup/);
 });
@@ -158,15 +165,18 @@ test("sqlite maintenance backup creates a verified private backup and verify lat
   assert.equal(backup.ok, true);
   assert.equal(backup.counts_match, true);
   assert.match(backup.backup_path, /^backups\/private\/exocortex-/);
+  assert.equal(statSync(backupDir).mode & 0o777, 0o700);
+  assert.equal(statSync(join(dir, backup.backup_path)).mode & 0o777, 0o600);
+  assert.equal(statSync(`${join(dir, backup.backup_path)}.manifest.json`).mode & 0o777, 0o600);
 
   const verify = executeSqliteMaintenance(parseArgs(["verify", "--latest", "--db", dbPath, "--backup-dir", backupDir]), {
     cwd: dir,
   });
   assert.equal(verify.ok, true);
-  assert.equal(verify.counts_match, true);
+  assert.equal(verify.manifest.status, "verified");
 });
 
-test("sqlite maintenance verify fails when backup counts no longer match source", (t) => {
+test("sqlite maintenance verify is independent of source growth and detects same-count backup tampering", (t) => {
   const dir = tempDir(t);
   const dbPath = join(dir, "shape.sqlite");
   const backupDir = join(dir, "backups", "private");
@@ -185,8 +195,63 @@ test("sqlite maintenance verify fails when backup counts no longer match source"
     cwd: dir,
   });
 
-  assert.equal(verify.ok, false);
-  assert.equal(verify.counts_match, false);
+  assert.equal(verify.ok, true);
+  assert.equal(verify.manifest.status, "verified");
+
+  const backupPath = join(dir, backup.backup_path);
+  sqliteExec(
+    backupPath,
+    "UPDATE sync_runs SET started_at = '2030-01-01T00:00:00.000Z' WHERE id = 1;",
+    "tamper backup without changing counts",
+  );
+  const tampered = executeSqliteMaintenance(parseArgs(["verify", "--backup", backupPath]), { cwd: dir });
+  assert.equal(tampered.ok, false);
+  assert.equal(tampered.manifest.status, "mismatch");
+  assert.equal(tampered.manifest.checks.sha256, false);
+
+  rmSync(`${backupPath}.manifest.json`);
+  const missingManifest = executeSqliteMaintenance(parseArgs(["verify", "--backup", backupPath]), { cwd: dir });
+  assert.equal(missingManifest.ok, false);
+  assert.equal(missingManifest.manifest.status, "missing");
+});
+
+test("a failed new backup is discarded without pruning the last verified backup", (t) => {
+  const dir = tempDir(t);
+  const dbPath = join(dir, "shape.sqlite");
+  const backupDir = join(dir, "backups", "private");
+  installSchema(dbPath);
+
+  const first = executeSqliteMaintenance(
+    parseArgs(["backup", "--db", dbPath, "--backup-dir", backupDir, "--backup-keep-count", "1"]),
+    { cwd: dir, now: () => new Date("2027-01-15T08:00:00.000Z") },
+  );
+  assert.equal(first.ok, true);
+  const firstName = first.backup_path.split("/").at(-1);
+
+  const failed = executeSqliteMaintenance(
+    parseArgs(["backup", "--db", dbPath, "--backup-dir", backupDir, "--backup-keep-count", "1"]),
+    {
+      cwd: dir,
+      now: () => new Date("2027-01-16T08:00:00.000Z"),
+      spawnSync: (cmd, args, options) => {
+        const candidatePath = String(args[1] || "");
+        if (
+          args[0] === "-json" &&
+          candidatePath.startsWith(backupDir) &&
+          String(options.input || "").includes("PRAGMA quick_check")
+        ) {
+          return { status: 0, stdout: '[{"quick_check":"corrupt"}]\n', stderr: "" };
+        }
+        return spawnSync(cmd, args, options);
+      },
+    },
+  );
+
+  assert.equal(failed.ok, false);
+  assert.equal(failed.backup_discarded, true);
+  assert.equal(failed.retention.skipped, "new_backup_failed_validation");
+  assert.deepEqual(readdirSync(backupDir).filter((name) => name.endsWith(".sqlite")), [firstName]);
+  assert.equal(existsSync(join(backupDir, `${firstName}.manifest.json`)), true);
 });
 
 test("sqlite maintenance prune-runs only removes old succeeded no-op runs when applied", (t) => {
@@ -213,7 +278,7 @@ test("sqlite maintenance prune-runs only removes old succeeded no-op runs when a
   const rendered = plain(renderSqliteMaintenanceText(dryRun));
   assert.equal(dryRun.ok, true);
   assert.equal(dryRun.prune.dry_run, true);
-  assert.equal(dryRun.prune.candidate_count, 1);
+  assert.equal(dryRun.prune.candidate_count, 2);
   assert.equal(dryRun.prune.deleted_count, 0);
   assert.equal(dryRun.check.counts.sync_runs, 7);
   assert.match(rendered, /Run retention/);
@@ -227,10 +292,10 @@ test("sqlite maintenance prune-runs only removes old succeeded no-op runs when a
   assert.equal(applied.ok, true);
   assert.equal(applied.maintenance_lock, "acquired");
   assert.equal(applied.prune.dry_run, false);
-  assert.equal(applied.prune.candidate_count, 1);
-  assert.equal(applied.prune.deleted_count, 1);
-  assert.equal(applied.check.counts.sync_runs, 6);
-  assert.deepEqual(remainingIds, [1, 3, 4, 5, 6, 7]);
+  assert.equal(applied.prune.candidate_count, 2);
+  assert.equal(applied.prune.deleted_count, 2);
+  assert.equal(applied.check.counts.sync_runs, 5);
+  assert.deepEqual(remainingIds, [1, 3, 4, 6, 7]);
 });
 
 test("sqlite maintenance prune-runs apply uses the maintenance lock", (t) => {
@@ -252,7 +317,7 @@ test("sqlite maintenance prune-runs apply uses the maintenance lock", (t) => {
   assert.equal(report.ok, true);
   assert.equal(report.maintenance_lock, "acquired");
   assert.deepEqual(calls, [
-    ["acquire", "sqlite-maintenance prune-runs"],
+    ["acquire", "sqlite maintenance prune-runs"],
     ["release", `pid:${process.pid}:sqlite-maintenance`],
   ]);
 });
@@ -306,4 +371,29 @@ test("sqlite maintenance CLI renders text, json, help, and errors", (t) => {
     deps: { cwd: dir },
   }), 1);
   assert.match(plain(err.text()), /verify requires --latest or --backup/);
+
+  const privatePathError = memoryWriter();
+  const privatePath = join(dir, "PRIVATE-SENTINEL", "missing.sqlite");
+  assert.equal(runSqliteMaintenanceCli(["check", "--db", privatePath], {
+    stderr: privatePathError.stream,
+    deps: { cwd: dir },
+  }), 1);
+  assert.doesNotMatch(privatePathError.text(), /PRIVATE-SENTINEL|missing\.sqlite/);
+  assert.match(plain(privatePathError.text()), /database not found/);
+});
+
+test("sqlite maintenance reports a readable missing sqlite3 error", () => {
+  assert.throws(
+    () =>
+      executeSqliteMaintenance(parseArgs(["check", "--db", "missing.sqlite"]), {
+        existsSync: () => true,
+        statSync: () => ({ size: 0 }),
+        spawnSync: () => {
+          const error = new Error("spawn sqlite3 ENOENT");
+          error.code = "ENOENT";
+          return { status: null, error };
+        },
+      }),
+    /sqlite3 executable not found \(ENOENT\)/,
+  );
 });

@@ -1,6 +1,7 @@
 // @ts-check
 
 import { spawnSync } from "node:child_process";
+import { diagnosticSubprocessError } from "./public-safe.mjs";
 
 /**
  * @typedef {"all" | "sent" | "received"} MessageDirection
@@ -44,11 +45,11 @@ function sqliteJson(dbPath, sql, label) {
     input: `.timeout 5000\n${sql}`,
     encoding: "utf8",
     maxBuffer: 20 * 1024 * 1024,
+    timeout: 30_000,
+    killSignal: "SIGKILL",
   });
-  if (result.status !== 0) {
-    throw new Error(`${label} failed: ${result.stderr.trim() || `exit ${result.status}`}`);
-  }
-  const trimmed = result.stdout.trim();
+  if (result.status !== 0 || result.error) throw diagnosticSubprocessError(result, label);
+  const trimmed = String(result.stdout || "").trim();
   return trimmed ? JSON.parse(trimmed) : [];
 }
 

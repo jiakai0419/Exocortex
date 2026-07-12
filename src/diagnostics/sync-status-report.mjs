@@ -4,8 +4,15 @@ import { spawnSync } from "node:child_process";
 import { recoverStaleSyncState } from "../../dist/storage/sqlite/ingestion-store.js";
 import { classifyLarkFailure } from "../adapters/lark-im/transport.mjs";
 import {
+  diagnosticSubprocessError,
+  publicCommandFailureReason,
+  publicErrorCode,
+  publicFailureKind,
+  publicTimestamp,
+  publicUnsupportedReasons,
+} from "./public-safe.mjs";
+import {
   countBy,
-  healthDetail,
   summarizeHealth,
 } from "./sync-status-core.mjs";
 
@@ -29,11 +36,11 @@ function sqliteJson(dbPath, sql, label) {
     input: `.timeout 5000\n${sql}`,
     encoding: "utf8",
     maxBuffer: 20 * 1024 * 1024,
+    timeout: 30_000,
+    killSignal: "SIGKILL",
   });
-  if (result.status !== 0) {
-    throw new Error(`${label} failed: ${result.stderr.trim() || `exit ${result.status}`}`);
-  }
-  const trimmed = result.stdout.trim();
+  if (result.status !== 0 || result.error) throw diagnosticSubprocessError(result, label);
+  const trimmed = String(result.stdout || "").trim();
   return trimmed ? JSON.parse(trimmed) : [];
 }
 
@@ -61,6 +68,134 @@ function quoteSql(value) {
   return `'${String(value).replaceAll("'", "''")}'`;
 }
 
+/** @param {unknown} value */
+function nonNegativeNumber(value) {
+  return Math.max(0, Number(value || 0));
+}
+
+/** @param {unknown} value */
+function publicCursor(value) {
+  if (!value || typeof value !== "object") return null;
+  const cursor = /** @type {JsonObject} */ (value);
+  /** @type {JsonObject} */
+  const projected = {};
+  if (typeof cursor.has_more === "boolean") projected.has_more = cursor.has_more;
+  if (Number.isFinite(Number(cursor.pages_scanned))) {
+    projected.pages_scanned = nonNegativeNumber(cursor.pages_scanned);
+  }
+  return Object.keys(projected).length > 0 ? projected : null;
+}
+
+/**
+ * @param {string} health
+ * @param {JsonObject} scopes
+ * @param {JsonObject | null} discoveryCursor
+ */
+function publicHealthDetail(health, scopes, discoveryCursor) {
+  if (health === "syncing") return "worker is currently syncing";
+  if (health === "catching_up") {
+    /** @type {string[]} */
+    const details = [];
+    if (discoveryCursor?.has_more === true) details.push("discovery still has more pages");
+    const withoutCursor = nonNegativeNumber(scopes.received_without_cursor);
+    if (withoutCursor > 0) details.push(`${withoutCursor} chat scopes need cursors`);
+    return `initial catch-up: ${details.join(", ") || "work remains"}`;
+  }
+  if (health === "ok_with_history") return "all known enabled scopes have cursors; historical failures recorded";
+  if (health === "ok") return "all known enabled scopes have cursors";
+  return "sync status unavailable";
+}
+
+/**
+ * @param {JsonObject} report
+ * @returns {JsonObject}
+ */
+function sanitizeStatusReportForPublicOutput(report) {
+  if (report?.status === "command_failed") {
+    return {
+      ok: false,
+      status: "command_failed",
+      reason: publicCommandFailureReason(`${report.reason || ""}\n${report.stderr || ""}\n${report.stdout || ""}`),
+      exit_status: Number(report.exit_status || 1),
+    };
+  }
+  const health = ["syncing", "catching_up", "ok", "ok_with_history"].includes(report?.health)
+    ? report.health
+    : "unknown";
+  const scopes = {
+    total: nonNegativeNumber(report?.scopes?.total),
+    enabled: nonNegativeNumber(report?.scopes?.enabled),
+    received_enabled: nonNegativeNumber(report?.scopes?.received_enabled),
+    received_without_cursor: nonNegativeNumber(report?.scopes?.received_without_cursor),
+    received_unsupported: nonNegativeNumber(report?.scopes?.received_unsupported),
+    unsupported_reasons: publicUnsupportedReasons(report?.scopes?.unsupported_reasons),
+  };
+  const discoveryCursor = publicCursor(report?.discovery?.cursor);
+  /** @type {JsonObject} */
+  const byStatus = {};
+  for (const status of ["running", "succeeded", "failed", "cancelled"]) {
+    const count = nonNegativeNumber(report?.runs?.by_status?.[status]);
+    if (count > 0) byStatus[status] = count;
+  }
+  return {
+    records: {
+      total: nonNegativeNumber(report?.records?.total),
+      latest_ms: Number.isFinite(Number(report?.records?.latest_ms)) ? Number(report.records.latest_ms) : null,
+      by_direction: (Array.isArray(report?.records?.by_direction) ? report.records.by_direction : [])
+        .filter((row) => ["sent", "received", "unknown"].includes(String(row.direction)))
+        .map((row) => ({
+          direction: String(row.direction),
+          count: nonNegativeNumber(row.count),
+          latest_ms: Number.isFinite(Number(row.latest_ms)) ? Number(row.latest_ms) : null,
+        })),
+    },
+    scopes,
+    discovery: {
+      cursor: discoveryCursor,
+      cursor_updated_at: publicTimestamp(report?.discovery?.cursor_updated_at),
+      complete: report?.discovery?.complete === true,
+    },
+    hot_discovery: {
+      cursor: publicCursor(report?.hot_discovery?.cursor),
+      cursor_updated_at: publicTimestamp(report?.hot_discovery?.cursor_updated_at),
+      ran: report?.hot_discovery?.ran === true,
+    },
+    reconcile: {
+      cursor: publicCursor(report?.reconcile?.cursor),
+      cursor_updated_at: publicTimestamp(report?.reconcile?.cursor_updated_at),
+      complete: report?.reconcile?.complete === true,
+    },
+    runs: {
+      by_status: byStatus,
+      recent: (Array.isArray(report?.runs?.recent) ? report.runs.recent : []).map((run) => ({
+        status: ["running", "succeeded", "failed", "cancelled"].includes(String(run.status))
+          ? String(run.status)
+          : "failed",
+        started_at: publicTimestamp(run.started_at),
+        finished_at: publicTimestamp(run.finished_at),
+        scanned_count: nonNegativeNumber(run.scanned_count),
+        inserted_count: nonNegativeNumber(run.inserted_count),
+        updated_count: nonNegativeNumber(run.updated_count),
+        duplicate_count: nonNegativeNumber(run.duplicate_count),
+        failure_kind: run.status === "succeeded" ? "" : publicFailureKind(run.failure_kind),
+        transient: run.transient === true,
+        error_code: publicErrorCode(run.error_code),
+      })),
+    },
+    locks: (Array.isArray(report?.locks) ? report.locks : []).map((lock) => ({
+      locked_at: publicTimestamp(lock.locked_at),
+      expires_at: publicTimestamp(lock.expires_at),
+    })),
+    recovery: {
+      recovered_locks: nonNegativeNumber(report?.recovery?.recovered_locks),
+      cancelled_runs: nonNegativeNumber(report?.recovery?.cancelled_runs),
+      active_expired_locks: nonNegativeNumber(report?.recovery?.active_expired_locks),
+    },
+    health,
+    health_detail: publicHealthDetail(health, scopes, discoveryCursor),
+  };
+}
+
 /**
  * @param {string} dbPath
  * @param {string} scopeId
@@ -71,7 +206,7 @@ function readScopeStatus(dbPath, scopeId, label, query) {
   return first(
     query(
       dbPath,
-      `SELECT id, cursor_json, cursor_updated_at, last_success_run_id, last_error_run_id
+      `SELECT cursor_json, cursor_updated_at, (last_success_run_id IS NOT NULL) AS has_success
        FROM sync_scopes
        WHERE id = ${quoteSql(scopeId)}
        LIMIT 1;`,
@@ -121,7 +256,6 @@ function buildStatus(dbPath, deps = {}) {
     `SELECT
        COALESCE(json_extract(config_json, '$.unsupported_reason'), 'unknown') AS reason,
        MAX(COALESCE(json_extract(config_json, '$.lark_cli_error_code'), '')) AS lark_cli_error_code,
-       MAX(COALESCE(json_extract(config_json, '$.lark_cli_error_message'), '')) AS lark_cli_error_message,
        COUNT(*) AS count
      FROM sync_scopes
      WHERE id LIKE 'lark.im.received.chat.%'
@@ -155,7 +289,7 @@ function buildStatus(dbPath, deps = {}) {
   );
   const recentRuns = query(
     dbPath,
-    `SELECT id, scope_id, status, started_at, finished_at, scanned_count, inserted_count, updated_count, duplicate_count, error_type, error_message
+    `SELECT status, started_at, finished_at, scanned_count, inserted_count, updated_count, duplicate_count, error_message
      FROM sync_runs
      ORDER BY id DESC
      LIMIT 10;`,
@@ -163,15 +297,14 @@ function buildStatus(dbPath, deps = {}) {
   );
   const locks = query(
     dbPath,
-    "SELECT scope_id, locked_by, locked_at, expires_at FROM sync_locks ORDER BY locked_at DESC;",
+    "SELECT locked_at, expires_at FROM sync_locks ORDER BY locked_at DESC;",
     "read locks",
   );
 
   const discoveryCursor = parseMaybeJson(discoveryRow.cursor_json);
   const hotDiscoveryCursor = parseMaybeJson(hotDiscoveryRow.cursor_json);
   const reconcileCursor = parseMaybeJson(reconcileRow.cursor_json);
-  return {
-    db_path: dbPath,
+  return sanitizeStatusReportForPublicOutput({
     records: {
       total: Number(totals.count || 0),
       latest_ms: totals.latest_ms ?? null,
@@ -192,22 +325,16 @@ function buildStatus(dbPath, deps = {}) {
     discovery: {
       cursor: discoveryCursor,
       cursor_updated_at: discoveryRow.cursor_updated_at || null,
-      last_success_run_id: discoveryRow.last_success_run_id || null,
-      last_error_run_id: discoveryRow.last_error_run_id || null,
       complete: discoveryCursor ? discoveryCursor.has_more === false : false,
     },
     hot_discovery: {
       cursor: hotDiscoveryCursor,
       cursor_updated_at: hotDiscoveryRow.cursor_updated_at || null,
-      last_success_run_id: hotDiscoveryRow.last_success_run_id || null,
-      last_error_run_id: hotDiscoveryRow.last_error_run_id || null,
-      ran: Boolean(hotDiscoveryRow.last_success_run_id),
+      ran: Boolean(hotDiscoveryRow.has_success),
     },
     reconcile: {
       cursor: reconcileCursor,
       cursor_updated_at: reconcileRow.cursor_updated_at || null,
-      last_success_run_id: reconcileRow.last_success_run_id || null,
-      last_error_run_id: reconcileRow.last_error_run_id || null,
       complete: reconcileCursor ? reconcileCursor.has_more === false : false,
     },
     runs: {
@@ -215,7 +342,13 @@ function buildStatus(dbPath, deps = {}) {
       recent: recentRuns.map((run) => {
         const classification = classifyLarkFailure(run.error_message || "");
         return {
-          ...run,
+          status: run.status,
+          started_at: run.started_at,
+          finished_at: run.finished_at,
+          scanned_count: run.scanned_count,
+          inserted_count: run.inserted_count,
+          updated_count: run.updated_count,
+          duplicate_count: run.duplicate_count,
           failure_kind: run.status === "succeeded" ? "" : classification.kind,
           transient: run.status === "succeeded" ? false : classification.transient,
           error_code: run.status === "succeeded" ? null : classification.code,
@@ -225,11 +358,11 @@ function buildStatus(dbPath, deps = {}) {
     locks,
     recovery,
     health: summarizeHealth({ discoveryCursor, scopeCounts, locks, runCounts }),
-    health_detail: healthDetail({ discoveryCursor, scopeCounts, locks, runCounts }),
-  };
+  });
 }
 
 export {
   buildStatus,
+  sanitizeStatusReportForPublicOutput,
   sqliteJson,
 };

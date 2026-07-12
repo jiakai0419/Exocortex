@@ -20,16 +20,44 @@ type ListOptions = {
   empty?: string;
 };
 
+type SanitizeOptions = {
+  preserveNewlines?: boolean;
+};
+
 type StyleFormat = Parameters<typeof styleText>[0];
 type StyleName = Extract<StyleFormat, string>;
 
+const OSC_SEQUENCE = /(?:\u001B\]|\u009D)[\s\S]*?(?:\u0007|\u001B\\|\u009C)/g;
+const CSI_SEQUENCE = /(?:\u001B\[|\u009B)[0-?]*[ -/]*[@-~]/g;
+const BIDI_CONTROLS = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
+const TERMINAL_CONTROLS = /[\u0000-\u001F\u007F-\u009F]/g;
+const UNICODE_LINE_SEPARATORS = /[\u2028\u2029]/g;
+
+/**
+ * Normalize text that crosses into terminal rendering. Styling added by this
+ * module is applied only after this function returns, so remote ANSI/CSI/OSC
+ * sequences cannot be confused with trusted presentation escapes.
+ */
+function sanitizeTerminalText(value: unknown, options: SanitizeOptions = {}) {
+  const preserveNewlines = options.preserveNewlines === true;
+  const withoutSequences = stripVTControlCharacters(
+    String(value ?? "").replace(OSC_SEQUENCE, "").replace(CSI_SEQUENCE, ""),
+  );
+  return withoutSequences
+    .replace(BIDI_CONTROLS, "")
+    .replace(UNICODE_LINE_SEPARATORS, " ")
+    .replace(TERMINAL_CONTROLS, (control) =>
+      preserveNewlines && control === "\n" ? "\n" : " ",
+    );
+}
+
 function paint(format: StyleFormat, text: unknown, options: PaintOptions = {}) {
   const stream = options.stream || stdout;
-  return styleText(format, String(text), { stream });
+  return styleText(format, sanitizeTerminalText(text), { stream });
 }
 
 function plain(value: unknown) {
-  return stripVTControlCharacters(String(value ?? ""));
+  return sanitizeTerminalText(value, { preserveNewlines: true });
 }
 
 function visibleLength(value: unknown) {
@@ -37,7 +65,7 @@ function visibleLength(value: unknown) {
 }
 
 function padRight(value: unknown, width: number) {
-  const text = String(value ?? "");
+  const text = sanitizeTerminalText(value);
   const padding = Math.max(0, width - visibleLength(text));
   return `${text}${" ".repeat(padding)}`;
 }
@@ -63,7 +91,7 @@ function key(text: unknown) {
 }
 
 function value(text: unknown) {
-  return String(text ?? "");
+  return sanitizeTerminalText(text);
 }
 
 function hint(label: unknown, text: unknown) {
@@ -71,7 +99,8 @@ function hint(label: unknown, text: unknown) {
 }
 
 function statusBadge(status: unknown) {
-  const normalized = String(status || "unknown").toLowerCase();
+  const safeStatus = sanitizeTerminalText(status || "unknown");
+  const normalized = safeStatus.toLowerCase();
   const labels: Record<string, [string, StyleName]> = {
     fresh: ["OK", "green"],
     healthy: ["OK", "green"],
@@ -84,6 +113,7 @@ function statusBadge(status: unknown) {
     problem: ["PROBLEM", "red"],
     failed: ["FAILED", "red"],
     command_failed: ["FAILED", "red"],
+    inconclusive: ["INCONCLUSIVE", "yellow"],
     unavailable: ["UNAVAILABLE", "gray"],
     verified: ["VERIFIED", "green"],
     behind: ["BEHIND", "yellow"],
@@ -98,7 +128,7 @@ function statusBadge(status: unknown) {
     skipped: ["SKIPPED", "gray"],
     unknown: ["UNKNOWN", "gray"],
   };
-  const fallback: [string, StyleName] = [String(status || "UNKNOWN").toUpperCase(), "gray"];
+  const fallback: [string, StyleName] = [safeStatus.toUpperCase(), "gray"];
   const [label, color] = labels[normalized] || fallback;
   return paint(["bold", color], label);
 }
@@ -108,7 +138,7 @@ function kv(rows: Array<[unknown, unknown] | null | undefined>, options: KvOptio
   for (const row of rows) {
     if (!row) continue;
     const [name, val] = row;
-    entries.push([String(name), String(val ?? "")]);
+    entries.push([sanitizeTerminalText(name), sanitizeTerminalText(val)]);
   }
   const width = Math.max(options.width || 0, ...entries.map(([name]) => visibleLength(name)));
   return entries.map(([name, val]) => `  ${key(padRight(name, width))}  ${value(val)}`).join("\n");
@@ -116,26 +146,30 @@ function kv(rows: Array<[unknown, unknown] | null | undefined>, options: KvOptio
 
 function table<Row extends Record<string, any>>(rows: Row[], columns: Array<TableColumn<Row>>) {
   if (rows.length === 0) return "";
-  const widths = columns.map((column) =>
+  const headers = columns.map((column) => sanitizeTerminalText(column.header));
+  const cells = rows.map((row) =>
+    columns.map((column) =>
+      sanitizeTerminalText(column.render ? column.render(row) : row[column.key]),
+    ),
+  );
+  const widths = columns.map((_column, index) =>
     Math.max(
-      visibleLength(column.header),
-      ...rows.map((row) => visibleLength(column.render ? column.render(row) : row[column.key])),
+      visibleLength(headers[index]),
+      ...cells.map((row) => visibleLength(row[index])),
     ),
   );
   const header = columns
-    .map((column, index) => paint("bold", padRight(column.header, widths[index])))
+    .map((_column, index) => paint("bold", padRight(headers[index], widths[index])))
     .join("  ");
-  const body = rows.map((row) =>
-    columns
-      .map((column, index) => padRight(column.render ? column.render(row) : row[column.key], widths[index]))
-      .join("  "),
+  const body = cells.map((row) =>
+    row.map((cell, index) => padRight(cell, widths[index])).join("  "),
   );
   return [header, ...body].join("\n");
 }
 
 function list(items: unknown[] | null | undefined, options: ListOptions = {}) {
-  if (!items || items.length === 0) return options.empty || "";
-  return items.map((item) => `  - ${item}`).join("\n");
+  if (!items || items.length === 0) return sanitizeTerminalText(options.empty || "");
+  return items.map((item) => `  - ${sanitizeTerminalText(item)}`).join("\n");
 }
 
 function block(lines: unknown[]) {
@@ -143,7 +177,7 @@ function block(lines: unknown[]) {
 }
 
 function compact(value: unknown, limit = 240) {
-  const text = String(value || "").replace(/\s+/g, " ").trim();
+  const text = sanitizeTerminalText(value).replace(/\s+/g, " ").trim();
   if (!text) return "(empty)";
   return text.length > limit ? `${text.slice(0, limit - 3)}...` : text;
 }
@@ -181,7 +215,7 @@ function renderError(error: unknown) {
     }
   } else {
     lines.push("");
-    lines.push(`  ${message}`);
+    lines.push(`  ${sanitizeTerminalText(message)}`);
   }
   return `${block(lines)}\n`;
 }
@@ -199,6 +233,7 @@ export {
   paint,
   plain,
   renderError,
+  sanitizeTerminalText,
   section,
   statusBadge,
   subtitle,

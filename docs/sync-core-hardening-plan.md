@@ -97,7 +97,7 @@
 
 - cycle step 顺序。
 - hot lane 每轮跑。
-- catchup lane 渐进推进。
+- fair steady-state lane 按最旧 cursor 更新时间轮转所有已知 scope，hot rank 不能造成饥饿。
 - doctor 能区分 syncing / catching_up / needs_attention。
 
 ## 当前执行切片
@@ -136,6 +136,16 @@ v0 质量验收已经完成并固化到 `docs/v0-baseline.md`。
 消息过滤、按人/会话/关键词查询等 `messages` 阅读体验增强暂不进入近期计划。当前 `messages` 只承担“查看最近同步事实”的验收入口。
 
 ## 执行记录
+
+### 2026-07-12
+
+- SQLite CLI 写事务统一启用 fail-fast，run success/fail 受状态、scope/source、lock owner、lock acquisition 和 cursor-before fence 保护；锁后重读 scope，旧或 cancelled run 不能回写新 cursor。
+- record upsert 增加外部版本单调保护，事务内统计实际 insert/update/duplicate；API envelope、消息 ID/时间和非法 cursor 改为 fail-closed。
+- received worker 增加公平 steady-state lane，hot snapshot 会清理旧 rank；超页时间窗会二分成可提交的完整前缀，外部命令增加硬超时和更完整的 transient retry。
+- 诊断默认只输出 public-safe 投影，terminal 渲染边界移除 ANSI/OSC/control/bidi；doctor、quality、service 和有限 worker cycle 统一传播不健康退出码。
+- 私有运行文件统一收紧为目录 `0700`、文件 `0600`；worker 日志轮转并去除 launchd 重复副本，run retention 定期执行。
+- SQLite 备份使用自身 manifest/hash 验证并自动保留，历史快照不再和变化中的当前库比较计数；新增显式 compact 维护动作。
+- CI 提交 lockfile、改用 `npm ci`，syntax checker 会逐文件执行 `node --check`。
 
 ### 2026-06-24
 

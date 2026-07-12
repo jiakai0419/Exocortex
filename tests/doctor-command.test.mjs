@@ -6,7 +6,10 @@ import {
   parseArgs,
   runDoctorCli,
 } from "../src/cli/doctor-command.mjs";
-import { buildReport } from "../src/diagnostics/doctor-report.mjs";
+import {
+  buildReport,
+  runJson,
+} from "../src/diagnostics/doctor-report.mjs";
 import { renderDoctorText } from "../src/terminal/doctor-view.mjs";
 
 function memoryWriter() {
@@ -93,6 +96,41 @@ test("doctor command renders help without touching dependencies", () => {
   assert.equal(stderr.text(), "");
 });
 
+test("doctor subprocesses use absolute project scripts, process executable, and a hard timeout", () => {
+  const calls = [];
+  const report = runJson(
+    ["scripts/sync-status.mjs", "--format", "json"],
+    new Set([0]),
+    {
+      execPath: "/runtime/node",
+      projectRoot: "/project/root",
+      timeoutMs: 1234,
+      spawnSync: (cmd, args, options) => {
+        calls.push({ cmd, args, options });
+        return { status: 0, stdout: '{"health":"ok"}', stderr: "" };
+      },
+    },
+  );
+
+  assert.equal(report.health, "ok");
+  assert.equal(calls[0].cmd, "/runtime/node");
+  assert.deepEqual(calls[0].args, ["/project/root/scripts/sync-status.mjs", "--format", "json"]);
+  assert.equal(calls[0].options.cwd, "/project/root");
+  assert.equal(calls[0].options.timeout, 1234);
+  assert.equal(calls[0].options.killSignal, "SIGKILL");
+
+  const unavailable = runJson(["scripts/sync-status.mjs"], new Set([0]), {
+    spawnSync: () => ({
+      status: null,
+      stdout: undefined,
+      stderr: undefined,
+      error: Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" }),
+    }),
+  });
+  assert.equal(unavailable.status, "command_failed");
+  assert.equal(unavailable.reason, "dependency_unavailable");
+});
+
 test("doctor command emits fresh local report as json", () => {
   const stdout = memoryWriter();
   const stderr = memoryWriter();
@@ -118,7 +156,8 @@ test("doctor command emits fresh local report as json", () => {
   assert.equal(report.ok, true);
   assert.equal(report.overall, "fresh");
   assert.equal(report.checked_at, "2026-06-20T00:00:00.000Z");
-  assert.equal(report.db_path, "/abs/custom.sqlite");
+  assert.equal(report.db_path, undefined);
+  assert.equal(stdout.text().includes("/abs/custom.sqlite"), false);
   assert.equal(report.live, null);
   assert.deepEqual(calls.map((call) => call.args[0]), [
     "scripts/sync-status.mjs",
@@ -260,7 +299,48 @@ test("doctor command returns exit code 1 on dependency errors", () => {
 
   assert.equal(exitCode, 1);
   assert.equal(stdout.text(), "");
-  assert.match(plain(stderr.text()), /status unavailable/);
+  assert.match(plain(stderr.text()), /doctor check failed/);
+});
+
+test("doctor json applies a public-safe projection to nested diagnostics", () => {
+  const privateSentinel = "PRIVATE_DOCTOR_SENTINEL";
+  const privateId = `oc_${"x".repeat(80)}`;
+  const stdout = memoryWriter();
+  const exitCode = runDoctorCli(["--live", "--format", "json"], {
+    stdout: stdout.stream,
+    deps: {
+      resolvePath: (dbPath) => `/private/users/example/${dbPath}`,
+      now: () => new Date("2026-06-20T00:00:00.000Z"),
+      runJson: fakeRunJson([], {
+        status: statusFixture({
+          db_path: "/private/users/example/exocortex.sqlite",
+          locks: [{ scope_id: privateId, locked_by: privateSentinel }],
+          runs: { by_status: {}, recent: [{ scope_id: privateId, error_message: privateSentinel }] },
+        }),
+        quality: qualityFixture({
+          latest_records: [{ body: privateSentinel, chat_name: privateSentinel }],
+          recent_failures: [{ scope_id: privateId, error_message: privateSentinel }],
+        }),
+        live: {
+          ...statusFixture(),
+          ok: true,
+          status: "healthy",
+          checked_at: "2026-06-20T00:00:00.000Z",
+          window: { start: "2026-06-20T00:00:00.000Z", end: "2026-06-20T00:05:00.000Z" },
+          probe: { hot_chats_requested: 1, hot_chats_found: 1, remote_messages_checked: 1 },
+          latest_remote: { message_id: privateId, chat_name: privateSentinel, body: privateSentinel },
+          missing: [],
+          unsupported_chats: [],
+          probe_errors: [],
+        },
+      }),
+    },
+  });
+
+  assert.equal(exitCode, 0);
+  assert.doesNotMatch(stdout.text(), new RegExp(privateSentinel));
+  assert.doesNotMatch(stdout.text(), new RegExp(privateId));
+  assert.doesNotMatch(stdout.text(), /\/private\/users\/example/);
 });
 
 test("renderDoctorText includes summary, live, and findings", () => {
@@ -292,7 +372,9 @@ test("parseArgs validates live options and format", () => {
     messagesPerChat: 4,
     format: "text",
   });
-  assert.throws(() => parseArgs(["--hot-chats", "0"]), /hot-chats must be positive/);
+  assert.throws(() => parseArgs(["--hot-chats", "0"]), /hot-chats must be a positive integer/);
+  assert.throws(() => parseArgs(["--hot-chats", "20junk"]), /positive integer/);
+  assert.throws(() => parseArgs(["--messages-per-chat", "4.9"]), /positive integer/);
   assert.throws(() => parseArgs(["--format", "yaml"]), /--format must be text or json/);
   assert.throws(() => parseArgs(["--db"]), /--db requires a value/);
 });

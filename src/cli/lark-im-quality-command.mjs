@@ -5,8 +5,11 @@ import { resolve } from "node:path";
 import { renderError } from "../../dist/terminal/index.js";
 import {
   collectQualityReport,
+  hasQualityIssues,
+  sanitizeQualityReportForPublicOutput,
   sqliteJson,
 } from "../diagnostics/lark-im-quality-report.mjs";
+import { publicDiagnosticError } from "../diagnostics/public-safe.mjs";
 import { renderQualityText } from "../terminal/lark-im-quality-view.mjs";
 
 const DEFAULT_DB = "data/exocortex.sqlite";
@@ -69,8 +72,8 @@ function executeQuality(opts, deps = {}) {
   const fileExists = deps.existsSync || existsSync;
   const collect = deps.collect || collectQualityReport;
   const dbPath = resolvePath(opts.db);
-  if (!fileExists(dbPath)) throw new Error(`database not found: ${dbPath}`);
-  return collect(dbPath);
+  if (!fileExists(dbPath)) throw new Error("database not found");
+  return sanitizeQualityReportForPublicOutput(collect(dbPath));
 }
 
 /**
@@ -89,9 +92,9 @@ function runQualityCli(argv, io = {}) {
     const report = executeQuality(opts, io.deps || {});
     if (opts.format === "json") stdout.write(`${JSON.stringify(report, null, 2)}\n`);
     else stdout.write(renderQualityText(report));
-    return 0;
+    return hasQualityIssues(report) ? 2 : 0;
   } catch (error) {
-    stderr.write(renderError(error));
+    stderr.write(renderError(publicDiagnosticError(error, "quality check failed")));
     return 1;
   }
 }

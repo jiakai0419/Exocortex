@@ -66,6 +66,10 @@ test("real live failures still need attention and delayed live status stays dela
     overallStatus(localState({ live: { status: "delayed" } })),
     "delayed",
   );
+  assert.equal(
+    overallStatus(localState({ live: { status: "inconclusive" } })),
+    "needs_attention",
+  );
 });
 
 test("doctor ignores non-actionable sender gaps but flags actionable sender gaps", () => {
@@ -99,4 +103,23 @@ test("doctor ignores non-actionable sender gaps but flags actionable sender gaps
   assert.equal(actionableMissingSenderNames(actionable), 1);
   assert.equal(overallStatus(actionable), "needs_attention");
   assert.deepEqual(buildFindings(actionable), ["some senders still lack display names"]);
+});
+
+test("doctor uses highest severity and includes missing chat names", () => {
+  const state = localState({
+    status: { health: "syncing" },
+    quality: {
+      quality: {
+        actionable_missing_sender_name: 0,
+        missing_chat_name: 2,
+        invalid_rendered_body: 0,
+      },
+    },
+  });
+
+  assert.equal(overallStatus(state), "needs_attention");
+  assert.deepEqual(buildFindings(state), [
+    "worker is currently syncing",
+    "some group messages still lack chat names",
+  ]);
 });

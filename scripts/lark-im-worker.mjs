@@ -10,6 +10,7 @@ import {
   runCycle,
   runStep,
   runWorker,
+  rotateLogIfNeeded,
   sleepSeconds,
   usage,
   writeLog,
@@ -22,6 +23,7 @@ export {
   runCycle,
   runStep,
   runWorker,
+  rotateLogIfNeeded,
   sleepSeconds,
   usage,
   writeLog,
@@ -29,7 +31,8 @@ export {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   try {
-    main();
+    const exitCode = main();
+    if (exitCode !== 0) process.exit(exitCode);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     process.stderr.write(`${message}\n`);

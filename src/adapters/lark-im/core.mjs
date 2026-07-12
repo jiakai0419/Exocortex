@@ -3,6 +3,7 @@
 import {
   compareRecordToCursor,
   floorToPrecisionMs,
+  isPaginationLimitError,
   readPaginatedPages,
   stableWindowEndMs,
   timeCursorAfter,
@@ -11,6 +12,7 @@ import {
 } from "../../../dist/core/sync.js";
 import {
   SOURCE_ID,
+  assertValidLarkMessage,
   bodyFromContent,
   bodyFromMessage,
   chatId,
@@ -148,10 +150,66 @@ function localIsoFromMs(ms) {
  * @returns {LocalRecord[]}
  */
 function prepareRecords(messages, scopeId, direction, cursor, startMs, endMs, filterFn = null, context = {}, scopeConfig = {}) {
-  const records = messages
-    .filter((message) => messageId(message))
-    .map((message) => recordFromMessage(message, scopeId, direction, context, scopeConfig));
+  messages.forEach((message, index) => assertValidLarkMessage(message, `lark message at index ${index}`));
+  const records = messages.map((message) => recordFromMessage(message, scopeId, direction, context, scopeConfig));
   return windowRecordsAfterCursor(records, cursor, startMs, endMs, filterFn);
+}
+
+/**
+ * Shrink an overflowing time window while preserving at least one cursor
+ * precision unit of progress. Returning null means one precision unit itself
+ * exceeds the page budget and needs a future page-token checkpoint strategy.
+ *
+ * @param {number} startMs
+ * @param {number} endMs
+ */
+function bisectMessageWindowEnd(startMs, endMs) {
+  const startCursorMs = floorToLarkMessageCursorMs(startMs);
+  const midpointMs = floorToLarkMessageCursorMs(startMs + Math.floor((endMs - startMs) / 2));
+  const candidateMs = Math.max(startCursorMs + LARK_MESSAGE_CURSOR_PRECISION_MS, midpointMs);
+  return candidateMs > startMs && candidateMs < endMs ? candidateMs : null;
+}
+
+/**
+ * A page-budget failure must not make the scope retry the same ever-growing
+ * window forever. Find one complete prefix and let the caller checkpoint that
+ * prefix in this run; the next run resumes from its cursor.
+ *
+ * @param {(startMs: number, endMs: number) => Record<string, any>} fetchWindow
+ * @param {number} startMs
+ * @param {number} requestedEndMs
+ * @returns {Record<string, any> & {
+ *   window_end_ms: number,
+ *   requested_window_end_ms: number,
+ *   window_bisections: number
+ * }}
+ */
+function fetchMessageWindowWithBisection(fetchWindow, startMs, requestedEndMs) {
+  let endMs = requestedEndMs;
+  let bisections = 0;
+  for (;;) {
+    try {
+      return {
+        ...fetchWindow(startMs, endMs),
+        window_end_ms: endMs,
+        requested_window_end_ms: requestedEndMs,
+        window_bisections: bisections,
+      };
+    } catch (error) {
+      if (!isPaginationLimitError(error)) throw error;
+      const nextEndMs = bisectMessageWindowEnd(startMs, endMs);
+      if (nextEndMs === null) {
+        const saturated = new Error(
+          `${error.message}; one ${LARK_MESSAGE_CURSOR_PRECISION_MS}ms message window still exceeds the page limit`,
+          { cause: error },
+        );
+        saturated.name = "PaginationWindowSaturatedError";
+        throw saturated;
+      }
+      endMs = nextEndMs;
+      bisections += 1;
+    }
+  }
 }
 
 /** @param {number} ms */
@@ -223,15 +281,19 @@ export {
   CHAT_RECONCILE_SCOPE_ID,
   SENT_SCOPE_ID,
   SOURCE_ID,
+  assertValidLarkMessage,
   bodyFromContent,
   bodyFromMessage,
+  bisectMessageWindowEnd,
   chatId,
   chatScopeId,
   compareRecordToCursor,
   cursorAfter,
   floorToLarkMessageCursorMs,
+  fetchMessageWindowWithBisection,
   hash,
   isInvalidRenderedContent,
+  isPaginationLimitError,
   localDay,
   localIsoFromMs,
   localOffset,

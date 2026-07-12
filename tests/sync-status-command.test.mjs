@@ -106,6 +106,8 @@ test("sync status command emits injected status as json", () => {
   const stdout = memoryWriter();
   const stderr = memoryWriter();
   const calls = [];
+  const privateSentinel = "PRIVATE_STATUS_SENTINEL";
+  const privateId = `scope_${"x".repeat(80)}`;
   const exitCode = runSyncStatusCli(["--db", "custom.sqlite", "--format", "json"], {
     stdout: stdout.stream,
     stderr: stderr.stream,
@@ -117,7 +119,16 @@ test("sync status command emits injected status as json", () => {
       },
       buildStatus: (dbPath) => {
         calls.push(["build", dbPath]);
-        return statusFixture({ db_path: dbPath, health: "ok" });
+        return statusFixture({
+          db_path: dbPath,
+          health: "ok",
+          discovery: { cursor: { has_more: false, page_token: privateSentinel }, complete: true },
+          runs: {
+            by_status: { failed: 1 },
+            recent: [{ status: "failed", scope_id: privateId, error_message: privateSentinel }],
+          },
+          locks: [{ scope_id: privateId, locked_by: privateSentinel }],
+        });
       },
     },
   });
@@ -125,7 +136,10 @@ test("sync status command emits injected status as json", () => {
   assert.equal(exitCode, 0);
   assert.equal(stderr.text(), "");
   const payload = JSON.parse(stdout.text());
-  assert.equal(payload.db_path, "/abs/custom.sqlite");
+  assert.equal(payload.db_path, undefined);
+  assert.equal(stdout.text().includes("/abs/custom.sqlite"), false);
+  assert.doesNotMatch(stdout.text(), new RegExp(privateSentinel));
+  assert.doesNotMatch(stdout.text(), new RegExp(privateId));
   assert.equal(payload.health, "ok");
   assert.deepEqual(calls, [
     ["exists", "/abs/custom.sqlite"],
@@ -147,7 +161,8 @@ test("sync status command reports missing database as a terminal error", () => {
 
   assert.equal(exitCode, 1);
   assert.equal(stdout.text(), "");
-  assert.match(plain(stderr.text()), /database not found: \/abs\/missing\.sqlite/);
+  assert.match(plain(stderr.text()), /database not found/);
+  assert.doesNotMatch(stderr.text(), /\/abs\/missing\.sqlite/);
 });
 
 test("renderText shows summary, unsupported reasons, recovery, and recent failures", () => {
@@ -156,10 +171,11 @@ test("renderText shows summary, unsupported reasons, recovery, and recent failur
   assert.match(output, /Exocortex sync status/);
   assert.match(output, /Records\s+3 total, 1 sent, 2 received/);
   assert.match(output, /Unsupported reasons/);
-  assert.match(output, /230002: Bot\/User can NOT be out of the chat\./);
+  assert.match(output, /code 230002/);
   assert.match(output, /Recovery/);
   assert.match(output, /Recent non-success runs/);
-  assert.match(output, /#12 FAILED \[rate_limited\] lark\.im\.received\.chat\.1: api/);
+  assert.match(output, /FAILED \[rate_limited\]/);
+  assert.doesNotMatch(output, /lark\.im\.received\.chat\.1/);
 });
 
 test("buildStatus assembles sqlite rows, recovery, and health detail", () => {
@@ -204,7 +220,7 @@ test("buildStatus assembles sqlite rows, recovery, and health detail", () => {
         ];
       }
       if (label === "read hot discovery scope") {
-        return [{ cursor_json: null, last_success_run_id: 11 }];
+        return [{ cursor_json: null, has_success: 1 }];
       }
       if (label === "read reconcile scope") {
         return [
@@ -232,7 +248,7 @@ test("buildStatus assembles sqlite rows, recovery, and health detail", () => {
     },
   });
 
-  assert.equal(status.db_path, "/abs/db.sqlite");
+  assert.equal(status.db_path, undefined);
   assert.equal(status.records.total, 3);
   assert.equal(status.discovery.complete, true);
   assert.equal(status.reconcile.complete, false);

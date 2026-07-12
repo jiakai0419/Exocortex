@@ -1,11 +1,19 @@
 // @ts-check
 
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
+  chmodSync,
   existsSync,
+  closeSync,
+  openSync,
+  readFileSync,
+  readSync,
   mkdirSync,
   readdirSync,
+  rmSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
 import {
   basename,
@@ -26,14 +34,18 @@ import {
   acquireMaintenanceLock,
   releaseMaintenanceLock,
 } from "../../dist/storage/sqlite/ingestion-store.js";
+import { publicDiagnosticError } from "../diagnostics/public-safe.mjs";
 
 const DEFAULT_DB = "data/exocortex.sqlite";
 const DEFAULT_BACKUP_DIR = "backups/private";
 const DEFAULT_PRUNE_RUNS_RETENTION_DAYS = 14;
+const DEFAULT_BACKUP_KEEP_COUNT = 7;
+const DEFAULT_BACKUP_KEEP_DAYS = 30;
 const TRACKED_TABLES = ["sources", "sync_scopes", "records", "sync_runs", "sync_locks", "maintenance_locks"];
+const DURABLE_BACKUP_TABLES = ["sources", "sync_scopes", "records", "sync_runs"];
 
 /**
- * @typedef {"check" | "backup" | "verify" | "prune-runs"} SqliteMaintenanceAction
+ * @typedef {"check" | "backup" | "verify" | "prune-runs" | "compact"} SqliteMaintenanceAction
  * @typedef {"text" | "json"} SqliteMaintenanceFormat
  *
  * @typedef {object} SqliteMaintenanceOptions
@@ -44,6 +56,8 @@ const TRACKED_TABLES = ["sources", "sync_scopes", "records", "sync_runs", "sync_
  * @property {boolean} latest
  * @property {SqliteMaintenanceFormat} format
  * @property {boolean} dryRun
+ * @property {number} backupKeepCount
+ * @property {number} backupKeepDays
  * @property {boolean=} help
  *
  * @typedef {Record<string, any>} JsonObject
@@ -53,7 +67,11 @@ const TRACKED_TABLES = ["sources", "sync_scopes", "records", "sync_runs", "sync_
  * @property {(path: string, options?: {recursive?: boolean}) => void=} mkdirSync
  * @property {(path: string, options?: {withFileTypes?: boolean}) => any[]=} readdirSync
  * @property {(path: string) => {size?: number, mtimeMs?: number}=} statSync
- * @property {(cmd: string, args: string[], options: JsonObject) => {status: number | null, stdout?: string, stderr?: string}=} spawnSync
+ * @property {(path: string, mode: number) => void=} chmodSync
+ * @property {(path: string, encoding: BufferEncoding) => string=} readFileSync
+ * @property {(path: string, data: string, options?: JsonObject) => void=} writeFileSync
+ * @property {(path: string, options?: JsonObject) => void=} rmSync
+ * @property {(cmd: string, args: string[], options: JsonObject) => {status: number | null, stdout?: string, stderr?: string, error?: NodeJS.ErrnoException}=} spawnSync
  * @property {() => Date=} now
  * @property {(dbPath: string, options: JsonObject) => {acquired: boolean, reason?: string, active_sync_locks?: number, lock_owner?: string | null}=} acquireMaintenanceLock
  * @property {(dbPath: string, owner: string) => void=} releaseMaintenanceLock
@@ -66,7 +84,7 @@ const TRACKED_TABLES = ["sources", "sync_scopes", "records", "sync_runs", "sync_
  */
 
 function usage() {
-  return `Usage: node scripts/sqlite-maintenance.mjs <check|backup|verify|prune-runs> [options]
+  return `Usage: node scripts/sqlite-maintenance.mjs <check|backup|verify|prune-runs|compact> [options]
 
 Options:
   --db <path>           SQLite database path. Default: ${DEFAULT_DB}
@@ -75,6 +93,8 @@ Options:
   --latest              Verify the newest backup in --backup-dir.
   --dry-run             For prune-runs: report only. This is the default.
   --apply               For prune-runs: actually delete eligible old no-op runs.
+  --backup-keep-count <n>  Backups to retain after backup. Default: ${DEFAULT_BACKUP_KEEP_COUNT}
+  --backup-keep-days <n>   Maximum backup age in days. Default: ${DEFAULT_BACKUP_KEEP_DAYS}
   --format <fmt>        text | json. Default: text
   --help                Show this help.
 `;
@@ -88,8 +108,17 @@ function quoteSql(value) {
 
 /** @param {string} value */
 function normalizeAction(value) {
-  if (["check", "backup", "verify", "prune-runs"].includes(value)) return /** @type {SqliteMaintenanceAction} */ (value);
-  throw new Error("action must be check, backup, verify, or prune-runs");
+  if (["check", "backup", "verify", "prune-runs", "compact"].includes(value)) return /** @type {SqliteMaintenanceAction} */ (value);
+  throw new Error("action must be check, backup, verify, prune-runs, or compact");
+}
+
+/** @param {unknown} value @param {string} name */
+function parsePositiveInt(value, name) {
+  const text = String(value);
+  if (!/^[1-9]\d*$/.test(text)) throw new Error(`${name} must be positive integer`);
+  const parsed = Number(text);
+  if (!Number.isSafeInteger(parsed)) throw new Error(`${name} must be a safe positive integer`);
+  return parsed;
 }
 
 /** @param {string[]} argv */
@@ -104,6 +133,8 @@ function parseArgs(argv) {
       latest: false,
       format: "text",
       dryRun: true,
+      backupKeepCount: DEFAULT_BACKUP_KEEP_COUNT,
+      backupKeepDays: DEFAULT_BACKUP_KEEP_DAYS,
       help: true,
     };
     return opts;
@@ -118,6 +149,8 @@ function parseArgs(argv) {
     latest: false,
     format: "text",
     dryRun: true,
+    backupKeepCount: DEFAULT_BACKUP_KEEP_COUNT,
+    backupKeepDays: DEFAULT_BACKUP_KEEP_DAYS,
   };
 
   for (let i = 1; i < argv.length; i += 1) {
@@ -142,6 +175,9 @@ function parseArgs(argv) {
     if (arg === "--db") opts.db = next;
     else if (arg === "--backup-dir") opts.backupDir = next;
     else if (arg === "--backup") opts.backup = next;
+    else if (arg === "--backup-keep-count")
+      opts.backupKeepCount = parsePositiveInt(next, "backup-keep-count");
+    else if (arg === "--backup-keep-days") opts.backupKeepDays = parsePositiveInt(next, "backup-keep-days");
     else if (arg === "--format") opts.format = /** @type {SqliteMaintenanceFormat} */ (next);
     else throw new Error(`Unknown option: ${arg}`);
     i += 1;
@@ -166,13 +202,13 @@ function subtractDays(date, days) {
  * @param {string} dbPath
  * @param {SqliteMaintenanceDeps} [deps]
  */
-function acquireSqliteMaintenanceLock(dbPath, deps = {}) {
+function acquireSqliteMaintenanceLock(dbPath, deps = {}, reason = "sqlite maintenance") {
   const owner = `pid:${process.pid}:sqlite-maintenance`;
   const acquire = deps.acquireMaintenanceLock || acquireMaintenanceLock;
   const result = acquire(dbPath, {
     owner,
     ttlSeconds: 1800,
-    reason: "sqlite-maintenance prune-runs",
+    reason,
   });
   if (result.acquired) return owner;
   if (result.reason === "sync_locks_active") {
@@ -181,8 +217,25 @@ function acquireSqliteMaintenanceLock(dbPath, deps = {}) {
     );
   }
   throw new Error(
-    `maintenance lock unavailable: held by ${result.lock_owner || "another maintenance command"}`,
+    "maintenance lock unavailable: held by another maintenance command",
   );
+}
+
+/** @param {unknown} error */
+function publicMaintenanceError(error) {
+  const message = String(error instanceof Error ? error.message : error || "");
+  const safeMessages = [
+    /^verify requires --latest or --backup <path>$/,
+    /^use either --latest or --backup, not both$/,
+    /^--(?:dry-run|apply) is only supported for prune-runs$/,
+    /^--format must be text or json$/,
+    /^action must be check, backup, verify, prune-runs, or compact$/,
+    /^(?:backup-keep-count|backup-keep-days) must be (?:a safe )?positive integer$/,
+    /^maintenance lock unavailable: \d+ active sync lock\(s\); retry shortly or stop the worker$/,
+    /^maintenance lock unavailable: held by another maintenance command$/,
+  ];
+  if (safeMessages.some((pattern) => pattern.test(message))) return new Error(message);
+  return publicDiagnosticError(error, "SQLite maintenance failed");
 }
 
 /**
@@ -197,6 +250,21 @@ function releaseSqliteMaintenanceLock(dbPath, owner, deps = {}) {
 }
 
 /**
+ * @param {{status: number | null, stderr?: unknown, error?: NodeJS.ErrnoException}} result
+ * @param {string} label
+ */
+function sqliteFailure(result, label) {
+  if (result.error?.code === "ENOENT") {
+    return new Error(`${label} failed: sqlite3 executable not found (ENOENT); install SQLite and ensure sqlite3 is on PATH`);
+  }
+  const detail =
+    String(result.stderr || "").trim() ||
+    result.error?.message ||
+    `sqlite3 exited with status ${String(result.status)}`;
+  return new Error(`${label} failed: ${detail}`);
+}
+
+/**
  * @param {string} dbPath
  * @param {string} sql
  * @param {string} label
@@ -206,11 +274,11 @@ function releaseSqliteMaintenanceLock(dbPath, owner, deps = {}) {
 function sqliteJson(dbPath, sql, label, deps = {}) {
   const run = deps.spawnSync || spawnSync;
   const result = run("sqlite3", ["-json", dbPath], {
-    input: `.timeout 5000\nPRAGMA foreign_keys = ON;\n${sql}`,
+    input: `.bail on\n.timeout 5000\nPRAGMA foreign_keys = ON;\n${sql}`,
     encoding: "utf8",
     maxBuffer: 50 * 1024 * 1024,
   });
-  if (result.status !== 0) throw new Error(`${label} failed: ${String(result.stderr || "").trim()}`);
+  if (result.status !== 0 || result.error) throw sqliteFailure(result, label);
   const stdout = String(result.stdout || "").trim();
   return stdout ? JSON.parse(stdout) : [];
 }
@@ -224,11 +292,11 @@ function sqliteJson(dbPath, sql, label, deps = {}) {
 function sqliteExec(dbPath, sql, label, deps = {}) {
   const run = deps.spawnSync || spawnSync;
   const result = run("sqlite3", [dbPath], {
-    input: `.timeout 5000\nPRAGMA foreign_keys = ON;\n${sql}`,
+    input: `.bail on\n.timeout 5000\nPRAGMA foreign_keys = ON;\n${sql}`,
     encoding: "utf8",
     maxBuffer: 50 * 1024 * 1024,
   });
-  if (result.status !== 0) throw new Error(`${label} failed: ${String(result.stderr || "").trim()}`);
+  if (result.status !== 0 || result.error) throw sqliteFailure(result, label);
 }
 
 /** @param {JsonObject[]} rows */
@@ -256,7 +324,7 @@ function publicPath(cwd, path) {
 function databaseCheck(dbPath, deps = {}) {
   const fileExists = deps.existsSync || existsSync;
   const fileStat = deps.statSync || statSync;
-  if (!fileExists(dbPath)) throw new Error(`database not found: ${dbPath}`);
+  if (!fileExists(dbPath)) throw new Error("database not found");
 
   const quickCheck = String(firstCell(sqliteJson(dbPath, "PRAGMA quick_check;", "quick check", deps)) || "");
   const foreignKeyIssues = sqliteJson(dbPath, "PRAGMA foreign_key_check;", "foreign key check", deps);
@@ -278,6 +346,9 @@ function databaseCheck(dbPath, deps = {}) {
     counts[name] = Number(firstCell(sqliteJson(dbPath, `SELECT count(*) AS count FROM ${name};`, `count ${name}`, deps)));
   }
   const stat = fileStat(dbPath);
+  const pageSize = Number(firstCell(sqliteJson(dbPath, "PRAGMA page_size;", "page size", deps)) || 0);
+  const pageCount = Number(firstCell(sqliteJson(dbPath, "PRAGMA page_count;", "page count", deps)) || 0);
+  const freelistCount = Number(firstCell(sqliteJson(dbPath, "PRAGMA freelist_count;", "freelist count", deps)) || 0);
   const ok = quickCheck === "ok" && foreignKeyIssues.length === 0 && missingTables.length === 0;
   return {
     ok,
@@ -286,12 +357,17 @@ function databaseCheck(dbPath, deps = {}) {
     missing_tables: missingTables,
     counts,
     size_bytes: Number(stat.size || 0),
+    page_size: pageSize,
+    page_count: pageCount,
+    freelist_count: freelistCount,
+    reclaimable_bytes: pageSize * freelistCount,
   };
 }
 
 /**
- * Old no-op success runs are diagnostic noise, not durable memory. Keep failures,
- * running/cancelled runs, non-empty successes, and each scope's current success.
+ * Old success runs that changed no durable record are diagnostic noise, not
+ * durable memory. Keep failures, running/cancelled runs, mutating successes,
+ * and each scope's current success.
  * @param {string} dbPath
  * @param {string} cutoffAt
  * @param {boolean} dryRun
@@ -301,10 +377,8 @@ function pruneNoopSuccessfulRuns(dbPath, cutoffAt, dryRun, deps = {}) {
   const eligibleWhere = `
     r.status = 'succeeded'
     AND r.started_at < ${quoteSql(cutoffAt)}
-    AND r.scanned_count = 0
     AND r.inserted_count = 0
     AND r.updated_count = 0
-    AND r.duplicate_count = 0
     AND NOT EXISTS (
       SELECT 1
       FROM sync_scopes s
@@ -357,6 +431,141 @@ function timestampForFile(date) {
 function backupDatabase(dbPath, backupPath, deps = {}) {
   if ((deps.existsSync || existsSync)(backupPath)) throw new Error(`backup already exists: ${backupPath}`);
   sqliteExec(dbPath, `VACUUM main INTO ${quoteSql(backupPath)};`, "backup", deps);
+  sqliteExec(
+    backupPath,
+    "BEGIN IMMEDIATE; DELETE FROM sync_locks; DELETE FROM maintenance_locks; COMMIT;",
+    "remove ephemeral locks from backup",
+    deps,
+  );
+  const chmod = deps.chmodSync || chmodSync;
+  chmod(backupPath, 0o600);
+}
+
+/** @param {string} path */
+function sha256File(path) {
+  const digest = createHash("sha256");
+  const buffer = Buffer.allocUnsafe(1024 * 1024);
+  const fd = openSync(path, "r");
+  try {
+    let bytesRead = 0;
+    do {
+      bytesRead = readSync(fd, buffer, 0, buffer.length, null);
+      if (bytesRead > 0) digest.update(buffer.subarray(0, bytesRead));
+    } while (bytesRead > 0);
+  } finally {
+    closeSync(fd);
+  }
+  return digest.digest("hex");
+}
+
+/** @param {string} backupPath */
+function backupManifestPath(backupPath) {
+  return `${backupPath}.manifest.json`;
+}
+
+/**
+ * @param {string} backupPath
+ * @param {JsonObject} backupCheck
+ * @param {string} createdAt
+ * @param {SqliteMaintenanceDeps} [deps]
+ */
+function writeBackupManifest(backupPath, backupCheck, createdAt, deps = {}) {
+  const fileStat = deps.statSync || statSync;
+  const writeFile = deps.writeFileSync || writeFileSync;
+  const chmod = deps.chmodSync || chmodSync;
+  const manifest = {
+    kind: "exocortex.sqlite-backup-manifest/v1",
+    created_at: createdAt,
+    backup_file: basename(backupPath),
+    sha256: sha256File(backupPath),
+    size_bytes: Number(fileStat(backupPath).size || 0),
+    counts: backupCheck.counts,
+  };
+  const path = backupManifestPath(backupPath);
+  writeFile(path, `${JSON.stringify(manifest, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  chmod(path, 0o600);
+  return manifest;
+}
+
+/**
+ * @param {string} backupPath
+ * @param {JsonObject} backupCheck
+ * @param {SqliteMaintenanceDeps} [deps]
+ */
+function verifyBackupManifest(backupPath, backupCheck, deps = {}) {
+  const fileExists = deps.existsSync || existsSync;
+  const readFile = deps.readFileSync || readFileSync;
+  const fileStat = deps.statSync || statSync;
+  const path = backupManifestPath(backupPath);
+  if (!fileExists(path)) {
+    return { ok: false, status: "missing", path: basename(path) };
+  }
+  try {
+    const manifest = JSON.parse(String(readFile(path, "utf8")));
+    const actualSha256 = sha256File(backupPath);
+    const actualSize = Number(fileStat(backupPath).size || 0);
+    const checks = {
+      kind: manifest.kind === "exocortex.sqlite-backup-manifest/v1",
+      backup_file: manifest.backup_file === basename(backupPath),
+      sha256: manifest.sha256 === actualSha256,
+      size: Number(manifest.size_bytes) === actualSize,
+      counts: compareCounts(manifest.counts || {}, backupCheck.counts || {}),
+    };
+    return {
+      ok: Object.values(checks).every(Boolean),
+      status: Object.values(checks).every(Boolean) ? "verified" : "mismatch",
+      checks,
+      path: basename(path),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: "invalid",
+      path: basename(path),
+      error: "manifest could not be verified",
+    };
+  }
+}
+
+/** @param {string} backupPath @param {SqliteMaintenanceDeps} [deps] */
+function discardBackup(backupPath, deps = {}) {
+  const remove = deps.rmSync || rmSync;
+  remove(backupPath, { force: true });
+  remove(backupManifestPath(backupPath), { force: true });
+}
+
+/**
+ * @param {string} backupDir
+ * @param {number} keepCount
+ * @param {number} keepDays
+ * @param {Date} now
+ * @param {SqliteMaintenanceDeps} [deps]
+ * @param {string} [protectedPath]
+ */
+function pruneBackups(backupDir, keepCount, keepDays, now, deps = {}, protectedPath = "") {
+  const readDir = deps.readdirSync || readdirSync;
+  const fileStat = deps.statSync || statSync;
+  const remove = deps.rmSync || rmSync;
+  const chmod = deps.chmodSync || chmodSync;
+  const cutoff = now.getTime() - keepDays * 24 * 60 * 60 * 1000;
+  const backups = readDir(backupDir)
+    .map((name) => resolve(backupDir, String(name)))
+    .filter((path) => path.endsWith(".sqlite"))
+    .map((path) => ({ path, mtimeMs: Number(fileStat(path).mtimeMs || 0) }))
+    .sort((left, right) => right.mtimeMs - left.mtimeMs || right.path.localeCompare(left.path));
+  const removed = [];
+  for (const [index, backup] of backups.entries()) {
+    chmod(backup.path, 0o600);
+    if ((deps.existsSync || existsSync)(backupManifestPath(backup.path))) {
+      chmod(backupManifestPath(backup.path), 0o600);
+    }
+    if (protectedPath && resolve(backup.path) === resolve(protectedPath)) continue;
+    if (index < keepCount && backup.mtimeMs >= cutoff) continue;
+    remove(backup.path, { force: true });
+    remove(backupManifestPath(backup.path), { force: true });
+    removed.push(basename(backup.path));
+  }
+  return { keep_count: keepCount, keep_days: keepDays, removed_count: removed.length, removed };
 }
 
 /**
@@ -367,13 +576,13 @@ function latestBackupPath(backupDir, deps = {}) {
   const fileExists = deps.existsSync || existsSync;
   const readDir = deps.readdirSync || readdirSync;
   const fileStat = deps.statSync || statSync;
-  if (!fileExists(backupDir)) throw new Error(`backup directory not found: ${backupDir}`);
+  if (!fileExists(backupDir)) throw new Error("backup directory not found");
   const files = readDir(backupDir)
     .map((name) => resolve(backupDir, String(name)))
     .filter((path) => path.endsWith(".sqlite"))
     .map((path) => ({ path, mtimeMs: Number(fileStat(path).mtimeMs || 0) }))
     .sort((left, right) => right.mtimeMs - left.mtimeMs || right.path.localeCompare(left.path));
-  if (files.length === 0) throw new Error(`no .sqlite backups found in ${backupDir}`);
+  if (files.length === 0) throw new Error("no SQLite backups found");
   return files[0].path;
 }
 
@@ -381,8 +590,8 @@ function latestBackupPath(backupDir, deps = {}) {
  * @param {Record<string, number>} left
  * @param {Record<string, number>} right
  */
-function compareCounts(left, right) {
-  return TRACKED_TABLES.every((name) => Number(left[name] || 0) === Number(right[name] || 0));
+function compareCounts(left, right, tables = TRACKED_TABLES) {
+  return tables.every((name) => Number(left[name] || 0) === Number(right[name] || 0));
 }
 
 /**
@@ -410,40 +619,79 @@ function executeSqliteMaintenance(opts, deps = {}) {
 
   if (opts.action === "backup") {
     const makeDir = deps.mkdirSync || mkdirSync;
-    const source = databaseCheck(dbPath, deps);
-    if (!source.ok) {
+    const chmod = deps.chmodSync || chmodSync;
+    let lockOwner = null;
+    /** @type {string | null} */
+    let pendingBackupPath = null;
+    let verifiedBackup = false;
+    try {
+      lockOwner = acquireSqliteMaintenanceLock(dbPath, deps, "sqlite maintenance backup");
+      const source = databaseCheck(dbPath, deps);
+      if (!source.ok) {
+        return {
+          ok: false,
+          status: "failed",
+          action: opts.action,
+          checked_at: checkedAt,
+          db_path: publicPath(cwd, dbPath),
+          source_check: source,
+        };
+      }
+      makeDir(backupDir, { recursive: true, mode: 0o700 });
+      chmod(backupDir, 0o700);
+      const createdAt = now();
+      const backupPath = resolve(backupDir, `exocortex-${timestampForFile(createdAt)}.sqlite`);
+      pendingBackupPath = backupPath;
+      backupDatabase(dbPath, backupPath, deps);
+      const backupCheck = databaseCheck(backupPath, deps);
+      const countsMatch = compareCounts(source.counts, backupCheck.counts, DURABLE_BACKUP_TABLES);
+      const manifest = writeBackupManifest(backupPath, backupCheck, createdAt.toISOString(), deps);
+      const manifestVerification = verifyBackupManifest(backupPath, backupCheck, deps);
+      const ok = backupCheck.ok && countsMatch && manifestVerification.ok;
+      verifiedBackup = ok;
+      const retention = ok
+        ? pruneBackups(
+            backupDir,
+            opts.backupKeepCount,
+            opts.backupKeepDays,
+            createdAt,
+            deps,
+            backupPath,
+          )
+        : {
+            keep_count: opts.backupKeepCount,
+            keep_days: opts.backupKeepDays,
+            removed_count: 0,
+            removed: [],
+            skipped: "new_backup_failed_validation",
+          };
+      if (!ok) discardBackup(backupPath, deps);
       return {
-        ok: false,
-        status: "failed",
+        ok,
+        status: ok ? "ok" : "failed",
         action: opts.action,
         checked_at: checkedAt,
         db_path: publicPath(cwd, dbPath),
+        backup_path: publicPath(cwd, backupPath),
         source_check: source,
+        backup_check: backupCheck,
+        counts_match: countsMatch,
+        manifest: { ...manifestVerification, sha256: manifest.sha256 },
+        retention,
+        backup_discarded: !ok,
       };
+    } catch (error) {
+      if (pendingBackupPath && !verifiedBackup) discardBackup(pendingBackupPath, deps);
+      throw error;
+    } finally {
+      releaseSqliteMaintenanceLock(dbPath, lockOwner, deps);
     }
-    makeDir(backupDir, { recursive: true });
-    const backupPath = resolve(backupDir, `exocortex-${timestampForFile(now())}.sqlite`);
-    backupDatabase(dbPath, backupPath, deps);
-    const backupCheck = databaseCheck(backupPath, deps);
-    const countsMatch = compareCounts(source.counts, backupCheck.counts);
-    const ok = backupCheck.ok && countsMatch;
-    return {
-      ok,
-      status: ok ? "ok" : "failed",
-      action: opts.action,
-      checked_at: checkedAt,
-      db_path: publicPath(cwd, dbPath),
-      backup_path: publicPath(cwd, backupPath),
-      source_check: source,
-      backup_check: backupCheck,
-      counts_match: countsMatch,
-    };
   }
 
   if (opts.action === "prune-runs") {
     let lockOwner = null;
     try {
-      if (!opts.dryRun) lockOwner = acquireSqliteMaintenanceLock(dbPath, deps);
+      if (!opts.dryRun) lockOwner = acquireSqliteMaintenanceLock(dbPath, deps, "sqlite maintenance prune-runs");
       const source = databaseCheck(dbPath, deps);
       if (!source.ok) {
         return {
@@ -473,12 +721,36 @@ function executeSqliteMaintenance(opts, deps = {}) {
     }
   }
 
+  if (opts.action === "compact") {
+    let lockOwner = null;
+    try {
+      lockOwner = acquireSqliteMaintenanceLock(dbPath, deps, "sqlite maintenance compact");
+      const before = databaseCheck(dbPath, deps);
+      if (!before.ok) {
+        return { ok: false, status: "failed", action: opts.action, checked_at: checkedAt, db_path: publicPath(cwd, dbPath), before };
+      }
+      sqliteExec(dbPath, "PRAGMA optimize; VACUUM;", "compact database", deps);
+      const after = databaseCheck(dbPath, deps);
+      return {
+        ok: after.ok,
+        status: after.ok ? "ok" : "failed",
+        action: opts.action,
+        checked_at: checkedAt,
+        db_path: publicPath(cwd, dbPath),
+        before,
+        after,
+        reclaimed_bytes: Math.max(0, Number(before.size_bytes || 0) - Number(after.size_bytes || 0)),
+      };
+    } finally {
+      releaseSqliteMaintenanceLock(dbPath, lockOwner, deps);
+    }
+  }
+
   if (!opts.latest && !opts.backup) throw new Error("verify requires --latest or --backup <path>");
   const backupPath = resolve(opts.backup || latestBackupPath(backupDir, deps));
-  const source = databaseCheck(dbPath, deps);
   const backupCheck = databaseCheck(backupPath, deps);
-  const countsMatch = compareCounts(source.counts, backupCheck.counts);
-  const ok = source.ok && backupCheck.ok && countsMatch;
+  const manifest = verifyBackupManifest(backupPath, backupCheck, deps);
+  const ok = backupCheck.ok && manifest.ok;
   return {
     ok,
     status: ok ? "ok" : "failed",
@@ -486,9 +758,8 @@ function executeSqliteMaintenance(opts, deps = {}) {
     checked_at: checkedAt,
     db_path: publicPath(cwd, dbPath),
     backup_path: publicPath(cwd, backupPath),
-    source_check: source,
     backup_check: backupCheck,
-    counts_match: countsMatch,
+    manifest,
   };
 }
 
@@ -504,6 +775,8 @@ function renderSqliteMaintenanceText(report) {
       ["Database", report.db_path],
       ["Backup", report.backup_path || ""],
       ["Counts match", report.counts_match === undefined ? "" : report.counts_match ? "yes" : "no"],
+      ["Manifest", report.manifest?.status || ""],
+      ["Reclaimed", report.reclaimed_bytes === undefined ? "" : `${report.reclaimed_bytes} bytes`],
     ]),
   ];
   if (report.prune) {
@@ -517,7 +790,15 @@ function renderSqliteMaintenanceText(report) {
       ["Deleted", report.prune.deleted_count],
     ]));
   }
-  const check = report.backup_check || report.check || report.source_check;
+  if (report.retention) {
+    lines.push("");
+    lines.push(section("Backup retention"));
+    lines.push(kv([
+      ["Policy", `${report.retention.keep_count} files / ${report.retention.keep_days} days`],
+      ["Removed", report.retention.removed_count],
+    ]));
+  }
+  const check = report.after || report.backup_check || report.check || report.source_check || report.before;
   if (check) {
     lines.push("");
     lines.push(section("Integrity"));
@@ -557,7 +838,7 @@ function runSqliteMaintenanceCli(argv, io = {}) {
     else stdout.write(renderSqliteMaintenanceText(report));
     return report.ok ? 0 : 2;
   } catch (error) {
-    stderr.write(renderError(error));
+    stderr.write(renderError(publicMaintenanceError(error)));
     return 1;
   }
 }
@@ -570,20 +851,27 @@ function main(argv = process.argv.slice(2)) {
 export {
   DEFAULT_BACKUP_DIR,
   DEFAULT_DB,
+  DEFAULT_BACKUP_KEEP_COUNT,
+  DEFAULT_BACKUP_KEEP_DAYS,
   DEFAULT_PRUNE_RUNS_RETENTION_DAYS,
   TRACKED_TABLES,
   acquireSqliteMaintenanceLock,
   compareCounts,
+  backupManifestPath,
   databaseCheck,
   executeSqliteMaintenance,
   latestBackupPath,
   main,
   parseArgs,
+  parsePositiveInt,
+  pruneBackups,
   pruneNoopSuccessfulRuns,
   publicPath,
   releaseSqliteMaintenanceLock,
   renderSqliteMaintenanceText,
   runSqliteMaintenanceCli,
   timestampForFile,
+  verifyBackupManifest,
+  writeBackupManifest,
   usage,
 };

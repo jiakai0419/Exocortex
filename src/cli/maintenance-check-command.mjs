@@ -87,8 +87,10 @@ Options:
  * @param {string} name
  */
 function parsePositiveInt(value, name) {
-  const parsed = Number.parseInt(String(value), 10);
-  if (!Number.isInteger(parsed) || parsed <= 0) throw new Error(`${name} must be positive`);
+  const text = String(value);
+  if (!/^[1-9]\d*$/.test(text)) throw new Error(`${name} must be positive integer`);
+  const parsed = Number(text);
+  if (!Number.isSafeInteger(parsed)) throw new Error(`${name} must be a safe positive integer`);
   return parsed;
 }
 

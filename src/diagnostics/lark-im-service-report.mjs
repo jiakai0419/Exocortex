@@ -12,6 +12,7 @@ import { resolve } from "node:path";
 import { summarizeWorkerEvents } from "../../dist/runtime/worker/lark-im-worker-core.js";
 import { classifyLarkFailure } from "../adapters/lark-im/transport.mjs";
 import { readLiveProbeCache } from "./live-probe-cache.mjs";
+import { diagnosticSubprocessError } from "./public-safe.mjs";
 
 const DEFAULT_FRESHNESS_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_STABILITY_WINDOW_MS = 24 * 60 * 60 * 1000;
@@ -63,11 +64,20 @@ const DEFAULT_DB = "data/exocortex.sqlite";
  * @returns {SpawnResult}
  */
 function runCommand(cmd, args, options = {}) {
-  const result = spawnSync(cmd, args, { encoding: "utf8", maxBuffer: 20 * 1024 * 1024 });
-  if (result.status !== 0 && !options.allowFailure) {
-    throw new Error(`${cmd} ${args.join(" ")} failed: ${result.stderr.trim() || result.stdout.trim()}`);
+  const result = spawnSync(cmd, args, {
+    encoding: "utf8",
+    maxBuffer: 20 * 1024 * 1024,
+    timeout: 120_000,
+    killSignal: "SIGKILL",
+  });
+  if ((result.status !== 0 || result.error) && !options.allowFailure) {
+    throw diagnosticSubprocessError(result, "service diagnostic command");
   }
-  return result;
+  return {
+    ...result,
+    stdout: String(result.stdout || ""),
+    stderr: String(result.stderr || ""),
+  };
 }
 
 /**
@@ -81,9 +91,11 @@ function sqliteJson(dbPath, sql, label) {
     input: `.timeout 5000\n${sql}`,
     encoding: "utf8",
     maxBuffer: 20 * 1024 * 1024,
+    timeout: 30_000,
+    killSignal: "SIGKILL",
   });
-  if (result.status !== 0) throw new Error(`${label} failed: ${result.stderr.trim() || `exit ${result.status}`}`);
-  const trimmed = result.stdout.trim();
+  if (result.status !== 0 || result.error) throw diagnosticSubprocessError(result, label);
+  const trimmed = String(result.stdout || "").trim();
   return trimmed ? JSON.parse(trimmed) : [];
 }
 

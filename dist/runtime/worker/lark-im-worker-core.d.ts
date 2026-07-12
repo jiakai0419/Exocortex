@@ -7,12 +7,14 @@ type WorkerCycleOptions = {
     receivedScopesPerCycle: number;
     maxChatPages: number;
     reconcileIntervalHours: number;
+    retentionEveryCycles?: number;
     chatTypes?: string;
     logDir?: string;
 };
 type WorkerStepSpec = {
     name: string;
     args: string[];
+    command?: "sync" | "maintenance";
 };
 type RunSummary = {
     run_id?: number | null;
@@ -58,11 +60,12 @@ type WorkerCyclePayload = {
     cycle: number;
     ok: boolean;
     at: string;
-    steps: WorkerEvent[];
+    step_count: number;
+    failed_steps: string[];
 };
-type WorkerStepRunner = (name: string, args: string[]) => WorkerEvent;
+type WorkerStepRunner = (name: string, args: string[], command?: "sync" | "maintenance") => WorkerEvent;
 type WorkerLogWriter = (opts: WorkerCycleOptions, payload: WorkerEvent | WorkerCyclePayload) => void;
-declare function buildCycleStepSpecs(opts: WorkerCycleOptions): WorkerStepSpec[];
+declare function buildCycleStepSpecs(opts: WorkerCycleOptions, cycle?: number): WorkerStepSpec[];
 declare function compactRun(run: RunSummary | null | undefined): {
     run_id: number | null | undefined;
     ok: boolean | undefined;

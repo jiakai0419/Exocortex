@@ -12,10 +12,12 @@ import {
 import { collectQualityReport } from "../src/diagnostics/lark-im-quality-report.mjs";
 import { renderQualityText } from "../src/terminal/lark-im-quality-view.mjs";
 import {
+  acquireLock,
   createRun,
   ensureInitialized,
   failRun,
   readScope,
+  releaseLock,
   sqliteExec,
   succeedMessageRun,
 } from "../dist/storage/sqlite/ingestion-store.js";
@@ -57,6 +59,15 @@ function larkMessage(id, occurredAtMs, overrides = {}) {
     chat_name: "Synthetic Chat",
     content: "hello",
     ...overrides,
+  };
+}
+
+function createLockedRun(dbPath, scope) {
+  assert.equal(acquireLock(dbPath, scope.id, 60), true);
+  const lockedScope = readScope(dbPath, scope.id);
+  return {
+    scope: lockedScope,
+    runId: createRun(dbPath, lockedScope, { runner: "tests/lark-im-quality.test.mjs" }),
   };
 }
 
@@ -102,8 +113,9 @@ test("lark im quality report flags missing names, chat names, and invalid bodies
       "received",
     ),
   ];
-  const runId = createRun(dbPath, scope, { runner: "tests/lark-im-quality.test.mjs" });
-  succeedMessageRun(dbPath, scope, runId, records, records.length, cursorAfter(base + 2000), { test: true });
+  const lockedRun = createLockedRun(dbPath, scope);
+  succeedMessageRun(dbPath, lockedRun.scope, lockedRun.runId, records, records.length, cursorAfter(base + 2000), { test: true });
+  releaseLock(dbPath, scope.id);
   sqliteExec(
     dbPath,
     `INSERT INTO sync_scopes (id, source_id, name, description, enabled, config_json)
@@ -151,15 +163,14 @@ test("lark im quality report flags missing names, chat names, and invalid bodies
   assert.deepEqual(report.unsupported_reasons, [
     {
       reason: "bot_user_out_of_chat",
-      lark_cli_error_code: 230002,
-      lark_cli_error_message: "Bot/User can NOT be out of the chat.",
+      error_code: 230002,
       count: 1,
     },
-    { reason: "restricted_mode", lark_cli_error_code: "", lark_cli_error_message: "", count: 1 },
+    { reason: "restricted_mode", error_code: null, count: 1 },
   ]);
   assert.match(plain(renderQualityText(report)), /Lark IM data quality NEEDS ATTENTION/);
   assert.match(plain(renderQualityText(report)), /Unsupported reasons/);
-  assert.match(plain(renderQualityText(report)), /230002: Bot\/User can NOT be out of the chat\./);
+  assert.match(plain(renderQualityText(report)), /code 230002/);
   assert.match(plain(renderQualityText(report)), /restricted_mode/);
 });
 
@@ -191,8 +202,9 @@ test("lark im quality treats senderless system and known unresolved app senders 
       "received",
     ),
   ];
-  const runId = createRun(dbPath, scope, { runner: "tests/lark-im-quality.test.mjs" });
-  succeedMessageRun(dbPath, scope, runId, records, records.length, cursorAfter(base + 1000), { test: true });
+  const lockedRun = createLockedRun(dbPath, scope);
+  succeedMessageRun(dbPath, lockedRun.scope, lockedRun.runId, records, records.length, cursorAfter(base + 1000), { test: true });
+  releaseLock(dbPath, scope.id);
   sqliteExec(
     dbPath,
     `UPDATE records
@@ -219,22 +231,25 @@ test("lark im quality treats senderless system and known unresolved app senders 
 test("lark im quality classifies historical Lark rate limits", (t) => {
   const dbPath = tempDb(t);
   const scope = readScope(dbPath, "lark.im.sent_by_me");
-  const runId = createRun(dbPath, scope, { runner: "tests/lark-im-quality.test.mjs" });
+  const lockedRun = createLockedRun(dbPath, scope);
   failRun(
     dbPath,
-    scope,
-    runId,
+    lockedRun.scope,
+    lockedRun.runId,
     new Error(
       'lark-cli im +messages-search --sender <redacted> failed: {"ok":false,"error":{"type":"api","code":9499,"message":"too many request"}}',
     ),
   );
+  releaseLock(dbPath, scope.id);
 
   const report = collectQualityReport(dbPath);
   const output = plain(renderQualityText(report));
 
-  assert.equal(report.recent_failures[0].failure_kind, "rate_limited");
-  assert.equal(report.recent_failures[0].transient, true);
-  assert.equal(report.recent_failures[0].error_code, 9499);
+  assert.deepEqual(report.recent_failures[0], {
+    failure_kind: "rate_limited",
+    transient: true,
+    error_code: 9499,
+  });
   assert.match(output, /\[rate_limited\]/);
   assert.doesNotMatch(output, /ou_secret/);
 });
@@ -302,6 +317,34 @@ test("lark im quality command renders text, json, help, and dependency errors", 
   assert.equal(exitJson, 0);
   assert.equal(JSON.parse(jsonOut.text()).messages.total, 3);
 
+  const privateSentinel = "PRIVATE_QUALITY_SENTINEL";
+  const unsafeReport = {
+    ...report,
+    message_types: [{ msg_type: privateSentinel, count: 1 }],
+    quality: { ...report.quality, missing_chat_name: 1 },
+    unsupported_reasons: [{ reason: privateSentinel, count: 1 }],
+    recent_failures: [{
+      scope_id: `oc_${"x".repeat(80)}`,
+      error_message: `https://example.invalid/?token=${privateSentinel}`,
+    }],
+    latest_records: [{ chat_name: privateSentinel, body: privateSentinel }],
+    db_path: "/private/users/example/exocortex.sqlite",
+  };
+  const unsafeOut = memoryWriter();
+  const unhealthyExit = runQualityCli(["--format", "json"], {
+    stdout: unsafeOut.stream,
+    deps: {
+      resolvePath: () => "/private/users/example/exocortex.sqlite",
+      existsSync: () => true,
+      collect: () => unsafeReport,
+    },
+  });
+  assert.equal(unhealthyExit, 2);
+  assert.equal(JSON.parse(unsafeOut.text()).quality.missing_chat_name, 1);
+  assert.doesNotMatch(unsafeOut.text(), new RegExp(privateSentinel));
+  assert.doesNotMatch(unsafeOut.text(), /\/private\/users\/example/);
+  assert.equal(JSON.parse(unsafeOut.text()).latest_records, undefined);
+
   const helpOut = memoryWriter();
   assert.equal(runQualityCli(["--help"], { stdout: helpOut.stream }), 0);
   assert.match(helpOut.text(), /Usage: node scripts\/lark-im-quality\.mjs/);
@@ -316,4 +359,5 @@ test("lark im quality command renders text, json, help, and dependency errors", 
   });
   assert.equal(exitError, 1);
   assert.match(plain(errorOut.text()), /database not found/);
+  assert.doesNotMatch(errorOut.text(), /\/abs\/missing\.sqlite/);
 });

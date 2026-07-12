@@ -1,6 +1,27 @@
+export class PaginationLimitError extends Error {
+    code = "pagination_limit";
+    maxPages;
+    constructor(message, maxPages) {
+        super(message);
+        this.name = "PaginationLimitError";
+        this.maxPages = maxPages;
+    }
+}
+export function isPaginationLimitError(error) {
+    return (error instanceof PaginationLimitError ||
+        (typeof error === "object" && error !== null && error.code === "pagination_limit"));
+}
 export function compareRecordToCursor(record, cursor, fallbackStartMs) {
     const hasCursor = cursor?.created_at_ms !== undefined && cursor?.created_at_ms !== null;
-    const cursorMs = Number(hasCursor ? cursor.created_at_ms : fallbackStartMs - 1);
+    if (!Number.isFinite(record.occurred_at_ms)) {
+        throw new Error(`invalid record occurred_at_ms: ${String(record.occurred_at_ms)}`);
+    }
+    const rawCursorMs = hasCursor ? cursor.created_at_ms : fallbackStartMs - 1;
+    if (typeof rawCursorMs !== "number" || !Number.isFinite(rawCursorMs)) {
+        const label = hasCursor ? "cursor.created_at_ms" : "fallback start";
+        throw new Error(`invalid ${label}: ${String(rawCursorMs)}`);
+    }
+    const cursorMs = rawCursorMs;
     const cursorId = String(cursor?.message_id ?? "");
     if (record.occurred_at_ms > cursorMs)
         return 1;
@@ -35,11 +56,29 @@ export function timeCursorAfter({ endMs, precisionMs, sourceTimePrecision, kind 
     };
 }
 export function stableWindowEndMs(opts, startMs) {
+    if (typeof startMs !== "number" || !Number.isFinite(startMs)) {
+        throw new Error(`invalid window start: ${String(startMs)}`);
+    }
+    if (typeof opts.endMs !== "number" || !Number.isFinite(opts.endMs)) {
+        throw new Error(`invalid window end: ${String(opts.endMs)}`);
+    }
     const guardMs = opts.endExplicit ? 0 : Number(opts.stableHorizonMs || 0);
+    if (!Number.isFinite(guardMs) || guardMs < 0) {
+        throw new Error(`invalid stable horizon: ${String(opts.stableHorizonMs)}`);
+    }
     return Math.max(startMs, opts.endMs - guardMs);
 }
 export function timeWindow(scope, opts) {
-    const startMs = Number(scope.cursor?.created_at_ms ?? opts.startMs);
+    const cursorStart = scope.cursor?.created_at_ms;
+    if (cursorStart !== undefined && cursorStart !== null) {
+        if (typeof cursorStart !== "number" || !Number.isFinite(cursorStart)) {
+            throw new Error(`invalid cursor.created_at_ms: ${String(cursorStart)}`);
+        }
+    }
+    const startMs = cursorStart ?? opts.startMs;
+    if (typeof startMs !== "number" || !Number.isFinite(startMs)) {
+        throw new Error(`invalid window start: ${String(startMs)}`);
+    }
     return {
         startMs,
         endMs: stableWindowEndMs(opts, startMs),
@@ -58,8 +97,9 @@ export function readPaginatedPages({ fetchPage, getItems, getHasMore, getPageTok
         pageToken = getPageToken(page);
         if (hasMore && !pageToken)
             throw new Error(missingPageTokenMessage);
-        if (hasMore && pages >= maxPages)
-            throw new Error(maxPagesMessage(maxPages));
+        if (hasMore && pages >= maxPages) {
+            throw new PaginationLimitError(maxPagesMessage(maxPages), maxPages);
+        }
     } while (hasMore);
     return { items, pages };
 }

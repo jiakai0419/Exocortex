@@ -12,7 +12,7 @@
  *
  * @typedef {object} LocalQuality
  * @property {string=} status
- * @property {{missing_sender_name?: number, missing_user_sender_name?: number, missing_app_sender_name?: number, actionable_missing_sender_name?: number, invalid_rendered_body?: number}=} quality
+ * @property {{missing_sender_name?: number, missing_user_sender_name?: number, missing_app_sender_name?: number, actionable_missing_sender_name?: number, missing_chat_name?: number, invalid_rendered_body?: number}=} quality
  *
  * @typedef {object} LiveResult
  * @property {boolean | null=} ok
@@ -49,7 +49,10 @@ function isKeychainUnavailable(text) {
  */
 function normalizeLiveResult(live) {
   if (!live) return null;
-  if (live.status === "command_failed" && isKeychainUnavailable(textFromCommandFailure(live))) {
+  if (
+    live.status === "command_failed" &&
+    (live.reason === "keychain_unavailable" || isKeychainUnavailable(textFromCommandFailure(live)))
+  ) {
     return {
       ...live,
       status: "unavailable",
@@ -72,20 +75,33 @@ function actionableMissingSenderNames(state) {
 }
 
 /** @param {DoctorState} state */
+function hasActionableQualityIssues(state) {
+  const q = state.quality.quality || {};
+  return (
+    actionableMissingSenderNames(state) > 0 ||
+    Number(q.missing_chat_name || 0) > 0 ||
+    Number(q.invalid_rendered_body || 0) > 0
+  );
+}
+
+/** @param {DoctorState} state */
 function buildFindings({ status, quality, live }) {
   /** @type {string[]} */
   const findings = [];
   const missingSenderName = actionableMissingSenderNames({ status, quality, live });
+  const missingChatName = Number(quality.quality?.missing_chat_name || 0);
   const invalidRenderedBody = Number(quality.quality?.invalid_rendered_body || 0);
   if (status.status === "command_failed") findings.push("local status command failed");
   if (quality.status === "command_failed") findings.push("local quality command failed");
   if (status.health === "syncing") findings.push("worker is currently syncing");
   if (status.health === "catching_up") findings.push(status.health_detail || "initial catch-up is still in progress");
   if (missingSenderName > 0) findings.push("some senders still lack display names");
+  if (missingChatName > 0) findings.push("some group messages still lack chat names");
   if (invalidRenderedBody > 0) findings.push("some messages still have invalid rendered bodies");
   if (live?.status === "delayed") findings.push("remote hot messages are not fully present locally yet");
   if (live?.status === "needs_attention") findings.push("live lag probe had remote API errors");
   if (live?.status === "command_failed") findings.push("live lag probe could not run");
+  if (live?.status === "inconclusive") findings.push("live lag probe did not obtain a usable remote sample");
   if (live?.status === "unavailable") findings.push("live lag probe unavailable in this shell");
   return findings;
 }
@@ -95,22 +111,24 @@ function buildFindings({ status, quality, live }) {
  * @returns {OverallStatus}
  */
 function overallStatus({ status, quality, live }) {
-  const missingSenderName = actionableMissingSenderNames({ status, quality, live });
-  const invalidRenderedBody = Number(quality.quality?.invalid_rendered_body || 0);
+  const state = { status, quality, live };
   if (status.status === "command_failed" || quality.status === "command_failed") return "needs_attention";
-  if (live?.status === "needs_attention" || live?.status === "command_failed") return "needs_attention";
+  if (
+    live?.status === "needs_attention" ||
+    live?.status === "command_failed" ||
+    live?.status === "inconclusive"
+  ) return "needs_attention";
+  if (hasActionableQualityIssues(state)) return "needs_attention";
   if (live?.status === "delayed") return "delayed";
   if (status.health === "syncing") return "syncing";
   if (status.health === "catching_up") return "catching_up";
-  if (missingSenderName > 0 || invalidRenderedBody > 0) {
-    return "needs_attention";
-  }
   return "fresh";
 }
 
 export {
   actionableMissingSenderNames,
   buildFindings,
+  hasActionableQualityIssues,
   isKeychainUnavailable,
   normalizeLiveResult,
   overallStatus,

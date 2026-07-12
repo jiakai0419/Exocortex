@@ -479,7 +479,27 @@ test("service status view renders sync failure and missing worker log", () => {
   assert.match(output, /PROBLEM sync unavailable/);
   assert.match(output, /FAILED sync unavailable/);
   assert.match(output, /no worker events yet/);
-  assert.match(output, /logs\/test\/worker\.jsonl \(missing\)/);
+  assert.match(output, /worker\.jsonl \(missing\)/);
+  assert.doesNotMatch(output, /logs\/test/);
+});
+
+test("service status text never exposes an absolute worker log path", () => {
+  const output = plain(
+    renderServiceStatusText({
+      label: "com.example.worker",
+      service_state: "running",
+      launchd: { loaded: true, state: "running", pid: "123" },
+      sync: { status: syncStatusFixture() },
+      worker: {
+        log: { path: "/private/PRIVATE-SENTINEL/logs/worker.jsonl", exists: true, events: [] },
+        summary: workerSummaryFixture(),
+      },
+      stability: stabilityFixture(),
+    }),
+  );
+
+  assert.match(output, /Log\s+worker\.jsonl/);
+  assert.doesNotMatch(output, /PRIVATE-SENTINEL|\/private\//);
 });
 
 test("service status helpers parse launchd and json output", () => {

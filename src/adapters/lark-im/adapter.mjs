@@ -1,6 +1,7 @@
 // @ts-check
 
 import {
+  assertValidLarkMessage,
   localIsoFromMs,
   readBoundedPages,
 } from "./core.mjs";
@@ -96,25 +97,79 @@ import {
  * @returns {ApiEnvelope}
  */
 function getEnvelope(json, collectionName) {
-  const root = json && typeof json === "object" ? json : /** @type {JsonObject} */ ({});
+  if (!json || typeof json !== "object" || Array.isArray(json)) {
+    throw new Error(`${collectionName} response must be an object`);
+  }
+  const root = /** @type {JsonObject} */ (json);
+  if (root.data !== null && root.data !== undefined && (typeof root.data !== "object" || Array.isArray(root.data))) {
+    throw new Error(`${collectionName} response data must be an object`);
+  }
   const data = root.data && typeof root.data === "object" ? /** @type {JsonObject} */ (root.data) : {};
+  const candidates = [
+    root[collectionName],
+    data[collectionName],
+    root.items,
+    data.items,
+    root.results,
+    data.results,
+  ];
+  const presentCollections = candidates.filter((value) => value !== undefined);
+  if (presentCollections.length === 0 || presentCollections.some((value) => !Array.isArray(value))) {
+    throw new Error(`${collectionName} response is missing a valid ${collectionName} array`);
+  }
+  const items = /** @type {any[]} */ (presentCollections[0]);
+  if (root.has_more !== undefined && data.has_more !== undefined && root.has_more !== data.has_more) {
+    throw new Error(`${collectionName} response has conflicting has_more values`);
+  }
+  const hasMore = root.has_more ?? data.has_more;
+  if (typeof hasMore !== "boolean") {
+    throw new Error(`${collectionName} response is missing a boolean has_more`);
+  }
+  if (root.page_token !== undefined && data.page_token !== undefined && root.page_token !== data.page_token) {
+    throw new Error(`${collectionName} response has conflicting page_token values`);
+  }
+  const pageToken = root.page_token ?? data.page_token ?? "";
+  if (typeof pageToken !== "string") {
+    throw new Error(`${collectionName} response has a non-string page_token`);
+  }
   return {
-    items: firstArray(root[collectionName], data[collectionName], root.items, data.items, root.results, data.results),
-    has_more: Boolean(root.has_more ?? data.has_more),
-    page_token: root.page_token || data.page_token || "",
+    items,
+    has_more: hasMore,
+    page_token: pageToken,
+  };
+}
+
+/** @param {any[]} messages @param {string} endpoint */
+function assertValidMessagePage(messages, endpoint) {
+  messages.forEach((message, index) => assertValidLarkMessage(message, `${endpoint} message at index ${index}`));
+}
+
+/** @param {unknown} value @param {number} index */
+function normalizeChat(value, index) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`chat-list chat at index ${index} must be an object`);
+  }
+  const chat = /** @type {JsonObject} */ (value);
+  if (typeof chat.chat_id !== "string" || !chat.chat_id.trim()) {
+    throw new Error(`chat-list chat at index ${index} is missing a valid chat_id`);
+  }
+  return {
+    chat_id: chat.chat_id,
+    chat_type: chat.chat_mode || chat.chat_type || null,
+    chat_name: chat.name || chat.i18n_names?.zh_cn || chat.i18n_names?.en_us || null,
   };
 }
 
 /** @param {unknown} error */
 function isRestrictedModeError(error) {
   const message = String(error instanceof Error ? error.message : error || "");
-  return /"code"\s*:\s*231203|Restricted Mode|don't allow copying or forwarding messages/i.test(message);
+  return /\bkind=restricted_mode\b|(?:"code"\s*:\s*|\bcode[=:]\s*)231203\b|Restricted Mode|don't allow copying or forwarding messages/i.test(message);
 }
 
 /** @param {unknown} error */
 function isBotUserOutOfChatError(error) {
   const message = String(error instanceof Error ? error.message : error || "");
-  return /"code"\s*:\s*230002|Bot\/User can NOT be out of the chat/i.test(message);
+  return /\bkind=bot_user_out_of_chat\b|(?:"code"\s*:\s*|\bcode[=:]\s*)230002\b|Bot\/User can NOT be out of the chat/i.test(message);
 }
 
 /**
@@ -192,6 +247,7 @@ function createLarkImAdapter({ run = runLark } = {}) {
           retryDelayMs: opts.retryDelayMs,
         });
         const envelope = getEnvelope(json, "messages");
+        assertValidMessagePage(envelope.items, "messages-search");
         return {
           messages: envelope.items,
           has_more: envelope.has_more,
@@ -239,6 +295,7 @@ function createLarkImAdapter({ run = runLark } = {}) {
           retryDelayMs: opts.retryDelayMs,
         });
         const envelope = getEnvelope(json, "messages");
+        assertValidMessagePage(envelope.items, "chat-messages-list");
         return {
           messages: envelope.items,
           has_more: envelope.has_more,
@@ -277,13 +334,7 @@ function createLarkImAdapter({ run = runLark } = {}) {
     });
     const envelope = getEnvelope(json, "chats");
     return {
-      chats: envelope.items
-        .filter((chat) => chat?.chat_id)
-        .map((chat) => ({
-          chat_id: chat.chat_id,
-          chat_type: chat.chat_mode || chat.chat_type || null,
-          chat_name: chat.name || chat.i18n_names?.zh_cn || chat.i18n_names?.en_us || null,
-        })),
+      chats: envelope.items.map(normalizeChat),
       has_more: envelope.has_more,
       page_token: envelope.page_token,
     };

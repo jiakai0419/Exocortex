@@ -96,3 +96,27 @@ test("lag core reports needs_attention when the live probe has remote API errors
   assert.equal(report.probe.probe_errors, 1);
   assert.equal(exitCodeForReport(report), 2);
 });
+
+test("lag core treats empty chat and remote-message samples as inconclusive", () => {
+  const noChats = buildLagReport({
+    opts,
+    chats: [],
+    remoteMessages: [],
+    existingRecords: new Set(),
+  });
+  const noMessages = buildLagReport({
+    opts,
+    chats: HOT_CHATS,
+    remoteMessages: [],
+    existingRecords: new Set(),
+  });
+
+  assert.equal(noChats.status, "inconclusive");
+  assert.equal(noChats.reason, "no_hot_chats");
+  assert.equal(noChats.ok, false);
+  assert.equal(exitCodeForReport(noChats), 2);
+  assert.equal(noMessages.status, "inconclusive");
+  assert.equal(noMessages.reason, "no_usable_remote_messages");
+  assert.equal(noMessages.ok, false);
+  assert.equal(exitCodeForReport(noMessages), 2);
+});

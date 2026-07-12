@@ -150,6 +150,7 @@ const COMMANDS = [
       "node scripts/sqlite-maintenance.mjs backup",
       "node scripts/sqlite-maintenance.mjs verify --latest",
       "node scripts/sqlite-maintenance.mjs prune-runs",
+      "node scripts/sqlite-maintenance.mjs compact",
     ],
   },
   {
@@ -183,6 +184,13 @@ const COMMANDS = [
     file: "scripts/lark-im-cursor-probe.mjs",
     summary: "Probe Lark IM paging, ordering, and cursor behavior.",
     examples: ["node scripts/lark-im-cursor-probe.mjs"],
+  },
+  {
+    group: "development",
+    command: "node scripts/check-syntax.mjs",
+    file: "scripts/check-syntax.mjs",
+    summary: "Syntax-check every JavaScript source file individually.",
+    examples: ["node scripts/check-syntax.mjs"],
   },
   {
     group: "development",

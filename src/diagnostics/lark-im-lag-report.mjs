@@ -6,6 +6,10 @@ import {
   buildLagReport,
   normalizeRemoteMessage,
 } from "./lark-im-lag-core.mjs";
+import {
+  diagnosticSubprocessError,
+  publicCommandFailureReason,
+} from "./public-safe.mjs";
 
 /**
  * @typedef {Record<string, any>} JsonObject
@@ -38,24 +42,41 @@ function sqliteJson(dbPath, sql, label) {
     input: `.timeout 5000\n${sql}`,
     encoding: "utf8",
     maxBuffer: 50 * 1024 * 1024,
+    timeout: 30_000,
+    killSignal: "SIGKILL",
   });
-  if (result.status !== 0) throw new Error(`${label} failed: ${result.stderr.trim()}`);
-  const trimmed = result.stdout.trim();
+  if (result.status !== 0 || result.error) throw diagnosticSubprocessError(result, label);
+  const trimmed = String(result.stdout || "").trim();
   return trimmed ? JSON.parse(trimmed) : [];
 }
 
 /** @param {string[]} args */
 function runLark(args) {
   const bin = process.env.LARK_CLI || "lark-cli";
-  const result = spawnSync(bin, args, { encoding: "utf8", maxBuffer: 100 * 1024 * 1024 });
-  if (result.status !== 0) {
-    const error = new Error(result.stderr.trim() || `${bin} ${args.join(" ")} failed`);
-    // @ts-expect-error dynamic compatibility field for callers that inspect process status.
-    error.exitCode = result.status;
-    throw error;
+  const result = spawnSync(bin, args, {
+    encoding: "utf8",
+    maxBuffer: 100 * 1024 * 1024,
+    timeout: 120_000,
+    killSignal: "SIGKILL",
+  });
+  if (result.status !== 0 || result.error) {
+    const stderr = String(result.stderr || "");
+    const spawnError = /** @type {NodeJS.ErrnoException | undefined} */ (result.error);
+    if (/"code"\s*:\s*231203|Restricted Mode|don't allow copying or forwarding messages/i.test(stderr)) {
+      throw new Error("reason=restricted_mode code=231203");
+    }
+    if (publicCommandFailureReason(`${spawnError?.code || ""}\n${stderr}`) === "keychain_unavailable") {
+      throw new Error("keychain not initialized");
+    }
+    throw diagnosticSubprocessError(result, "lark-cli live probe");
   }
-  const trimmed = result.stdout.trim();
-  return trimmed ? JSON.parse(trimmed) : null;
+  const trimmed = String(result.stdout || "").trim();
+  if (!trimmed) return null;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    throw new Error("lark-cli live probe returned invalid JSON");
+  }
 }
 
 /** @param {unknown[]} values */
@@ -85,7 +106,7 @@ function errorMessage(error) {
 /** @param {unknown} error */
 function isRestrictedModeError(error) {
   const message = errorMessage(error);
-  return /"code"\s*:\s*231203|Restricted Mode|don't allow copying or forwarding messages/i.test(message);
+  return /"code"\s*:\s*231203|\bcode=231203\b|reason=restricted_mode|Restricted Mode|don't allow copying or forwarding messages/i.test(message);
 }
 
 /** @param {LagReportDeps} [deps] */
@@ -120,7 +141,7 @@ function fetchHotChats(opts, deps = {}) {
       "user",
       "--exclude-muted",
       "--types",
-      "group",
+      "group,p2p",
       "--sort",
       "active_time",
       "--page-size",
@@ -137,7 +158,7 @@ function fetchHotChats(opts, deps = {}) {
       chats.push({
         chat_id: chat.chat_id,
         chat_name: chat.name || chat.i18n_names?.zh_cn || chat.i18n_names?.en_us || chat.chat_id,
-        chat_type: chat.chat_mode || "group",
+        chat_type: chat.chat_mode || chat.chat_type || "unknown",
       });
       if (chats.length >= opts.hotChats) break;
     }

@@ -39,6 +39,12 @@ export type PaginationOptions<TPage, TItem> = {
     missingPageTokenMessage: string;
     maxPagesMessage: (maxPages: number) => string;
 };
+export declare class PaginationLimitError extends Error {
+    readonly code = "pagination_limit";
+    readonly maxPages: number;
+    constructor(message: string, maxPages: number);
+}
+export declare function isPaginationLimitError(error: unknown): error is PaginationLimitError;
 export declare function compareRecordToCursor(record: CursorRecord, cursor: TimeCursor | null | undefined, fallbackStartMs: number): number;
 export declare function windowRecordsAfterCursor<TRecord extends CursorRecord>(records: TRecord[], cursor: TimeCursor | null | undefined, startMs: number, endMs: number, filterFn?: ((record: TRecord) => boolean) | null): TRecord[];
 export declare function floorToPrecisionMs(ms: number, precisionMs: number): number;

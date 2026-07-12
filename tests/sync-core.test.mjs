@@ -25,6 +25,20 @@ test("generic cursor comparison uses time plus external id tie-breaker", () => {
   assert.equal(compareRecordToCursor(record("a", base), null, base), 1);
 });
 
+test("cursor operations reject non-numeric and non-finite cursor timestamps", () => {
+  const base = 1700000000000;
+  for (const invalid of [NaN, String(base), Infinity]) {
+    assert.throws(
+      () => compareRecordToCursor(record("a", base), { created_at_ms: invalid }, base),
+      /invalid cursor\.created_at_ms/,
+    );
+    assert.throws(
+      () => timeWindow({ cursor: { created_at_ms: invalid } }, { startMs: base, endMs: base + 1000 }),
+      /invalid cursor\.created_at_ms/,
+    );
+  }
+});
+
 test("windowRecordsAfterCursor filters by cursor and stable end, then sorts", () => {
   const base = 1700000000000;
   const records = windowRecordsAfterCursor(

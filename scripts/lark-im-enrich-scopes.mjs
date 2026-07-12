@@ -39,8 +39,9 @@ function parseArgs(argv) {
 }
 
 function parsePositiveInt(value, name) {
-  const parsed = Number.parseInt(String(value), 10);
-  if (!Number.isInteger(parsed) || parsed <= 0) throw new Error(`${name} must be positive`);
+  const text = String(value);
+  const parsed = Number(text);
+  if (!/^[1-9]\d*$/.test(text) || !Number.isSafeInteger(parsed)) throw new Error(`${name} must be positive integer`);
   return parsed;
 }
 
@@ -55,7 +56,7 @@ function sqlJson(value) {
 
 function sqliteJson(dbPath, sql, label) {
   const result = spawnSync("sqlite3", ["-json", dbPath], {
-    input: `.timeout 5000\n${sql}`,
+    input: `.bail on\n.timeout 5000\n${sql}`,
     encoding: "utf8",
     maxBuffer: 20 * 1024 * 1024,
   });
@@ -68,7 +69,7 @@ function sqliteJson(dbPath, sql, label) {
 
 function sqliteExec(dbPath, sql, label) {
   const result = spawnSync("sqlite3", [dbPath], {
-    input: `.timeout 5000\n${sql}`,
+    input: `.bail on\n.timeout 5000\n${sql}`,
     encoding: "utf8",
     maxBuffer: 20 * 1024 * 1024,
   });

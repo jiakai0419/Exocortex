@@ -139,7 +139,7 @@ test("createLarkCliRunner preserves a redacted error after retry budget is exhau
       retryDelayMs: 3,
       redactedFlags: ["--sender"],
     }),
-    /lark-cli im \+messages-search --sender <redacted> failed: .*too many request/s,
+    /lark-cli im \+messages-search --sender <redacted> failed: kind=rate_limited code=9499/,
   );
   assert.deepEqual(sleeps, [3, 6]);
 });
@@ -160,7 +160,59 @@ test("createLarkCliRunner does not retry non-transient failures and redacts the 
 
   assert.throws(
     () => run(["contact", "+search-user", "--user-ids", "ou_secret"], { retries: 3, redactedFlags: ["--user-ids"] }),
-    /lark-cli contact \+search-user --user-ids <redacted> failed: permission denied/,
+    /lark-cli contact \+search-user --user-ids <redacted> failed: kind=unknown/,
+  );
+});
+
+test("createLarkCliRunner applies a hard timeout and never exposes raw stderr", () => {
+  const calls = [];
+  const run = createLarkCliRunner({
+    timeoutMs: 321,
+    spawn(cmd, args, options) {
+      calls.push({ cmd, args, options });
+      return {
+        status: null,
+        signal: "SIGKILL",
+        output: [],
+        pid: 1,
+        stdout: "",
+        stderr: "private body oc_secret pt_secret",
+        error: Object.assign(new Error("timed out"), { code: "ETIMEDOUT" }),
+      };
+    },
+  });
+
+  assert.throws(
+    () => run(["im", "+chat-list"], {}),
+    (error) => {
+      assert.match(error.message, /kind=network_timeout timeout_ms=321/);
+      assert.doesNotMatch(error.message, /private body|oc_secret|pt_secret/);
+      return true;
+    },
+  );
+  assert.equal(calls[0].options.timeout, 321);
+  assert.equal(calls[0].options.killSignal, "SIGKILL");
+});
+
+test("createLarkCliRunner reports missing executables without dereferencing stderr", () => {
+  const run = createLarkCliRunner({
+    bin: "missing-lark-cli",
+    spawn() {
+      return {
+        status: null,
+        signal: null,
+        output: [],
+        pid: 0,
+        stdout: undefined,
+        stderr: undefined,
+        error: Object.assign(new Error("spawn missing-lark-cli ENOENT"), { code: "ENOENT" }),
+      };
+    },
+  });
+
+  assert.throws(
+    () => run(["im", "+chat-list"], {}),
+    /lark-cli im \+chat-list failed: kind=command_unavailable spawn_code=ENOENT/,
   );
 });
 
@@ -168,6 +220,9 @@ test("isTransientLarkFailure classifies known transient Lark failures", () => {
   assert.equal(isTransientLarkFailure("TLS handshake timeout"), true);
   assert.equal(isTransientLarkFailure(JSON.stringify({ error: { type: "network", subtype: "timeout" } })), true);
   assert.equal(isTransientLarkFailure(JSON.stringify({ error: { type: "api", code: 9499, message: "too many request" } })), true);
+  assert.equal(isTransientLarkFailure(JSON.stringify({ error: { type: "api", code: 1663, message: "Internal Error" } })), true);
+  assert.equal(isTransientLarkFailure("request failed: EAI_AGAIN"), true);
+  assert.equal(isTransientLarkFailure("HTTP 503 Service Unavailable"), true);
   assert.equal(isTransientLarkFailure("permission denied"), false);
 });
 
@@ -194,6 +249,24 @@ test("classifyLarkFailure exposes public-safe failure kinds", () => {
     transient: false,
     code: 2200,
     message: "scope fail",
+  });
+  assert.deepEqual(classifyLarkFailure(JSON.stringify({ error: { type: "api", code: 1663, message: "Internal Error" } })), {
+    kind: "internal_error",
+    transient: true,
+    code: 1663,
+    message: "Internal Error",
+  });
+  assert.deepEqual(classifyLarkFailure("Restricted Mode: copying is disabled"), {
+    kind: "restricted_mode",
+    transient: false,
+    code: null,
+    message: "restricted mode",
+  });
+  assert.deepEqual(classifyLarkFailure('{"error":{"type":"api","code":230002,"message":"private"}}'), {
+    kind: "bot_user_out_of_chat",
+    transient: false,
+    code: 230002,
+    message: "bot or user is not in the chat",
   });
 });
 

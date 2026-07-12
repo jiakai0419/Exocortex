@@ -27,6 +27,7 @@ import {
   uninstall,
   usage,
   waitOk,
+  xmlEscape,
 } from "../src/cli/lark-im-service-command.mjs";
 
 export {
@@ -53,6 +54,7 @@ export {
   uninstall,
   usage,
   waitOk,
+  xmlEscape,
 };
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
