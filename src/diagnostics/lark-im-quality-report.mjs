@@ -141,58 +141,90 @@ function collectQualityReport(dbPath, deps = {}) {
   );
   const quality = queryJson(
     dbPath,
-    `SELECT
-       SUM(COALESCE(json_extract(canonical_json, '$.sender_name'), '') = '') AS missing_sender_name,
+    `WITH message_quality AS (
+       SELECT
+         COALESCE(json_extract(canonical_json, '$.sender_name'), '') AS sender_name,
+         COALESCE(json_extract(canonical_json, '$.sender_id'), '') AS sender_id,
+         COALESCE(json_extract(canonical_json, '$.chat_id'), '') AS chat_id,
+         COALESCE(json_extract(canonical_json, '$.sender_name_resolution_status'), '') AS resolution_status,
+         COALESCE(json_extract(canonical_json, '$.msg_type'), '') AS msg_type,
+         COALESCE(json_extract(canonical_json, '$.chat_type'), '') AS chat_type,
+         COALESCE(json_extract(canonical_json, '$.chat_name'), '') AS chat_name,
+         body
+       FROM records
+       WHERE source_id = 'lark.im'
+         AND record_type = 'lark.im.message'
+     ),
+     unresolved_app_pairs AS (
+       SELECT DISTINCT sender_id, chat_id
+       FROM message_quality
+       WHERE sender_id LIKE 'cli_%'
+         AND chat_id <> ''
+         AND resolution_status = 'unresolved_app_sender'
+     ),
+     classified AS (
+       SELECT
+         message_quality.*,
+         CASE
+           WHEN message_quality.resolution_status = 'unresolved_app_sender' THEN 1
+           WHEN message_quality.chat_id <> '' AND unresolved_app_pairs.sender_id IS NOT NULL THEN 1
+           ELSE 0
+         END AS is_unresolved_app_sender
+       FROM message_quality
+       LEFT JOIN unresolved_app_pairs
+         ON unresolved_app_pairs.sender_id = message_quality.sender_id
+        AND unresolved_app_pairs.chat_id = message_quality.chat_id
+     )
+     SELECT
+       SUM(sender_name = '') AS missing_sender_name,
        SUM(
-         COALESCE(json_extract(canonical_json, '$.sender_name'), '') = ''
-         AND COALESCE(json_extract(canonical_json, '$.sender_id'), '') LIKE 'ou_%'
+         sender_name = ''
+         AND sender_id LIKE 'ou_%'
        ) AS missing_user_sender_name,
        SUM(
-         COALESCE(json_extract(canonical_json, '$.sender_name'), '') = ''
-         AND COALESCE(json_extract(canonical_json, '$.sender_id'), '') LIKE 'cli_%'
+         sender_name = ''
+         AND sender_id LIKE 'cli_%'
        ) AS missing_app_sender_name,
        SUM(
-         COALESCE(json_extract(canonical_json, '$.sender_name'), '') = ''
-         AND COALESCE(json_extract(canonical_json, '$.sender_id'), '') LIKE 'cli_%'
-         AND COALESCE(json_extract(canonical_json, '$.sender_name_resolution_status'), '') = 'unresolved_app_sender'
+         sender_name = ''
+         AND sender_id LIKE 'cli_%'
+         AND is_unresolved_app_sender = 1
        ) AS unresolved_app_sender_name,
        SUM(
-         COALESCE(json_extract(canonical_json, '$.sender_name'), '') = ''
-         AND COALESCE(json_extract(canonical_json, '$.msg_type'), '') = 'system'
-         AND COALESCE(json_extract(canonical_json, '$.sender_id'), '') = ''
+         sender_name = ''
+         AND msg_type = 'system'
+         AND sender_id = ''
        ) AS missing_system_sender_name,
        SUM(
-         COALESCE(json_extract(canonical_json, '$.sender_name'), '') = ''
-         AND COALESCE(json_extract(canonical_json, '$.sender_id'), '') NOT LIKE 'ou_%'
+         sender_name = ''
+         AND sender_id NOT LIKE 'ou_%'
          AND (
-           COALESCE(json_extract(canonical_json, '$.sender_id'), '') NOT LIKE 'cli_%'
-           OR COALESCE(json_extract(canonical_json, '$.sender_name_resolution_status'), '') = 'unresolved_app_sender'
+           sender_id NOT LIKE 'cli_%'
+           OR is_unresolved_app_sender = 1
          )
          AND NOT (
-           COALESCE(json_extract(canonical_json, '$.msg_type'), '') = 'system'
-           AND COALESCE(json_extract(canonical_json, '$.sender_id'), '') = ''
+           msg_type = 'system'
+           AND sender_id = ''
          )
        ) AS missing_non_actionable_sender_name,
        SUM(
-         COALESCE(json_extract(canonical_json, '$.sender_name'), '') = ''
+         sender_name = ''
          AND (
-           COALESCE(json_extract(canonical_json, '$.sender_id'), '') LIKE 'ou_%'
+           sender_id LIKE 'ou_%'
            OR (
-             COALESCE(json_extract(canonical_json, '$.sender_id'), '') LIKE 'cli_%'
-             AND COALESCE(json_extract(canonical_json, '$.sender_name_resolution_status'), '') <> 'unresolved_app_sender'
+             sender_id LIKE 'cli_%'
+             AND is_unresolved_app_sender = 0
            )
          )
        ) AS actionable_missing_sender_name,
-       SUM(COALESCE(json_extract(canonical_json, '$.sender_id'), '') LIKE 'cli_%') AS app_sender_records,
+       SUM(sender_id LIKE 'cli_%') AS app_sender_records,
        SUM(
-         json_extract(canonical_json, '$.chat_type') IN ('group', 'topic')
-         AND COALESCE(json_extract(canonical_json, '$.chat_name'), '') = ''
+         chat_type IN ('group', 'topic')
+         AND chat_name = ''
        ) AS missing_chat_name,
        SUM(body LIKE '[Invalid%JSON]') AS invalid_rendered_body,
        SUM(body LIKE '[已撤回/已删除%') AS deleted_or_recalled_body
-     FROM records
-     WHERE source_id = 'lark.im'
-       AND record_type = 'lark.im.message';`,
+     FROM classified;`,
     "quality counts",
   );
   const scopes = queryJson(

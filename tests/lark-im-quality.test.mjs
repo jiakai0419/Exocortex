@@ -71,6 +71,55 @@ function createLockedRun(dbPath, scope) {
   };
 }
 
+function missingAppRecord(scopeId, id, occurredAtMs, appId, chatId) {
+  return recordFromMessage(
+    larkMessage(id, occurredAtMs, {
+      sender: {
+        id: appId,
+        id_type: "app_id",
+        sender_type: "app",
+      },
+      chat_id: chatId,
+      msg_type: "interactive",
+      content: "[Card]",
+    }),
+    scopeId,
+    "received",
+  );
+}
+
+function storeRecords(dbPath, scope, records, cursorMs) {
+  const lockedRun = createLockedRun(dbPath, scope);
+  try {
+    succeedMessageRun(
+      dbPath,
+      lockedRun.scope,
+      lockedRun.runId,
+      records,
+      records.length,
+      cursorAfter(cursorMs),
+      { test: true },
+    );
+  } finally {
+    releaseLock(dbPath, scope.id);
+  }
+}
+
+function markUnresolved(dbPath, externalId) {
+  const quotedId = `'${String(externalId).replaceAll("'", "''")}'`;
+  sqliteExec(
+    dbPath,
+    `UPDATE records
+     SET canonical_json = json_set(
+       canonical_json,
+       '$.sender_name_resolution_status', 'unresolved_app_sender',
+       '$.sender_name_resolution_reason', 'no_safe_fallback'
+     )
+     WHERE external_id = ${quotedId};`,
+    "mark unresolved app sender",
+  );
+}
+
 test("lark im quality report flags missing names, chat names, and invalid bodies", (t) => {
   const dbPath = tempDb(t);
   const scope = readScope(dbPath, "lark.im.sent_by_me");
@@ -226,6 +275,66 @@ test("lark im quality treats senderless system and known unresolved app senders 
   assert.equal(report.quality.missing_system_sender_name, 1);
   assert.equal(report.quality.actionable_missing_sender_name, 0);
   assert.match(plain(renderQualityText(report)), /Lark IM data quality OK/);
+});
+
+test("lark im quality inherits unresolved app verdict within the same app and chat pair", (t) => {
+  const dbPath = tempDb(t);
+  const scope = readScope(dbPath, "lark.im.sent_by_me");
+  const base = 1700000000000;
+  const records = [
+    missingAppRecord(scope.id, "om_pair_known", base, "cli_pair_app", "oc_pair_chat"),
+    missingAppRecord(scope.id, "om_pair_new", base + 1000, "cli_pair_app", "oc_pair_chat"),
+  ];
+  storeRecords(dbPath, scope, records, base + 1000);
+  markUnresolved(dbPath, "om_pair_known");
+
+  const report = collectQualityReport(dbPath);
+
+  assert.equal(report.quality.missing_app_sender_name, 2);
+  assert.equal(report.quality.unresolved_app_sender_name, 2);
+  assert.equal(report.quality.missing_non_actionable_sender_name, 2);
+  assert.equal(report.quality.actionable_missing_sender_name, 0);
+  assert.match(plain(renderQualityText(report)), /Lark IM data quality OK/);
+});
+
+test("lark im quality does not inherit unresolved app verdict across chats", (t) => {
+  const dbPath = tempDb(t);
+  const scope = readScope(dbPath, "lark.im.sent_by_me");
+  const base = 1700000000000;
+  const records = [
+    missingAppRecord(scope.id, "om_chat_known", base, "cli_shared_app", "oc_known_chat"),
+    missingAppRecord(scope.id, "om_chat_new", base + 1000, "cli_shared_app", "oc_other_chat"),
+  ];
+  storeRecords(dbPath, scope, records, base + 1000);
+  markUnresolved(dbPath, "om_chat_known");
+
+  const report = collectQualityReport(dbPath);
+
+  assert.equal(report.quality.missing_app_sender_name, 2);
+  assert.equal(report.quality.unresolved_app_sender_name, 1);
+  assert.equal(report.quality.missing_non_actionable_sender_name, 1);
+  assert.equal(report.quality.actionable_missing_sender_name, 1);
+  assert.match(plain(renderQualityText(report)), /Lark IM data quality NEEDS ATTENTION/);
+});
+
+test("lark im quality does not inherit unresolved app verdict across apps", (t) => {
+  const dbPath = tempDb(t);
+  const scope = readScope(dbPath, "lark.im.sent_by_me");
+  const base = 1700000000000;
+  const records = [
+    missingAppRecord(scope.id, "om_app_known", base, "cli_known_app", "oc_shared_chat"),
+    missingAppRecord(scope.id, "om_app_new", base + 1000, "cli_other_app", "oc_shared_chat"),
+  ];
+  storeRecords(dbPath, scope, records, base + 1000);
+  markUnresolved(dbPath, "om_app_known");
+
+  const report = collectQualityReport(dbPath);
+
+  assert.equal(report.quality.missing_app_sender_name, 2);
+  assert.equal(report.quality.unresolved_app_sender_name, 1);
+  assert.equal(report.quality.missing_non_actionable_sender_name, 1);
+  assert.equal(report.quality.actionable_missing_sender_name, 1);
+  assert.match(plain(renderQualityText(report)), /Lark IM data quality NEEDS ATTENTION/);
 });
 
 test("lark im quality classifies historical Lark rate limits", (t) => {
