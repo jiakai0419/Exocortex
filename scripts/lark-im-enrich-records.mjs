@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import {
@@ -17,6 +18,7 @@ Options:
   --db <path>       SQLite database path. Default: ${DEFAULT_DB}
   --limit <n>       Max records to scan. Default: 1000
   --probe-apps      Re-check all app senders with the Application API.
+  --dry-run         Report proposed changes without writing or acquiring locks.
   --unsafe-details  Include local IDs, names, and detailed lookup results in stdout.
   --help            Show this help.
 `;
@@ -30,7 +32,7 @@ function parsePositiveInt(value, name) {
 }
 
 function parseArgs(argv) {
-  const opts = { db: DEFAULT_DB, limit: 1000, probeApps: false, unsafeDetails: false };
+  const opts = { db: DEFAULT_DB, limit: 1000, probeApps: false, unsafeDetails: false, dryRun: false };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--help" || arg === "-h") {
@@ -39,6 +41,10 @@ function parseArgs(argv) {
     }
     if (arg === "--probe-apps") {
       opts.probeApps = true;
+      continue;
+    }
+    if (arg === "--dry-run") {
+      opts.dryRun = true;
       continue;
     }
     if (arg === "--unsafe-details") {
@@ -61,23 +67,25 @@ function quoteSql(value) {
 }
 
 function sqliteJson(dbPath, sql, label) {
-  const result = spawnSync("sqlite3", ["-json", dbPath], {
-    input: `.bail on\n.timeout 5000\n${sql}`,
+  const result = spawnSync("sqlite3", ["-readonly", "-json", dbPath], {
+    input: `.bail on\n.timeout 5000\nPRAGMA query_only = ON;\n${sql}`,
     encoding: "utf8",
     maxBuffer: 50 * 1024 * 1024,
   });
-  if (result.status !== 0) throw new Error(`${label} failed: ${result.stderr.trim()}`);
+  if (result.status !== 0 || result.error) throw new Error(`${label} failed: ${String(result.stderr || result.error?.message || "SQLite unavailable").trim()}`);
   const trimmed = result.stdout.trim();
   return trimmed ? JSON.parse(trimmed) : [];
 }
 
 function sqliteExec(dbPath, sql, label) {
-  const result = spawnSync("sqlite3", [dbPath], {
+  const result = spawnSync("sqlite3", ["-json", dbPath], {
     input: `.bail on\n.timeout 5000\nPRAGMA foreign_keys = ON;\n${sql}`,
     encoding: "utf8",
     maxBuffer: 50 * 1024 * 1024,
   });
-  if (result.status !== 0) throw new Error(`${label} failed: ${result.stderr.trim()}`);
+  if (result.status !== 0 || result.error) throw new Error(`${label} failed: ${String(result.stderr || result.error?.message || "SQLite unavailable").trim()}`);
+  const trimmed = result.stdout.trim();
+  return trimmed ? JSON.parse(trimmed) : [];
 }
 
 function parseMaybeJson(value) {
@@ -98,8 +106,9 @@ function runLark(args) {
 }
 
 function acquireWriteMaintenanceLock(dbPath, reason) {
-  const owner = `pid:${process.pid}:lark-im-enrich-records`;
-  const result = acquireMaintenanceLock(dbPath, { owner, ttlSeconds: 1800, reason });
+  const owner = `pid:${process.pid}:lark-im-enrich-records:${randomUUID()}`;
+  // Network lookups have finished; this lease covers only the local commit.
+  const result = acquireMaintenanceLock(dbPath, { owner, ttlSeconds: 60, reason });
   if (result.acquired) return owner;
   if (result.reason === "sync_locks_active") {
     throw new Error(`maintenance lock unavailable: ${result.active_sync_locks || 0} active sync lock(s); retry shortly`);
@@ -422,6 +431,9 @@ function loadRows(dbPath, limit) {
     dbPath,
     `SELECT
        r.id,
+       r.external_id,
+       r.external_version,
+       r.content_hash,
        r.actor_id,
        r.container_id,
        r.body,
@@ -567,7 +579,6 @@ function main() {
   const appFallbackNames = resolveChatBotAppFallbackNames(appIdsByChat, appNames, diagnostics);
   const appProbeResultsById = new Map(diagnostics.app_lookup_results.map((result) => [result.app_id, result]));
 
-  let updated = 0;
   const updates = [];
   for (const row of rows) {
     const next = { ...row.canonical };
@@ -632,16 +643,46 @@ function main() {
          SET canonical_json = ${quoteSql(canonicalJson)},
              body = ${quoteSql(body)},
              updated_at = ${quoteSql(new Date().toISOString())}
-         WHERE id = ${Number(row.id)};`,
+         WHERE id = ${Number(row.id)}
+           AND source_id = 'lark.im'
+           AND record_type = 'lark.im.message'
+           AND external_id IS ${quoteSql(row.external_id)}
+           AND external_version IS ${quoteSql(row.external_version)}
+           AND content_hash IS ${quoteSql(row.content_hash)}
+           AND actor_id IS ${quoteSql(row.actor_id)}
+           AND container_id IS ${quoteSql(row.container_id)}
+           AND raw_json IS ${quoteSql(row.raw_json)}
+           AND canonical_json IS ${quoteSql(row.canonical_json)}
+           AND body IS ${quoteSql(row.body)};
+         INSERT INTO __enrichment_effects (updated) VALUES (changes());`,
       );
-      updated += 1;
     }
   }
 
-  if (updates.length > 0) {
+  let updated = 0;
+  let skippedConflicts = 0;
+  if (updates.length > 0 && !opts.dryRun) {
     const lockOwner = acquireWriteMaintenanceLock(dbPath, "lark-im-enrich-records");
     try {
-      sqliteExec(dbPath, `BEGIN;\n${updates.join("\n")}\nCOMMIT;`, "update records");
+      // Recheck authority under the write transaction. CAS protects each
+      // snapshot even if synchronization committed during the remote lookups.
+      const effects = sqliteExec(dbPath, `
+        BEGIN IMMEDIATE;
+        CREATE TEMP TABLE __enrichment_fence (allowed INTEGER NOT NULL CHECK (allowed = 1));
+        INSERT INTO __enrichment_fence (allowed)
+        SELECT CASE WHEN EXISTS (
+          SELECT 1 FROM maintenance_locks
+          WHERE name = 'global'
+            AND owner = ${quoteSql(lockOwner)}
+            AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        ) AND NOT EXISTS (SELECT 1 FROM sync_locks) THEN 1 ELSE 0 END;
+        CREATE TEMP TABLE __enrichment_effects (updated INTEGER NOT NULL);
+        ${updates.join("\n")}
+        SELECT COALESCE(SUM(updated), 0) AS updated FROM __enrichment_effects;
+        COMMIT;
+      `, "update records");
+      updated = Number(effects[0]?.updated || 0);
+      skippedConflicts = updates.length - updated;
     } finally {
       releaseMaintenanceLock(dbPath, lockOwner);
     }
@@ -672,8 +713,12 @@ function main() {
     }));
   const output = {
     ok: true,
+    dry_run: opts.dryRun,
     scanned: rows.length,
+    planned: updates.length,
     updated,
+    skipped_conflicts: skippedConflicts,
+    unchanged: rows.length - updates.length,
     contact_names: contactNames.size,
     group_member_names: memberNames.size,
     app_names: appNames.size,

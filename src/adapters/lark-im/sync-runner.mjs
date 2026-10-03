@@ -141,29 +141,53 @@ function resolveDeps(deps = {}) {
   return { ...defaultDeps, ...deps };
 }
 
+// The discovery rank is an activity hint, not a timestamp of a message.
+const HOT_POOL_SIZE = 20;
+const HOT_SNAPSHOT_TTL_MS = 10 * 60_000;
+const RECENT_SUCCESS_SKIP_MS = 60_000;
+
 /** @param {ScopeRow} scope @param {string} key */
 function numericScopeRank(scope, key) {
-  const value = Number(scope.config?.[key]);
+  const raw = scope.config?.[key];
+  const value = raw === null || raw === undefined || raw === "" ? NaN : Number(raw);
   return Number.isFinite(value) ? value : Number.MAX_SAFE_INTEGER;
+}
+
+/** Persisted attempts rotate failed/killed work too. Creation time keeps a
+ * continuous stream of new scopes from always jumping ahead of a retry.
+ * @param {ScopeRow} scope */
+function scopeAttemptTime(scope) {
+  for (const value of [scope.last_attempt_at, scope.cursor_updated_at, scope.created_at]) {
+    const time = Date.parse(String(value || ""));
+    if (Number.isFinite(time)) return time;
+  }
+  return 0;
 }
 
 /** @param {ScopeRow} left @param {ScopeRow} right @param {ReceivedMode} mode */
 function compareReceivedScopes(left, right, mode) {
-  if (mode === "hot") {
-    const rank = numericScopeRank(left, "hot_rank") - numericScopeRank(right, "hot_rank");
-    if (rank !== 0) return rank;
-  } else {
-    const leftHasCursor = left.cursor !== null && left.cursor !== undefined;
-    const rightHasCursor = right.cursor !== null && right.cursor !== undefined;
-    if (leftHasCursor !== rightHasCursor) return leftHasCursor ? 1 : -1;
-    if (!leftHasCursor) {
-      const rank = numericScopeRank(left, "discovery_rank") - numericScopeRank(right, "discovery_rank");
-      if (rank !== 0) return rank;
-    }
-  }
-  const updated = String(left.cursor_updated_at || "").localeCompare(String(right.cursor_updated_at || ""));
-  if (updated !== 0) return updated;
+  const attempted = scopeAttemptTime(left) - scopeAttemptTime(right);
+  if (attempted !== 0) return attempted;
+  const rank = numericScopeRank(left, mode === "hot" ? "hot_rank" : "discovery_rank") -
+    numericScopeRank(right, mode === "hot" ? "hot_rank" : "discovery_rank");
+  if (rank !== 0) return rank;
   return left.id.localeCompare(right.id);
+}
+
+/**
+ * Fair traffic reserves alternating places for initialized and new scopes.
+ * When either lane is empty, the other borrows every remaining place.
+ * @param {ScopeRow[]} scopes
+ */
+function interleaveReceivedScopes(scopes) {
+  const initialized = scopes.filter((scope) => scope.cursor !== null && scope.cursor !== undefined);
+  const pending = scopes.filter((scope) => scope.cursor === null || scope.cursor === undefined);
+  const result = [];
+  for (let i = 0; i < Math.max(initialized.length, pending.length); i += 1) {
+    if (i < initialized.length) result.push(initialized[i]);
+    if (i < pending.length) result.push(pending[i]);
+  }
+  return result;
 }
 
 /**
@@ -173,38 +197,30 @@ function compareReceivedScopes(left, right, mode) {
  * @returns {ScopeRow[]}
  */
 function listReceivedScopes(dbPath, mode = "all", deps = defaultDeps) {
-  const modeWhere =
-    mode === "hot"
-      ? "AND json_extract(config_json, '$.hot_seen_at') IS NOT NULL"
-      : "";
-  const orderBy =
-    mode === "hot"
-      ? `
-     ORDER BY
-       CAST(COALESCE(json_extract(config_json, '$.hot_rank'), 999999999) AS INTEGER),
-       cursor_updated_at,
-       id;`
-      : `
-     ORDER BY
-       cursor_json IS NOT NULL,
-       CASE WHEN cursor_json IS NULL
-         THEN CAST(COALESCE(json_extract(config_json, '$.discovery_rank'), 999999999) AS INTEGER)
-         ELSE NULL
-       END,
-       cursor_updated_at,
-       id;`;
+  const nowMs = Date.parse(deps.nowIso());
+  if (!Number.isFinite(nowMs)) throw new Error("invalid received scheduling time");
+  const cutoff = new Date(nowMs - HOT_SNAPSHOT_TTL_MS).toISOString();
+  const modeWhere = mode === "hot" ? `
+       AND julianday(json_extract(s.config_json, '$.hot_seen_at')) >= julianday(${deps.quoteSql(cutoff)})
+       AND julianday(json_extract(s.config_json, '$.hot_seen_at')) <= julianday(${deps.quoteSql(new Date(nowMs).toISOString())})
+       AND json_extract(s.config_json, '$.hot_rank') >= 0
+       AND json_extract(s.config_json, '$.hot_rank') < ${HOT_POOL_SIZE}` : "";
+  const rankKey = mode === "hot" ? "hot_rank" : "discovery_rank";
   const rows = deps.sqliteQuery(
     dbPath,
-    `SELECT id, source_id, name, enabled, config_json, cursor_json, cursor_updated_at
-     FROM sync_scopes
-     WHERE source_id = ${deps.quoteSql(SOURCE_ID)}
-       AND id LIKE 'lark.im.received.chat.%'
-       AND enabled = 1
+    `SELECT s.id, s.source_id, s.name, s.enabled, s.config_json, s.cursor_json,
+       s.cursor_updated_at, s.created_at,
+       (SELECT MAX(r.started_at) FROM sync_runs r WHERE r.scope_id = s.id) AS last_attempt_at
+     FROM sync_scopes s
+     WHERE s.source_id = ${deps.quoteSql(SOURCE_ID)}
+       AND s.id LIKE 'lark.im.received.chat.%'
+       AND s.enabled = 1
        ${modeWhere}
-     ${orderBy}`,
+     ORDER BY COALESCE(last_attempt_at, s.cursor_updated_at, s.created_at),
+       CAST(COALESCE(json_extract(s.config_json, '$.${rankKey}'), 999999999) AS INTEGER), s.id;`,
     "list received scopes",
   );
-  return rows.map((row) => {
+  const scopes = rows.map((row) => {
     const scope = /** @type {ScopeRow} */ (row);
     return {
       ...scope,
@@ -212,6 +228,18 @@ function listReceivedScopes(dbPath, mode = "all", deps = defaultDeps) {
       cursor: scope.cursor_json ? JSON.parse(scope.cursor_json) : null,
     };
   }).sort((left, right) => compareReceivedScopes(left, right, mode));
+  if (mode !== "hot") return interleaveReceivedScopes(scopes);
+  // Repeat the eligibility guard for injected stores and malformed rank values.
+  return scopes.filter((scope) => {
+    const seen = Date.parse(String(scope.config.hot_seen_at || ""));
+    const rank = numericScopeRank(scope, "hot_rank");
+    const successfulAt = Date.parse(String(scope.cursor_updated_at || ""));
+    const boundary = Number(scope.cursor?.created_at_ms);
+    const recentlyCaughtUp = successfulAt > nowMs - RECENT_SUCCESS_SKIP_MS &&
+      successfulAt <= nowMs && Number.isFinite(boundary) && boundary >= nowMs - 2 * RECENT_SUCCESS_SKIP_MS;
+    return Number.isFinite(seen) && seen <= nowMs && seen >= nowMs - HOT_SNAPSHOT_TTL_MS &&
+      Number.isInteger(rank) && rank >= 0 && rank < HOT_POOL_SIZE && !recentlyCaughtUp;
+  });
 }
 
 /**
@@ -924,9 +952,41 @@ function syncReceivedScope(dbPath, opts, scope, selfProfile, deps = defaultDeps)
  */
 function syncReceived(dbPath, opts, selfProfile, deps = defaultDeps) {
   const allScopes = listReceivedScopes(dbPath, opts.receivedMode, deps);
-  const scopes =
-    opts.receivedScopesPerRun > 0 ? allScopes.slice(0, opts.receivedScopesPerRun) : allScopes;
-  return scopes.map((scope) => syncReceivedScope(dbPath, opts, scope, selfProfile, deps));
+  const limit = opts.receivedScopesPerRun > 0 ? opts.receivedScopesPerRun : allScopes.length;
+  // Refill a locked place from the same lane, preserving the split in actual
+  // started work. Each lane has a finite inspection budget; unused places may
+  // be borrowed after its candidates are exhausted or unavailable.
+  const queues = opts.receivedMode === "hot" ? [allScopes] : [
+    allScopes.filter((scope) => scope.cursor !== null && scope.cursor !== undefined),
+    allScopes.filter((scope) => scope.cursor === null || scope.cursor === undefined),
+  ];
+  const indices = queues.map(() => 0);
+  const laneAttempts = queues.map(() => 0);
+  const scanLimit = Math.max(limit * 3, limit + 20);
+  /** @type {RunResult[]} */
+  const results = [];
+  let attempted = 0;
+  while (attempted < limit) {
+    const available = queues.map((_, lane) => lane).filter((lane) =>
+      indices[lane] < queues[lane].length && indices[lane] < scanLimit);
+    if (!available.length) break;
+    const lane = available.sort((a, b) => laneAttempts[a] - laneAttempts[b] || a - b)[0];
+    const scope = queues[lane][indices[lane]++];
+    const result = syncReceivedScope(dbPath, opts, scope, selfProfile, deps);
+    results.push(result);
+    if (!result.skipped || result.run_id !== undefined && result.run_id !== null) {
+      attempted += 1;
+      laneAttempts[lane] += 1;
+    }
+    if (result.skipped && result.reason === "maintenance_lock") break;
+    // Transport retries are exhausted; leave the remaining scopes for a later run.
+    if (
+      result.ok === false &&
+      typeof result.error === "string" &&
+      /^lark-cli failed: kind=(rate_limited|network_timeout|network_error|service_unavailable)(?=\s|;|$)/.test(result.error)
+    ) break;
+  }
+  return results;
 }
 
 /**
@@ -960,6 +1020,7 @@ function createSyncRunner(deps = {}) {
 
 export {
   compareReceivedScopes,
+  interleaveReceivedScopes,
   createSyncRunner,
   discoverChatPages,
   discoverHotChatPages,

@@ -14,6 +14,7 @@ import {
  * @property {string[]=} redactedFlags
  * @property {number=} retries
  * @property {number=} retryDelayMs
+ * @property {number=} retryBudgetMs
  *
  * @typedef {(args: string[], options?: AdapterRunOptions) => JsonObject | null} LarkRunner
  *
@@ -106,10 +107,44 @@ function botAppId(bot) {
 }
 
 /**
- * @param {{run: LarkRunner}} deps
+ * @param {{run: LarkRunner, now?: () => number}} deps
  * @returns {NameResolver}
  */
-function createNameResolver({ run }) {
+function createNameResolver({ run, now = Date.now }) {
+  // Optional enrichment must yield to message ingestion. This retry budget is
+  // an application priority policy, not an official API rate limit.
+  const nameLookupRetryBudgetMs = 5000;
+  // Resolver-local, positive-only cache: never persist profile data or retain
+  // failed lookups. Reads refresh LRU order, not the five-minute rename TTL.
+  const cacheTtlMs = 5 * 60 * 1000;
+  const cacheMaxEntries = 1000;
+  /** @type {Map<string, {name: string, expiresAt: number}>} */
+  const nameCache = new Map();
+
+  /** @param {string} key */
+  function cachedName(key) {
+    const entry = nameCache.get(key);
+    if (!entry) return "";
+    nameCache.delete(key);
+    if (entry.expiresAt <= now()) return "";
+    nameCache.set(key, entry);
+    return entry.name;
+  }
+
+  /**
+   * @param {string} key
+   * @param {unknown} name
+   */
+  function cacheName(key, name) {
+    if (typeof name !== "string" || !name.trim()) return;
+    nameCache.delete(key);
+    nameCache.set(key, { name, expiresAt: now() + cacheTtlMs });
+    if (nameCache.size > cacheMaxEntries) {
+      const oldestKey = nameCache.keys().next().value;
+      if (oldestKey !== undefined) nameCache.delete(oldestKey);
+    }
+  }
+
   /**
    * @param {unknown[]} openIds
    * @param {AdapterOptions} opts
@@ -117,8 +152,15 @@ function createNameResolver({ run }) {
    */
   function resolveContactNames(openIds, opts, seed = new Map()) {
     const names = new Map(seed);
-    const unresolved = uniqueOpenIds(openIds).filter((id) => !names.has(id));
-    for (const ids of chunk(unresolved, 100)) {
+    const unresolved = uniqueOpenIds(openIds).filter((id) => {
+      if (names.has(id)) return false;
+      const name = cachedName(`user:${id}`);
+      if (name) names.set(id, name);
+      return !name;
+    });
+    // lark-cli +search-user returns at most 30 users per page. Keep each ID
+    // batch within that page and request it explicitly rather than default 20.
+    for (const ids of chunk(unresolved, 30)) {
       try {
         const json = run(
           [
@@ -126,6 +168,8 @@ function createNameResolver({ run }) {
             "+search-user",
             "--user-ids",
             ids.join(","),
+            "--page-size",
+            "30",
             "--as",
             "user",
             "--format",
@@ -135,13 +179,18 @@ function createNameResolver({ run }) {
             redactedFlags: ["--user-ids"],
             retries: opts.retries,
             retryDelayMs: opts.retryDelayMs,
+            retryBudgetMs: nameLookupRetryBudgetMs,
           },
         );
         const users = firstArray(json?.users, json?.data?.users);
         for (const user of users) {
           const openId = user?.open_id;
           const name = displayNameFromUser(user);
-          if (openId && name) names.set(openId, name);
+          if (openId && name && !seed.has(openId)) {
+            names.set(openId, name);
+            // An ID echoed as a display fallback is not a resolved name.
+            if (ids.includes(openId) && name !== openId) cacheName(`user:${openId}`, name);
+          }
         }
       } catch {
         // Name enrichment is best-effort; message sync correctness must not depend on it.
@@ -159,6 +208,14 @@ function createNameResolver({ run }) {
     const targetIds = new Set(uniqueOpenIds(openIds));
     const names = new Map();
     if (!chatIdValue || targetIds.size === 0) return names;
+
+    for (const id of targetIds) {
+      const name = cachedName(`member:${JSON.stringify([chatIdValue, id])}`);
+      if (name) {
+        names.set(id, name);
+        targetIds.delete(id);
+      }
+    }
 
     let pageToken = "";
     for (let page = 0; page < 50 && targetIds.size > 0; page += 1) {
@@ -185,6 +242,7 @@ function createNameResolver({ run }) {
             redactedFlags: ["--params"],
             retries: opts.retries,
             retryDelayMs: opts.retryDelayMs,
+            retryBudgetMs: nameLookupRetryBudgetMs,
           },
         );
         const items = firstArray(json?.items, json?.data?.items);
@@ -193,6 +251,7 @@ function createNameResolver({ run }) {
           const name = item?.name || item?.localized_name || "";
           if (memberId && targetIds.has(memberId) && name) {
             names.set(memberId, name);
+            cacheName(`member:${JSON.stringify([chatIdValue, memberId])}`, name);
             targetIds.delete(memberId);
           }
         }
@@ -213,6 +272,11 @@ function createNameResolver({ run }) {
   function resolveApplicationNames(appIds, opts) {
     const names = new Map();
     for (const appId of uniqueAppIds(appIds)) {
+      const cached = cachedName(`app:${appId}`);
+      if (cached) {
+        names.set(appId, cached);
+        continue;
+      }
       try {
         const json = run(
           [
@@ -229,11 +293,15 @@ function createNameResolver({ run }) {
           {
             retries: opts.retries,
             retryDelayMs: opts.retryDelayMs,
+            retryBudgetMs: nameLookupRetryBudgetMs,
           },
         );
         const app = json?.data?.app || json?.app;
         const name = app?.app_name || firstArray(app?.i18n).find((item) => item?.i18n_key === "zh_cn")?.name || "";
-        if (name) names.set(appId, name);
+        if (name) {
+          names.set(appId, name);
+          cacheName(`app:${appId}`, name);
+        }
       } catch {
         // App-name enrichment is best-effort. If permission is missing, leave it unresolved.
       }
@@ -268,6 +336,7 @@ function createNameResolver({ run }) {
             redactedFlags: ["--params"],
             retries: opts.retries,
             retryDelayMs: opts.retryDelayMs,
+            retryBudgetMs: nameLookupRetryBudgetMs,
           },
         );
         const bots = firstArray(json?.items, json?.data?.items).filter((bot) => botName(bot));

@@ -9,6 +9,7 @@ import {
   parseJsonOutput,
   parseLaunchdState,
   summarizeWorkerStability,
+  summarizeServiceFreshness,
 } from "../src/diagnostics/lark-im-service-report.mjs";
 import { renderServiceStatusText } from "../src/terminal/lark-im-service-view.mjs";
 
@@ -111,6 +112,17 @@ function stabilityFixture(overrides = {}) {
   };
 }
 
+const probeContext = { database_key: "a".repeat(64), source_id: "lark.im", auth_identity_verified: false };
+function probeFixture(checkedAt, overrides = {}) {
+  return {
+    kind: "lark_im_live_probe_cache/v2", context: probeContext, scope: "recent_hot_messages",
+    checked_at: checkedAt, expires_at: new Date(Date.parse(checkedAt) + 300000).toISOString(),
+    window: { start: "2026-06-19T00:00:00.000Z", end: "2026-06-20T00:00:00.000Z" },
+    sample: { remote_messages_checked: 3, probe_errors: 0 },
+    status: "healthy", ok: true, missing_count: 0, ...overrides,
+  };
+}
+
 test("service status report parses launchd, sync status, and worker log summary", () => {
   const calls = [];
   const cachePaths = [];
@@ -151,17 +163,10 @@ test("service status report parses launchd, sync status, and worker log summary"
         exists: true,
         events: workerEvents,
       }),
+      liveProbeContext: () => probeContext,
       readLiveProbeCache: (path) => {
         cachePaths.push(path);
-        return {
-          kind: "lark_im_live_probe_cache/v1",
-          checked_at: "2026-06-20T00:02:00.000Z",
-          status: "healthy",
-          ok: true,
-          missing_count: 0,
-          lag_ms: 1000,
-          reason: null,
-        };
+        return probeFixture("2026-06-20T00:02:00.000Z");
       },
       sqliteJson: (_dbPath, _sql, label) => {
         assert.equal(label, "read recent failed run kinds");
@@ -186,8 +191,8 @@ test("service status report parses launchd, sync status, and worker log summary"
   assert.equal(report.overview.service.status, "running");
   assert.equal(report.overview.health.status, "ok");
   assert.equal(report.overview.activity.status, "idle");
-  assert.equal(report.overview.freshness.status, "verified");
-  assert.equal(report.overview.freshness.detail, "checked 1m ago, missing 0, lag 1s");
+  assert.equal(report.overview.freshness.status, "sampled");
+  assert.equal(report.overview.freshness.detail, "3 recent hot messages sampled 1m ago; auth identity unknown");
   assert.match(report.freshness.cache_path, /logs\/test\/live-probe\.json$/);
   assert.deepEqual(cachePaths, [report.freshness.cache_path]);
   assert.equal(report.worker.log.exists, true);
@@ -198,7 +203,7 @@ test("service status report parses launchd, sync status, and worker log summary"
   assert.deepEqual(report.stability.failures.by_kind, [{ kind: "rate_limited", count: 1 }]);
   assert.deepEqual(calls, [
     ["launchctl", "print", "gui/501/com.example.worker"],
-    [process.execPath, "scripts/sync-status.mjs", "--format", "json"],
+    [process.execPath, "scripts/sync-status.mjs", "--db", "data/exocortex.sqlite", "--format", "json"],
   ]);
 });
 
@@ -299,22 +304,17 @@ test("service overview separates service, health, activity, and freshness", () =
       in_progress: true,
       last_step: { cycle: 13, name: "received-hot", ok: true, age_ms: 1000 },
     }),
-    liveProbe: {
-      checked_at: "2026-06-20T00:01:00.000Z",
-      status: "healthy",
-      ok: true,
-      missing_count: 0,
-      lag_ms: 0,
-    },
+    liveProbe: probeFixture("2026-06-20T00:01:00.000Z"),
+    expectedContext: probeContext,
     nowMs: Date.parse("2026-06-20T00:01:00.000Z"),
   });
 
   assert.equal(overview.service.status, "running");
   assert.equal(overview.health.status, "ok");
-  assert.equal(overview.health.detail, "all known enabled scopes have cursors");
+  assert.equal(overview.health.detail, "sync activity observed; this does not verify remote freshness");
   assert.equal(overview.activity.status, "syncing");
-  assert.equal(overview.freshness.status, "verified");
-  assert.equal(overview.freshness.detail, "checked 0s ago, missing 0, lag 0s");
+  assert.equal(overview.freshness.status, "sampled");
+  assert.equal(overview.freshness.detail, "3 recent hot messages sampled 0s ago; auth identity unknown");
 });
 
 test("service overview keeps catch-up as health, not activity", () => {
@@ -344,31 +344,21 @@ test("service overview maps delayed and stale live caches to freshness states", 
     launchd: { loaded: true, state: "running", pid: "123" },
     syncStatus: syncStatusFixture(),
     workerSummary: workerSummaryFixture(),
-    liveProbe: {
-      checked_at: "2026-06-20T00:00:00.000Z",
-      status: "delayed",
-      ok: false,
-      missing_count: 2,
-      lag_ms: 42000,
-    },
-    nowMs: Date.parse("2026-06-20T00:05:00.000Z"),
+    liveProbe: probeFixture("2026-06-20T00:00:00.000Z", { status: "delayed", ok: false, missing_count: 2 }),
+    expectedContext: probeContext,
+    nowMs: Date.parse("2026-06-20T00:04:00.000Z"),
   });
   const stale = buildServiceOverview({
     launchd: { loaded: true, state: "running", pid: "123" },
     syncStatus: syncStatusFixture(),
     workerSummary: workerSummaryFixture(),
-    liveProbe: {
-      checked_at: "2026-06-20T00:00:00.000Z",
-      status: "healthy",
-      ok: true,
-      missing_count: 0,
-      lag_ms: 0,
-    },
+    liveProbe: probeFixture("2026-06-20T00:00:00.000Z"),
+    expectedContext: probeContext,
     nowMs: Date.parse("2026-06-22T00:00:01.000Z"),
   });
 
   assert.equal(delayed.freshness.status, "behind");
-  assert.equal(delayed.freshness.detail, "checked 5m ago, missing 2, lag 42s");
+  assert.equal(delayed.freshness.detail, "sample checked 4m ago, missing 2; auth identity unknown");
   assert.equal(stale.freshness.status, "unknown");
   assert.equal(stale.freshness.detail, "last live probe stale, checked 2d ago");
 });
@@ -510,4 +500,26 @@ test("service status helpers parse launchd and json output", () => {
   });
   assert.deepEqual(parseJsonOutput({ stdout: "{\"ok\":true}" }), { ok: true });
   assert.equal(parseJsonOutput({ stdout: "not json" }), null);
+});
+
+test("freshness requires a bound nonempty sample with a current bounded lease", () => {
+  const now = Date.parse("2026-06-20T00:01:00.000Z");
+  const base = probeFixture("2026-06-20T00:00:00.000Z");
+  const read = (cache, context = probeContext, at = now) => summarizeServiceFreshness(cache, at, undefined, context);
+  assert.equal(read(base).status, "sampled");
+  assert.equal(read(base).auth_identity, "unknown");
+  assert.equal(read(base).sample_count, 3);
+  assert.equal(read(base).expires_at, "2026-06-20T00:05:00.000Z");
+  assert.equal(read({ ...base, kind: "lark_im_live_probe_cache/v1" }).reason, "legacy_evidence");
+  assert.equal(read(base, null).reason, "context_mismatch");
+  assert.equal(read(base, { ...probeContext, database_key: "b".repeat(64) }).reason, "context_mismatch");
+  assert.equal(read(base, { ...probeContext, source_id: "other" }).reason, "context_mismatch");
+  assert.equal(read({ ...base, sample: { remote_messages_checked: 0, probe_errors: 0 } }).reason, "no_usable_sample");
+  assert.equal(read({ ...base, sample: { remote_messages_checked: 3, probe_errors: 1 } }).status, "unknown");
+  assert.equal(read({ ...base, window: {} }).status, "unknown");
+  assert.equal(read({ ...base, missing_count: 1 }).status, "unknown");
+  assert.equal(read({ ...base, ok: false }).status, "unknown");
+  assert.equal(read(base, probeContext, now - 120000).reason, "invalid_timestamp");
+  assert.equal(read(base, probeContext, now + 240000).reason, "expired");
+  assert.equal(read({ ...base, expires_at: "2027-01-01T00:00:00.000Z" }, probeContext, now + 240000).reason, "expired");
 });

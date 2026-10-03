@@ -31,6 +31,18 @@ type WriteEffects = {
     updated: number;
     duplicate: number;
 };
+type BoundedReplayOptions = {
+    scope: SyncScope;
+    initialSyncStartMs: number;
+    startMs: number;
+    endMs: number;
+    planId: string;
+    attemptId: string;
+    selfIdHash: string;
+    pages: number;
+    fetchedCount: number;
+    records: StoredRecord[];
+};
 type MaintenanceLockOptions = {
     owner?: string;
     ttlSeconds?: number;
@@ -52,6 +64,10 @@ type RecoveryOptions = {
     hardLeaseSeconds?: number;
 };
 type SqliteRow = Record<string, any>;
+type InitialSyncStartOptions = {
+    explicit?: boolean;
+    endMs?: number;
+};
 declare const DEFAULT_HARD_LEASE_SECONDS: number;
 declare function quoteSql(value: unknown): string;
 declare function sqlJson(value: unknown): string;
@@ -68,6 +84,8 @@ declare function recoverStaleSyncState(dbPath: string, options?: RecoveryOptions
 };
 declare function ensureInitialized(dbPath: string): void;
 declare function readScope(dbPath: string, scopeId: string): SyncScope;
+declare function validateInitialSyncStartMs(value: unknown): number;
+declare function ensureSourceInitialSyncStart(dbPath: string, sourceId: string, candidateStartMs: number, options?: InitialSyncStartOptions): number;
 declare function isMaintenanceLocked(dbPath: string, now?: Date): boolean;
 declare function acquireMaintenanceLock(dbPath: string, options?: MaintenanceLockOptions): MaintenanceLockResult;
 declare function releaseMaintenanceLock(dbPath: string, owner?: string): void;
@@ -78,8 +96,22 @@ declare function failRun(dbPath: string, scope: SyncScope, runId: number, error:
 declare function existingRecordMap(dbPath: string, sourceId: string, records: StoredRecord[]): Map<any, any>;
 declare function normalizeExternalVersion(value: unknown): string | null;
 declare function normalizeStoredRecords(records: StoredRecord[], sourceId?: string): StoredRecord[];
-declare function upsertRecordsSql(records: StoredRecord[]): string;
+/** A repair must not silently choose between unordered conflicting page items. */
+declare function normalizeBoundedReplayRecords(records: StoredRecord[], sourceId: string): StoredRecord[];
+declare function upsertRecordsSql(records: StoredRecord[], options?: {
+    strictVersionIncrease?: boolean;
+}): string;
+/** Commit one completely fetched, explicitly bounded repair without touching
+ * normal runs, scope cursors, or freshness markers. Remote work belongs outside
+ * this method; only this short transaction holds a maintenance lease. */
+declare function commitBoundedReplayRecords(dbPath: string, options: BoundedReplayOptions): {
+    audit_id: string;
+    inserted: number;
+    updated: number;
+    duplicate: number;
+    conflicts: number;
+};
 declare function countWriteEffects(dbPath: string, sourceId: string, records: StoredRecord[]): WriteEffects;
 declare function succeedRecordRun(dbPath: string, scope: SyncScope, runId: number, records: StoredRecord[], scannedCount: number, cursor: JsonObject | null, metadata: JsonObject): WriteEffects;
 declare const succeedMessageRun: typeof succeedRecordRun;
-export { DEFAULT_HARD_LEASE_SECONDS, acquireLock, acquireMaintenanceLock, countWriteEffects, createRun, ensureInitialized, existingRecordMap, failRun, isMaintenanceLocked, normalizeExternalVersion, normalizeStoredRecords, ownerPid, ownerStartedAtMs, defaultOwnerState, recoverStaleSyncState, quoteSql, readScope, releaseLock, releaseMaintenanceLock, secureDatabasePaths, sqlJson, sqliteExec, sqliteQuery, succeedMessageRun, succeedRecordRun, upsertRecordsSql, };
+export { DEFAULT_HARD_LEASE_SECONDS, acquireLock, acquireMaintenanceLock, countWriteEffects, commitBoundedReplayRecords, normalizeBoundedReplayRecords, createRun, ensureInitialized, ensureSourceInitialSyncStart, existingRecordMap, failRun, isMaintenanceLocked, normalizeExternalVersion, normalizeStoredRecords, ownerPid, ownerStartedAtMs, defaultOwnerState, recoverStaleSyncState, quoteSql, readScope, releaseLock, releaseMaintenanceLock, secureDatabasePaths, sqlJson, sqliteExec, sqliteQuery, succeedMessageRun, succeedRecordRun, upsertRecordsSql, validateInitialSyncStartMs, };

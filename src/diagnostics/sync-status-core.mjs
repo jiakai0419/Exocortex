@@ -5,6 +5,8 @@
  *
  * @typedef {object} ScopeCounts
  * @property {number | string=} received_without_cursor
+ * @property {number | string=} message_enabled
+ * @property {number | string=} message_without_success
  *
  * @typedef {object} HealthStateInput
  * @property {{has_more?: boolean} | null | undefined} discoveryCursor
@@ -12,7 +14,7 @@
  * @property {Row[]} locks
  * @property {Row[]} runCounts
  *
- * @typedef {"syncing" | "catching_up" | "ok_with_history" | "ok"} HealthState
+ * @typedef {"syncing" | "catching_up" | "not_ready" | "needs_attention" | "ok_with_history" | "ok"} HealthState
  */
 
 /**
@@ -35,15 +37,22 @@ function countBy(rows, keyName, valueName) {
 function summarizeHealth({ discoveryCursor, scopeCounts, locks, runCounts }) {
   const running = Number(countBy(runCounts, "status", "count").running || 0);
   const failed = Number(countBy(runCounts, "status", "count").failed || 0);
+  const succeeded = Number(countBy(runCounts, "status", "count").succeeded || 0);
   const receivedWithoutCursor = Number(scopeCounts.received_without_cursor || 0);
   if (locks.length > 0 || running > 0) return "syncing";
+  if (succeeded === 0 && failed > 0) return "needs_attention";
+  if (succeeded === 0 || Number(scopeCounts.message_enabled || 0) === 0) return "not_ready";
   if (receivedWithoutCursor > 0 || discoveryCursor?.has_more === true) return "catching_up";
+  if (discoveryCursor?.has_more !== false || Number(scopeCounts.message_without_success || 0) > 0) return "not_ready";
   if (failed > 0) return "ok_with_history";
   return "ok";
 }
 
 /** @param {HealthStateInput} input */
 function healthDetail({ discoveryCursor, scopeCounts, locks, runCounts }) {
+  const health = summarizeHealth({ discoveryCursor, scopeCounts, locks, runCounts });
+  if (health === "not_ready") return "initial discovery or successful message-scope evidence is missing";
+  if (health === "needs_attention") return "sync history contains failures but no successful run";
   const running = Number(countBy(runCounts, "status", "count").running || 0);
   const receivedWithoutCursor = Number(scopeCounts.received_without_cursor || 0);
   if (locks.length > 0 || running > 0) return "worker is currently syncing";

@@ -1,5 +1,7 @@
 // @ts-check
 
+import { readOnlySqliteJson } from "../storage/sqlite/readonly-query.mjs";
+
 import { spawnSync } from "node:child_process";
 import {
   closeSync,
@@ -11,10 +13,10 @@ import {
 import { resolve } from "node:path";
 import { summarizeWorkerEvents } from "../../dist/runtime/worker/lark-im-worker-core.js";
 import { classifyLarkFailure } from "../adapters/lark-im/transport.mjs";
-import { readLiveProbeCache } from "./live-probe-cache.mjs";
+import { readLiveProbeCache, liveProbeContext, DEFAULT_LIVE_PROBE_TTL_MS } from "./live-probe-cache.mjs";
 import { diagnosticSubprocessError } from "./public-safe.mjs";
 
-const DEFAULT_FRESHNESS_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_FRESHNESS_MAX_AGE_MS = DEFAULT_LIVE_PROBE_TTL_MS;
 const DEFAULT_STABILITY_WINDOW_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_WORKER_LOG_TAIL_BYTES = 8 * 1024 * 1024;
 const DEFAULT_WORKER_LOG_MAX_EVENTS = 20000;
@@ -40,6 +42,7 @@ const DEFAULT_DB = "data/exocortex.sqlite";
  * @property {(logDir: string) => WorkerLogTail=} readRecentWorkerEvents
  * @property {(events: unknown[], nowMs?: number) => JsonObject=} summarizeWorkerEvents
  * @property {(path: string) => JsonObject | null=} readLiveProbeCache
+ * @property {(path: string) => JsonObject | null=} liveProbeContext
  * @property {(dbPath: string, sql: string, label: string) => JsonObject[]=} sqliteJson
  * @property {number=} nowMs
  * @property {number=} freshnessMaxAgeMs
@@ -48,7 +51,7 @@ const DEFAULT_DB = "data/exocortex.sqlite";
  * @typedef {"running" | "stopped"} ServiceRuntimeStatus
  * @typedef {"ok" | "catching_up" | "problem"} ServiceHealthStatus
  * @typedef {"idle" | "syncing"} ServiceActivityStatus
- * @typedef {"verified" | "unknown" | "behind"} ServiceFreshnessStatus
+ * @typedef {"sampled" | "unknown" | "behind"} ServiceFreshnessStatus
  *
  * @typedef {object} ServiceOverview
  * @property {{status: ServiceRuntimeStatus, detail: string}} service
@@ -87,16 +90,7 @@ function runCommand(cmd, args, options = {}) {
  * @returns {JsonObject[]}
  */
 function sqliteJson(dbPath, sql, label) {
-  const result = spawnSync("sqlite3", ["-json", dbPath], {
-    input: `.timeout 5000\n${sql}`,
-    encoding: "utf8",
-    maxBuffer: 20 * 1024 * 1024,
-    timeout: 30_000,
-    killSignal: "SIGKILL",
-  });
-  if (result.status !== 0 || result.error) throw diagnosticSubprocessError(result, label);
-  const trimmed = String(result.stdout || "").trim();
-  return trimmed ? JSON.parse(trimmed) : [];
+  return readOnlySqliteJson(dbPath, sql, label);
 }
 
 /** @param {string} stdout */
@@ -308,7 +302,7 @@ function summarizeServiceHealth({ service, syncStatus, syncErrorText = "", worke
   if (service.status !== "running") return { status: "problem", detail: "background service is stopped" };
   if (!syncStatus) return { status: "problem", detail: syncErrorText || "sync status unavailable" };
   const rawHealth = String(syncStatus.health || "").toLowerCase();
-  if (["failed", "needs_attention", "problem", "command_failed"].includes(rawHealth)) {
+  if (["failed", "needs_attention", "problem", "command_failed", "not_ready", "unknown"].includes(rawHealth)) {
     return { status: "problem", detail: syncStatus.health_detail || rawHealth };
   }
   if (workerSummary.last_cycle?.ok === false && !workerSummary.in_progress) {
@@ -318,8 +312,9 @@ function summarizeServiceHealth({ service, syncStatus, syncErrorText = "", worke
     return { status: "catching_up", detail: syncStatus.health_detail || "sync is still catching up" };
   }
   if (rawHealth === "syncing") {
-    return { status: "ok", detail: "all known enabled scopes have cursors" };
+    return { status: "ok", detail: "sync activity observed; this does not verify remote freshness" };
   }
+  if (!["ok", "ok_with_history"].includes(rawHealth)) return { status: "problem", detail: "sync health is unknown" };
   return { status: "ok", detail: syncStatus.health_detail || "all known enabled scopes have cursors" };
 }
 
@@ -358,37 +353,54 @@ function durationText(ms) {
 }
 
 /**
+ * Cached evidence is local-file/source bound and deliberately says nothing
+ * about the identity of the currently authenticated remote principal.
  * @param {JsonObject | null | undefined} liveProbe
  * @param {number} [nowMs]
  * @param {number} [maxAgeMs]
- * @returns {{status: ServiceFreshnessStatus, detail: string}}
+ * @param {JsonObject | null} [expectedContext]
+ * @returns {{status: ServiceFreshnessStatus, detail: string, [key: string]: any}}
  */
-function summarizeServiceFreshness(liveProbe, nowMs = Date.now(), maxAgeMs = DEFAULT_FRESHNESS_MAX_AGE_MS) {
-  if (!liveProbe) return { status: "unknown", detail: "no cached live probe" };
+function summarizeServiceFreshness(liveProbe, nowMs = Date.now(), maxAgeMs = DEFAULT_FRESHNESS_MAX_AGE_MS, expectedContext = null) {
+  const unknown = (/** @type {string} */ reason, /** @type {string} */ detail) => ({
+    status: /** @type {ServiceFreshnessStatus} */ ("unknown"), reason, detail, auth_identity: "unknown",
+  });
+  if (!liveProbe) return unknown("no_cached_probe", "no cached live probe");
+  if (liveProbe.kind !== "lark_im_live_probe_cache/v2") return unknown("legacy_evidence", "legacy live probe lacks bound sample evidence");
+  if (!expectedContext || !liveProbe.context || liveProbe.context.database_key !== expectedContext.database_key || liveProbe.context.source_id !== expectedContext.source_id) {
+    return unknown("context_mismatch", "live probe does not match the current database/source");
+  }
   const checkedAtMs = Date.parse(String(liveProbe.checked_at || ""));
-  if (!Number.isFinite(checkedAtMs)) {
-    return { status: "unknown", detail: "cached live probe has no valid timestamp" };
+  const expiresAtMs = Date.parse(String(liveProbe.expires_at || ""));
+  if (!Number.isFinite(checkedAtMs) || !Number.isFinite(expiresAtMs) || checkedAtMs > nowMs || expiresAtMs <= checkedAtMs) {
+    return unknown("invalid_timestamp", "cached live probe has invalid timestamps");
   }
-  const ageMs = Math.max(0, nowMs - checkedAtMs);
-  const ageText = `${durationText(ageMs)} ago`;
-  if (ageMs > maxAgeMs) return { status: "unknown", detail: `last live probe stale, checked ${ageText}` };
-  const status = String(liveProbe.status || "").toLowerCase();
-  if (status === "healthy" || liveProbe.ok === true) {
-    const missing = liveProbe.missing_count ?? 0;
-    const lag = liveProbe.lag_ms === null || liveProbe.lag_ms === undefined ? "unknown" : durationText(liveProbe.lag_ms);
-    return { status: "verified", detail: `checked ${ageText}, missing ${missing}, lag ${lag}` };
+  const deadlineMs = Math.min(expiresAtMs, checkedAtMs + Math.min(DEFAULT_FRESHNESS_MAX_AGE_MS, maxAgeMs));
+  const ageText = `${durationText(nowMs - checkedAtMs)} ago`;
+  if (nowMs >= deadlineMs) return unknown("expired", `last live probe stale, checked ${ageText}`);
+  const windowStartMs = Date.parse(String(liveProbe.window?.start || ""));
+  const windowEndMs = Date.parse(String(liveProbe.window?.end || ""));
+  const sampleCount = liveProbe.sample?.remote_messages_checked;
+  if (liveProbe.scope !== "recent_hot_messages" || !Number.isFinite(windowStartMs) || !Number.isFinite(windowEndMs) || windowStartMs >= windowEndMs || !Number.isSafeInteger(sampleCount) || sampleCount <= 0) {
+    return unknown("no_usable_sample", "live probe lacks a usable message sample and bounded window");
   }
-  if (status === "delayed") {
-    const missing = liveProbe.missing_count ?? "?";
-    const lag = liveProbe.lag_ms === null || liveProbe.lag_ms === undefined ? "unknown" : durationText(liveProbe.lag_ms);
-    return { status: "behind", detail: `checked ${ageText}, missing ${missing}, lag ${lag}` };
+  const evidence = {
+    scope: "recent_hot_messages", sample_count: sampleCount,
+    window: { start: new Date(windowStartMs).toISOString(), end: new Date(windowEndMs).toISOString() },
+    checked_at: new Date(checkedAtMs).toISOString(), expires_at: new Date(deadlineMs).toISOString(),
+    auth_identity: "unknown",
+  };
+  if (liveProbe.status === "healthy" && liveProbe.ok === true && liveProbe.missing_count === 0 && liveProbe.sample?.probe_errors === 0) {
+    return { ...evidence, status: "sampled", detail: `${sampleCount} recent hot messages sampled ${ageText}; auth identity unknown` };
   }
-  const reason = liveProbe.reason ? `: ${liveProbe.reason}` : "";
-  return { status: "unknown", detail: `last live probe ${status || "unavailable"} ${ageText}${reason}` };
+  if (liveProbe.status === "delayed" && Number(liveProbe.missing_count) > 0) {
+    return { ...evidence, status: "behind", detail: `sample checked ${ageText}, missing ${liveProbe.missing_count}; auth identity unknown` };
+  }
+  return unknown("inconclusive", "last live probe did not establish sample freshness");
 }
 
 /**
- * @param {{launchd: JsonObject, syncStatus: JsonObject | null, syncErrorText?: string, workerSummary: JsonObject, liveProbe?: JsonObject | null, nowMs?: number, freshnessMaxAgeMs?: number}} input
+ * @param {{launchd: JsonObject, syncStatus: JsonObject | null, syncErrorText?: string, workerSummary: JsonObject, liveProbe?: JsonObject | null, expectedContext?: JsonObject | null, nowMs?: number, freshnessMaxAgeMs?: number}} input
  * @returns {ServiceOverview}
  */
 function buildServiceOverview({
@@ -397,6 +409,7 @@ function buildServiceOverview({
   syncErrorText = "",
   workerSummary,
   liveProbe = null,
+  expectedContext = null,
   nowMs = Date.now(),
   freshnessMaxAgeMs = DEFAULT_FRESHNESS_MAX_AGE_MS,
 }) {
@@ -405,7 +418,7 @@ function buildServiceOverview({
     service,
     health: summarizeServiceHealth({ service, syncStatus, syncErrorText, workerSummary }),
     activity: summarizeServiceActivity({ service, syncStatus, workerSummary }),
-    freshness: summarizeServiceFreshness(liveProbe, nowMs, freshnessMaxAgeMs),
+    freshness: summarizeServiceFreshness(liveProbe, nowMs, freshnessMaxAgeMs, expectedContext),
   };
 }
 
@@ -422,7 +435,7 @@ function buildServiceStatusReport(opts, deps = {}) {
   const launchd = run("launchctl", ["print", opts.target], { allowFailure: true });
   const loaded = launchd.status === 0;
   const launchdState = loaded ? parseLaunchdState(launchd.stdout || "") : {};
-  const sync = run(process.execPath, ["scripts/sync-status.mjs", "--format", "json"], { allowFailure: true });
+  const sync = run(process.execPath, ["scripts/sync-status.mjs", "--db", opts.db || DEFAULT_DB, "--format", "json"], { allowFailure: true });
   const syncStatus = parseJsonOutput(sync);
   const workerLog = readWorkerLog(opts.logDir);
   const workerSummary = summarize(workerLog.events, nowMs);
@@ -464,6 +477,7 @@ function buildServiceStatusReport(opts, deps = {}) {
       syncErrorText,
       workerSummary,
       liveProbe,
+      expectedContext: (deps.liveProbeContext || liveProbeContext)(opts.db || DEFAULT_DB),
       nowMs,
       freshnessMaxAgeMs: deps.freshnessMaxAgeMs,
     }),

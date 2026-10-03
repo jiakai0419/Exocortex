@@ -1,6 +1,7 @@
 // @ts-check
 
 import { createHash } from "node:crypto";
+import { renderSystemContent } from "./system-content.mjs";
 
 /**
  * @typedef {"sent" | "received"} MessageDirection
@@ -25,6 +26,12 @@ import { createHash } from "node:crypto";
  * @property {boolean=} updated
  * @property {Array<Record<string, any>>=} mentions
  * @property {unknown=} content
+ * @property {string=} source_api
+ * @property {Record<string, any>=} raw_api
+ * @property {Record<string, any>=} raw_api_expansions
+ * @property {Record<string, any>=} content_rendering
+ * @property {string=} root_id
+ * @property {string=} parent_id
  *
  * @typedef {object} NameDetails
  * @property {string} name
@@ -211,6 +218,12 @@ function bodyFromMessage(message) {
   if (message?.deleted === true && isInvalidRenderedContent(body)) {
     return "[已撤回/已删除：飞书未返回原始富文本内容]";
   }
+  if ((message?.msg_type || message?.message_type) === "system") {
+    if (message?.source_api === "im.v1.messages" && message.content_rendering?.status === "structured_fallback") {
+      return body;
+    }
+    return renderSystemContent(message?.content) ?? body;
+  }
   return body;
 }
 
@@ -332,7 +345,24 @@ function recordFromMessage(message, scopeId, direction, context = {}, scopeConfi
     mentions: Array.isArray(message?.mentions) ? message.mentions : [],
     content: message?.content ?? null,
   };
-  const rawJson = JSON.stringify(message);
+  // Native API adapters retain their original message separately from derived
+  // text. Keep hash(raw_json) as the source-content hash, independent of the
+  // renderer version. Legacy CLI messages retain their existing serialization.
+  const native = message.source_api === "im.v1.messages"
+    && message.raw_api && typeof message.raw_api === "object" && !Array.isArray(message.raw_api);
+  let sourceMessage = native ? message.raw_api : message;
+  if (native) {
+    Object.assign(canonical, {
+      source_api: message.source_api,
+      content_rendering: message.content_rendering || null,
+      root_id: message.root_id || null,
+      parent_id: message.parent_id || null,
+    });
+    if (message.raw_api_expansions) {
+      sourceMessage = { ...message.raw_api, raw_api_expansions: message.raw_api_expansions };
+    }
+  }
+  const rawJson = JSON.stringify(sourceMessage);
   const body = bodyFromMessage(message);
   return {
     source_id: SOURCE_ID,

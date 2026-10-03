@@ -172,9 +172,11 @@ function buildLagReport({
       end: localIsoFromMs(opts.endMs),
     },
     probe: {
+      mode: "raw_first_page_including_replies",
+      comparison: "message_id_presence",
       hot_chats_requested: opts.hotChats,
       hot_chats_found: chats.length,
-      messages_per_chat: opts.messagesPerChat,
+      messages_per_chat: Math.min(50, opts.messagesPerChat),
       remote_messages_checked: sortedRemote.length,
       unsupported_chats: unsupportedChats.length,
       probe_errors: probeErrors.length,
@@ -246,15 +248,21 @@ function sanitizeLagReportForPublicOutput(report) {
       exit_status: Number(report.exit_status || 1),
     };
   }
-  const status = ["healthy", "delayed", "needs_attention", "inconclusive", "unavailable"].includes(
+  let status = ["healthy", "delayed", "needs_attention", "inconclusive", "unavailable"].includes(
     String(report?.status),
   )
     ? String(report.status)
     : "inconclusive";
   const safeReasons = new Set(["no_hot_chats", "no_usable_remote_messages", "keychain_unavailable"]);
-  const reason = safeReasons.has(String(report?.reason)) ? String(report.reason) : null;
+  let reason = safeReasons.has(String(report?.reason)) ? String(report.reason) : null;
+  const sampleCount = Number(report?.probe?.remote_messages_checked);
+  if (status === "healthy" && (!Number.isSafeInteger(sampleCount) || sampleCount <= 0)) {
+    status = "inconclusive";
+    reason = "no_usable_remote_messages";
+  }
+  if (status === "healthy" && Number(report?.probe?.probe_errors || 0) > 0) status = "needs_attention";
   return {
-    ok: status === "healthy",
+    ok: status === "healthy" && report.ok === true,
     status,
     reason: reason || undefined,
     checked_at: publicTimestamp(report?.checked_at),
@@ -263,6 +271,8 @@ function sanitizeLagReportForPublicOutput(report) {
       end: publicTimestamp(report?.window?.end),
     },
     probe: {
+      mode: report?.probe?.mode === "raw_first_page_including_replies" ? "raw_first_page_including_replies" : "unknown",
+      comparison: report?.probe?.comparison === "message_id_presence" ? "message_id_presence" : "unknown",
       hot_chats_requested: Math.max(0, Number(report?.probe?.hot_chats_requested || 0)),
       hot_chats_found: Math.max(0, Number(report?.probe?.hot_chats_found || 0)),
       messages_per_chat: Math.max(0, Number(report?.probe?.messages_per_chat || 0)),

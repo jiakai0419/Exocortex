@@ -22,13 +22,18 @@
  * @property {string=} stderr
  * @property {string=} reason
  * @property {string=} hint
+ * @property {string=} scope
+ * @property {string=} auth_identity
+ * @property {number=} missing_count
+ * @property {{remote_messages_checked?: number, probe_errors?: number}=} probe
+ * @property {{start?: string, end?: string}=} window
  *
  * @typedef {object} DoctorState
  * @property {LocalStatus} status
  * @property {LocalQuality} quality
  * @property {LiveResult | null=} live
  *
- * @typedef {"needs_attention" | "delayed" | "syncing" | "catching_up" | "fresh"} OverallStatus
+ * @typedef {"needs_attention" | "delayed" | "syncing" | "catching_up" | "not_ready" | "unknown" | "local_ready" | "sampled"} OverallStatus
  */
 
 /** @param {CommandResult | null | undefined} result */
@@ -95,6 +100,11 @@ function buildFindings({ status, quality, live }) {
   if (quality.status === "command_failed") findings.push("local quality command failed");
   if (status.health === "syncing") findings.push("worker is currently syncing");
   if (status.health === "catching_up") findings.push(status.health_detail || "initial catch-up is still in progress");
+  if (status.health === "not_ready") findings.push("initial discovery or successful message-scope evidence is missing");
+  if (status.health === "needs_attention") findings.push("local sync state needs attention");
+  if (!["syncing", "catching_up", "not_ready", "needs_attention", "ok", "ok_with_history"].includes(status.health || "")) {
+    findings.push("local sync state is unknown");
+  }
   if (missingSenderName > 0) findings.push("some senders still lack display names");
   if (missingChatName > 0) findings.push("some group messages still lack chat names");
   if (invalidRenderedBody > 0) findings.push("some messages still have invalid rendered bodies");
@@ -103,6 +113,9 @@ function buildFindings({ status, quality, live }) {
   if (live?.status === "command_failed") findings.push("live lag probe could not run");
   if (live?.status === "inconclusive") findings.push("live lag probe did not obtain a usable remote sample");
   if (live?.status === "unavailable") findings.push("live lag probe unavailable in this shell");
+  if (live?.status === "healthy" && !(Number(live.probe?.remote_messages_checked) > 0)) {
+    findings.push("live lag probe has no usable message sample");
+  }
   return findings;
 }
 
@@ -113,6 +126,7 @@ function buildFindings({ status, quality, live }) {
 function overallStatus({ status, quality, live }) {
   const state = { status, quality, live };
   if (status.status === "command_failed" || quality.status === "command_failed") return "needs_attention";
+  if (status.health === "needs_attention") return "needs_attention";
   if (
     live?.status === "needs_attention" ||
     live?.status === "command_failed" ||
@@ -122,7 +136,17 @@ function overallStatus({ status, quality, live }) {
   if (live?.status === "delayed") return "delayed";
   if (status.health === "syncing") return "syncing";
   if (status.health === "catching_up") return "catching_up";
-  return "fresh";
+  if (status.health === "not_ready") return "not_ready";
+  if (!["ok", "ok_with_history"].includes(status.health || "")) return "unknown";
+  if (live?.status === "healthy") {
+    const start = Date.parse(String(live.window?.start || ""));
+    const end = Date.parse(String(live.window?.end || ""));
+    return live.ok === true && Number.isSafeInteger(live.probe?.remote_messages_checked) && Number(live.probe?.remote_messages_checked) > 0
+      && live.missing_count === 0 && Number(live.probe?.probe_errors || 0) === 0
+      && Number.isFinite(start) && Number.isFinite(end) && start < end
+      ? "sampled" : "unknown";
+  }
+  return "local_ready";
 }
 
 export {

@@ -2,16 +2,20 @@
 
 import { resolve } from "node:path";
 import { getSelfProfile } from "../adapters/lark-im/adapter.mjs";
+import { getTransportStats, resetTransportStats } from "../adapters/lark-im/transport.mjs";
 import {
   createSyncRunner,
 } from "../adapters/lark-im/sync-runner.mjs";
 import {
-  localDay,
   localIsoFromMs,
-  localOffset,
   parseLarkTimeMs,
+  SOURCE_ID,
 } from "../adapters/lark-im/core.mjs";
-import { ensureInitialized } from "../../dist/storage/sqlite/ingestion-store.js";
+import {
+  ensureInitialized,
+  ensureSourceInitialSyncStart,
+  validateInitialSyncStartMs,
+} from "../../dist/storage/sqlite/ingestion-store.js";
 
 const DEFAULT_DB = "data/exocortex.sqlite";
 const DEFAULT_PAGE_SIZE = 50;
@@ -47,6 +51,7 @@ const DEFAULT_RETRY_DELAY_MS = 2000;
  * @property {string} chatTypes
  * @property {number} stableHorizonSeconds
  * @property {boolean} endExplicit
+ * @property {boolean} startExplicit
  * @property {number} lockTtlSeconds
  * @property {number} retries
  * @property {number} retryDelayMs
@@ -67,10 +72,13 @@ const DEFAULT_RETRY_DELAY_MS = 2000;
  *
  * @typedef {object} LarkImSyncCommandDeps
  * @property {(dbPath: string) => void=} ensureInitialized
+ * @property {(dbPath: string, sourceId: string, candidateStartMs: number, options?: {explicit?: boolean, endMs?: number}) => number=} ensureSourceInitialSyncStart
  * @property {(opts: SyncOptions) => SelfProfile=} getSelfProfile
  * @property {any=} syncRunner
  * @property {Partial<Record<string, any>>=} syncRunnerDeps
  * @property {(dbPath: string) => string=} resolvePath
+ * @property {() => JsonObject=} getTransportStats
+ * @property {() => void=} resetTransportStats
  *
  * @typedef {object} CliIo
  * @property {{write: (text: string) => unknown}=} stdout
@@ -84,7 +92,8 @@ function usage() {
 Options:
   --db <path>                 SQLite database path. Default: ${DEFAULT_DB}
   --scope <scope>             all | sent | discover | received. Default: all
-  --start <iso>               Initial sync start when a scope has no cursor. Default: today 00:00 local time.
+  --start <iso>               Confirm the persistent start for scopes without cursors; requires an ISO timezone.
+                              On a new source, default: today 00:00 local time. Later conflicting values fail.
   --end <iso>                 Upper bound for this run. Default: now.
   --page-size <n>             Message page size, max 50. Default: ${DEFAULT_PAGE_SIZE}
   --max-pages <n>             Max message pages per scope. Default: ${DEFAULT_MAX_PAGES}
@@ -146,18 +155,32 @@ function parseTimeMs(value, name) {
   return parsed;
 }
 
-function defaultStartIso() {
-  const now = new Date();
-  return `${localDay(now)}T00:00:00${localOffset(now)}`;
+function defaultStartIso(now) {
+  return localIsoFromMs(new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime());
+}
+
+/** @param {string} value */
+function parseInitialStartMs(value) {
+  const match = value.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,3}))?(Z|([+-])(\d{2}):(\d{2}))$/);
+  if (!match) throw new Error("--start must be an ISO timestamp with an explicit timezone (Z or +/-HH:mm)");
+  const [, local, fraction = "", zone, sign, hour = "0", minute = "0"] = match;
+  if (Number(hour) > 23 || Number(minute) > 59) throw new Error("--start has an invalid timezone offset");
+  const parsed = validateInitialSyncStartMs(Date.parse(value));
+  const offset = zone === "Z" ? 0 : (sign === "-" ? -1 : 1) * (Number(hour) * 60 + Number(minute)) * 60_000;
+  if (new Date(parsed + offset).toISOString() !== `${local}.${fraction.padEnd(3, "0")}Z`) {
+    throw new Error("--start is not a valid calendar timestamp");
+  }
+  return parsed;
 }
 
 /** @returns {SyncOptions} */
 function defaultOptions() {
+  const now = new Date();
   return {
     db: DEFAULT_DB,
     scope: "all",
-    start: defaultStartIso(),
-    end: localIsoFromMs(Date.now()),
+    start: defaultStartIso(now),
+    end: localIsoFromMs(now.getTime()),
     pageSize: DEFAULT_PAGE_SIZE,
     maxPages: DEFAULT_MAX_PAGES,
     chatPageSize: DEFAULT_CHAT_PAGE_SIZE,
@@ -170,6 +193,7 @@ function defaultOptions() {
     chatTypes: DEFAULT_CHAT_TYPES,
     stableHorizonSeconds: DEFAULT_STABLE_HORIZON_SECONDS,
     endExplicit: false,
+    startExplicit: false,
     lockTtlSeconds: 600,
     retries: DEFAULT_RETRIES,
     retryDelayMs: DEFAULT_RETRY_DELAY_MS,
@@ -192,7 +216,10 @@ function parseArgs(argv) {
     if (!next || next.startsWith("--")) throw new Error(`${arg} requires a value`);
     if (arg === "--db") opts.db = next;
     else if (arg === "--scope") opts.scope = /** @type {SyncScopeOption} */ (next);
-    else if (arg === "--start") opts.start = next;
+    else if (arg === "--start") {
+      opts.start = next;
+      opts.startExplicit = true;
+    }
     else if (arg === "--end") {
       opts.end = next;
       opts.endExplicit = true;
@@ -231,10 +258,10 @@ function parseArgs(argv) {
   if (!["all", "hot", "catchup"].includes(opts.receivedMode)) {
     throw new Error("--received-mode must be all, hot, or catchup");
   }
-  opts.startMs = parseTimeMs(opts.start, "start");
+  opts.startMs = parseInitialStartMs(opts.start);
   opts.endMs = parseTimeMs(opts.end, "end");
   opts.stableHorizonMs = opts.stableHorizonSeconds * 1000;
-  if (opts.endMs < opts.startMs) throw new Error("--end must be after --start");
+  if (opts.startExplicit && opts.endMs < opts.startMs) throw new Error("--end must be after --start");
   return opts;
 }
 
@@ -248,6 +275,11 @@ function executeLarkImSync(opts, deps = {}) {
   const loadSelfProfile = deps.getSelfProfile || getSelfProfile;
   const runner = deps.syncRunner || createSyncRunner(deps.syncRunnerDeps || {});
   initialize(dbPath);
+  const baseline = (deps.ensureSourceInitialSyncStart || ensureSourceInitialSyncStart)(
+    dbPath, SOURCE_ID, opts.startMs, { explicit: opts.startExplicit, endMs: opts.endMs },
+  );
+  opts = { ...opts, startMs: baseline, start: new Date(baseline).toISOString() };
+  if (opts.endMs < baseline) throw new Error("--end must be after the persisted initial sync baseline");
 
   const needsSelfProfile = opts.scope === "all" || opts.scope === "sent" || opts.scope === "received";
   const selfProfile = /** @type {SelfProfile | null} */ (needsSelfProfile ? loadSelfProfile(opts) : null);
@@ -260,6 +292,8 @@ function executeLarkImSync(opts, deps = {}) {
   const summary = {
     ok: true,
     db_path: dbPath,
+    initial_sync_start_ms: baseline,
+    initial_sync_start: new Date(baseline).toISOString(),
     window: {
       start: localIsoFromMs(opts.startMs),
       end: localIsoFromMs(opts.endMs),
@@ -299,6 +333,8 @@ function executeLarkImSync(opts, deps = {}) {
 function runLarkImSyncCli(argv, io = {}) {
   const stdout = io.stdout || process.stdout;
   const stderr = io.stderr || process.stderr;
+  const readTransport = io.deps?.getTransportStats || getTransportStats;
+  (io.deps?.resetTransportStats || resetTransportStats)();
   try {
     const opts = parseArgs(argv);
     if (opts.help) {
@@ -306,11 +342,16 @@ function runLarkImSyncCli(argv, io = {}) {
       return 0;
     }
     const summary = executeLarkImSync(opts, io.deps || {});
+    summary.transport = readTransport();
     stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
     return summary.ok ? 0 : 1;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     stderr.write(`${message}\n`);
+    const transport = readTransport();
+    if (transport.calls > 0) {
+      stderr.write(`${JSON.stringify({ type: "lark_transport_summary", transport })}\n`);
+    }
     return 1;
   }
 }

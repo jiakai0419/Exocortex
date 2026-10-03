@@ -28,7 +28,6 @@ const DEFAULT_DB = "data/exocortex.sqlite";
  * @property {(dbPath: string) => string=} resolvePath
  * @property {(dbPath: string) => JsonObject=} buildStatus
  * @property {(dbPath: string, sql: string, label: string) => Record<string, any>[]=} sqliteJson
- * @property {(dbPath: string) => JsonObject=} recoverStaleSyncState
  *
  * @typedef {object} CliIo
  * @property {{write: (text: string) => unknown}=} stdout
@@ -42,7 +41,7 @@ function usage() {
 Options:
   --db <path>       SQLite database path. Default: ${DEFAULT_DB}
   --format <fmt>    text | json. Default: text
-  --help            Show this help.
+  --help            Show this help. This command never repairs sync state.
 `;
 }
 

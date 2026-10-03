@@ -2,9 +2,11 @@
 
 import {
   assertValidLarkMessage,
-  localIsoFromMs,
+  parseLarkTimeMs,
   readBoundedPages,
 } from "./core.mjs";
+import { PaginationLimitError } from "../../../dist/core/sync.js";
+import { normalizeApiMessage } from "./raw-message.mjs";
 import {
   createNameResolver,
   displayNameFromUser,
@@ -13,6 +15,8 @@ import {
   uniqueOpenIds,
 } from "./name-resolver.mjs";
 import {
+  DEFAULT_LARK_CLI_TIMEOUT_MS,
+  DEFAULT_LARK_RETRY_BUDGET_MS,
   isTransientLarkFailure,
   parseJson,
   redactCommand,
@@ -26,6 +30,8 @@ import {
  * @property {string[]=} redactedFlags
  * @property {number=} retries
  * @property {number=} retryDelayMs
+ * @property {number=} timeoutMs
+ * @property {number=} retryBudgetMs
  *
  * @typedef {(args: string[], options?: AdapterRunOptions) => JsonObject | null} LarkRunner
  *
@@ -144,6 +150,93 @@ function assertValidMessagePage(messages, endpoint) {
   messages.forEach((message, index) => assertValidLarkMessage(message, `${endpoint} message at index ${index}`));
 }
 
+/** Native API output must positively acknowledge success, including CLI's code-stripping wrapper.
+ * @param {JsonObject | null} json @param {string} endpoint @returns {JsonObject}
+ */
+function nativeData(json, endpoint) {
+  if (!json || typeof json !== "object" || Array.isArray(json) ||
+      (json.ok !== undefined && json.ok !== true) ||
+      (json.code !== undefined && json.code !== 0) ||
+      (json.ok !== true && json.code !== 0) || json.error != null ||
+      !json.data || typeof json.data !== "object" || Array.isArray(json.data)) {
+    throw new Error(`${endpoint} returned an invalid or unsuccessful API envelope`);
+  }
+  return json.data;
+}
+
+/** @param {JsonObject} data @param {string} endpoint @returns {JsonObject[]} */
+function nativeItems(data, endpoint) {
+  if (!Array.isArray(data.items)) throw new Error(`${endpoint} response is missing a valid items array`);
+  return data.items;
+}
+
+/** @param {JsonObject | null} json @param {string} endpoint @param {Set<string>} tokens */
+function nativePage(json, endpoint, tokens) {
+  const data = nativeData(json, endpoint);
+  const items = nativeItems(data, endpoint);
+  if (typeof data.has_more !== "boolean") throw new Error(`${endpoint} response is missing a boolean has_more`);
+  const token = data.page_token ?? "";
+  if (typeof token !== "string") throw new Error(`${endpoint} response has a non-string page_token`);
+  if (data.has_more) {
+    if (!token.trim()) throw new Error(`${endpoint} returned has_more without page_token`);
+    if (tokens.has(token)) throw new Error(`${endpoint} returned a repeated page_token`);
+    tokens.add(token);
+  } else if (token) {
+    // Some endpoints keep their final token. It cannot schedule another request.
+    if (tokens.has(token)) throw new Error(`${endpoint} returned a repeated final page_token`);
+  }
+  return { items, has_more: data.has_more, page_token: token };
+}
+
+/** @param {JsonObject[]} messages @param {string} endpoint */
+function assertRawMessagePage(messages, endpoint) {
+  assertValidMessagePage(messages, endpoint);
+  for (const message of messages) {
+    if (typeof message.message_id !== "string" || !message.message_id.trim() ||
+        typeof message.msg_type !== "string" || !message.msg_type.trim() ||
+        !message.body || typeof message.body !== "object" || Array.isArray(message.body) ||
+        typeof message.body.content !== "string") {
+      throw new Error(`${endpoint} response contains an invalid raw message`);
+    }
+  }
+}
+
+/** @param {number} startMs @param {number} endMs @param {FetchOptions} opts */
+function assertFetchBounds(startMs, endMs, opts) {
+  if (!Number.isSafeInteger(startMs) || !Number.isSafeInteger(endMs) || startMs < 0 || endMs < startMs ||
+      !Number.isFinite(new Date(endMs).getTime()) || !Number.isSafeInteger(opts.pageSize) || opts.pageSize < 1 ||
+      !Number.isSafeInteger(opts.maxPages) || opts.maxPages < 1) {
+    throw new Error("message fetch requires valid millisecond bounds and positive page limits");
+  }
+}
+
+/** All embedded nodes must reach this root; malformed trees cannot render as complete.
+ * @param {string} rootId @param {JsonObject[]} items
+ */
+function assertMergeTree(rootId, items) {
+  const byId = new Map(items.map((item) => [item.message_id, item]));
+  if (byId.size !== items.length) throw new Error("message-details returned duplicate merge-forward IDs");
+  if (!byId.has(rootId)) throw new Error("message-details is missing the merge-forward root");
+  for (const item of items) {
+    if (item.upper_message_id != null && typeof item.upper_message_id !== "string") {
+      throw new Error("message-details returned an invalid merge-forward parent");
+    }
+    const visited = new Set();
+    let current = item;
+    while (current.message_id !== rootId) {
+      if (visited.has(current.message_id) || visited.size >= 64) {
+        throw new Error("message-details returned a cyclic or excessively deep merge-forward tree");
+      }
+      visited.add(current.message_id);
+      const parent = current.upper_message_id || rootId;
+      if (parent === rootId) break;
+      if (!byId.has(parent)) throw new Error("message-details returned an orphan merge-forward item");
+      current = /** @type {JsonObject} */ (byId.get(parent));
+    }
+  }
+  if (byId.get(rootId)?.upper_message_id) throw new Error("message-details returned an invalid merge-forward root");
+}
+
 /** @param {unknown} value @param {number} index */
 function normalizeChat(value, index) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -173,11 +266,84 @@ function isBotUserOutOfChatError(error) {
 }
 
 /**
- * @param {{run?: LarkRunner}} [deps]
+ * @param {{run?: LarkRunner, clock?: () => number}} [deps]
  * @returns {LarkImAdapter}
  */
-function createLarkImAdapter({ run = runLark } = {}) {
+function createLarkImAdapter({ run = runLark, clock = Date.now } = {}) {
   const nameResolver = createNameResolver({ run });
+
+  /** One fetch window shares its retry time and detail bounds; no per-child deadline reset.
+   * @param {FetchOptions} opts @param {string} operation @param {number} startMs @param {number} endMs
+   */
+  function nativeWindow(opts, operation, startMs, endMs) {
+    let lastNow = clock();
+    if (!Number.isFinite(lastNow)) throw new Error("message fetch clock is invalid");
+    const now = () => {
+      const value = clock();
+      if (!Number.isFinite(value)) throw new Error("message fetch clock is invalid");
+      lastNow = Math.max(lastNow, value);
+      return lastNow;
+    };
+    const deadline = lastNow + DEFAULT_LARK_RETRY_BUDGET_MS;
+    let detailCalls = 0;
+    let detailItems = 0;
+    /** @type {Map<string, JsonObject[]>} */
+    const mergeCache = new Map();
+    /** @param {string} method @param {string} path @param {JsonObject} params @param {JsonObject} [body] */
+    const request = (method, path, params, body) => {
+      const remaining = Math.floor(deadline - now());
+      if (remaining <= 0) {
+        throw new Error(`lark-cli failed: kind=network_timeout operation=${operation} retry_exhausted=1`);
+      }
+      const args = ["api", method, path, "--as", "user", "--params", JSON.stringify(params), "--format", "json"];
+      if (body !== undefined) args.push("--data", JSON.stringify(body));
+      return run(args, { redactedFlags: ["--params", "--data"], retries: opts.retries,
+        retryDelayMs: opts.retryDelayMs, timeoutMs: Math.min(DEFAULT_LARK_CLI_TIMEOUT_MS, remaining), retryBudgetMs: remaining });
+    };
+    /** @param {JsonObject[]} messages */
+    const normalize = (messages) => messages.filter((message) => {
+      const created = parseLarkTimeMs(message.create_time);
+      return created >= startMs && created <= endMs;
+    }).map((message) => {
+      if (message.msg_type !== "merge_forward") return normalizeApiMessage(message);
+      let items = mergeCache.get(message.message_id);
+      if (!items) {
+        /** @type {JsonObject[]} */
+        const collected = [];
+        const tokens = new Set();
+        let token = "";
+        for (;;) {
+          // Details consume the same page budget; the caller may retry a smaller complete time prefix.
+          if (detailCalls >= Math.min(opts.maxPages, 50)) {
+            throw new PaginationLimitError("merge-forward details exceed the bounded page budget", opts.maxPages);
+          }
+          detailCalls += 1;
+          const json = request("GET", `/open-apis/im/v1/messages/${encodeURIComponent(message.message_id)}`,
+            { user_id_type: "open_id", card_msg_content_type: "raw_card_content", ...(token ? { page_token: token } : {}) });
+          const data = nativeData(json, "message-details");
+          const pageItems = nativeItems(data, "message-details");
+          assertRawMessagePage(pageItems, "message-details");
+          detailItems += pageItems.length;
+          if (detailItems > 1000) throw new PaginationLimitError("merge-forward details exceed the bounded item budget", opts.maxPages);
+          collected.push(...pageItems);
+          // The documented CLI detail path returns a single items array without pagination fields.
+          if (data.has_more === undefined) {
+            if (data.page_token != null && data.page_token !== "") throw new Error("message-details returned a token without has_more");
+            break;
+          }
+          const page = nativePage(json, "message-details", tokens);
+          if (!page.has_more) break;
+          token = page.page_token;
+        }
+        if (!collected.length) throw new Error("message-details returned no merge-forward items");
+        assertMergeTree(message.message_id, collected);
+        items = collected;
+        mergeCache.set(message.message_id, items);
+      }
+      return normalizeApiMessage(message, { mergeItems: items });
+    });
+    return { request, normalize };
+  }
 
   /** @param {AdapterOptions} [opts] */
   function getSelfProfile(opts = {}) {
@@ -216,40 +382,47 @@ function createLarkImAdapter({ run = runLark } = {}) {
    * @param {FetchOptions} opts
    */
   function fetchSentMessages(selfOpenId, startMs, endMs, opts) {
+    assertFetchBounds(startMs, endMs, opts);
+    const { request, normalize } = nativeWindow(opts, "message_search_bundle", startMs, endMs);
+    const tokens = new Set();
     return readBoundedPages({
       maxPages: opts.maxPages,
       missingPageTokenMessage: "messages-search returned has_more without page_token",
       maxPagesMessage: (maxPages) => `messages-search still has more data after ${maxPages} pages`,
       fetchPage: (pageToken) => {
-        const args = [
-          "im",
-          "+messages-search",
-          "--as",
-          "user",
-          "--query",
-          "",
-          "--sender",
-          selfOpenId,
-          "--start",
-          localIsoFromMs(startMs),
-          "--end",
-          localIsoFromMs(endMs),
-          "--page-size",
-          String(opts.pageSize),
-          "--no-reactions",
-          "--format",
-          "json",
-        ];
-        if (pageToken) args.push("--page-token", pageToken);
-        const json = run(args, {
-          redactedFlags: ["--sender", "--page-token"],
-          retries: opts.retries,
-          retryDelayMs: opts.retryDelayMs,
-        });
-        const envelope = getEnvelope(json, "messages");
-        assertValidMessagePage(envelope.items, "messages-search");
+        const json = request("POST", "/open-apis/im/v1/messages/search",
+          { page_size: Math.min(opts.pageSize, 30), ...(pageToken ? { page_token: pageToken } : {}) },
+          { query: "", filter: { from_ids: [selfOpenId], time_range: {
+            // Search validates second-precision ISO8601; fractional seconds are rejected.
+            // Round outwards for the request, then retain only the exact millisecond window.
+            start_time: new Date(Math.floor(startMs / 1000) * 1000).toISOString().replace(".000Z", "Z"),
+            end_time: new Date(Math.ceil(endMs / 1000) * 1000).toISOString().replace(".000Z", "Z"),
+          } } });
+        const envelope = nativePage(json, "messages-search", tokens);
+        const ids = envelope.items.map((item) => item?.meta_data?.message_id);
+        if (ids.some((id) => typeof id !== "string" || !id.trim()) || new Set(ids).size !== ids.length) {
+          throw new Error("messages-search returned invalid or duplicate message IDs");
+        }
+        /** @type {JsonObject[]} */
+        const messages = [];
+        for (let offset = 0; offset < ids.length; offset += 50) {
+          const expected = ids.slice(offset, offset + 50);
+          const detailData = nativeData(request("GET", "/open-apis/im/v1/messages/mget",
+            { message_ids: expected, card_msg_content_type: "raw_card_content" }), "messages-mget");
+          if ((detailData.has_more !== undefined && detailData.has_more !== false) ||
+              (detailData.page_token != null && detailData.page_token !== "")) {
+            throw new Error("messages-mget returned unexpected pagination");
+          }
+          const details = nativeItems(detailData, "messages-mget");
+          assertRawMessagePage(details, "messages-mget");
+          const byId = new Map(details.map((message) => [message.message_id, message]));
+          if (byId.size !== details.length || details.length !== expected.length || expected.some((id) => !byId.has(id))) {
+            throw new Error("messages-mget response does not exactly match the requested message IDs");
+          }
+          messages.push(...expected.map((id) => /** @type {JsonObject} */ (byId.get(id))));
+        }
         return {
-          messages: envelope.items,
+          messages: normalize(messages),
           has_more: envelope.has_more,
           page_token: envelope.page_token,
         };
@@ -264,40 +437,24 @@ function createLarkImAdapter({ run = runLark } = {}) {
    * @param {FetchOptions} opts
    */
   function fetchChatMessages(chatIdValue, startMs, endMs, opts) {
+    assertFetchBounds(startMs, endMs, opts);
+    const { request, normalize } = nativeWindow(opts, "message_history_bundle", startMs, endMs);
+    const tokens = new Set();
     return readBoundedPages({
       maxPages: opts.maxPages,
       missingPageTokenMessage: "chat-messages-list returned has_more without page_token",
       maxPagesMessage: (maxPages) => `chat-messages-list still has more data after ${maxPages} pages`,
       fetchPage: (pageToken) => {
-        const args = [
-          "im",
-          "+chat-messages-list",
-          "--as",
-          "user",
-          "--chat-id",
-          chatIdValue,
-          "--start",
-          localIsoFromMs(startMs),
-          "--end",
-          localIsoFromMs(endMs),
-          "--order",
-          "asc",
-          "--page-size",
-          String(opts.pageSize),
-          "--no-reactions",
-          "--format",
-          "json",
-        ];
-        if (pageToken) args.push("--page-token", pageToken);
-        const json = run(args, {
-          redactedFlags: ["--chat-id", "--page-token"],
-          retries: opts.retries,
-          retryDelayMs: opts.retryDelayMs,
+        const json = request("GET", "/open-apis/im/v1/messages", {
+          container_id_type: "chat", container_id: chatIdValue, only_thread_root_messages: false,
+          sort_type: "ByCreateTimeAsc", page_size: Math.min(opts.pageSize, 50),
+          card_msg_content_type: "raw_card_content", start_time: String(Math.floor(startMs / 1000)),
+          end_time: String(Math.ceil(endMs / 1000)), ...(pageToken ? { page_token: pageToken } : {}),
         });
-        const envelope = getEnvelope(json, "messages");
-        assertValidMessagePage(envelope.items, "chat-messages-list");
+        const envelope = nativePage(json, "chat-messages-list", tokens);
+        assertRawMessagePage(envelope.items, "chat-messages-list");
         return {
-          messages: envelope.items,
+          messages: normalize(envelope.items),
           has_more: envelope.has_more,
           page_token: envelope.page_token,
         };
@@ -383,6 +540,9 @@ export {
   fetchSentMessages,
   firstArray,
   getEnvelope,
+  nativeData,
+  nativePage,
+  assertRawMessagePage,
   getSelfProfile,
   isBotUserOutOfChatError,
   isRestrictedModeError,

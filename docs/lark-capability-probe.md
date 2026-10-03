@@ -19,16 +19,11 @@
    - `received` 的第一版定义是：用户身份可拉取、发送者不是我、且来自非免打扰会话的消息。
    - 默认纳入非免打扰群聊和私聊：`--chat-types group,p2p`。
 
-## 低隐私原则
+## 私有研究输出
 
-默认 probe 不保存：
+研究 probe 的输出属于私有运行数据，不能提交为文档或测试样例。`commands` 中可能保留完整身份 ID；不要把 `privacy_mode` 标签当作脱敏保证。
 
-- 消息正文
-- 群名 / 单聊对象名
-- 联系人姓名
-- 完整 open_id
-
-默认 probe 保存：
+报告可能包含：
 
 - 命令是否成功
 - endpoint / dry-run 信息
@@ -53,8 +48,8 @@ reports/lark-capabilities/lark-capability-probe-<timestamp>.json
 
 ```bash
 node scripts/lark-capability-probe.mjs \
-  --start 2026-06-13T00:00:00+08:00 \
-  --end 2026-06-13T23:59:59+08:00
+  --start "$PROBE_START_ISO" \
+  --end "$PROBE_END_ISO"
 ```
 
 如果只想看 schema / dry-run / event identity 验证，不触发用户消息字段探针：
@@ -85,7 +80,7 @@ node scripts/lark-im-cursor-probe.mjs
 reports/lark-capabilities/lark-im-cursor-probe-<timestamp>.json
 ```
 
-报告只保存 hash 后的 ID、时间戳、页信息和判断结果，不保存消息正文、群名或联系人名。
+Cursor probe 报告包含 hash 后的 ID、时间戳、分页信息和判断结果，但任意远端 stderr 不保证完全脱敏，可能保留私人内容。全部 probe 输出均按私有运行数据处理，不提交仓库，也不用于派生测试样例。
 
 ## 判定标准
 

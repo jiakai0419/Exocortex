@@ -1,19 +1,69 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 
+// Authored from empty objects for this suite: an imaginary materials bench.
+// The API field names are contracts; all identities, prose, times and relationships
+// below are composed here, without loading or transforming captured messages.
+const LAB = Object.freeze({
+  self: Object.freeze({ open_id: "ou_fixture_bench_operator", name: "Operator Seven" }),
+  room: Object.freeze({ id: "oc_fixture_paper_bench", name: ["Paper", "Kite", "Bench"].join(" ") }),
+  shelf: Object.freeze({ id: "oc_fixture_tile_shelf", name: ["Copper", "Tile", "Shelf"].join(" ") }),
+  app: Object.freeze({ id: "cli_fixture_counter", name: ["Pebble", "Counter"].join(" ") }),
+  receivedScope: "lark.im.received.chat.fixture_bench",
+});
+const FIXTURE_EPOCH = Date.UTC(2042, 1, 3, 4, 5, 6);
+const CONCURRENT_AT = new Date(FIXTURE_EPOCH + 86_400_000).toISOString();
+const SAFE_PATH = [...new Set([dirname(process.execPath), "/usr/bin", "/bin"])].join(":");
+
+function syntheticRecord({ key = "calibration", ordinal = 0, room = LAB.room,
+  sender = { id: LAB.self.open_id, name: LAB.self.name, sender_type: "user" },
+  msgType = "text", content, ...overrides } = {}) {
+  const occurredAt = FIXTURE_EPOCH + ordinal * 13_000;
+  const body = ["Count", ordinal + 3, "paper triangles on tray", key].join(" ");
+  const messageId = ["om", "fixture", "bench", key, ordinal].join("_");
+  const raw = {
+    message_id: messageId, msg_type: msgType, create_time: String(occurredAt),
+    update_time: String(occurredAt + 137), chat_id: room.id, sender: { ...sender },
+    content: content ?? { text: body },
+  };
+  const canonical = {
+    message_id: messageId, msg_type: msgType,
+    sender_id: sender.id || null, sender_name: sender.name || null,
+    sender_type: sender.sender_type || null,
+    chat_id: room.id, chat_type: "group", chat_name: null, content: raw.content,
+    ...overrides.canonical,
+  };
+  return {
+    raw, external_id: messageId, external_version: raw.update_time,
+    body, occurred_at_ms: occurredAt, updated_at: new Date(occurredAt + 500).toISOString(),
+    ...overrides, canonical,
+  };
+}
+
+function isolatedEnvironment(dir, fakeLarkCli, overrides = {}) {
+  return {
+    PATH: SAFE_PATH, HOME: join(dir, "home"), XDG_CONFIG_HOME: join(dir, "config"),
+    XDG_CACHE_HOME: join(dir, "cache"), XDG_DATA_HOME: join(dir, "data"),
+    TMPDIR: dir, LANG: "C", TZ: "UTC",
+    LARK_CLI: fakeLarkCli, ...overrides,
+  };
+}
+
 function tempDir(t) {
   const dir = mkdtempSync(join(tmpdir(), "exocortex-enrich-records-test-"));
+  for (const child of ["home", "config", "cache", "data"]) mkdirSync(join(dir, child));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   return dir;
 }
 
 function sqliteExec(dbPath, sql, label) {
   const result = spawnSync("sqlite3", [dbPath], {
-    input: `.timeout 5000\n${sql}`,
+    input: `.bail on\n.timeout 5000\n${sql}`,
     encoding: "utf8",
     maxBuffer: 10 * 1024 * 1024,
   });
@@ -21,8 +71,8 @@ function sqliteExec(dbPath, sql, label) {
 }
 
 function sqliteJson(dbPath, sql, label) {
-  const result = spawnSync("sqlite3", ["-json", dbPath], {
-    input: `.timeout 5000\n${sql}`,
+  const result = spawnSync("sqlite3", ["-readonly", "-json", dbPath], {
+    input: `.bail on\n.timeout 5000\nPRAGMA query_only=ON;\n${sql}`,
     encoding: "utf8",
     maxBuffer: 10 * 1024 * 1024,
   });
@@ -32,17 +82,35 @@ function sqliteJson(dbPath, sql, label) {
 }
 
 function quoteSql(value) {
+  if (value === null || value === undefined) return "NULL";
   return `'${String(value).replaceAll("'", "''")}'`;
 }
 
-function installFakeLarkCli(dir) {
+function installFakeLarkCli(dir, { dbPath = null, beforeSelfSql = "", assertNoMaintenanceLock = false } = {}) {
   const path = join(dir, "fake-lark-cli.mjs");
   writeFileSync(
     path,
     `#!/usr/bin/env node
+import { spawnSync } from "node:child_process";
 const args = process.argv.slice(2);
 if (args.join(" ") === "contact +get-user --as user --format json") {
-  process.stdout.write(JSON.stringify({ open_id: "ou_shape_self", name: "Shape Self" }));
+  const dbPath = ${JSON.stringify(dbPath)};
+  if (${JSON.stringify(assertNoMaintenanceLock)}) {
+    const locks = spawnSync("sqlite3", ["-readonly", dbPath, "SELECT count(*) FROM maintenance_locks;"], { encoding: "utf8" });
+    if (locks.status !== 0 || locks.stdout.trim() !== "0") {
+      process.stderr.write("network lookup unexpectedly held maintenance lock");
+      process.exit(1);
+    }
+  }
+  const sql = ${JSON.stringify(beforeSelfSql)};
+  if (sql) {
+    const changed = spawnSync("sqlite3", [dbPath], { input: ".bail on\\n" + sql, encoding: "utf8" });
+    if (changed.status !== 0) {
+      process.stderr.write(changed.stderr || "synthetic interleaving failed");
+      process.exit(1);
+    }
+  }
+  process.stdout.write(JSON.stringify(${JSON.stringify(LAB.self)}));
   process.exit(0);
 }
 process.stderr.write("unexpected lark-cli call: " + args.join(" "));
@@ -76,6 +144,8 @@ function installSchema(dbPath) {
        source_id TEXT NOT NULL,
        first_seen_scope_id TEXT NOT NULL,
        external_id TEXT NOT NULL,
+       external_version TEXT,
+       content_hash TEXT,
        actor_id TEXT,
        container_id TEXT,
        body TEXT NOT NULL,
@@ -99,24 +169,16 @@ function insertScope(dbPath, id, config) {
 }
 
 function insertRecord(dbPath, overrides = {}) {
-  const canonical = {
-    message_id: "om_shape_sent_001",
-    msg_type: "text",
-    sender_id: "ou_shape_self",
-    sender_name: "Shape Self",
-    sender_type: "user",
-    chat_id: "oc_shape_group",
-    chat_type: "group",
-    chat_name: null,
-    ...overrides.canonical,
-  };
-  const raw = overrides.raw || {};
+  const fixture = syntheticRecord(overrides);
+  const { canonical, raw } = fixture;
   sqliteExec(
     dbPath,
     `INSERT INTO records (
        source_id,
        first_seen_scope_id,
        external_id,
+       external_version,
+       content_hash,
        actor_id,
        container_id,
        body,
@@ -128,55 +190,46 @@ function insertRecord(dbPath, overrides = {}) {
      )
      VALUES (
        'lark.im',
-       ${quoteSql(overrides.first_seen_scope_id || "lark.im.sent_by_me")},
-       ${quoteSql(overrides.external_id || canonical.message_id)},
+       ${quoteSql(fixture.first_seen_scope_id || "lark.im.sent_by_me")},
+       ${quoteSql(fixture.external_id)},
+       ${quoteSql(fixture.external_version)},
+       ${quoteSql(fixture.content_hash ?? createHash("sha256").update(JSON.stringify(raw)).digest("hex"))},
        ${quoteSql(canonical.sender_id)},
        ${quoteSql(canonical.chat_id)},
-       ${quoteSql(overrides.body || "shape body")},
+       ${quoteSql(fixture.body)},
        ${quoteSql(JSON.stringify(canonical))},
        ${quoteSql(JSON.stringify(raw))},
        'lark.im.message',
-       ${Number(overrides.occurred_at_ms || 1800000000000)},
-       '2027-01-15T08:00:00.000Z'
+       ${Number(fixture.occurred_at_ms)},
+       ${quoteSql(fixture.updated_at)}
      );`,
-    `insert ${overrides.external_id || canonical.message_id}`,
+    `insert ${fixture.external_id}`,
   );
+  return fixture;
 }
 
-test("lark-im-enrich-records fills sent group chat names from known local chat metadata", (t) => {
+test("scope and record metadata independently name synthetic rooms without exposing app details", (t) => {
   const dir = tempDir(t);
-  const dbPath = join(dir, "shape.sqlite");
+  const dbPath = join(dir, "bench.sqlite");
   const fakeLarkCli = installFakeLarkCli(dir);
   installSchema(dbPath);
   insertScope(dbPath, "lark.im.sent_by_me", {});
-  insertScope(dbPath, "lark.im.received.chat.shape", {
-    chat_id: "oc_shape_group",
+  insertScope(dbPath, LAB.receivedScope, {
+    chat_id: LAB.room.id,
     chat_type: "group",
-    chat_name: "Shape Hiring Group",
+    chat_name: LAB.room.name,
+  });
+  const unnamedBench = insertRecord(dbPath, { key: "fold", ordinal: 2 });
+  const unnamedShelf = insertRecord(dbPath, { key: "stack", ordinal: 3, room: LAB.shelf });
+  insertRecord(dbPath, {
+    key: "inventory", ordinal: 4, room: LAB.shelf,
+    first_seen_scope_id: LAB.receivedScope,
+    canonical: { chat_name: LAB.shelf.name },
   });
   insertRecord(dbPath, {
-    external_id: "om_shape_sent_missing_chat",
-    canonical: { message_id: "om_shape_sent_missing_chat", chat_name: null },
-  });
-  insertRecord(dbPath, {
-    external_id: "om_shape_received_known_chat",
-    first_seen_scope_id: "lark.im.received.chat.shape",
-    canonical: {
-      message_id: "om_shape_received_known_chat",
-      chat_name: "Shape Hiring Group",
-    },
-    occurred_at_ms: 1800000060000,
-  });
-  insertRecord(dbPath, {
-    external_id: "om_shape_app_named",
-    canonical: {
-      message_id: "om_shape_app_named",
-      sender_id: "cli_shape_private_app",
-      sender_name: "Private Shape App",
-      sender_type: "app",
-      chat_name: "Shape Hiring Group",
-    },
-    occurred_at_ms: 1800000120000,
+    key: "counter", ordinal: 5,
+    sender: { id: LAB.app.id, name: LAB.app.name, sender_type: "app" },
+    canonical: { chat_name: LAB.room.name },
   });
 
   const result = spawnSync(
@@ -184,7 +237,7 @@ test("lark-im-enrich-records fills sent group chat names from known local chat m
     ["scripts/lark-im-enrich-records.mjs", "--db", dbPath, "--limit", "10"],
     {
       cwd: process.cwd(),
-      env: { ...process.env, LARK_CLI: fakeLarkCli },
+      env: isolatedEnvironment(dir, fakeLarkCli),
       encoding: "utf8",
       maxBuffer: 10 * 1024 * 1024,
     },
@@ -193,32 +246,308 @@ test("lark-im-enrich-records fills sent group chat names from known local chat m
   assert.equal(result.status, 0, result.stderr);
   const summary = JSON.parse(result.stdout);
   assert.equal(summary.ok, true);
-  assert.equal(summary.updated, 1);
-  assert.equal(result.stdout.includes("cli_shape_private_app"), false);
-  assert.equal(result.stdout.includes("Private Shape App"), false);
-  assert.equal(result.stdout.includes("Shape Hiring Group"), false);
+  assert.equal(summary.updated, 2);
+  for (const value of [LAB.app.id, LAB.app.name, LAB.room.name, LAB.shelf.name]) {
+    assert.equal(result.stdout.includes(value), false);
+  }
 
   const rows = sqliteJson(
     dbPath,
-    `SELECT json_extract(canonical_json, '$.chat_name') AS chat_name
+    `SELECT external_id, json_extract(canonical_json, '$.chat_name') AS chat_name
      FROM records
-     WHERE external_id = 'om_shape_sent_missing_chat';`,
+     WHERE external_id IN (${quoteSql(unnamedBench.external_id)}, ${quoteSql(unnamedShelf.external_id)}) ORDER BY id;`,
     "read enriched sent record",
   );
-  assert.deepEqual(rows, [{ chat_name: "Shape Hiring Group" }]);
+  assert.deepEqual(rows, [
+    { external_id: unnamedBench.external_id, chat_name: LAB.room.name },
+    { external_id: unnamedShelf.external_id, chat_name: LAB.shelf.name },
+  ]);
 
   const unsafe = spawnSync(
     process.execPath,
     ["scripts/lark-im-enrich-records.mjs", "--db", dbPath, "--limit", "10", "--unsafe-details"],
     {
       cwd: process.cwd(),
-      env: { ...process.env, LARK_CLI: fakeLarkCli },
+      env: isolatedEnvironment(dir, fakeLarkCli),
       encoding: "utf8",
       maxBuffer: 10 * 1024 * 1024,
     },
   );
 
   assert.equal(unsafe.status, 0, unsafe.stderr);
-  assert.equal(unsafe.stdout.includes("cli_shape_private_app"), true);
-  assert.equal(unsafe.stdout.includes("Private Shape App"), true);
+  assert.equal(unsafe.stdout.includes(LAB.app.id), true);
+  assert.equal(unsafe.stdout.includes(LAB.app.name), true);
 });
+
+function enrichmentFixture(t, options = {}) {
+  const dir = tempDir(t);
+  const dbPath = join(dir, "bench.sqlite");
+  installSchema(dbPath);
+  insertScope(dbPath, "lark.im.sent_by_me", {});
+  insertScope(dbPath, LAB.receivedScope, {
+    chat_id: LAB.room.id, chat_type: "group", chat_name: LAB.room.name,
+  });
+  insertRecord(dbPath, options.record || {});
+  const fakeLarkCli = installFakeLarkCli(dir, {
+    dbPath, assertNoMaintenanceLock: true, ...options,
+  });
+  return { dir, dbPath, fakeLarkCli };
+}
+
+function runEnrichment(fixture, args = [], env = {}) {
+  return spawnSync(process.execPath, ["scripts/lark-im-enrich-records.mjs", "--db", fixture.dbPath, ...args], {
+    cwd: process.cwd(),
+    env: isolatedEnvironment(fixture.dir || dirname(fixture.dbPath), fixture.fakeLarkCli, env),
+    encoding: "utf8",
+    maxBuffer: 10 * 1024 * 1024,
+  });
+}
+
+function readRecords(dbPath) {
+  return sqliteJson(dbPath, "SELECT * FROM records ORDER BY id;", "read synthetic records");
+}
+
+function maintenanceLocks(dbPath) {
+  return sqliteJson(dbPath, "SELECT * FROM maintenance_locks;", "read synthetic locks");
+}
+
+test("enrichment commits only derived fields, holds no lock during lookup, and is idempotent", (t) => {
+  const fixture = enrichmentFixture(t);
+  const before = readRecords(fixture.dbPath)[0];
+  const result = runEnrichment(fixture);
+  assert.equal(result.status, 0, result.stderr);
+  const summary = JSON.parse(result.stdout);
+  assert.equal(summary.planned, 1);
+  assert.equal(summary.updated, 1);
+  assert.equal(summary.skipped_conflicts, 0);
+  assert.equal(summary.dry_run, false);
+  const after = readRecords(fixture.dbPath)[0];
+  assert.equal(JSON.parse(after.canonical_json).chat_name, LAB.room.name);
+  for (const field of Object.keys(before).filter((key) => !["canonical_json", "updated_at"].includes(key))) {
+    assert.deepEqual(after[field], before[field], field);
+  }
+  assert.deepEqual(maintenanceLocks(fixture.dbPath), []);
+
+  const repeated = runEnrichment(fixture);
+  assert.equal(repeated.status, 0, repeated.stderr);
+  const repeatedSummary = JSON.parse(repeated.stdout);
+  assert.equal(repeatedSummary.planned, 0);
+  assert.equal(repeatedSummary.updated, 0);
+  assert.equal(repeatedSummary.unchanged, 1);
+  assert.deepEqual(readRecords(fixture.dbPath), [after]);
+  assert.deepEqual(maintenanceLocks(fixture.dbPath), []);
+});
+
+test("room enrichment preserves an independently composed system event and absent actor", (t) => {
+  const content = { template: "Tile {item} moved to {slot}.", item: "hexagon" };
+  const display = "Tile hexagon moved to [未知参数：slot].";
+  const fixture = enrichmentFixture(t, { record: {
+    key: "system_tile", ordinal: 11, msgType: "system", sender: {}, content, body: display,
+    canonical: { thread_id: "omt_fixture_tile_chain" },
+  } });
+  const before = readRecords(fixture.dbPath)[0];
+  const result = runEnrichment(fixture);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).updated, 1);
+  const after = readRecords(fixture.dbPath)[0];
+  assert.equal(after.body, display);
+  assert.equal(after.actor_id, null);
+  assert.equal(after.raw_json, before.raw_json);
+  assert.equal(after.content_hash, before.content_hash);
+  assert.equal(after.external_version, before.external_version);
+  const canonical = JSON.parse(after.canonical_json);
+  assert.deepEqual(canonical.content, content);
+  assert.equal(canonical.thread_id, "omt_fixture_tile_chain");
+  assert.equal(canonical.sender_id, null);
+  assert.equal(canonical.sender_name, null);
+  assert.equal(canonical.chat_name, LAB.room.name);
+});
+
+const concurrentChanges = [
+  ["external version", `external_version = ${quoteSql(String(FIXTURE_EPOCH + 9_100))}`],
+  ["content hash", `content_hash = ${quoteSql(createHash("sha256").update("six spare tiles").digest("hex"))}`],
+  ["raw content", `raw_json = ${quoteSql(JSON.stringify(syntheticRecord({ key: "raw_swap", ordinal: 8 }).raw))}`],
+  ["canonical content", "canonical_json = json_set(canonical_json, '$.content', 'Draw four violet squares.')"],
+  ["body", "body = 'Move five cork disks to tray B.'"],
+  ["actor", "actor_id = 'ou_fixture_bench_observer'"],
+  ["container", `container_id = ${quoteSql(LAB.shelf.id)}`],
+];
+
+for (const [label, update] of concurrentChanges) {
+  test(`enrichment skips a concurrent ${label} change and reports actual effects`, (t) => {
+    const fixture = enrichmentFixture(t, {
+      beforeSelfSql: `UPDATE records SET ${update}, updated_at = ${quoteSql(CONCURRENT_AT)};`,
+    });
+    const result = runEnrichment(fixture);
+    assert.equal(result.status, 0, result.stderr);
+    const summary = JSON.parse(result.stdout);
+    assert.equal(summary.ok, true);
+    assert.equal(summary.planned, 1);
+    assert.equal(summary.updated, 0);
+    assert.equal(summary.skipped_conflicts, 1);
+    const row = readRecords(fixture.dbPath)[0];
+    assert.equal(row.updated_at, CONCURRENT_AT);
+    assert.equal(JSON.parse(row.canonical_json).chat_name, null);
+    assert.deepEqual(maintenanceLocks(fixture.dbPath), []);
+    assert.equal(result.stdout.includes(LAB.self.open_id), false);
+    assert.equal(result.stdout.includes(syntheticRecord().external_id), false);
+  });
+}
+
+test("a full newer source snapshot survives enrichment while unchanged rows can commit", (t) => {
+  const newerBody = "Sort seven wooden polygons by edge count.";
+  const replacement = syntheticRecord({ content: { text: newerBody }, body: newerBody,
+    canonical: { chat_name: "Polygon Sorting Station" } });
+  const version = String(FIXTURE_EPOCH + 19_000);
+  replacement.raw.update_time = version;
+  const newerRaw = JSON.stringify(replacement.raw);
+  const newerCanonical = JSON.stringify(replacement.canonical);
+  const newerHash = createHash("sha256").update(newerRaw).digest("hex");
+  const fixture = enrichmentFixture(t, {
+    beforeSelfSql: `UPDATE records SET external_version = ${quoteSql(version)},
+      raw_json = ${quoteSql(newerRaw)}, content_hash = ${quoteSql(newerHash)},
+      canonical_json = ${quoteSql(newerCanonical)}, body = ${quoteSql(newerBody)},
+      updated_at = ${quoteSql(CONCURRENT_AT)}
+      WHERE external_id = ${quoteSql(replacement.external_id)};`,
+  });
+  insertRecord(fixture.dbPath, { key: "uncontended", ordinal: 6 });
+  const result = runEnrichment(fixture);
+  assert.equal(result.status, 0, result.stderr);
+  const summary = JSON.parse(result.stdout);
+  assert.equal(summary.planned, 2);
+  assert.equal(summary.updated, 1);
+  assert.equal(summary.skipped_conflicts, 1);
+  const [newer, enriched] = readRecords(fixture.dbPath);
+  assert.equal(newer.external_version, version);
+  assert.equal(newer.content_hash, newerHash);
+  assert.equal(newer.raw_json, newerRaw);
+  assert.equal(newer.canonical_json, newerCanonical);
+  assert.equal(newer.body, newerBody);
+  assert.equal(newer.updated_at, CONCURRENT_AT);
+  assert.equal(JSON.parse(enriched.canonical_json).chat_name, LAB.room.name);
+  assert.deepEqual(maintenanceLocks(fixture.dbPath), []);
+});
+
+test("enrichment does not resurrect a record deleted during lookup", (t) => {
+  const fixture = enrichmentFixture(t, { beforeSelfSql: "DELETE FROM records;" });
+  const result = runEnrichment(fixture);
+  assert.equal(result.status, 0, result.stderr);
+  const summary = JSON.parse(result.stdout);
+  assert.equal(summary.updated, 0);
+  assert.equal(summary.skipped_conflicts, 1);
+  assert.deepEqual(readRecords(fixture.dbPath), []);
+  assert.deepEqual(maintenanceLocks(fixture.dbPath), []);
+});
+
+test("dry-run changes no database bytes, permissions, files, or maintenance locks", (t) => {
+  const fixture = enrichmentFixture(t);
+  chmodSync(fixture.dir, 0o755);
+  chmodSync(fixture.dbPath, 0o644);
+  const beforeBytes = readFileSync(fixture.dbPath);
+  const beforeFiles = readdirSync(fixture.dir).sort();
+  const result = runEnrichment(fixture, ["--dry-run"]);
+  assert.equal(result.status, 0, result.stderr);
+  const summary = JSON.parse(result.stdout);
+  assert.equal(summary.dry_run, true);
+  assert.equal(summary.planned, 1);
+  assert.equal(summary.updated, 0);
+  assert.equal(summary.skipped_conflicts, 0);
+  assert.deepEqual(readFileSync(fixture.dbPath), beforeBytes);
+  assert.equal(statSync(fixture.dir).mode & 0o777, 0o755);
+  assert.equal(statSync(fixture.dbPath).mode & 0o777, 0o644);
+  assert.deepEqual(readdirSync(fixture.dir).sort(), beforeFiles);
+  assert.deepEqual(maintenanceLocks(fixture.dbPath), []);
+});
+
+test("a no-change default run reads without chmod or database writes", (t) => {
+  const fixture = enrichmentFixture(t, { record: { canonical: { chat_name: LAB.room.name } } });
+  chmodSync(fixture.dir, 0o755);
+  chmodSync(fixture.dbPath, 0o644);
+  const before = readFileSync(fixture.dbPath);
+  const result = runEnrichment(fixture);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).planned, 0);
+  assert.deepEqual(readFileSync(fixture.dbPath), before);
+  assert.equal(statSync(fixture.dir).mode & 0o777, 0o755);
+  assert.equal(statSync(fixture.dbPath).mode & 0o777, 0o644);
+});
+
+test("dry-run on a missing path creates neither database nor parent directory", (t) => {
+  const dir = tempDir(t);
+  const missingParent = join(dir, "missing");
+  const result = runEnrichment({ dir, dbPath: join(missingParent, "bench.sqlite"), fakeLarkCli: "/usr/bin/false" }, ["--dry-run"]);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /database not found/);
+  assert.equal(existsSync(missingParent), false);
+});
+
+test("a failed commit rolls back all enrichment and releases its maintenance lock", (t) => {
+  const fixture = enrichmentFixture(t);
+  sqliteExec(fixture.dbPath, `CREATE TRIGGER reject_enrichment BEFORE UPDATE ON records
+    BEGIN SELECT RAISE(ABORT, 'synthetic write failure'); END;`, "install rejection trigger");
+  const before = readRecords(fixture.dbPath);
+  const result = runEnrichment(fixture);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /synthetic write failure/);
+  assert.deepEqual(readRecords(fixture.dbPath), before);
+  assert.deepEqual(maintenanceLocks(fixture.dbPath), []);
+});
+
+test("an active sync lock blocks only the commit and remains untouched", (t) => {
+  const fixture = enrichmentFixture(t, {
+    beforeSelfSql: "INSERT INTO sync_locks (scope_id) VALUES ('lark.im.sent_by_me');",
+  });
+  const before = readRecords(fixture.dbPath);
+  const result = runEnrichment(fixture);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /active sync lock/);
+  assert.deepEqual(readRecords(fixture.dbPath), before);
+  assert.equal(sqliteJson(fixture.dbPath, "SELECT count(*) AS count FROM sync_locks;", "read sync lock")[0].count, 1);
+  assert.deepEqual(maintenanceLocks(fixture.dbPath), []);
+});
+
+function installCommitInterleavingSqlite(dir, dbPath, sql) {
+  const path = join(dir, "sqlite3");
+  writeFileSync(path, `#!/usr/bin/env node
+import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+const args = process.argv.slice(2);
+const input = readFileSync(0, "utf8");
+if (input.includes("CREATE TEMP TABLE __enrichment_fence")) {
+  const changed = spawnSync("/usr/bin/sqlite3", [${JSON.stringify(dbPath)}], {
+    input: ${JSON.stringify(`.bail on\n${sql}`)}, encoding: "utf8",
+  });
+  if (changed.status !== 0) {
+    process.stderr.write(changed.stderr || "synthetic interleaving failed");
+    process.exit(1);
+  }
+}
+const result = spawnSync("/usr/bin/sqlite3", args, { input, encoding: "utf8" });
+process.stdout.write(result.stdout || "");
+process.stderr.write(result.stderr || "");
+process.exit(result.status ?? 1);
+`);
+  chmodSync(path, 0o755);
+}
+
+for (const replacement of [false, true]) {
+  test(`commit rejects a maintenance lease ${replacement ? "replaced" : "expired"} after acquisition`, (t) => {
+    const fixture = enrichmentFixture(t);
+    const before = readRecords(fixture.dbPath);
+    const mutation = replacement
+      ? "UPDATE maintenance_locks SET owner = 'synthetic-other-owner';"
+      : "UPDATE maintenance_locks SET expires_at = '1997-03-11T12:13:14.000Z';";
+    installCommitInterleavingSqlite(fixture.dir, fixture.dbPath, mutation);
+    const result = runEnrichment(fixture, [], { PATH: `${fixture.dir}:${SAFE_PATH}` });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /CHECK constraint failed/);
+    assert.deepEqual(readRecords(fixture.dbPath), before);
+    const locks = maintenanceLocks(fixture.dbPath);
+    if (replacement) {
+      assert.equal(locks.length, 1);
+      assert.equal(locks[0].owner, "synthetic-other-owner");
+    } else {
+      assert.deepEqual(locks, []);
+    }
+  });
+}

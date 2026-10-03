@@ -109,6 +109,13 @@ const COMMANDS = [
     core: true,
   },
   {
+    group: "maintenance",
+    command: "node scripts/sync-repair.mjs",
+    file: "scripts/sync-repair.mjs",
+    summary: "Preview stale sync state; use --apply for fenced recovery with the worker stopped.",
+    examples: ["node scripts/sync-repair.mjs", "node scripts/sync-repair.mjs --apply"],
+  },
+  {
     group: "diagnostics",
     command: "node scripts/sync-status.mjs",
     file: "scripts/sync-status.mjs",
@@ -163,6 +170,13 @@ const COMMANDS = [
       "node scripts/lark-im-enrich-records.mjs --limit 100",
       "node scripts/lark-im-enrich-records.mjs --limit 1000 --probe-apps",
     ],
+  },
+  {
+    group: "maintenance",
+    command: "node scripts/lark-im-replay.mjs",
+    file: "scripts/lark-im-replay.mjs",
+    summary: "Preview or apply a bounded repair for up to three selected chats without moving cursors.",
+    examples: ["node scripts/lark-im-replay.mjs --help"],
   },
   {
     group: "maintenance",

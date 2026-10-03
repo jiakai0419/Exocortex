@@ -172,18 +172,17 @@ test("renderText shows summary, unsupported reasons, recovery, and recent failur
   assert.match(output, /Records\s+3 total, 1 sent, 2 received/);
   assert.match(output, /Unsupported reasons/);
   assert.match(output, /code 230002/);
-  assert.match(output, /Recovery/);
+  assert.doesNotMatch(output, /Recovery/);
   assert.match(output, /Recent non-success runs/);
   assert.match(output, /FAILED \[rate_limited\]/);
   assert.doesNotMatch(output, /lark\.im\.received\.chat\.1/);
 });
 
-test("buildStatus assembles sqlite rows, recovery, and health detail", () => {
+test("buildStatus assembles rows without performing recovery", () => {
   const calls = [];
   const status = buildStatus("/abs/db.sqlite", {
     recoverStaleSyncState: (dbPath) => {
-      calls.push(["recover", dbPath]);
-      return { recovered_locks: 0, cancelled_runs: 0, active_expired_locks: 0 };
+      throw new Error("read-only status must not recover");
     },
     sqliteJson: (dbPath, _sql, label) => {
       calls.push([label, dbPath]);
@@ -202,6 +201,8 @@ test("buildStatus assembles sqlite rows, recovery, and health detail", () => {
             total: 4,
             enabled: 3,
             received_enabled: 2,
+            message_enabled: 3,
+            message_without_success: 0,
             received_without_cursor: 1,
             received_unsupported: 1,
           },
@@ -231,7 +232,7 @@ test("buildStatus assembles sqlite rows, recovery, and health detail", () => {
         ];
       }
       if (label === "read run counts") {
-        return [{ status: "failed", count: 1 }];
+        return [{ status: "failed", count: 1 }, { status: "succeeded", count: 1 }];
       }
       if (label === "read recent runs") {
         return [
@@ -257,7 +258,8 @@ test("buildStatus assembles sqlite rows, recovery, and health detail", () => {
   assert.equal(status.runs.recent[0].failure_kind, "rate_limited");
   assert.equal(status.runs.recent[0].transient, true);
   assert.equal(status.runs.recent[0].error_code, 9499);
-  assert.deepEqual(calls[0], ["recover", "/abs/db.sqlite"]);
+  assert.equal(calls.some(([label]) => label === "recover"), false);
+  assert.equal(status.recovery.performed, false);
 });
 
 test("parseArgs validates format and missing values", () => {

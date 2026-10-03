@@ -713,6 +713,92 @@ test("syncReceived honors receivedScopesPerRun batch limits", () => {
   assert.deepEqual(results.map((result) => result.records), [1, 1]);
 });
 
+test("syncReceived stops after exhausted transient transport failures and keeps committed progress", async (t) => {
+  const cases = ["rate_limited", "network_timeout", "network_error", "service_unavailable"].map((kind) => ({
+    errorMessage: `lark-cli failed: kind=${kind} operation=message_history_bundle`,
+    shouldStop: true,
+  }));
+  cases.push(...[
+    "lark-cli failed: kind=unknown operation=message_history_bundle",
+    "validation noted kind=rate_limited",
+    "lark-cli failed: kind=rate_limited-other operation=message_history_bundle",
+  ].map((errorMessage) => ({ errorMessage, shouldStop: false })));
+  for (const { errorMessage, shouldStop } of cases) {
+    await t.test(errorMessage, () => {
+      const rows = ["a", "b", "c"].map((name) => ({
+        id: `lark.im.received.chat.${name}`,
+        source_id: "lark.im",
+        enabled: 1,
+        config_json: JSON.stringify({ chat_id: `oc_${name}`, discovery_rank: name.charCodeAt(0) }),
+        cursor_json: null,
+      }));
+      const scopes = new Map(rows.map((row) => [row.id, {
+        ...row,
+        config: JSON.parse(row.config_json),
+        cursor: null,
+      }]));
+      const untouchedBefore = structuredClone(scopes.get(rows[2].id));
+      const calls = [];
+      const runner = createTestRunner({
+        sqliteQuery: () => rows,
+        readScope: (_dbPath, scopeId) => scopes.get(scopeId),
+        acquireLock: (_dbPath, scopeId) => {
+          calls.push(["lock", scopeId]);
+          return true;
+        },
+        createRun: (_dbPath, scope) => {
+          calls.push(["run", scope.id]);
+          return scope.id.at(-1).charCodeAt(0);
+        },
+        fetchChatMessages: (chatId) => {
+          calls.push(["fetch", chatId]);
+          if (chatId === "oc_b") throw new Error(errorMessage);
+          return { messages: [], pages: 1 };
+        },
+        buildPeopleContext: (_messages, _opts, profile) => peopleContext(profile),
+        succeedMessageRun: (_dbPath, scope, _runId, _records, _scanned, cursor) => {
+          calls.push(["checkpoint", scope.id]);
+          scopes.get(scope.id).cursor = cursor;
+          return { inserted: 0, updated: 0, duplicate: 0 };
+        },
+        failRun: (_dbPath, scope, _runId, error) => {
+          assert.equal(error.message, errorMessage);
+          calls.push(["fail", scope.id]);
+        },
+        releaseLock: (_dbPath, scopeId) => calls.push(["release", scopeId]),
+        sqliteExec: () => assert.fail("received failure must not disable or rewrite a scope"),
+      });
+
+      const results = runner.syncReceived(
+        "fake.sqlite",
+        syncOptions({ receivedScopesPerRun: 3 }),
+        { open_id: "ou_self", name: "Me" },
+      );
+
+      assert.deepEqual(results.map((result) => result.ok), shouldStop ? [true, false] : [true, false, true]);
+      assert.equal(results[1].error, errorMessage);
+      assert.equal(scopes.get(rows[0].id).cursor.created_at_ms, BASE_MS + 60_000);
+      assert.equal(scopes.get(rows[1].id).cursor, null);
+      assert.equal(scopes.get(rows[1].id).enabled, 1);
+      const expectedCalls = [
+        ["lock", rows[0].id], ["run", rows[0].id], ["fetch", "oc_a"],
+        ["checkpoint", rows[0].id], ["release", rows[0].id],
+        ["lock", rows[1].id], ["run", rows[1].id], ["fetch", "oc_b"],
+        ["fail", rows[1].id], ["release", rows[1].id],
+      ];
+      if (shouldStop) {
+        assert.deepEqual(scopes.get(rows[2].id), untouchedBefore);
+      } else {
+        expectedCalls.push(
+          ["lock", rows[2].id], ["run", rows[2].id], ["fetch", "oc_c"],
+          ["checkpoint", rows[2].id], ["release", rows[2].id],
+        );
+      }
+      assert.deepEqual(calls, expectedCalls);
+    });
+  }
+});
+
 test("catchup mode becomes a fair steady lane after initial cursors exist", () => {
   const rows = Array.from({ length: 21 }, (_, index) => {
     const number = String(index + 1).padStart(2, "0");

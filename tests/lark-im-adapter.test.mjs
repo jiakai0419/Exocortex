@@ -32,20 +32,30 @@ test("lark im adapter shim re-exports the src implementation", () => {
   assert.equal(shimCreateLarkImAdapter, createLarkImAdapter);
 });
 
-test("fetchSentMessages builds user search commands and follows page tokens", () => {
+test("fetchSentMessages builds native user search commands and closes each page with raw mget", () => {
   const calls = [];
   const adapter = createLarkImAdapter({
     run(args, options) {
       calls.push({ args, options });
-      assert.equal(args[0], "im");
-      assert.equal(args[1], "+messages-search");
-      assert.equal(commandValue(args, "--sender"), "ou_self");
-      if (commandValue(args, "--page-token") === "p2") {
-        return { messages: [{ message_id: "om_2", create_time: "2" }], has_more: false };
+      assert.equal(args[0], "api");
+      const params = JSON.parse(commandValue(args, "--params"));
+      if (args[2].endsWith("/mget")) {
+        return { ok: true, data: { items: params.message_ids.map((id) => ({
+          message_id: id, create_time: id === "om_1" ? "1" : "2", update_time: "3",
+          msg_type: "text", body: { content: '{"text":"hello"}' },
+        })) } };
+      }
+      assert.equal(args[1], "POST");
+      assert.equal(args[2], "/open-apis/im/v1/messages/search");
+      assert.deepEqual(JSON.parse(commandValue(args, "--data")).filter.from_ids, ["ou_self"]);
+      assert.equal(params.page_size, 30);
+      if (params.page_token === "p2") {
+        return { ok: true, data: { items: [{ meta_data: { message_id: "om_2" } }], has_more: false } };
       }
       return {
+        ok: true,
         data: {
-          messages: [{ message_id: "om_1", create_time: "1" }],
+          items: [{ meta_data: { message_id: "om_1" } }],
           has_more: true,
           page_token: "p2",
         },
@@ -57,8 +67,9 @@ test("fetchSentMessages builds user search commands and follows page tokens", ()
 
   assert.equal(result.pages, 2);
   assert.deepEqual(result.messages.map((message) => message.message_id), ["om_1", "om_2"]);
-  assert.deepEqual(calls[0].options.redactedFlags, ["--sender", "--page-token"]);
-  assert.equal(commandValue(calls[1].args, "--page-token"), "p2");
+  assert.deepEqual(calls[0].options.redactedFlags, ["--params", "--data"]);
+  assert.equal(JSON.parse(commandValue(calls[2].args, "--params")).page_token, "p2");
+  assert.equal(result.messages[0].raw_api.update_time, "3");
 });
 
 test("fetchChatDiscoveryPage normalizes non-muted chat-list output", () => {
@@ -129,10 +140,10 @@ test("message and chat pages fail closed instead of dropping malformed items", (
     { message_id: "om_bad_time", create_time: "not-a-time", content: "bad time" },
   ]) {
     const adapter = createLarkImAdapter({
-      run: () => ({ messages: [badMessage], has_more: false }),
+      run: () => ({ ok: true, data: { items: [badMessage], has_more: false } }),
     });
     assert.throws(
-      () => adapter.fetchSentMessages("ou_self", 1000, 2000, adapterOpts()),
+      () => adapter.fetchChatMessages("oc_scope", 1000, 2000, adapterOpts()),
       /missing a valid message_id|invalid create_time/,
     );
   }

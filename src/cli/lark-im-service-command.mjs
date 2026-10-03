@@ -56,6 +56,7 @@ const SYNC_STATUS_SCRIPT = resolve(PROJECT_ROOT, "scripts/sync-status.mjs");
  * @property {number} reconcileIntervalHours
  * @property {string} chatTypes
  * @property {string} logDir
+ * @property {string=} db
  * @property {number} lines
  * @property {number} timeoutSeconds
  * @property {number} pollSeconds
@@ -136,6 +137,7 @@ Commands:
   uninstall   Stop and remove the plist.
 
 Options:
+  --db <path>                        Database for status/wait-ok only. Default: data/exocortex.sqlite
   --interval-seconds <n>              Worker interval. Default: 60
   --hot-received-scopes-per-cycle <n> Recently active received scopes per cycle. Default: 20
   --received-scopes-per-cycle <n>     Catch-up received scopes per cycle. Default: 50
@@ -218,6 +220,7 @@ function parseArgs(argv) {
       opts.reconcileIntervalHours = parsePositiveInt(next, "reconcile-interval-hours");
     else if (arg === "--chat-types") opts.chatTypes = next;
     else if (arg === "--log-dir") opts.logDir = next;
+    else if (arg === "--db") opts.db = next;
     else if (arg === "--lines") opts.lines = parsePositiveInt(next, "lines");
     else if (arg === "--timeout-seconds") opts.timeoutSeconds = parsePositiveInt(next, "timeout-seconds");
     else if (arg === "--poll-seconds") opts.pollSeconds = parsePositiveInt(next, "poll-seconds");
@@ -230,6 +233,7 @@ function parseArgs(argv) {
     else throw new Error(`Unknown option: ${arg}`);
     i += 1;
   }
+  if (opts.db && !["status", "wait-ok"].includes(opts.command)) throw new Error("--db is supported only for status and wait-ok");
   return opts;
 }
 
@@ -543,6 +547,7 @@ function status(opts, deps = {}) {
     label: LABEL,
     target: target(deps),
     logDir: opts.logDir,
+    db: opts.db,
   });
   output.write(renderText(report));
   return report;
@@ -589,7 +594,7 @@ function waitOk(opts, deps = {}) {
   let lastReason = null;
 
   while (nowMs() <= deadline) {
-    const sync = run(execPath, [SYNC_STATUS_SCRIPT, "--format", "json"], { allowFailure: true }, deps);
+    const sync = run(execPath, [SYNC_STATUS_SCRIPT, "--db", opts.db || "data/exocortex.sqlite", "--format", "json"], { allowFailure: true }, deps);
     const syncStatus = parseJson(sync);
     const workerLog = readWorkerEvents(opts.logDir);
     const workerSummary = summarize(workerLog.events);

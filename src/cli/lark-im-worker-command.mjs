@@ -13,7 +13,11 @@ import {
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  adaptiveFairDecision,
   compactSummary,
+  compactTransportStats,
+  createAdaptiveFairState,
+  mergeTransportCooldowns,
   runCycleWithRunner,
 } from "../../dist/runtime/worker/lark-im-worker-core.js";
 
@@ -32,6 +36,14 @@ const DEFAULT_RETENTION_EVERY_CYCLES = 1440;
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const SYNC_SCRIPT = resolve(PROJECT_ROOT, "scripts/lark-im-sync.mjs");
 const MAINTENANCE_SCRIPT = resolve(PROJECT_ROOT, "scripts/sqlite-maintenance.mjs");
+const STEP_OPERATIONS = {
+  sent: "message_search_bundle",
+  "discover-hot": "chat_discovery_bundle",
+  "discover-catchup": "chat_discovery_bundle",
+  "discover-reconcile": "chat_discovery_bundle",
+  "received-hot": "message_history_bundle",
+  "received-fair": "message_history_bundle",
+};
 
 /**
  * @typedef {object} WorkerOptions
@@ -50,6 +62,10 @@ const MAINTENANCE_SCRIPT = resolve(PROJECT_ROOT, "scripts/sqlite-maintenance.mjs
  * @property {number} logKeepFiles
  * @property {number} retentionEveryCycles
  * @property {number | null} maxCycles
+ * @property {boolean} adaptiveFair
+ * @property {number} adaptiveFairMin
+ * @property {number} adaptiveFairMax
+ * @property {number} adaptiveTargetCycleSeconds
  *
  * @typedef {Record<string, any>} JsonObject
  *
@@ -74,6 +90,8 @@ const MAINTENANCE_SCRIPT = resolve(PROJECT_ROOT, "scripts/sqlite-maintenance.mjs
  * @property {() => Date=} now
  * @property {number=} timeoutSeconds
  * @property {string=} scriptPath
+ * @property {Record<string, number>=} cooldownsByOperation
+ * @property {() => number=} nowMs
  *
  * @typedef {object} WriteLogDeps
  * @property {{write(chunk: string): void}=} stdout
@@ -90,10 +108,16 @@ const MAINTENANCE_SCRIPT = resolve(PROJECT_ROOT, "scripts/sqlite-maintenance.mjs
  * @property {RunStepDeps=} runStep
  * @property {WriteLogDeps=} writeLog
  * @property {() => string=} now
+ * @property {() => number=} nowMs
+ * @property {Record<string, number>=} cooldownsByOperation
+ * @property {(steps: JsonObject[], payload: JsonObject) => void=} onComplete
  *
  * @typedef {object} RunWorkerDeps
- * @property {(opts: WorkerOptions, cycle: number) => unknown=} runCycle
+ * @property {(opts: WorkerOptions, cycle: number, deps?: RunCycleDeps) => unknown=} runCycle
  * @property {(seconds: number) => void=} sleepSeconds
+ * @property {() => number=} nowMs
+ * @property {(opts: WorkerOptions, payload: JsonObject) => void=} writeScheduler
+ * @property {Record<string, number>=} cooldownsByOperation
  */
 
 function usage() {
@@ -114,6 +138,10 @@ Options:
   --log-max-bytes <n>                 Rotate worker.jsonl at this size. Default: ${DEFAULT_LOG_MAX_BYTES}
   --log-keep-files <n>                Rotated worker logs to keep. Default: ${DEFAULT_LOG_KEEP_FILES}
   --retention-every-cycles <n>        Apply run retention every N cycles. Default: ${DEFAULT_RETENTION_EVERY_CYCLES}
+  --adaptive-fair                    Adapt fair scope batch size. Off by default; this is not an HTTP rate limiter.
+  --adaptive-fair-min <n>            Minimum adaptive fair batch. Default: 10
+  --adaptive-fair-max <n>            Maximum adaptive fair batch. Default: 50
+  --adaptive-target-cycle-seconds <n> Target work plus interval duration. Default: 90
   --max-cycles <n>                    Stop after N cycles. Omit to run forever.
   --once                              Run one cycle and exit.
   --help                              Show this help.
@@ -151,6 +179,10 @@ function parseArgs(argv) {
     logKeepFiles: DEFAULT_LOG_KEEP_FILES,
     retentionEveryCycles: DEFAULT_RETENTION_EVERY_CYCLES,
     maxCycles: null,
+    adaptiveFair: false,
+    adaptiveFairMin: 10,
+    adaptiveFairMax: 50,
+    adaptiveTargetCycleSeconds: 90,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -160,6 +192,10 @@ function parseArgs(argv) {
     }
     if (arg === "--once") {
       opts.maxCycles = 1;
+      continue;
+    }
+    if (arg === "--adaptive-fair") {
+      opts.adaptiveFair = true;
       continue;
     }
     const next = argv[i + 1];
@@ -188,8 +224,19 @@ function parseArgs(argv) {
     else if (arg === "--retention-every-cycles")
       opts.retentionEveryCycles = parsePositiveInt(next, "retention-every-cycles");
     else if (arg === "--max-cycles") opts.maxCycles = parsePositiveInt(next, "max-cycles");
+    else if (arg === "--adaptive-fair-min") opts.adaptiveFairMin = parsePositiveInt(next, "adaptive-fair-min");
+    else if (arg === "--adaptive-fair-max") opts.adaptiveFairMax = parsePositiveInt(next, "adaptive-fair-max");
+    else if (arg === "--adaptive-target-cycle-seconds")
+      opts.adaptiveTargetCycleSeconds = parsePositiveInt(next, "adaptive-target-cycle-seconds");
     else throw new Error(`Unknown option: ${arg}`);
     i += 1;
+  }
+  if (opts.adaptiveFairMin > opts.adaptiveFairMax) throw new Error("adaptive-fair-min must not exceed adaptive-fair-max");
+  if (opts.adaptiveFair && (opts.receivedScopesPerCycle < opts.adaptiveFairMin || opts.receivedScopesPerCycle > opts.adaptiveFairMax)) {
+    throw new Error("received-scopes-per-cycle must be within adaptive fair bounds");
+  }
+  if (opts.adaptiveFair && opts.adaptiveTargetCycleSeconds <= opts.intervalSeconds) {
+    throw new Error("adaptive-target-cycle-seconds must exceed interval-seconds");
   }
   return opts;
 }
@@ -215,10 +262,28 @@ function runStep(name, args, deps = {}) {
     maxBuffer: 100 * 1024 * 1024,
     timeout: Number(deps.timeoutSeconds || DEFAULT_STEP_TIMEOUT_SECONDS) * 1000,
     killSignal: "SIGKILL",
+    ...(deps.cooldownsByOperation !== undefined ? { env: {
+      ...process.env,
+      EXOCORTEX_LARK_COOLDOWNS_JSON: JSON.stringify(mergeTransportCooldowns(
+        deps.cooldownsByOperation, {}, (deps.nowMs || Date.now)(),
+      )),
+    } } : {}),
   });
   const finishedAt = now().toISOString();
   const stdout = String(result.stdout || "");
-  const stderr = String(result.stderr || result.error?.message || (result.status === null ? "worker step terminated" : ""));
+  const rawStderr = String(result.stderr || "");
+  let errorTransport = null;
+  const stderrLines = rawStderr.split("\n").filter((line) => {
+    try {
+      const event = JSON.parse(line);
+      if (event?.type === "lark_transport_summary") {
+        errorTransport = compactTransportStats(event.transport);
+        return false;
+      }
+    } catch { /* Ordinary stderr keeps its existing private-log behavior. */ }
+    return true;
+  });
+  const stderr = stderrLines.join("\n") || String(result.error?.message || (result.status === null ? "worker step terminated" : ""));
   /** @type {JsonObject | null} */
   let summary = null;
   try {
@@ -233,6 +298,8 @@ function runStep(name, args, deps = {}) {
     summary.ok === true,
   );
   const ok = result.status === 0 && validSummary;
+  const transport = errorTransport || compactTransportStats(summary?.transport);
+  const outputSummary = compactSummary(summary);
   let failureDetail = stderr.trim();
   if (result.status === 0 && !validSummary && !failureDetail) {
     failureDetail = summary && typeof summary === "object"
@@ -245,7 +312,7 @@ function runStep(name, args, deps = {}) {
     exit_code: result.status ?? undefined,
     started_at: startedAt,
     finished_at: finishedAt,
-    summary: compactSummary(summary),
+    summary: transport ? { ...(outputSummary || {}), transport } : outputSummary,
     stderr: failureDetail.slice(0, 4000),
   };
 }
@@ -308,17 +375,47 @@ function writeLog(opts, payload, deps = {}) {
  * @param {RunCycleDeps} [deps]
  */
 function runCycle(opts, cycle, deps = {}) {
+  const cooldowns = deps.cooldownsByOperation || {};
+  const nowMs = deps.nowMs || Date.now;
   return runCycleWithRunner(
     opts,
     cycle,
-    (name, args, command) =>
-      runStep(name, args, {
+    (name, args, command) => {
+      const startedMs = nowMs();
+      const activeCooldowns = mergeTransportCooldowns(cooldowns, {}, startedMs);
+      for (const key of Object.keys(cooldowns)) delete cooldowns[key];
+      Object.assign(cooldowns, activeCooldowns);
+      const operation = STEP_OPERATIONS[/** @type {keyof typeof STEP_OPERATIONS} */ (name)];
+      if (operation && cooldowns[operation] > startedMs) {
+        const at = new Date(startedMs).toISOString();
+        return {
+          name,
+          ok: false,
+          started_at: at,
+          finished_at: at,
+          summary: {
+            ok: false,
+            deferred: { reason: "operation_cooldown", operation, retry_at_ms: cooldowns[operation] },
+            transport: compactTransportStats({ cooldowns_by_operation: cooldowns }),
+          },
+          stderr: "worker step deferred until its operation cooldown expires",
+        };
+      }
+      const step = runStep(name, args, {
         ...deps.runStep,
         timeoutSeconds: opts.stepTimeoutSeconds,
         scriptPath: command === "maintenance" ? MAINTENANCE_SCRIPT : SYNC_SCRIPT,
-      }),
+        cooldownsByOperation: cooldowns,
+        nowMs,
+      });
+      const merged = mergeTransportCooldowns(cooldowns, step.summary?.transport?.cooldowns_by_operation, nowMs());
+      for (const key of Object.keys(cooldowns)) delete cooldowns[key];
+      Object.assign(cooldowns, merged);
+      return step;
+    },
     (logOpts, payload) => writeLog(logOpts, payload, deps.writeLog),
     deps.now,
+    deps.onComplete,
   );
 }
 
@@ -329,11 +426,33 @@ function runCycle(opts, cycle, deps = {}) {
 function runWorker(opts, deps = {}) {
   const runOneCycle = deps.runCycle || runCycle;
   const sleep = deps.sleepSeconds || sleepSeconds;
+  const nowMs = deps.nowMs || Date.now;
+  const logScheduler = deps.writeScheduler || writeLog;
+  const cooldowns = deps.cooldownsByOperation || {};
+  let adaptiveState = createAdaptiveFairState(opts);
   let cycle = 0;
   let ok = true;
   while (opts.maxCycles === null || cycle < opts.maxCycles) {
     cycle += 1;
-    ok = Boolean(runOneCycle(opts, cycle)) && ok;
+    const startedMs = nowMs();
+    /** @type {JsonObject[] | undefined} */
+    let observedSteps;
+    const cycleOpts = opts.adaptiveFair ? { ...opts, receivedScopesPerCycle: adaptiveState.batch } : opts;
+    const cycleOk = Boolean(runOneCycle(cycleOpts, cycle, {
+      cooldownsByOperation: cooldowns,
+      nowMs,
+      onComplete: (steps) => { observedSteps = steps; },
+    }));
+    ok = cycleOk && ok;
+    if (opts.adaptiveFair) {
+      const outcome = adaptiveFairDecision(adaptiveState, {
+        ok: cycleOk,
+        durationMs: Math.max(0, nowMs() - startedMs),
+        steps: observedSteps,
+      }, opts);
+      adaptiveState = outcome.state;
+      logScheduler(cycleOpts, { type: "lark_im_worker_scheduler", cycle, at: new Date(nowMs()).toISOString(), ...outcome.decision });
+    }
     if (opts.maxCycles !== null && cycle >= opts.maxCycles) break;
     sleep(opts.intervalSeconds);
   }

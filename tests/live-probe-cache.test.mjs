@@ -11,6 +11,7 @@ import test from "node:test";
 
 import {
   liveProbeCacheFromReport,
+  liveProbeContext,
   readLiveProbeCache,
   writeLiveProbeCache,
 } from "../src/diagnostics/live-probe-cache.mjs";
@@ -30,7 +31,12 @@ test("live probe cache keeps only redacted summary fields", () => {
   });
 
   assert.deepEqual(cache, {
-    kind: "lark_im_live_probe_cache/v1",
+    kind: "lark_im_live_probe_cache/v2",
+    context: null,
+    scope: "recent_hot_messages",
+    expires_at: "2026-06-21T00:05:00.000Z",
+    window: { start: null, end: null },
+    sample: { hot_chats_requested: null, hot_chats_found: null, messages_per_chat: null, remote_messages_checked: 0, unsupported_chats: 0, probe_errors: 0 },
     checked_at: "2026-06-21T00:00:00.000Z",
     status: "delayed",
     ok: false,
@@ -73,7 +79,7 @@ test("live probe cache read/write uses injected filesystem deps", () => {
   assert.deepEqual(read, written);
 });
 
-test("live probe cache enforces private modes for new and existing paths", (t) => {
+test("cache writes enforce private modes and reads preserve existing modes", (t) => {
   const root = mkdtempSync(join(tmpdir(), "exocortex-live-cache-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const path = join(root, "logs", "live-probe.json");
@@ -89,8 +95,12 @@ test("live probe cache enforces private modes for new and existing paths", (t) =
   chmodSync(dirname(path), 0o755);
   chmodSync(path, 0o644);
   assert.ok(readLiveProbeCache(path));
-  assert.equal(statSync(dirname(path)).mode & 0o777, 0o700);
-  assert.equal(statSync(path).mode & 0o777, 0o600);
+  assert.equal(statSync(dirname(path)).mode & 0o777, 0o755);
+  assert.equal(statSync(path).mode & 0o777, 0o644);
+  const context = liveProbeContext(path);
+  assert.match(context.database_key, /^[a-f0-9]{64}$/);
+  assert.equal(context.auth_identity_verified, false);
+  assert.equal(statSync(dirname(path)).mode & 0o777, 0o755);
 });
 
 test("live probe cache ignores missing, invalid, and wrong-kind files", () => {

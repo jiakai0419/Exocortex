@@ -174,6 +174,13 @@ function renderServiceStatusText(report) {
         ["Health", formatOverviewItem(overview.health)],
         ["Activity", formatOverviewItem(overview.activity)],
         ["Freshness", formatOverviewItem(overview.freshness)],
+        ...(overview.freshness?.sample_count > 0 ? /** @type {Array<[unknown, unknown]>} */ ([
+          ["Sample", `${overview.freshness.scope}, ${overview.freshness.sample_count} messages`],
+          ["Window", `${overview.freshness.window?.start} → ${overview.freshness.window?.end}`],
+          ["Checked", overview.freshness.checked_at],
+          ["Expires", overview.freshness.expires_at],
+          ["Identity", "current authenticated principal unknown"],
+        ]) : []),
       ],
       { width: 9 },
     ),

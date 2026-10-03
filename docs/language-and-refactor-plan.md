@@ -1,5 +1,7 @@
 # Language and Refactor Plan
 
+> 本文保留早期 Node/TypeScript 模块规划，不是当前文件清单。部分 .mjs 路径已迁为 .ts，实际入口和构建边界以仓库文件及 Operations 为准。
+
 ## 结论
 
 衍我的主系统语言方向定为：
@@ -21,9 +23,8 @@ TypeScript on Node.js
 
 ## 背景
 
-截至 2026-06-15，项目已经不再是一次性 spike：
+当前代码结构：
 
-- 后台 Lark IM worker 已经通过 macOS LaunchAgent 长期运行。
 - 本地 SQLite schema 已经沉淀出 Source / Scope / Cursor / Record / Run / Lock。
 - `src/` 已经承载 core、SQLite store、Lark IM adapter、worker core、terminal helper 和 CLI command 边界。
 - `scripts/` 继续保留稳定用户入口和兼容 wrapper。
@@ -32,7 +33,7 @@ TypeScript on Node.js
 - Terminal-first 已经成为长期交互原则。
 - public-safe 已经成为仓库原则。
 
-运行数据和本地数据库只作为判断系统形态的输入，不进入本文档。本文档不记录真实消息、真实会话、真实人员、真实链接或具体本机运行规模。
+本文档不记录真实消息、真实会话、真实人员、真实链接或具体本机运行规模。
 
 ## 为什么要现在规划
 
@@ -518,7 +519,7 @@ probe/maintenance scripts mostly JavaScript
 
 特别要求：
 
-- 类型和诊断 fixture 使用 anonymized shape fixtures：字段形状可以来自真实 API，但值必须是脱敏占位符。
+- 类型和诊断 fixture 必须从零合成，不使用真实数据或其脱敏派生样例。
 - 不把真实 SQLite 数据导出为测试 fixture。
 - 不把真实 probe JSON 放入仓库。
 - 不在文档里记录真实消息、真实群名、真实人名、真实链接或本机运行规模。

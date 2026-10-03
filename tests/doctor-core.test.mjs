@@ -32,8 +32,8 @@ test("keychain failures are classified as live unavailable, not sync failure", (
   assert.equal(live.status, "unavailable");
   assert.equal(live.reason, "keychain_unavailable");
   assert.match(live.hint, /background service can still be healthy/);
-  assert.equal(overallStatus(localState({ live })), "fresh");
-  assert.equal(shimOverallStatus(localState({ live })), "fresh");
+  assert.equal(overallStatus(localState({ live })), "local_ready");
+  assert.equal(shimOverallStatus(localState({ live })), "local_ready");
   assert.deepEqual(buildFindings(localState({ live })), ["live lag probe unavailable in this shell"]);
 });
 
@@ -87,7 +87,7 @@ test("doctor ignores non-actionable sender gaps but flags actionable sender gaps
   });
 
   assert.equal(actionableMissingSenderNames(advisoryOnly), 0);
-  assert.equal(overallStatus(advisoryOnly), "fresh");
+  assert.equal(overallStatus(advisoryOnly), "local_ready");
   assert.deepEqual(buildFindings(advisoryOnly), []);
 
   const actionable = localState({

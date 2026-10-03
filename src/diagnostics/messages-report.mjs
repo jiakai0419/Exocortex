@@ -1,7 +1,7 @@
 // @ts-check
 
-import { spawnSync } from "node:child_process";
-import { diagnosticSubprocessError } from "./public-safe.mjs";
+import { readOnlySqliteJson } from "../storage/sqlite/readonly-query.mjs";
+import { renderSystemContent } from "../adapters/lark-im/system-content.mjs";
 
 /**
  * @typedef {"all" | "sent" | "received"} MessageDirection
@@ -41,16 +41,7 @@ import { diagnosticSubprocessError } from "./public-safe.mjs";
  * @returns {Row[]}
  */
 function sqliteJson(dbPath, sql, label) {
-  const result = spawnSync("sqlite3", ["-json", dbPath], {
-    input: `.timeout 5000\n${sql}`,
-    encoding: "utf8",
-    maxBuffer: 20 * 1024 * 1024,
-    timeout: 30_000,
-    killSignal: "SIGKILL",
-  });
-  if (result.status !== 0 || result.error) throw diagnosticSubprocessError(result, label);
-  const trimmed = String(result.stdout || "").trim();
-  return trimmed ? JSON.parse(trimmed) : [];
+  return readOnlySqliteJson(dbPath, sql, label);
 }
 
 /** @param {unknown} value */
@@ -167,6 +158,12 @@ function isInvalidRenderedContent(value) {
 function displayBody(body, canonical, raw) {
   if ((canonical.deleted === true || raw.deleted === true) && isInvalidRenderedContent(body)) {
     return "[已撤回/已删除：飞书未返回原始富文本内容]";
+  }
+  if ((canonical.msg_type || raw.msg_type || raw.message_type) === "system") {
+    if (canonical.content_rendering?.status === "structured_fallback" || raw.content_rendering?.status === "structured_fallback") {
+      return body;
+    }
+    return renderSystemContent(canonical.content ?? raw.content ?? body) || body;
   }
   return body;
 }

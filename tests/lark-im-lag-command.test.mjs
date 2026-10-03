@@ -32,10 +32,10 @@ function opts(overrides = {}) {
     chatPages: 2,
     hotChats: 2,
     messagesPerChat: 5,
-    start: "2027-01-15T08:00:00+00:00",
-    end: "2027-01-15T08:05:00+00:00",
-    startMs: 1800000000000,
-    endMs: 1800000300000,
+    start: "2001-09-09T01:46:40+00:00",
+    end: "2001-09-09T01:51:40+00:00",
+    startMs: 1000000000000,
+    endMs: 1000000300000,
     format: "text",
     ...overrides,
   };
@@ -43,10 +43,10 @@ function opts(overrides = {}) {
 
 function latestLocal(overrides = {}) {
   return {
-    external_id: "om_shape_remote_card_002",
-    occurred_at_ms: 1800000060000,
-    occurred_at: new Date(1800000060000).toISOString(),
-    chat_name: "Shape Group B",
+    external_id: "om_unit_lag_card",
+    occurred_at_ms: 1000000060000,
+    occurred_at: new Date(1000000060000).toISOString(),
+    chat_name: "Synthetic Room 2",
     direction: "received",
     ...overrides,
   };
@@ -57,7 +57,7 @@ function healthyReport(overrides = {}) {
     ok: true,
     status: "healthy",
     checked_at: "2026-06-20T00:00:00.000Z",
-    window: { start: "2027-01-15T08:00:00+00:00", end: "2027-01-15T08:05:00+00:00" },
+    window: { start: "2001-09-09T01:46:40+00:00", end: "2001-09-09T01:51:40+00:00" },
     probe: {
       hot_chats_requested: 2,
       hot_chats_found: 2,
@@ -67,17 +67,17 @@ function healthyReport(overrides = {}) {
       probe_errors: 0,
     },
     latest_remote: {
-      message_id: "om_shape_remote_card_002",
-      created_at: new Date(1800000060000).toISOString(),
-      chat_name: "Shape Group B",
-      sender_name: "Shape App",
-      body: "Private shape card title",
+      message_id: "om_unit_lag_card",
+      created_at: new Date(1000000060000).toISOString(),
+      chat_name: "Synthetic Room 2",
+      sender_name: "Synthetic App",
+      body: "Unit test card",
       exists_locally: true,
     },
     latest_local: {
-      message_id: "om_shape_remote_card_002",
-      created_at: new Date(1800000060000).toISOString(),
-      chat_name: "Shape Group B",
+      message_id: "om_unit_lag_card",
+      created_at: new Date(1000000060000).toISOString(),
+      chat_name: "Synthetic Room 2",
       direction: "received",
     },
     lag_ms: 0,
@@ -100,9 +100,9 @@ test("lag command parseArgs keeps explicit time windows stable", () => {
     "--messages-per-chat",
     "2",
     "--start",
-    "2027-01-15T08:00:00+00:00",
+    "2001-09-09T01:46:40+00:00",
     "--end",
-    "2027-01-15T08:05:00+00:00",
+    "2001-09-09T01:51:40+00:00",
     "--format",
     "json",
   ]);
@@ -111,8 +111,8 @@ test("lag command parseArgs keeps explicit time windows stable", () => {
   assert.equal(parsed.chatPages, 3);
   assert.equal(parsed.hotChats, 4);
   assert.equal(parsed.messagesPerChat, 2);
-  assert.equal(parsed.startMs, 1800000000000);
-  assert.equal(parsed.endMs, 1800000300000);
+  assert.equal(parsed.startMs, 1000000000000);
+  assert.equal(parsed.endMs, 1000000300000);
   assert.equal(parsed.format, "json");
   assert.equal(parsed.unsafeDetails, false);
   assert.equal(parseArgs(["--unsafe-details"]).unsafeDetails, true);
@@ -122,7 +122,7 @@ test("lag command parseArgs keeps explicit time windows stable", () => {
   assert.throws(() => parseArgs(["--messages-per-chat", "4.9"]), /positive integer/);
   assert.throws(() => parseArgs(["--format", "yaml"]), /--format must be text or json/);
   assert.throws(
-    () => parseArgs(["--start", "2027-01-15T08:05:00Z", "--end", "2027-01-15T08:00:00Z"]),
+    () => parseArgs(["--start", "2001-09-09T01:51:40Z", "--end", "2001-09-09T01:46:40Z"]),
     /--end must be after --start/,
   );
 });
@@ -141,12 +141,12 @@ test("lag hot-chat probe covers group and p2p chats", () => {
   assert.equal(calls[0][typeIndex + 1], "group,p2p");
 });
 
-test("lag report collects healthy anonymized remote messages through fake deps", () => {
+test("lag report collects healthy synthetic remote messages through fake deps", () => {
   const report = collectLagReport("/abs/db.sqlite", opts(), {
     getSelfOpenId: () => SELF_OPEN_ID,
     fetchHotChats: () => HOT_CHATS,
     fetchRecentChatMessages: (chat) => (chat.chat_id === HOT_CHATS[0].chat_id ? REMOTE_MESSAGES : []),
-    loadExistingRecords: () => new Set(["om_shape_remote_text_001", "om_shape_remote_card_002"]),
+    loadExistingRecords: () => new Set(["om_unit_lag_text", "om_unit_lag_card"]),
     localLatest: () => latestLocal(),
   });
 
@@ -154,7 +154,7 @@ test("lag report collects healthy anonymized remote messages through fake deps",
   assert.equal(report.ok, true);
   assert.equal(report.probe.hot_chats_found, 2);
   assert.equal(report.probe.remote_messages_checked, 2);
-  assert.equal(report.latest_remote.message_id, "om_shape_remote_card_002");
+  assert.equal(report.latest_remote.message_id, "om_unit_lag_card");
   assert.equal(report.latest_remote.exists_locally, true);
 });
 
@@ -163,19 +163,19 @@ test("lag report classifies missing remote messages as delayed", () => {
     getSelfOpenId: () => SELF_OPEN_ID,
     fetchHotChats: () => HOT_CHATS,
     fetchRecentChatMessages: (chat) => (chat.chat_id === HOT_CHATS[0].chat_id ? REMOTE_MESSAGES : []),
-    loadExistingRecords: () => new Set(["om_shape_remote_text_001"]),
+    loadExistingRecords: () => new Set(["om_unit_lag_text"]),
     localLatest: () => latestLocal({
-      external_id: "om_shape_remote_text_001",
-      occurred_at_ms: 1800000000000,
-      occurred_at: new Date(1800000000000).toISOString(),
-      chat_name: "Shape Group A",
+      external_id: "om_unit_lag_text",
+      occurred_at_ms: 1000000000000,
+      occurred_at: new Date(1000000000000).toISOString(),
+      chat_name: "Synthetic Room 1",
     }),
   });
 
   assert.equal(report.status, "delayed");
   assert.equal(report.ok, false);
   assert.equal(report.missing_count, 1);
-  assert.equal(report.missing[0].message_id, "om_shape_remote_card_002");
+  assert.equal(report.missing[0].message_id, "om_unit_lag_card");
   assert.match(plain(renderLagText(report)), /Lark IM lag check DELAYED/);
   assert.match(plain(renderLagText(report)), /Missing/);
 });
@@ -226,9 +226,9 @@ test("lag check CLI renders text, json, help, and dependency errors", () => {
   assert.equal(exitText, 0);
   assert.equal(stderr.text(), "");
   assert.match(plain(stdout.text()), /Lark IM lag check OK/);
-  assert.doesNotMatch(plain(stdout.text()), /Shape Group B/);
-  assert.doesNotMatch(plain(stdout.text()), /Shape App/);
-  assert.doesNotMatch(plain(stdout.text()), /Private shape card title/);
+  assert.doesNotMatch(plain(stdout.text()), /Synthetic Room 2/);
+  assert.doesNotMatch(plain(stdout.text()), /Synthetic App/);
+  assert.doesNotMatch(plain(stdout.text()), /Unit test card/);
 
   const unsafeOut = memoryWriter();
   const exitUnsafe = runLagCheckCli(["--start", opts().start, "--end", opts().end, "--unsafe-details"], {
@@ -240,9 +240,9 @@ test("lag check CLI renders text, json, help, and dependency errors", () => {
     },
   });
   assert.equal(exitUnsafe, 0);
-  assert.match(plain(unsafeOut.text()), /Shape Group B/);
-  assert.match(plain(unsafeOut.text()), /Shape App/);
-  assert.match(plain(unsafeOut.text()), /Private shape card title/);
+  assert.match(plain(unsafeOut.text()), /Synthetic Room 2/);
+  assert.match(plain(unsafeOut.text()), /Synthetic App/);
+  assert.match(plain(unsafeOut.text()), /Unit test card/);
 
   const delayed = healthyReport({ ok: false, status: "delayed", missing_count: 1 });
   const jsonOut = memoryWriter();
@@ -260,7 +260,7 @@ test("lag check CLI renders text, json, help, and dependency errors", () => {
   assert.equal(jsonReport.latest_remote.chat_name, "<redacted>");
   assert.equal(jsonReport.latest_remote.sender_name, "<redacted>");
   assert.equal(jsonReport.latest_remote.body, "<redacted>");
-  assert.equal(jsonOut.text().includes("Shape Group B"), false);
+  assert.equal(jsonOut.text().includes("Synthetic Room 2"), false);
 
   const helpOut = memoryWriter();
   assert.equal(runLagCheckCli(["--help"], { stdout: helpOut.stream }), 0);
@@ -296,7 +296,7 @@ test("lag public sanitizer removes local metadata and message excerpts", () => {
     missing: [
       {
         message_id: "om_private",
-        created_at: new Date(1800000060000).toISOString(),
+        created_at: new Date(1000000060000).toISOString(),
         chat_name: "Private Group",
         sender_name: "Private Sender",
         body: "Private missing body",
@@ -313,6 +313,6 @@ test("lag public sanitizer removes local metadata and message excerpts", () => {
   assert.equal(text.includes("Private Sender"), false);
   assert.equal(text.includes("Private missing body"), false);
   assert.equal(text.includes("private API detail"), false);
-  assert.equal(report.missing[0].created_at, new Date(1800000060000).toISOString());
+  assert.equal(report.missing[0].created_at, new Date(1000000060000).toISOString());
   assert.equal(report.unsupported_chats[0].reason, "restricted_mode");
 });

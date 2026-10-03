@@ -484,3 +484,15 @@ test("isReadyHealth keeps wait-ok accepted health states explicit", () => {
   assert.equal(isReadyHealth("catching_up"), false);
   assert.equal(isReadyHealth("needs_attention"), false);
 });
+
+test("service status passes an explicit database and install rejects ignored DB flags", () => {
+  assert.throws(() => parseArgs(["install", "--db", "custom.sqlite"]), /only for status and wait-ok/);
+  let seen;
+  runServiceCommand(parseArgs(["status", "--db", "/synthetic/custom.sqlite"]), {
+    stdout: memoryWriter().stream,
+    uid: () => 501,
+    buildServiceStatusReport: (opts) => { seen = opts; return {}; },
+    renderServiceStatusText: () => "",
+  });
+  assert.equal(seen.db, "/synthetic/custom.sqlite");
+});

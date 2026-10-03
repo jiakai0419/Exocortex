@@ -1,5 +1,7 @@
 # Ingestion Core Design
 
+> 本文保留早期架构设计，不是当前 CLI 与读取路径的完整说明。其中快捷命令示例不代表当前实现：当前 received 使用原生 list，sent 使用 search 加 mget；以源码和 Operations 为准。
+
 ## 目标
 
 衍我的信息同步内核负责一件事：
@@ -699,7 +701,7 @@ Cursor 注意事项：
 
 ```json
 {
-  "created_at_ms": 1781337300000,
+  "created_at_ms": 1000000000000,
   "message_id": "om_xxx"
 }
 ```

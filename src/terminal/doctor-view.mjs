@@ -92,6 +92,10 @@ function renderDoctorText(report) {
     /** @type {Array<[unknown, unknown]>} */
     const liveRows = [
       ["Status", statusBadge(report.live.status || "unknown")],
+      ["Scope", "recent_hot_messages (sample only)"],
+      ["Sample", report.live.probe?.remote_messages_checked ?? 0],
+      ["Window", `${report.live.window?.start || "unknown"} → ${report.live.window?.end || "unknown"}`],
+      ["Identity", "current authenticated principal unknown"],
       ["Missing", report.live.missing_count ?? "?"],
       [
         "Lag",

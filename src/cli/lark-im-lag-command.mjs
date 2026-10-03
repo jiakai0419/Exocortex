@@ -67,7 +67,7 @@ Options:
   --db <path>                SQLite database path. Default: ${DEFAULT_DB}
   --chat-pages <n>           Hot chat-list pages to probe. Default: ${DEFAULT_CHAT_PAGES}
   --hot-chats <n>            Max non-muted hot chats to inspect. Default: ${DEFAULT_HOT_CHATS}
-  --messages-per-chat <n>    Recent messages per hot chat. Default: ${DEFAULT_MESSAGES_PER_CHAT}
+  --messages-per-chat <n>    First-page sample per hot chat, capped at 50 (includes replies). Default: ${DEFAULT_MESSAGES_PER_CHAT}
   --start <iso>              Probe start time. Default: today 00:00 local time.
   --end <iso>                Probe end time. Default: now.
   --format <fmt>             text | json. Default: text

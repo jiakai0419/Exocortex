@@ -24,6 +24,9 @@ const DEFAULT_DOCTOR_CHILD_TIMEOUT_MS = 180_000;
  * @property {boolean} live
  * @property {number} hotChats
  * @property {number} messagesPerChat
+ * @property {number=} chatPages
+ * @property {string=} start
+ * @property {string=} end
  *
  * @typedef {object} DoctorReport
  * @property {boolean} ok
@@ -128,18 +131,25 @@ function buildReport(opts, deps = {}) {
               String(opts.messagesPerChat),
               "--format",
               "json",
+              ...(opts.chatPages !== undefined ? ["--chat-pages", String(opts.chatPages)] : []),
+              ...(opts.start !== undefined ? ["--start", opts.start] : []),
+              ...(opts.end !== undefined ? ["--end", opts.end] : []),
             ],
             new Set([0, 2]),
           ),
         ),
       )
     : null;
+  if (live) {
+    live.scope = "recent_hot_messages";
+    live.auth_identity = "unknown";
+  }
 
   const findings = buildFindings({ status, quality, live });
   const overall = overallStatus({ status, quality, live });
 
   return {
-    ok: ["fresh", "syncing", "catching_up"].includes(overall),
+    ok: ["local_ready", "sampled", "syncing", "catching_up"].includes(overall),
     overall,
     checked_at: now().toISOString(),
     status,

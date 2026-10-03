@@ -1,7 +1,10 @@
 // @ts-check
 
+import { readOnlySqliteJson } from "../storage/sqlite/readonly-query.mjs";
+
 import { spawnSync } from "node:child_process";
-import { localIsoFromMs } from "../adapters/lark-im/core.mjs";
+import { parseLarkTimeMs } from "../adapters/lark-im/core.mjs";
+import { nativePage, assertRawMessagePage } from "../adapters/lark-im/adapter.mjs";
 import {
   buildLagReport,
   normalizeRemoteMessage,
@@ -38,16 +41,7 @@ function quoteSql(value) {
  * @returns {JsonObject[]}
  */
 function sqliteJson(dbPath, sql, label) {
-  const result = spawnSync("sqlite3", ["-json", dbPath], {
-    input: `.timeout 5000\n${sql}`,
-    encoding: "utf8",
-    maxBuffer: 50 * 1024 * 1024,
-    timeout: 30_000,
-    killSignal: "SIGKILL",
-  });
-  if (result.status !== 0 || result.error) throw diagnosticSubprocessError(result, label);
-  const trimmed = String(result.stdout || "").trim();
-  return trimmed ? JSON.parse(trimmed) : [];
+  return readOnlySqliteJson(dbPath, sql, label);
 }
 
 /** @param {string[]} args */
@@ -174,28 +168,44 @@ function fetchHotChats(opts, deps = {}) {
  * @param {LagReportDeps} [deps]
  */
 function fetchRecentChatMessages(chat, opts, deps = {}) {
+  if (typeof chat.chat_id !== "string" || !chat.chat_id.trim() ||
+      !Number.isSafeInteger(opts.startMs) || !Number.isSafeInteger(opts.endMs) ||
+      opts.startMs < 0 || opts.endMs <= opts.startMs || !Number.isFinite(new Date(opts.endMs).getTime()) ||
+      !Number.isSafeInteger(opts.messagesPerChat) || opts.messagesPerChat < 1) {
+    throw new Error("live message sample requires a chat, valid window and positive page size");
+  }
   const callLark = deps.runLark || runLark;
+  const pageSize = Math.min(50, opts.messagesPerChat);
   const args = [
-    "im",
-    "+chat-messages-list",
+    "api",
+    "GET",
+    "/open-apis/im/v1/messages",
     "--as",
     "user",
-    "--chat-id",
-    chat.chat_id,
-    "--start",
-    localIsoFromMs(opts.startMs),
-    "--end",
-    localIsoFromMs(opts.endMs),
-    "--order",
-    "desc",
-    "--page-size",
-    String(Math.min(50, opts.messagesPerChat)),
-    "--no-reactions",
+    "--params",
+    JSON.stringify({
+      container_id_type: "chat", container_id: chat.chat_id,
+      only_thread_root_messages: false, sort_type: "ByCreateTimeDesc",
+      page_size: pageSize, card_msg_content_type: "raw_card_content",
+      start_time: String(Math.floor(opts.startMs / 1000)),
+      end_time: String(Math.ceil(opts.endMs / 1000)),
+    }),
     "--format",
     "json",
   ];
   const json = callLark(args);
-  return envelope(json, "messages").items;
+  const page = nativePage(json, "live message sample", new Set());
+  assertRawMessagePage(page.items, "live message sample");
+  if (page.items.length > pageSize) throw new Error("live message sample exceeded its page size");
+  if (page.items.some((message) => message.chat_id !== undefined && message.chat_id !== chat.chat_id)) {
+    throw new Error("live message sample contains a different chat");
+  }
+  // Deliberately one list page: no cursor continuation, thread requests,
+  // merged-message expansion or metadata enrichment. Compare ID presence only.
+  return page.items.filter((message) => {
+    const createdMs = parseLarkTimeMs(message.create_time ?? message.created_at ?? message.create_time_ms);
+    return createdMs >= opts.startMs && createdMs <= opts.endMs;
+  }).map((message) => ({ ...message, content: message.body.content }));
 }
 
 /**

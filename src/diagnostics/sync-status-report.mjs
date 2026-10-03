@@ -1,10 +1,9 @@
 // @ts-check
 
-import { spawnSync } from "node:child_process";
-import { recoverStaleSyncState } from "../../dist/storage/sqlite/ingestion-store.js";
+import { readOnlySqliteJson } from "../storage/sqlite/readonly-query.mjs";
+
 import { classifyLarkFailure } from "../adapters/lark-im/transport.mjs";
 import {
-  diagnosticSubprocessError,
   publicCommandFailureReason,
   publicErrorCode,
   publicFailureKind,
@@ -22,7 +21,6 @@ import {
  *
  * @typedef {object} SyncStatusReportDeps
  * @property {(dbPath: string, sql: string, label: string) => Row[]=} sqliteJson
- * @property {(dbPath: string) => JsonObject=} recoverStaleSyncState
  */
 
 /**
@@ -32,16 +30,7 @@ import {
  * @returns {Row[]}
  */
 function sqliteJson(dbPath, sql, label) {
-  const result = spawnSync("sqlite3", ["-json", dbPath], {
-    input: `.timeout 5000\n${sql}`,
-    encoding: "utf8",
-    maxBuffer: 20 * 1024 * 1024,
-    timeout: 30_000,
-    killSignal: "SIGKILL",
-  });
-  if (result.status !== 0 || result.error) throw diagnosticSubprocessError(result, label);
-  const trimmed = String(result.stdout || "").trim();
-  return trimmed ? JSON.parse(trimmed) : [];
+  return readOnlySqliteJson(dbPath, sql, label);
 }
 
 /** @param {unknown} value */
@@ -92,6 +81,8 @@ function publicCursor(value) {
  * @param {JsonObject | null} discoveryCursor
  */
 function publicHealthDetail(health, scopes, discoveryCursor) {
+  if (health === "not_ready") return "initial discovery or successful message-scope evidence is missing";
+  if (health === "needs_attention") return "sync history contains failures but no successful run";
   if (health === "syncing") return "worker is currently syncing";
   if (health === "catching_up") {
     /** @type {string[]} */
@@ -119,7 +110,7 @@ function sanitizeStatusReportForPublicOutput(report) {
       exit_status: Number(report.exit_status || 1),
     };
   }
-  const health = ["syncing", "catching_up", "ok", "ok_with_history"].includes(report?.health)
+  const health = ["syncing", "catching_up", "not_ready", "needs_attention", "ok", "ok_with_history"].includes(report?.health)
     ? report.health
     : "unknown";
   const scopes = {
@@ -127,6 +118,8 @@ function sanitizeStatusReportForPublicOutput(report) {
     enabled: nonNegativeNumber(report?.scopes?.enabled),
     received_enabled: nonNegativeNumber(report?.scopes?.received_enabled),
     received_without_cursor: nonNegativeNumber(report?.scopes?.received_without_cursor),
+    message_enabled: nonNegativeNumber(report?.scopes?.message_enabled),
+    message_without_success: nonNegativeNumber(report?.scopes?.message_without_success),
     received_unsupported: nonNegativeNumber(report?.scopes?.received_unsupported),
     unsupported_reasons: publicUnsupportedReasons(report?.scopes?.unsupported_reasons),
   };
@@ -187,9 +180,10 @@ function sanitizeStatusReportForPublicOutput(report) {
       expires_at: publicTimestamp(lock.expires_at),
     })),
     recovery: {
-      recovered_locks: nonNegativeNumber(report?.recovery?.recovered_locks),
-      cancelled_runs: nonNegativeNumber(report?.recovery?.cancelled_runs),
-      active_expired_locks: nonNegativeNumber(report?.recovery?.active_expired_locks),
+      performed: false,
+      recovered_locks: 0,
+      cancelled_runs: 0,
+      active_expired_locks: 0,
     },
     health,
     health_detail: publicHealthDetail(health, scopes, discoveryCursor),
@@ -222,8 +216,6 @@ function readScopeStatus(dbPath, scopeId, label, query) {
  */
 function buildStatus(dbPath, deps = {}) {
   const query = deps.sqliteJson || sqliteJson;
-  const recover = deps.recoverStaleSyncState || recoverStaleSyncState;
-  const recovery = recover(dbPath);
   const totals = first(
     query(
       dbPath,
@@ -245,6 +237,10 @@ function buildStatus(dbPath, deps = {}) {
          SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END) AS enabled,
          SUM(CASE WHEN id LIKE 'lark.im.received.chat.%' AND enabled = 1 THEN 1 ELSE 0 END) AS received_enabled,
          SUM(CASE WHEN id LIKE 'lark.im.received.chat.%' AND enabled = 1 AND cursor_json IS NULL THEN 1 ELSE 0 END) AS received_without_cursor,
+         SUM(CASE WHEN enabled = 1 AND (id = 'lark.im.sent_by_me' OR id LIKE 'lark.im.received.chat.%') THEN 1 ELSE 0 END) AS message_enabled,
+         SUM(CASE WHEN enabled = 1 AND (id = 'lark.im.sent_by_me' OR id LIKE 'lark.im.received.chat.%')
+           AND NOT EXISTS (SELECT 1 FROM sync_runs r WHERE r.id = sync_scopes.last_success_run_id AND r.scope_id = sync_scopes.id AND r.status = 'succeeded')
+           THEN 1 ELSE 0 END) AS message_without_success,
          SUM(CASE WHEN id LIKE 'lark.im.received.chat.%' AND json_extract(config_json, '$.unsupported_reason') IS NOT NULL THEN 1 ELSE 0 END) AS received_unsupported
        FROM sync_scopes;`,
       "read scope totals",
@@ -319,6 +315,8 @@ function buildStatus(dbPath, deps = {}) {
       enabled: Number(scopeCounts.enabled || 0),
       received_enabled: Number(scopeCounts.received_enabled || 0),
       received_without_cursor: Number(scopeCounts.received_without_cursor || 0),
+      message_enabled: Number(scopeCounts.message_enabled || 0),
+      message_without_success: Number(scopeCounts.message_without_success || 0),
       received_unsupported: Number(scopeCounts.received_unsupported || 0),
       unsupported_reasons: unsupportedReasons,
     },
@@ -356,7 +354,6 @@ function buildStatus(dbPath, deps = {}) {
       }),
     },
     locks,
-    recovery,
     health: summarizeHealth({ discoveryCursor, scopeCounts, locks, runCounts }),
   });
 }

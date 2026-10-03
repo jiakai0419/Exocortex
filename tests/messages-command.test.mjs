@@ -215,3 +215,24 @@ test("messages CLI renders text, json, help, and dependency errors", () => {
   assert.equal(exitError, 1);
   assert.match(plain(errorOut.text()), /database not found/);
 });
+
+test("historical system templates render unknown operators without rewriting stored content", () => {
+  const input = row({ body: "{name} clipped a topic to top.", canonical_json: JSON.stringify({ msg_type: "system" }), raw_json: "{}" });
+  const before = JSON.stringify(input);
+  assert.equal(enrichRow(input).display.body, "未知操作者置顶了一个话题");
+  assert.equal(JSON.stringify(input), before);
+  const plain = row({ body: "{name} clipped a topic to top.", canonical_json: JSON.stringify({ msg_type: "text" }), raw_json: "{}" });
+  assert.equal(enrichRow(plain).display.body, plain.body);
+});
+
+test("native structured system fallback preserves its JSON without template substitution", () => {
+  const body = '[system]\n{"template":"{name} clipped a topic to top.","unknown_field":true}';
+  for (const metadataField of ["canonical_json", "raw_json"]) {
+    const input = row({
+      body,
+      canonical_json: JSON.stringify({ msg_type: "system" }),
+      [metadataField]: JSON.stringify({ msg_type: "system", source_api: "im.v1.messages", content_rendering: { status: "structured_fallback" } }),
+    });
+    assert.equal(enrichRow(input).display.body, body);
+  }
+});

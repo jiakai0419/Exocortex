@@ -131,7 +131,7 @@ test("doctor subprocesses use absolute project scripts, process executable, and 
   assert.equal(unavailable.reason, "dependency_unavailable");
 });
 
-test("doctor command emits fresh local report as json", () => {
+test("doctor command emits local-ready report without a remote freshness claim as json", () => {
   const stdout = memoryWriter();
   const stderr = memoryWriter();
   const calls = [];
@@ -154,7 +154,7 @@ test("doctor command emits fresh local report as json", () => {
   assert.equal(stderr.text(), "");
   const report = JSON.parse(stdout.text());
   assert.equal(report.ok, true);
-  assert.equal(report.overall, "fresh");
+  assert.equal(report.overall, "local_ready");
   assert.equal(report.checked_at, "2026-06-20T00:00:00.000Z");
   assert.equal(report.db_path, undefined);
   assert.equal(stdout.text().includes("/abs/custom.sqlite"), false);
@@ -174,6 +174,7 @@ test("doctor command runs live probe with tolerated delayed exit status", () => 
   const exitCode = runDoctorCli(
     [
       "--live",
+      "--write-live-cache",
       "--hot-chats",
       "2",
       "--messages-per-chat",
@@ -188,7 +189,7 @@ test("doctor command runs live probe with tolerated delayed exit status", () => 
         resolvePath: (dbPath) => `/abs/${dbPath}`,
         now: () => new Date("2026-06-20T00:00:00.000Z"),
         runJson: fakeRunJson(calls, {
-          live: { status: "healthy", ok: true, missing_count: 0, lag_ms: 1000 },
+          live: { status: "healthy", ok: true, missing_count: 0, lag_ms: 1000, probe: { remote_messages_checked: 2 }, window: { start: "2026-06-19T00:00:00Z", end: "2026-06-20T00:00:00Z" } },
         }),
         liveProbeCachePath: "logs/test/live-probe.json",
         writeLiveProbeCache: (path, report) => {
@@ -247,12 +248,11 @@ test("doctor command normalizes live keychain failures without failing local hea
   assert.equal(exitCode, 0);
   assert.equal(stderr.text(), "");
   const report = JSON.parse(stdout.text());
-  assert.equal(report.overall, "fresh");
+  assert.equal(report.overall, "local_ready");
   assert.equal(report.live.status, "unavailable");
   assert.equal(report.live.reason, "keychain_unavailable");
   assert.deepEqual(report.findings, ["live lag probe unavailable in this shell"]);
-  assert.equal(cacheWrites.length, 1);
-  assert.equal(cacheWrites[0].report.live.status, "unavailable");
+  assert.equal(cacheWrites.length, 0);
 });
 
 test("doctor command returns exit code 2 when report needs attention", () => {
@@ -377,4 +377,21 @@ test("parseArgs validates live options and format", () => {
   assert.throws(() => parseArgs(["--messages-per-chat", "4.9"]), /positive integer/);
   assert.throws(() => parseArgs(["--format", "yaml"]), /--format must be text or json/);
   assert.throws(() => parseArgs(["--db"]), /--db requires a value/);
+});
+
+test("live probing is read-only by default and accepts a bounded window/page budget", () => {
+  assert.throws(() => parseArgs(["--write-live-cache"]), /requires --live/);
+  const calls = [];
+  const stdout = memoryWriter();
+  const code = runDoctorCli(["--live", "--chat-pages", "1", "--start", "2026-06-19T00:00:00Z", "--end", "2026-06-20T00:00:00Z", "--format", "json"], {
+    stdout: stdout.stream,
+    deps: {
+      runJson: fakeRunJson(calls, { live: { status: "healthy", ok: true, probe: { remote_messages_checked: 0 } } }),
+      writeLiveProbeCache: () => { throw new Error("must not write"); },
+      liveProbeContext: () => { throw new Error("must not inspect cache context"); },
+    },
+  });
+  assert.equal(code, 2);
+  assert.equal(JSON.parse(stdout.text()).live.status, "inconclusive");
+  assert.deepEqual(calls.at(-1).args.slice(-6), ["--chat-pages", "1", "--start", "2026-06-19T00:00:00Z", "--end", "2026-06-20T00:00:00Z"]);
 });

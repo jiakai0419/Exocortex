@@ -11,9 +11,9 @@ import { summarizeHealth as shimSummarizeHealth } from "../scripts/lib/sync-stat
 function state(overrides = {}) {
   return {
     discoveryCursor: { has_more: false },
-    scopeCounts: { received_without_cursor: 0 },
+    scopeCounts: { received_without_cursor: 0, message_enabled: 2, message_without_success: 0 },
     locks: [],
-    runCounts: [],
+    runCounts: [{ status: "succeeded", count: 2 }],
     ...overrides,
   };
 }
@@ -48,14 +48,14 @@ test("health is catching_up while discovery or received cursors are incomplete",
     "catching_up",
   );
   assert.equal(
-    summarizeHealth(state({ scopeCounts: { received_without_cursor: 12 } })),
+    summarizeHealth(state({ scopeCounts: { received_without_cursor: 12, message_enabled: 2, message_without_success: 0 } })),
     "catching_up",
   );
   assert.equal(
     healthDetail(
       state({
         discoveryCursor: { has_more: true },
-        scopeCounts: { received_without_cursor: 12 },
+        scopeCounts: { received_without_cursor: 12, message_enabled: 2, message_without_success: 0 },
       }),
     ),
     "initial catch-up: discovery still has more pages, 12 chat scopes need cursors",
@@ -64,10 +64,18 @@ test("health is catching_up while discovery or received cursors are incomplete",
 
 test("health separates historical failures from current attention needs", () => {
   assert.equal(
-    summarizeHealth(state({ runCounts: [{ status: "failed", count: 2 }] })),
+    summarizeHealth(state({ runCounts: [{ status: "failed", count: 2 }, { status: "succeeded", count: 2 }] })),
     "ok_with_history",
   );
   assert.equal(summarizeHealth(state()), "ok");
   assert.equal(shimSummarizeHealth(state()), "ok");
   assert.equal(healthDetail(state()), "all known enabled scopes have cursors");
+});
+
+test("empty, failed-only and missing discovery evidence never report ready", () => {
+  assert.equal(summarizeHealth(state({ runCounts: [] })), "not_ready");
+  assert.equal(summarizeHealth(state({ runCounts: [{ status: "failed", count: 2 }] })), "needs_attention");
+  assert.equal(summarizeHealth(state({ discoveryCursor: {} })), "not_ready");
+  assert.equal(summarizeHealth(state({ scopeCounts: { message_enabled: 0 } })), "not_ready");
+  assert.equal(summarizeHealth(state({ scopeCounts: { message_enabled: 2, message_without_success: 1 } })), "not_ready");
 });

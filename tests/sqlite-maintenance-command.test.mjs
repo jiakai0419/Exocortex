@@ -1,10 +1,20 @@
 import assert from "node:assert/strict";
 import {
+  chmodSync,
+  copyFileSync,
   existsSync,
+  linkSync,
+  mkdirSync,
   mkdtempSync,
+  readFileSync,
   readdirSync,
+  realpathSync,
+  renameSync,
   rmSync,
   statSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,12 +25,13 @@ import { plain } from "../dist/terminal/index.js";
 import {
   executeSqliteMaintenance,
   parseArgs,
+  pruneBackups,
   renderSqliteMaintenanceText,
   runSqliteMaintenanceCli,
 } from "../src/cli/sqlite-maintenance-command.mjs";
 
 function tempDir(t) {
-  const dir = mkdtempSync(join(tmpdir(), "exocortex-sqlite-maintenance-test-"));
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "exocortex-sqlite-maintenance-test-")));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   return dir;
 }
@@ -234,9 +245,9 @@ test("a failed new backup is discarded without pruning the last verified backup"
       cwd: dir,
       now: () => new Date("2027-01-16T08:00:00.000Z"),
       spawnSync: (cmd, args, options) => {
-        const candidatePath = String(args[1] || "");
+        const candidatePath = String(args.at(-1) || "");
         if (
-          args[0] === "-json" &&
+          args.includes("-json") &&
           candidatePath.startsWith(backupDir) &&
           String(options.input || "").includes("PRAGMA quick_check")
         ) {
@@ -396,4 +407,301 @@ test("sqlite maintenance reports a readable missing sqlite3 error", () => {
       }),
     /sqlite3 executable not found \(ENOENT\)/,
   );
+});
+
+function backupFor(dbPath, backupDir, cwd, extraArgs = [], deps = {}) {
+  return executeSqliteMaintenance(parseArgs(["backup", "--db", dbPath, "--backup-dir", backupDir, ...extraArgs]), { cwd, ...deps });
+}
+
+function reportBackupPath(dir, report) { return join(dir, report.backup_path); }
+function manifestAt(path) { return JSON.parse(readFileSync(`${path}.manifest.json`, "utf8")); }
+function noStagingFiles(dir) { assert.deepEqual(readdirSync(dir).filter((name) => name.startsWith(".exocortex-backup-")), []); }
+function mode(path) { return statSync(path).mode & 0o777; }
+
+test("retention and latest isolate source databases sharing a directory and never touch its source or foreign files", (t) => {
+  const dir = tempDir(t);
+  const shared = join(dir, "shared");
+  mkdirSync(shared, { mode: 0o755 });
+  const sourceA = join(shared, "source-a.sqlite");
+  const sourceB = join(dir, "source-b.sqlite");
+  const foreign = join(shared, "another-application.sqlite");
+  installSchema(sourceA);
+  installSchema(sourceB);
+  writeFileSync(foreign, "foreign bytes", { mode: 0o644 });
+  writeFileSync(`${foreign}.manifest.json`, "foreign manifest", { mode: 0o644 });
+  const firstA = reportBackupPath(dir, backupFor(sourceA, shared, dir));
+  const firstB = reportBackupPath(dir, backupFor(sourceB, shared, dir));
+  utimesSync(firstA, new Date(0), new Date(0));
+  const second = backupFor(sourceA, shared, dir, ["--backup-keep-count", "1"]);
+  const secondA = reportBackupPath(dir, second);
+  assert.deepEqual(second.retention.removed, [firstA.split("/").at(-1)]);
+  assert.equal(existsSync(firstA), false);
+  assert.equal(existsSync(firstB), true);
+  assert.equal(existsSync(sourceA), true);
+  assert.equal(sqliteJson(sourceA, "SELECT count(*) AS n FROM records;", "source preserved")[0].n, 1);
+  assert.equal(readFileSync(foreign, "utf8"), "foreign bytes");
+  assert.equal(readFileSync(`${foreign}.manifest.json`, "utf8"), "foreign manifest");
+  assert.equal(mode(foreign), 0o644);
+  assert.equal(mode(`${foreign}.manifest.json`), 0o644);
+  assert.equal(mode(shared), 0o755);
+  utimesSync(firstB, new Date(Date.now() + 10000), new Date(Date.now() + 10000));
+  const latest = executeSqliteMaintenance(parseArgs(["verify", "--latest", "--db", sourceA, "--backup-dir", shared]), { cwd: dir });
+  assert.equal(reportBackupPath(dir, latest), secondA);
+  assert.equal(latest.ok, true);
+  assert.notEqual(manifestAt(secondA).source_db_id, manifestAt(firstB).source_db_id);
+  assert.match(manifestAt(secondA).source_db_id, /^[a-f0-9]{64}$/);
+  assert.doesNotMatch(JSON.stringify(manifestAt(secondA)), new RegExp(dir));
+  noStagingFiles(shared);
+});
+
+test("backups at the same timestamp get distinct exclusive filenames", (t) => {
+  const dir = tempDir(t);
+  const dbPath = join(dir, "source.sqlite");
+  const backupDir = join(dir, "backups");
+  installSchema(dbPath);
+  const fixed = new Date();
+  const first = backupFor(dbPath, backupDir, dir, [], { now: () => fixed });
+  const second = backupFor(dbPath, backupDir, dir, [], { now: () => fixed });
+  assert.notEqual(first.backup_path, second.backup_path);
+  for (const report of [first, second]) {
+    assert.equal(existsSync(reportBackupPath(dir, report)), true);
+    assert.equal(mode(reportBackupPath(dir, report)), 0o600);
+    assert.equal(mode(`${reportBackupPath(dir, report)}.manifest.json`), 0o600);
+  }
+  noStagingFiles(backupDir);
+});
+
+for (const collisionMember of ["database", "manifest", "manifest-symlink"]) {
+  test(`publication collision preserves pre-existing ${collisionMember} and the last verified backup`, (t) => {
+    const dir = tempDir(t);
+    const dbPath = join(dir, "source.sqlite");
+    const backupDir = join(dir, "backups");
+    installSchema(dbPath);
+    const first = reportBackupPath(dir, backupFor(dbPath, backupDir, dir));
+    const target = join(dir, "private-target.txt");
+    writeFileSync(target, "foreign target", { mode: 0o644 });
+    let collided = "";
+    let publishedDatabase = "";
+    assert.throws(() => backupFor(dbPath, backupDir, dir, ["--backup-keep-count", "1"], {
+      linkSync(from, to) {
+        const manifest = to.endsWith(".manifest.json");
+        if ((collisionMember === "database" && !manifest) || (collisionMember !== "database" && manifest)) {
+          collided = to;
+          if (collisionMember === "manifest-symlink") symlinkSync(target, to);
+          else writeFileSync(to, "pre-existing object", { mode: 0o640 });
+        } else if (!manifest) publishedDatabase = to;
+        linkSync(from, to);
+      },
+    }), /EEXIST/);
+    assert.ok(collided);
+    assert.equal(readFileSync(collided, "utf8"), collisionMember === "manifest-symlink" ? "foreign target" : "pre-existing object");
+    assert.equal(readFileSync(target, "utf8"), "foreign target");
+    assert.equal(mode(target), 0o644);
+    if (collisionMember !== "manifest-symlink") assert.equal(mode(collided), 0o640);
+    if (publishedDatabase) assert.equal(existsSync(publishedDatabase), false);
+    assert.equal(existsSync(first), true);
+    assert.equal(existsSync(`${first}.manifest.json`), true);
+    noStagingFiles(backupDir);
+  });
+}
+
+test("backup directory symlinks and writable shared directories fail before taking a maintenance lock", (t) => {
+  const dir = tempDir(t);
+  const dbPath = join(dir, "source.sqlite");
+  installSchema(dbPath);
+  const target = join(dir, "real-backups");
+  const alias = join(dir, "alias-backups");
+  mkdirSync(target, { mode: 0o755 });
+  symlinkSync(target, alias);
+  let locks = 0;
+  const deps = { acquireMaintenanceLock() { locks += 1; return { acquired: true }; } };
+  assert.throws(() => backupFor(dbPath, alias, dir, [], deps), /real directory, not a symbolic link/);
+  assert.equal(mode(target), 0o755);
+  chmodSync(target, 0o777);
+  assert.throws(() => backupFor(dbPath, target, dir, [], deps), /must not be group or world writable/);
+  assert.equal(mode(target), 0o777);
+  assert.equal(locks, 0);
+  assert.deepEqual(readdirSync(target), []);
+  chmodSync(target, 0o755);
+});
+
+test("retention skips symlinks, hard links, corrupt manifests and unowned SQLite files without chmod", (t) => {
+  const dir = tempDir(t);
+  const dbPath = join(dir, "source.sqlite");
+  const backupDir = join(dir, "backups");
+  installSchema(dbPath);
+  const valid = reportBackupPath(dir, backupFor(dbPath, backupDir, dir));
+  const original = manifestAt(valid);
+  const fake = (suffix) => join(backupDir, `exocortex-${original.source_db_id}-20000101000000-000-${suffix}.sqlite`);
+  const sourceLink = fake("aaaa");
+  linkSync(dbPath, sourceLink);
+  const symbolic = fake("bbbb");
+  symlinkSync(dbPath, symbolic);
+  const corruptManifest = fake("cccc");
+  copyFileSync(valid, corruptManifest);
+  chmodSync(corruptManifest, 0o644);
+  const manifestLink = fake("dddd");
+  copyFileSync(valid, manifestLink);
+  chmodSync(manifestLink, 0o644);
+  const foreignManifest = join(dir, "foreign-manifest.json");
+  writeFileSync(foreignManifest, "foreign manifest", { mode: 0o644 });
+  for (const path of [sourceLink, symbolic, corruptManifest]) {
+    const manifest = { ...original, backup_file: path.split("/").at(-1), sha256: "0".repeat(64) };
+    writeFileSync(`${path}.manifest.json`, JSON.stringify(manifest), { mode: 0o644 });
+  }
+  symlinkSync(foreignManifest, `${manifestLink}.manifest.json`);
+  const result = pruneBackups(backupDir, 1, 1, new Date(Date.now() + 10 * 86400000), {}, valid, dbPath);
+  assert.equal(result.removed_count, 0);
+  for (const path of [sourceLink, symbolic, corruptManifest, manifestLink]) assert.equal(existsSync(path), true);
+  assert.equal(mode(corruptManifest), 0o644);
+  assert.equal(mode(`${corruptManifest}.manifest.json`), 0o644);
+  assert.equal(mode(manifestLink), 0o644);
+  assert.equal(mode(foreignManifest), 0o644);
+  assert.equal(readFileSync(foreignManifest, "utf8"), "foreign manifest");
+  assert.equal(sqliteJson(dbPath, "SELECT count(*) AS n FROM records;", "source alias protected")[0].n, 1);
+  assert.throws(() => executeSqliteMaintenance(parseArgs(["verify", "--db", dbPath, "--backup", symbolic]), { cwd: dir }), /not a symbolic link/);
+  assert.throws(() => executeSqliteMaintenance(parseArgs(["verify", "--db", dbPath, "--backup", sourceLink]), { cwd: dir }), /must not alias the source database/);
+  const verifyManifestLink = executeSqliteMaintenance(parseArgs(["verify", "--db", dbPath, "--backup", manifestLink]), { cwd: dir });
+  assert.equal(verifyManifestLink.manifest.status, "invalid");
+});
+
+test("legacy backup explicit verify and read-only maintenance leave file and directory modes unchanged", (t) => {
+  const dir = tempDir(t);
+  const dbPath = join(dir, "source.sqlite");
+  const backupDir = join(dir, "backups");
+  installSchema(dbPath);
+  const valid = reportBackupPath(dir, backupFor(dbPath, backupDir, dir));
+  const legacy = join(backupDir, "exocortex-legacy.sqlite");
+  copyFileSync(valid, legacy);
+  const oldManifest = { ...manifestAt(valid), kind: "exocortex.sqlite-backup-manifest/v1", backup_file: "exocortex-legacy.sqlite" };
+  delete oldManifest.source_db_id;
+  writeFileSync(`${legacy}.manifest.json`, JSON.stringify(oldManifest));
+  chmodSync(dir, 0o755);
+  chmodSync(backupDir, 0o755);
+  for (const path of [dbPath, legacy, `${legacy}.manifest.json`]) chmodSync(path, 0o644);
+  const before = new Map([dbPath, legacy, `${legacy}.manifest.json`].map((path) => [path, readFileSync(path)]));
+  const commands = [
+    ["check", "--db", dbPath], ["prune-runs", "--db", dbPath],
+    ["verify", "--db", dbPath, "--backup", legacy],
+  ];
+  for (const args of commands) {
+    const spawned = [];
+    const report = executeSqliteMaintenance(parseArgs(args), {
+      cwd: dir,
+      chmodSync() { assert.fail("read-only maintenance must not chmod"); },
+      spawnSync(cmd, cliArgs, opts) { spawned.push(cliArgs); return spawnSync(cmd, cliArgs, opts); },
+    });
+    assert.equal(report.ok, true);
+    assert.ok(spawned.length);
+    assert.ok(spawned.every((args) => args.includes("-readonly")));
+  }
+  for (const [path, bytes] of before) {
+    assert.deepEqual(readFileSync(path), bytes);
+    assert.equal(mode(path), 0o644);
+  }
+  assert.equal(mode(dir), 0o755);
+  assert.equal(mode(backupDir), 0o755);
+  const result = pruneBackups(backupDir, 1, 1, new Date(Date.now() + 10 * 86400000), {}, valid, dbPath);
+  assert.equal(result.removed_count, 0);
+  assert.equal(existsSync(legacy), true);
+  rmSync(valid);
+  rmSync(`${valid}.manifest.json`);
+  assert.throws(() => executeSqliteMaintenance(parseArgs(["verify", "--latest", "--db", dbPath, "--backup-dir", backupDir]), { cwd: dir }), /no owned SQLite backups found; use --backup for legacy/);
+});
+
+test("source ownership survives inode replacement and resolves symbolic source aliases", (t) => {
+  const dir = tempDir(t);
+  const dbPath = join(dir, "source.sqlite");
+  const backupDir = join(dir, "backups");
+  installSchema(dbPath);
+  const first = reportBackupPath(dir, backupFor(dbPath, backupDir, dir));
+  const firstId = manifestAt(first).source_db_id;
+  const firstInode = statSync(dbPath).ino;
+  renameSync(dbPath, join(dir, "old-source.sqlite"));
+  installSchema(dbPath);
+  assert.notEqual(statSync(dbPath).ino, firstInode);
+  const alias = join(dir, "source-alias.sqlite");
+  symlinkSync(dbPath, alias);
+  const second = reportBackupPath(dir, backupFor(alias, backupDir, dir));
+  assert.equal(manifestAt(second).source_db_id, firstId);
+  const latest = executeSqliteMaintenance(parseArgs(["verify", "--latest", "--db", dbPath, "--backup-dir", backupDir]), { cwd: dir });
+  assert.equal(reportBackupPath(dir, latest), second);
+  assert.equal(latest.ok, true);
+});
+
+test("failed VACUUM or manifest write only removes this operation's staging outputs", (t) => {
+  const dir = tempDir(t);
+  const dbPath = join(dir, "source.sqlite");
+  const backupDir = join(dir, "backups");
+  installSchema(dbPath);
+  const first = reportBackupPath(dir, backupFor(dbPath, backupDir, dir));
+  const firstBytes = readFileSync(first);
+  assert.throws(() => backupFor(dbPath, backupDir, dir, [], {
+    spawnSync(cmd, args, opts) {
+      const sql = String(opts.input || "");
+      if (sql.includes("VACUUM main INTO")) {
+        const target = sql.match(/VACUUM main INTO '([^']+)';/)?.[1];
+        assert.ok(target?.includes("/.exocortex-backup-"));
+        writeFileSync(target, "synthetic partial backup", { mode: 0o600 });
+        return { status: 1, stdout: "", stderr: "synthetic failure" };
+      }
+      return spawnSync(cmd, args, opts);
+    },
+  }), /synthetic failure/);
+  noStagingFiles(backupDir);
+  assert.throws(() => backupFor(dbPath, backupDir, dir, [], {
+    writeFileSync(path, data, opts) {
+      writeFileSync(path, data.slice(0, 10), opts);
+      throw new Error("synthetic manifest failure");
+    },
+  }), /synthetic manifest failure/);
+  noStagingFiles(backupDir);
+  assert.deepEqual(readFileSync(first), firstBytes);
+  assert.equal(existsSync(`${first}.manifest.json`), true);
+  assert.deepEqual(readdirSync(backupDir).filter((name) => name.endsWith(".sqlite")), [first.split("/").at(-1)]);
+});
+
+test("cleanup never deletes a replacement at a claimed publication path", (t) => {
+  const dir = tempDir(t);
+  const dbPath = join(dir, "source.sqlite");
+  const backupDir = join(dir, "backups");
+  installSchema(dbPath);
+  let replacement = "";
+  assert.throws(() => backupFor(dbPath, backupDir, dir, [], {
+    linkSync(from, to) {
+      linkSync(from, to);
+      replacement = to;
+      rmSync(to);
+      writeFileSync(to, "replacement owned by someone else", { mode: 0o644 });
+    },
+  }), /backup file identity changed/);
+  assert.equal(readFileSync(replacement, "utf8"), "replacement owned by someone else");
+  assert.equal(mode(replacement), 0o644);
+  noStagingFiles(backupDir);
+});
+
+test("mutating maintenance rejects missing or invalid sources before writable locks or directory creation", (t) => {
+  const dir = tempDir(t);
+  const missingParent = join(dir, "missing-parent");
+  const missingSource = join(missingParent, "source.sqlite");
+  const backupDir = join(dir, "backups");
+  let locks = 0;
+  const deps = { cwd: dir, acquireMaintenanceLock() { locks += 1; return { acquired: true }; } };
+  for (const action of [["backup"], ["compact"], ["prune-runs", "--apply"]]) {
+    assert.throws(() => executeSqliteMaintenance(parseArgs([...action, "--db", missingSource, "--backup-dir", backupDir]), deps), /database not found/);
+    assert.equal(existsSync(missingSource), false);
+    assert.equal(existsSync(missingParent), false);
+    assert.equal(existsSync(backupDir), false);
+  }
+  const invalidSource = join(dir, "incomplete.sqlite");
+  sqliteExec(invalidSource, "CREATE TABLE foreign_data (n INTEGER);", "unrelated schema");
+  const bytes = readFileSync(invalidSource);
+  for (const action of [["backup"], ["compact"], ["prune-runs", "--apply"]]) {
+    const report = executeSqliteMaintenance(parseArgs([...action, "--db", invalidSource, "--backup-dir", backupDir]), deps);
+    assert.equal(report.ok, false);
+    assert.ok(report.source_check.missing_tables.length);
+    assert.deepEqual(readFileSync(invalidSource), bytes);
+    assert.equal(existsSync(backupDir), false);
+  }
+  assert.equal(locks, 0);
 });

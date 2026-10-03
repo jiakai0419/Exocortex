@@ -1,9 +1,9 @@
 // @ts-check
 
-import { spawnSync } from "node:child_process";
+import { readOnlySqliteJson } from "../storage/sqlite/readonly-query.mjs";
+
 import { classifyLarkFailure } from "../adapters/lark-im/transport.mjs";
 import {
-  diagnosticSubprocessError,
   publicCommandFailureReason,
   publicErrorCode,
   publicFailureKind,
@@ -26,16 +26,7 @@ import {
  * @returns {JsonObject[]}
  */
 function sqliteJson(dbPath, sql, label) {
-  const result = spawnSync("sqlite3", ["-json", dbPath], {
-    input: `.timeout 5000\n${sql}`,
-    encoding: "utf8",
-    maxBuffer: 50 * 1024 * 1024,
-    timeout: 30_000,
-    killSignal: "SIGKILL",
-  });
-  if (result.status !== 0 || result.error) throw diagnosticSubprocessError(result, label);
-  const trimmed = String(result.stdout || "").trim();
-  return trimmed ? JSON.parse(trimmed) : [];
+  return readOnlySqliteJson(dbPath, sql, label);
 }
 
 /**

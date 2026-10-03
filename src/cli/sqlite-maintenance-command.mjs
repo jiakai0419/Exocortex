@@ -1,22 +1,29 @@
 // @ts-check
 
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
-  chmodSync,
   existsSync,
   closeSync,
+  constants,
+  fstatSync,
+  linkSync,
+  lstatSync,
   openSync,
   readFileSync,
   readSync,
   mkdirSync,
+  mkdtempSync,
   readdirSync,
   rmSync,
+  rmdirSync,
+  realpathSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import {
   basename,
+  dirname,
   relative,
   resolve,
 } from "node:path";
@@ -68,9 +75,10 @@ const DURABLE_BACKUP_TABLES = ["sources", "sync_scopes", "records", "sync_runs"]
  * @property {(path: string, options?: {withFileTypes?: boolean}) => any[]=} readdirSync
  * @property {(path: string) => {size?: number, mtimeMs?: number}=} statSync
  * @property {(path: string, mode: number) => void=} chmodSync
- * @property {(path: string, encoding: BufferEncoding) => string=} readFileSync
- * @property {(path: string, data: string, options?: JsonObject) => void=} writeFileSync
+ * @property {(path: string | number, encoding: BufferEncoding) => string=} readFileSync
+ * @property {(path: string | number, data: string, options?: JsonObject) => void=} writeFileSync
  * @property {(path: string, options?: JsonObject) => void=} rmSync
+ * @property {(existingPath: string, newPath: string) => void=} linkSync
  * @property {(cmd: string, args: string[], options: JsonObject) => {status: number | null, stdout?: string, stderr?: string, error?: NodeJS.ErrnoException}=} spawnSync
  * @property {() => Date=} now
  * @property {(dbPath: string, options: JsonObject) => {acquired: boolean, reason?: string, active_sync_locks?: number, lock_owner?: string | null}=} acquireMaintenanceLock
@@ -90,13 +98,19 @@ Options:
   --db <path>           SQLite database path. Default: ${DEFAULT_DB}
   --backup-dir <path>   Private backup directory. Default: ${DEFAULT_BACKUP_DIR}
   --backup <path>       Backup file to verify.
-  --latest              Verify the newest backup in --backup-dir.
+  --latest              Verify the newest owned backup for --db in --backup-dir.
   --dry-run             For prune-runs: report only. This is the default.
   --apply               For prune-runs: actually delete eligible old no-op runs.
   --backup-keep-count <n>  Backups to retain after backup. Default: ${DEFAULT_BACKUP_KEEP_COUNT}
   --backup-keep-days <n>   Maximum backup age in days. Default: ${DEFAULT_BACKUP_KEEP_DAYS}
   --format <fmt>        text | json. Default: text
   --help                Show this help.
+
+New backups include a canonical source-path hash, never the absolute source path.
+Retention and --latest only use backups with matching source ownership. Legacy
+backups remain available via verify --backup <path> and are never auto-pruned.
+Existing backup directories are not chmodded; symlinks and group/world-writable
+backup directories are rejected.
 `;
 }
 
@@ -233,6 +247,13 @@ function publicMaintenanceError(error) {
     /^(?:backup-keep-count|backup-keep-days) must be (?:a safe )?positive integer$/,
     /^maintenance lock unavailable: \d+ active sync lock\(s\); retry shortly or stop the worker$/,
     /^maintenance lock unavailable: held by another maintenance command$/,
+    /^backup directory must be a real directory, not a symbolic link$/,
+    /^backup directory must not be group or world writable$/,
+    /^backup directory not found$/,
+    /^backup path must be a regular file, not a symbolic link$/,
+    /^backup file must not alias the source database$/,
+    /^no owned SQLite backups found; use --backup for legacy backups$/,
+    /^backup file identity changed$/,
   ];
   if (safeMessages.some((pattern) => pattern.test(message))) return new Error(message);
   return publicDiagnosticError(error, "SQLite maintenance failed");
@@ -273,7 +294,7 @@ function sqliteFailure(result, label) {
  */
 function sqliteJson(dbPath, sql, label, deps = {}) {
   const run = deps.spawnSync || spawnSync;
-  const result = run("sqlite3", ["-json", dbPath], {
+  const result = run("sqlite3", ["-readonly", "-json", dbPath], {
     input: `.bail on\n.timeout 5000\nPRAGMA foreign_keys = ON;\n${sql}`,
     encoding: "utf8",
     maxBuffer: 50 * 1024 * 1024,
@@ -310,8 +331,8 @@ function firstCell(rows) {
  * @param {string} path
  */
 function publicPath(cwd, path) {
-  const resolvedCwd = resolve(cwd);
-  const resolvedPath = resolve(path);
+  const resolvedCwd = canonicalPath(cwd);
+  const resolvedPath = canonicalPath(path);
   const rel = relative(resolvedCwd, resolvedPath);
   if (!rel.startsWith("..") && rel !== "") return rel;
   return `<external-path>/${basename(path)}`;
@@ -423,44 +444,104 @@ function timestampForFile(date) {
   return date.toISOString().replace(/[-:TZ]/g, "").replace(".", "-").slice(0, 19);
 }
 
+/** @param {string} path */
+function fileIdentity(path) {
+  try { return lstatSync(path); }
+  catch (error) {
+    if (/** @type {NodeJS.ErrnoException} */ (error).code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+/** @param {import("node:fs").Stats | null} left @param {import("node:fs").Stats | null} right */
+function sameFile(left, right) {
+  return Boolean(left && right && left.dev === right.dev && left.ino === right.ino);
+}
+
+/** Resolve existing aliases, including the existing parent of a missing source. @param {string} path */
+function canonicalPath(path) {
+  const absolute = resolve(path);
+  try { return realpathSync(absolute); }
+  catch (error) {
+    if (/** @type {NodeJS.ErrnoException} */ (error).code !== "ENOENT" || dirname(absolute) === absolute) throw error;
+    return resolve(canonicalPath(dirname(absolute)), basename(absolute));
+  }
+}
+
 /**
+ * Ownership denotes the logical database at a canonical path. Inode replacement
+ * does not change it; inode equality is used separately to exclude source aliases.
  * @param {string} dbPath
- * @param {string} backupPath
- * @param {SqliteMaintenanceDeps} [deps]
  */
+function sourceDatabaseIdentity(dbPath) {
+  const path = canonicalPath(dbPath);
+  return { path, id: createHash("sha256").update(path).digest("hex"), identity: fileIdentity(path) };
+}
+
+/** @typedef {ReturnType<typeof sourceDatabaseIdentity>} SourceDatabaseIdentity */
+/** @param {string} path @param {SourceDatabaseIdentity} source */
+function isSourceDatabase(path, source) {
+  return resolve(path) === source.path || sameFile(fileIdentity(path), source.identity) || canonicalPath(path) === source.path;
+}
+
+/** @param {string} path */
+function regularFileIdentity(path) {
+  const identity = fileIdentity(path);
+  if (!identity?.isFile() || identity.isSymbolicLink()) throw new Error("backup path must be a regular file, not a symbolic link");
+  return identity;
+}
+
+/** @param {string} path @param {boolean} create @param {SqliteMaintenanceDeps} deps */
+function safeBackupDirectory(path, create, deps) {
+  let identity = fileIdentity(path);
+  if (!identity && create) {
+    (deps.mkdirSync || mkdirSync)(path, { recursive: true, mode: 0o700 });
+    identity = fileIdentity(path);
+  }
+  if (!identity) throw new Error("backup directory not found");
+  if (!identity.isDirectory() || identity.isSymbolicLink()) throw new Error("backup directory must be a real directory, not a symbolic link");
+  if (identity.mode & 0o022) throw new Error("backup directory must not be group or world writable");
+  return realpathSync(path);
+}
+
+/** @param {string} dbPath @param {string} backupPath @param {SqliteMaintenanceDeps} [deps] */
 function backupDatabase(dbPath, backupPath, deps = {}) {
-  if ((deps.existsSync || existsSync)(backupPath)) throw new Error(`backup already exists: ${backupPath}`);
-  sqliteExec(dbPath, `VACUUM main INTO ${quoteSql(backupPath)};`, "backup", deps);
-  sqliteExec(
-    backupPath,
-    "BEGIN IMMEDIATE; DELETE FROM sync_locks; DELETE FROM maintenance_locks; COMMIT;",
-    "remove ephemeral locks from backup",
-    deps,
-  );
-  const chmod = deps.chmodSync || chmodSync;
-  chmod(backupPath, 0o600);
+  if (fileIdentity(backupPath)) throw new Error("backup destination already exists");
+  // The target lives in this operation's exclusive 0700 staging directory.
+  const previousUmask = process.umask(0o077);
+  try {
+    sqliteExec(dbPath, `VACUUM main INTO ${quoteSql(backupPath)};`, "backup", deps);
+    regularFileIdentity(backupPath);
+    sqliteExec(backupPath, "BEGIN IMMEDIATE; DELETE FROM sync_locks; DELETE FROM maintenance_locks; COMMIT;", "remove ephemeral locks from backup", deps);
+  } finally { process.umask(previousUmask); }
 }
 
 /** @param {string} path */
 function sha256File(path) {
   const digest = createHash("sha256");
   const buffer = Buffer.allocUnsafe(1024 * 1024);
-  const fd = openSync(path, "r");
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
+    if (!fstatSync(fd).isFile()) throw new Error("backup path must be a regular file, not a symbolic link");
     let bytesRead = 0;
     do {
       bytesRead = readSync(fd, buffer, 0, buffer.length, null);
       if (bytesRead > 0) digest.update(buffer.subarray(0, bytesRead));
     } while (bytesRead > 0);
-  } finally {
-    closeSync(fd);
-  }
+  } finally { closeSync(fd); }
   return digest.digest("hex");
 }
 
 /** @param {string} backupPath */
-function backupManifestPath(backupPath) {
-  return `${backupPath}.manifest.json`;
+function backupManifestPath(backupPath) { return `${backupPath}.manifest.json`; }
+
+/** @param {string} path @param {SqliteMaintenanceDeps} deps */
+function readBackupManifest(path, deps) {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    if (!fstatSync(fd).isFile()) throw new Error("backup path must be a regular file, not a symbolic link");
+    return JSON.parse(String((deps.readFileSync || readFileSync)(fd, "utf8")));
+  } finally { closeSync(fd); }
 }
 
 /**
@@ -468,22 +549,28 @@ function backupManifestPath(backupPath) {
  * @param {JsonObject} backupCheck
  * @param {string} createdAt
  * @param {SqliteMaintenanceDeps} [deps]
+ * @param {string | null} [sourceDbId]
  */
-function writeBackupManifest(backupPath, backupCheck, createdAt, deps = {}) {
-  const fileStat = deps.statSync || statSync;
-  const writeFile = deps.writeFileSync || writeFileSync;
-  const chmod = deps.chmodSync || chmodSync;
+function writeBackupManifest(backupPath, backupCheck, createdAt, deps = {}, sourceDbId = null) {
+  const identity = regularFileIdentity(backupPath);
   const manifest = {
-    kind: "exocortex.sqlite-backup-manifest/v1",
+    kind: sourceDbId ? "exocortex.sqlite-backup-manifest/v2" : "exocortex.sqlite-backup-manifest/v1",
+    ...(sourceDbId ? { source_db_id: sourceDbId } : {}),
     created_at: createdAt,
     backup_file: basename(backupPath),
     sha256: sha256File(backupPath),
-    size_bytes: Number(fileStat(backupPath).size || 0),
+    size_bytes: identity.size,
     counts: backupCheck.counts,
   };
   const path = backupManifestPath(backupPath);
-  writeFile(path, `${JSON.stringify(manifest, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-  chmod(path, 0o600);
+  const fd = openSync(path, "wx", 0o600);
+  const owned = fstatSync(fd);
+  try {
+    (deps.writeFileSync || writeFileSync)(fd, `${JSON.stringify(manifest, null, 2)}\n`, { encoding: "utf8" });
+  } catch (error) {
+    if (sameFile(fileIdentity(path), owned)) (deps.rmSync || rmSync)(path, { force: true });
+    throw error;
+  } finally { closeSync(fd); }
   return manifest;
 }
 
@@ -491,98 +578,96 @@ function writeBackupManifest(backupPath, backupCheck, createdAt, deps = {}) {
  * @param {string} backupPath
  * @param {JsonObject} backupCheck
  * @param {SqliteMaintenanceDeps} [deps]
+ * @param {string | null} [sourceDbId]
  */
-function verifyBackupManifest(backupPath, backupCheck, deps = {}) {
-  const fileExists = deps.existsSync || existsSync;
-  const readFile = deps.readFileSync || readFileSync;
-  const fileStat = deps.statSync || statSync;
+function verifyBackupManifest(backupPath, backupCheck, deps = {}, sourceDbId = null) {
   const path = backupManifestPath(backupPath);
-  if (!fileExists(path)) {
-    return { ok: false, status: "missing", path: basename(path) };
-  }
+  if (!fileIdentity(path)) return { ok: false, status: "missing", path: basename(path) };
   try {
-    const manifest = JSON.parse(String(readFile(path, "utf8")));
-    const actualSha256 = sha256File(backupPath);
-    const actualSize = Number(fileStat(backupPath).size || 0);
+    const identity = regularFileIdentity(backupPath);
+    regularFileIdentity(path);
+    const manifest = readBackupManifest(path, deps);
+    const v2 = manifest.kind === "exocortex.sqlite-backup-manifest/v2";
     const checks = {
-      kind: manifest.kind === "exocortex.sqlite-backup-manifest/v1",
+      kind: v2 || manifest.kind === "exocortex.sqlite-backup-manifest/v1",
+      source: v2 ? /^[a-f0-9]{64}$/.test(manifest.source_db_id || "") && (!sourceDbId || manifest.source_db_id === sourceDbId) : !sourceDbId,
       backup_file: manifest.backup_file === basename(backupPath),
-      sha256: manifest.sha256 === actualSha256,
-      size: Number(manifest.size_bytes) === actualSize,
+      sha256: manifest.sha256 === sha256File(backupPath),
+      size: Number(manifest.size_bytes) === identity.size,
       counts: compareCounts(manifest.counts || {}, backupCheck.counts || {}),
     };
-    return {
-      ok: Object.values(checks).every(Boolean),
-      status: Object.values(checks).every(Boolean) ? "verified" : "mismatch",
-      checks,
-      path: basename(path),
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      status: "invalid",
-      path: basename(path),
-      error: "manifest could not be verified",
-    };
+    return { ok: Object.values(checks).every(Boolean), status: Object.values(checks).every(Boolean) ? "verified" : "mismatch", checks, path: basename(path) };
+  } catch {
+    return { ok: false, status: "invalid", path: basename(path), error: "manifest could not be verified" };
   }
-}
-
-/** @param {string} backupPath @param {SqliteMaintenanceDeps} [deps] */
-function discardBackup(backupPath, deps = {}) {
-  const remove = deps.rmSync || rmSync;
-  remove(backupPath, { force: true });
-  remove(backupManifestPath(backupPath), { force: true });
 }
 
 /**
  * @param {string} backupDir
- * @param {number} keepCount
- * @param {number} keepDays
- * @param {Date} now
- * @param {SqliteMaintenanceDeps} [deps]
- * @param {string} [protectedPath]
+ * @param {SourceDatabaseIdentity} source
+ * @param {SqliteMaintenanceDeps} deps
+ * @param {boolean} verifyHash
  */
-function pruneBackups(backupDir, keepCount, keepDays, now, deps = {}, protectedPath = "") {
-  const readDir = deps.readdirSync || readdirSync;
-  const fileStat = deps.statSync || statSync;
-  const remove = deps.rmSync || rmSync;
-  const chmod = deps.chmodSync || chmodSync;
+function ownedBackupFiles(backupDir, source, deps, verifyHash) {
+  const pattern = new RegExp(`^exocortex-${source.id}-[0-9-]+-[a-f0-9-]+\\.sqlite$`);
+  const files = [];
+  for (const entry of (deps.readdirSync || readdirSync)(backupDir)) {
+    const name = String(entry);
+    if (basename(name) !== name || !pattern.test(name)) continue;
+    const path = resolve(backupDir, name);
+    try {
+      const identity = regularFileIdentity(path);
+      const manifestPath = backupManifestPath(path);
+      const manifestIdentity = regularFileIdentity(manifestPath);
+      if (identity.nlink !== 1 || manifestIdentity.nlink !== 1 || isSourceDatabase(path, source) || isSourceDatabase(manifestPath, source)) continue;
+      const manifest = readBackupManifest(manifestPath, deps);
+      if (manifest.kind !== "exocortex.sqlite-backup-manifest/v2" || manifest.source_db_id !== source.id || manifest.backup_file !== name) continue;
+      if (verifyHash && !verifyBackupManifest(path, { counts: manifest.counts }, deps, source.id).ok) continue;
+      files.push({ path, identity, manifestIdentity, mtimeMs: identity.mtimeMs });
+    } catch { /* Foreign, incomplete or unverifiable files are never auto-deleted. */ }
+  }
+  return files.sort((left, right) => right.mtimeMs - left.mtimeMs || right.path.localeCompare(left.path));
+}
+
+/** Delete only the still-identical regular file we claimed, never a replacement or source alias.
+ * @param {string} path @param {import("node:fs").Stats} owned @param {SourceDatabaseIdentity} source @param {SqliteMaintenanceDeps} deps
+ */
+function removeOwnedFile(path, owned, source, deps) {
+  const current = fileIdentity(path);
+  if (!current) return true;
+  if (!current.isFile() || !sameFile(current, owned) || isSourceDatabase(path, source)) return false;
+  (deps.rmSync || rmSync)(path, { force: true });
+  return true;
+}
+
+/**
+ * @param {string} backupDir @param {number} keepCount @param {number} keepDays
+ * @param {Date} now @param {SqliteMaintenanceDeps} [deps] @param {string} [protectedPath]
+ * @param {string} [sourceDbPath]
+ */
+function pruneBackups(backupDir, keepCount, keepDays, now, deps = {}, protectedPath = "", sourceDbPath = DEFAULT_DB) {
+  const directory = safeBackupDirectory(backupDir, false, deps);
+  const source = sourceDatabaseIdentity(sourceDbPath);
   const cutoff = now.getTime() - keepDays * 24 * 60 * 60 * 1000;
-  const backups = readDir(backupDir)
-    .map((name) => resolve(backupDir, String(name)))
-    .filter((path) => path.endsWith(".sqlite"))
-    .map((path) => ({ path, mtimeMs: Number(fileStat(path).mtimeMs || 0) }))
-    .sort((left, right) => right.mtimeMs - left.mtimeMs || right.path.localeCompare(left.path));
+  const backups = ownedBackupFiles(directory, source, deps, true);
   const removed = [];
   for (const [index, backup] of backups.entries()) {
-    chmod(backup.path, 0o600);
-    if ((deps.existsSync || existsSync)(backupManifestPath(backup.path))) {
-      chmod(backupManifestPath(backup.path), 0o600);
-    }
-    if (protectedPath && resolve(backup.path) === resolve(protectedPath)) continue;
+    if (protectedPath && canonicalPath(backup.path) === canonicalPath(protectedPath)) continue;
     if (index < keepCount && backup.mtimeMs >= cutoff) continue;
-    remove(backup.path, { force: true });
-    remove(backupManifestPath(backup.path), { force: true });
+    // Check both members again before touching either member of the verified pair.
+    if (!sameFile(fileIdentity(backup.path), backup.identity) || !sameFile(fileIdentity(backupManifestPath(backup.path)), backup.manifestIdentity)) continue;
+    if (!removeOwnedFile(backup.path, backup.identity, source, deps)) continue;
+    removeOwnedFile(backupManifestPath(backup.path), backup.manifestIdentity, source, deps);
     removed.push(basename(backup.path));
   }
   return { keep_count: keepCount, keep_days: keepDays, removed_count: removed.length, removed };
 }
 
-/**
- * @param {string} backupDir
- * @param {SqliteMaintenanceDeps} [deps]
- */
-function latestBackupPath(backupDir, deps = {}) {
-  const fileExists = deps.existsSync || existsSync;
-  const readDir = deps.readdirSync || readdirSync;
-  const fileStat = deps.statSync || statSync;
-  if (!fileExists(backupDir)) throw new Error("backup directory not found");
-  const files = readDir(backupDir)
-    .map((name) => resolve(backupDir, String(name)))
-    .filter((path) => path.endsWith(".sqlite"))
-    .map((path) => ({ path, mtimeMs: Number(fileStat(path).mtimeMs || 0) }))
-    .sort((left, right) => right.mtimeMs - left.mtimeMs || right.path.localeCompare(left.path));
-  if (files.length === 0) throw new Error("no SQLite backups found");
+/** @param {string} backupDir @param {SqliteMaintenanceDeps} [deps] @param {string} [sourceDbPath] */
+function latestBackupPath(backupDir, deps = {}, sourceDbPath = DEFAULT_DB) {
+  const directory = safeBackupDirectory(backupDir, false, deps);
+  const files = ownedBackupFiles(directory, sourceDatabaseIdentity(sourceDbPath), deps, false);
+  if (!files.length) throw new Error("no owned SQLite backups found; use --backup for legacy backups");
   return files[0].path;
 }
 
@@ -605,6 +690,17 @@ function executeSqliteMaintenance(opts, deps = {}) {
   const dbPath = resolve(opts.db);
   const backupDir = resolve(opts.backupDir);
 
+  // Lock acquisition uses a writable SQLite connection. Reject missing or
+  // invalid sources through a read-only preflight before it can create a file.
+  // Recheck under the lock below before performing any maintenance mutation.
+  if (opts.action === "backup" || opts.action === "compact" || (opts.action === "prune-runs" && !opts.dryRun)) {
+    const preflight = databaseCheck(dbPath, deps);
+    if (!preflight.ok) {
+      return { ok: false, status: "failed", action: opts.action, checked_at: checkedAt,
+        db_path: publicPath(cwd, dbPath), source_check: preflight };
+    }
+  }
+
   if (opts.action === "check") {
     const check = databaseCheck(dbPath, deps);
     return {
@@ -618,73 +714,85 @@ function executeSqliteMaintenance(opts, deps = {}) {
   }
 
   if (opts.action === "backup") {
-    const makeDir = deps.mkdirSync || mkdirSync;
-    const chmod = deps.chmodSync || chmodSync;
+    // Validate the directory before acquiring a lock or touching source state.
+    const directory = safeBackupDirectory(backupDir, true, deps);
+    const sourceIdentity = sourceDatabaseIdentity(dbPath);
     let lockOwner = null;
-    /** @type {string | null} */
-    let pendingBackupPath = null;
+    /** @type {{path: string, identity: import("node:fs").Stats}[]} */
+    const published = [];
+    /** @type {{path: string, identity: import("node:fs").Stats, backupPath: string} | null} */
+    let staging = null;
     let verifiedBackup = false;
+    const cleanupStaging = () => {
+      if (!staging) return;
+      const current = fileIdentity(staging.path);
+      if (!current?.isDirectory() || !sameFile(current, staging.identity)) return;
+      // Never recursively remove a directory supplied by the user. This unique,
+      // private directory was created here, and only these outputs are ours.
+      for (const path of [staging.backupPath, backupManifestPath(staging.backupPath),
+        `${staging.backupPath}-journal`, `${staging.backupPath}-wal`, `${staging.backupPath}-shm`]) {
+        const identity = fileIdentity(path);
+        if (identity?.isFile()) removeOwnedFile(path, identity, sourceIdentity, deps);
+      }
+      try { rmdirSync(staging.path); }
+      catch (error) {
+        if (!["ENOENT", "ENOTEMPTY"].includes(/** @type {NodeJS.ErrnoException} */ (error).code || "")) throw error;
+      }
+    };
     try {
       lockOwner = acquireSqliteMaintenanceLock(dbPath, deps, "sqlite maintenance backup");
       const source = databaseCheck(dbPath, deps);
       if (!source.ok) {
-        return {
-          ok: false,
-          status: "failed",
-          action: opts.action,
-          checked_at: checkedAt,
-          db_path: publicPath(cwd, dbPath),
-          source_check: source,
-        };
+        return { ok: false, status: "failed", action: opts.action, checked_at: checkedAt,
+          db_path: publicPath(cwd, dbPath), source_check: source };
       }
-      makeDir(backupDir, { recursive: true, mode: 0o700 });
-      chmod(backupDir, 0o700);
       const createdAt = now();
-      const backupPath = resolve(backupDir, `exocortex-${timestampForFile(createdAt)}.sqlite`);
-      pendingBackupPath = backupPath;
-      backupDatabase(dbPath, backupPath, deps);
-      const backupCheck = databaseCheck(backupPath, deps);
+      const name = `exocortex-${sourceIdentity.id}-${timestampForFile(createdAt)}-${randomUUID()}.sqlite`;
+      const backupPath = resolve(directory, name);
+      if (isSourceDatabase(backupPath, sourceIdentity)) throw new Error("backup file must not alias the source database");
+      const stagingPath = mkdtempSync(resolve(directory, ".exocortex-backup-"));
+      staging = { path: stagingPath, identity: lstatSync(stagingPath), backupPath: resolve(stagingPath, name) };
+      backupDatabase(dbPath, staging.backupPath, deps);
+      const backupCheck = databaseCheck(staging.backupPath, deps);
       const countsMatch = compareCounts(source.counts, backupCheck.counts, DURABLE_BACKUP_TABLES);
-      const manifest = writeBackupManifest(backupPath, backupCheck, createdAt.toISOString(), deps);
-      const manifestVerification = verifyBackupManifest(backupPath, backupCheck, deps);
-      const ok = backupCheck.ok && countsMatch && manifestVerification.ok;
+      const manifest = writeBackupManifest(staging.backupPath, backupCheck, createdAt.toISOString(), deps, sourceIdentity.id);
+      let manifestVerification = verifyBackupManifest(staging.backupPath, backupCheck, deps, sourceIdentity.id);
+      let ok = backupCheck.ok && countsMatch && manifestVerification.ok;
+      if (ok) {
+        for (const [from, to] of [[staging.backupPath, backupPath], [backupManifestPath(staging.backupPath), backupManifestPath(backupPath)]]) {
+          const owned = regularFileIdentity(from);
+          // link is exclusive: an existing file, directory or symlink is never replaced.
+          (deps.linkSync || linkSync)(from, to);
+          if (!sameFile(fileIdentity(to), owned)) throw new Error("backup file identity changed");
+          published.push({ path: to, identity: owned });
+        }
+        cleanupStaging();
+        manifestVerification = verifyBackupManifest(backupPath, backupCheck, deps, sourceIdentity.id);
+        ok = manifestVerification.ok;
+      }
       verifiedBackup = ok;
+      if (!ok) {
+        for (const file of published) removeOwnedFile(file.path, file.identity, sourceIdentity, deps);
+        cleanupStaging();
+      }
       const retention = ok
-        ? pruneBackups(
-            backupDir,
-            opts.backupKeepCount,
-            opts.backupKeepDays,
-            createdAt,
-            deps,
-            backupPath,
-          )
-        : {
-            keep_count: opts.backupKeepCount,
-            keep_days: opts.backupKeepDays,
-            removed_count: 0,
-            removed: [],
-            skipped: "new_backup_failed_validation",
-          };
-      if (!ok) discardBackup(backupPath, deps);
+        ? pruneBackups(directory, opts.backupKeepCount, opts.backupKeepDays, createdAt, deps, backupPath, dbPath)
+        : { keep_count: opts.backupKeepCount, keep_days: opts.backupKeepDays, removed_count: 0,
+            removed: [], skipped: "new_backup_failed_validation" };
       return {
-        ok,
-        status: ok ? "ok" : "failed",
-        action: opts.action,
-        checked_at: checkedAt,
-        db_path: publicPath(cwd, dbPath),
-        backup_path: publicPath(cwd, backupPath),
-        source_check: source,
-        backup_check: backupCheck,
-        counts_match: countsMatch,
-        manifest: { ...manifestVerification, sha256: manifest.sha256 },
-        retention,
-        backup_discarded: !ok,
+        ok, status: ok ? "ok" : "failed", action: opts.action, checked_at: checkedAt,
+        db_path: publicPath(cwd, dbPath), backup_path: publicPath(cwd, backupPath),
+        source_check: source, backup_check: backupCheck, counts_match: countsMatch,
+        manifest: { ...manifestVerification, sha256: manifest.sha256 }, retention, backup_discarded: !ok,
       };
     } catch (error) {
-      if (pendingBackupPath && !verifiedBackup) discardBackup(pendingBackupPath, deps);
+      if (!verifiedBackup) {
+        for (const file of published) removeOwnedFile(file.path, file.identity, sourceIdentity, deps);
+      }
       throw error;
     } finally {
-      releaseSqliteMaintenanceLock(dbPath, lockOwner, deps);
+      try { cleanupStaging(); }
+      finally { releaseSqliteMaintenanceLock(dbPath, lockOwner, deps); }
     }
   }
 
@@ -747,7 +855,9 @@ function executeSqliteMaintenance(opts, deps = {}) {
   }
 
   if (!opts.latest && !opts.backup) throw new Error("verify requires --latest or --backup <path>");
-  const backupPath = resolve(opts.backup || latestBackupPath(backupDir, deps));
+  const backupPath = resolve(opts.backup || latestBackupPath(backupDir, deps, dbPath));
+  regularFileIdentity(backupPath);
+  if (isSourceDatabase(backupPath, sourceDatabaseIdentity(dbPath))) throw new Error("backup file must not alias the source database");
   const backupCheck = databaseCheck(backupPath, deps);
   const manifest = verifyBackupManifest(backupPath, backupCheck, deps);
   const ok = backupCheck.ok && manifest.ok;

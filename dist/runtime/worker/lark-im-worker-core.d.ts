@@ -40,6 +40,58 @@ type SyncSummary = {
     sent?: RunSummary | null;
     discovery?: RunSummary | null;
     received?: RunSummary[];
+    transport?: JsonObject;
+};
+type AdaptiveFairOptions = {
+    receivedScopesPerCycle: number;
+    adaptiveFairMin?: number;
+    adaptiveFairMax?: number;
+    adaptiveTargetCycleSeconds?: number;
+    intervalSeconds?: number;
+    stepTimeoutSeconds?: number;
+};
+type AdaptiveFairState = {
+    batch: number;
+    healthyCycles: number;
+};
+type AdaptiveCycleObservation = {
+    ok: boolean;
+    durationMs: number;
+    steps?: WorkerEvent[];
+};
+declare function compactTransportCooldowns(input: unknown): Record<string, number>;
+declare function mergeTransportCooldowns(previous: unknown, incoming: unknown, nowMs?: number): {
+    [k: string]: number;
+};
+declare function compactTransportStats(input: unknown): JsonObject | null;
+declare function createAdaptiveFairState(opts: AdaptiveFairOptions): AdaptiveFairState;
+declare function adaptiveFairDecision(state: AdaptiveFairState, observation: AdaptiveCycleObservation, opts: AdaptiveFairOptions): {
+    state: {
+        batch: number;
+        healthyCycles: number;
+    };
+    decision: {
+        effective_batch: number;
+        next_batch: number;
+        reason: string;
+        healthy_cycles: number;
+        durations: {
+            work_ms: number;
+            interval_ms: number;
+            target_cycle_ms: number;
+            fair_ms: number | null;
+            other_ms: number;
+            fair_budget_ms: number;
+            per_scope_ms: number | null;
+        };
+        observed_fair_scopes: number;
+        pressure: {
+            rate_limits: number;
+            timeouts: number;
+            exhausted: number;
+            failed_steps: number;
+        };
+    };
 };
 type WorkerEvent = {
     type?: string;
@@ -49,7 +101,7 @@ type WorkerEvent = {
     at?: string;
     started_at?: string;
     finished_at?: string;
-    summary?: RunSummary | null;
+    summary?: JsonObject | null;
     steps?: WorkerEvent[];
     exit_code?: number;
     stderr?: string;
@@ -76,7 +128,6 @@ declare function compactRun(run: RunSummary | null | undefined): {
     duplicate: number | undefined;
 } | null;
 declare function compactSummary(summary: SyncSummary | null | undefined): {
-    ok: boolean | undefined;
     window: JsonObject | undefined;
     sent: {
         run_id: number | null | undefined;
@@ -93,6 +144,7 @@ declare function compactSummary(summary: SyncSummary | null | undefined): {
     received: {
         failed: number;
         failed_scope_ids: (string | undefined)[];
+        skipped?: number | undefined;
         scopes: number;
         scanned: number;
         records: number;
@@ -101,9 +153,11 @@ declare function compactSummary(summary: SyncSummary | null | undefined): {
         duplicate: number;
         ok: boolean;
     } | null;
+    transport?: JsonObject | null | undefined;
+    ok: boolean | undefined;
 } | null;
 declare function cyclePayload(cycle: number, steps: WorkerEvent[], now?: () => string): WorkerCyclePayload;
-declare function runCycleWithRunner(opts: WorkerCycleOptions, cycle: number, runStep: WorkerStepRunner, writeLog: WorkerLogWriter, now?: () => string): boolean;
+declare function runCycleWithRunner(opts: WorkerCycleOptions, cycle: number, runStep: WorkerStepRunner, writeLog: WorkerLogWriter, now?: () => string, onComplete?: (steps: WorkerEvent[], payload: WorkerCyclePayload) => void): boolean;
 declare function summarizeWorkerEvents(events: unknown[], nowMs?: number): {
     has_events: boolean;
     last_event_type: string | null;
@@ -131,4 +185,4 @@ declare function summarizeWorkerEvents(events: unknown[], nowMs?: number): {
         age_ms: number | null;
     } | null;
 };
-export { buildCycleStepSpecs, compactRun, compactSummary, cyclePayload, runCycleWithRunner, summarizeWorkerEvents, };
+export { adaptiveFairDecision, buildCycleStepSpecs, compactRun, compactSummary, compactTransportCooldowns, compactTransportStats, createAdaptiveFairState, mergeTransportCooldowns, cyclePayload, runCycleWithRunner, summarizeWorkerEvents, };

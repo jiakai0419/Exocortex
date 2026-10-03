@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, } from "node:fs";
 import { dirname, resolve, } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,15 +32,21 @@ function chmodIfPresent(path, mode) {
             throw error;
     }
 }
-function secureDatabasePaths(dbPath) {
+function prepareWritableDatabasePaths(dbPath, protectExistingDirectory = false) {
     const resolvedDbPath = resolve(dbPath);
     const dbDir = dirname(resolvedDbPath);
     mkdirSync(dbDir, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
-    chmodSync(dbDir, PRIVATE_DIRECTORY_MODE);
+    // Ordinary store writes may target a DB in a shared directory. Tightening
+    // that existing directory is reserved for explicit initialization/security.
+    if (protectExistingDirectory)
+        chmodSync(dbDir, PRIVATE_DIRECTORY_MODE);
     for (const path of [resolvedDbPath, `${resolvedDbPath}-wal`, `${resolvedDbPath}-shm`, `${resolvedDbPath}-journal`]) {
         chmodIfPresent(path, PRIVATE_FILE_MODE);
     }
     return resolvedDbPath;
+}
+function secureDatabasePaths(dbPath) {
+    return prepareWritableDatabasePaths(dbPath, true);
 }
 function withPrivateUmask(work) {
     const previous = process.umask(0o077);
@@ -60,7 +67,7 @@ function sqliteFailure(result, label) {
     return new Error(`${label} failed: ${detail}`);
 }
 function sqliteExec(dbPath, sql, label) {
-    const resolvedDbPath = secureDatabasePaths(dbPath);
+    const resolvedDbPath = prepareWritableDatabasePaths(dbPath);
     let result;
     try {
         result = withPrivateUmask(() => spawnSync("sqlite3", [resolvedDbPath], {
@@ -70,14 +77,14 @@ function sqliteExec(dbPath, sql, label) {
         }));
     }
     finally {
-        secureDatabasePaths(resolvedDbPath);
+        prepareWritableDatabasePaths(resolvedDbPath);
     }
     if (result.status !== 0 || result.error)
         throw sqliteFailure(result, label);
     return String(result.stdout || "");
 }
 function sqliteQuery(dbPath, sql, label) {
-    const resolvedDbPath = secureDatabasePaths(dbPath);
+    const resolvedDbPath = prepareWritableDatabasePaths(dbPath);
     let result;
     try {
         result = withPrivateUmask(() => spawnSync("sqlite3", ["-json", resolvedDbPath], {
@@ -87,7 +94,7 @@ function sqliteQuery(dbPath, sql, label) {
         }));
     }
     finally {
-        secureDatabasePaths(resolvedDbPath);
+        prepareWritableDatabasePaths(resolvedDbPath);
     }
     if (result.status !== 0 || result.error)
         throw sqliteFailure(result, label);
@@ -155,96 +162,104 @@ function recoverStaleSyncState(dbPath, options = {}) {
     if (!Number.isFinite(hardLeaseSeconds) || hardLeaseSeconds <= 0) {
         throw new Error(`hardLeaseSeconds must be positive: ${String(hardLeaseSeconds)}`);
     }
+    if (!Number.isFinite(orphanRunSeconds) || orphanRunSeconds <= 0) {
+        throw new Error(`orphanRunSeconds must be positive: ${String(orphanRunSeconds)}`);
+    }
+    if (scopeId !== null && (typeof scopeId !== "string" || !scopeId.trim())) {
+        throw new Error("scopeId must be a non-empty string or null");
+    }
     const nowIso = now.toISOString();
     const nowMs = now.getTime();
-    const scopeWhere = scopeId ? `WHERE scope_id = ${quoteSql(scopeId)}` : "";
-    const locks = sqliteQuery(dbPath, `SELECT scope_id, locked_by, locked_at, expires_at
-     FROM sync_locks
+    const hardLeaseCutoffIso = new Date(nowMs - hardLeaseSeconds * 1000).toISOString();
+    const orphanCutoffIso = new Date(nowMs - orphanRunSeconds * 1000).toISOString();
+    const scopeWhere = scopeId === null ? "" : `WHERE l.scope_id = ${quoteSql(scopeId)}`;
+    const locks = sqliteQuery(dbPath, `SELECT l.scope_id, s.source_id, l.locked_by, l.locked_at, l.expires_at
+     FROM sync_locks l
+     JOIN sync_scopes s ON s.id = l.scope_id
      ${scopeWhere}
-     ORDER BY locked_at;`, "read sync locks for recovery");
-    const staleLocks = [];
-    const activeExpiredLocks = [];
+     ORDER BY l.locked_at;`, "read sync locks for recovery");
+    // Process liveness is only a hint for the observed lease. Revalidate its full
+    // identity under the write transaction before selecting any recovery target.
     const ownerStates = new Map();
-    for (const lock of locks) {
+    const observations = locks.map((lock) => {
         const owner = String(lock.locked_by || "");
         if (!ownerStates.has(owner))
             ownerStates.set(owner, normalizeOwnerState(ownerState(owner)));
-        const state = ownerStates.get(owner) || "unknown";
-        const expiresAtMs = Date.parse(lock.expires_at);
-        const lockedAtMs = Date.parse(lock.locked_at);
-        const expired = Number.isFinite(expiresAtMs) && expiresAtMs <= nowMs;
-        const hardLeaseExceeded = !Number.isFinite(lockedAtMs) || lockedAtMs + hardLeaseSeconds * 1000 <= nowMs;
-        if (state === "dead" || hardLeaseExceeded || (expired && state !== "alive")) {
-            staleLocks.push({
-                ...lock,
-                reason: state === "dead"
-                    ? "owner_dead"
-                    : hardLeaseExceeded
-                        ? "hard_lease_exceeded"
-                        : "lock_expired",
-            });
-        }
-        else if (expired && state === "alive") {
-            activeExpiredLocks.push(lock);
-        }
-    }
-    const orphanCutoffIso = new Date(nowMs - orphanRunSeconds * 1000).toISOString();
-    const orphanScopeWhere = scopeId ? `AND r.scope_id = ${quoteSql(scopeId)}` : "";
-    const orphanRuns = sqliteQuery(dbPath, `SELECT r.id, r.scope_id
-     FROM sync_runs r
-     WHERE r.status = 'running'
-       ${orphanScopeWhere}
-       AND r.started_at <= ${quoteSql(orphanCutoffIso)}
-       AND NOT EXISTS (
-         SELECT 1 FROM sync_locks l WHERE l.scope_id = r.scope_id
-       )
-     ORDER BY r.started_at;`, "read orphan running runs for recovery");
-    if (staleLocks.length === 0 && orphanRuns.length === 0) {
-        return {
-            recovered_locks: 0,
-            cancelled_runs: 0,
-            active_expired_locks: activeExpiredLocks.length,
-        };
-    }
-    const staleSql = staleLocks
-        .map((lock) => {
-        const message = `Recovered stale lock ${lock.locked_by}: ${lock.reason}`;
-        return `
+        return `(${[lock.scope_id, lock.source_id, owner, lock.locked_at, lock.expires_at,
+            ownerStates.get(owner) || "unknown"].map(quoteSql).join(", ")})`;
+    });
+    const orphanScopeWhere = scopeId === null ? "" : `AND r.scope_id = ${quoteSql(scopeId)}`;
+    const rows = sqliteQuery(dbPath, `BEGIN IMMEDIATE;
+CREATE TEMP TABLE __recovery_observations (
+  scope_id TEXT PRIMARY KEY, source_id TEXT NOT NULL, locked_by TEXT NOT NULL,
+  locked_at TEXT NOT NULL, expires_at TEXT NOT NULL, owner_state TEXT NOT NULL
+);
+${observations.length ? `INSERT INTO __recovery_observations VALUES ${observations.join(",\n")};` : ""}
+CREATE TEMP TABLE __recovery_current_locks AS
+SELECT l.scope_id, s.source_id, l.locked_by, l.locked_at, l.expires_at,
+       o.owner_state,
+       CASE
+         WHEN o.owner_state = 'dead' THEN 'owner_dead'
+         WHEN julianday(l.locked_at) IS NULL
+           OR julianday(l.locked_at) <= julianday(${quoteSql(hardLeaseCutoffIso)}) THEN 'hard_lease_exceeded'
+         WHEN julianday(l.expires_at) <= julianday(${quoteSql(nowIso)})
+           AND o.owner_state <> 'alive' THEN 'lock_expired'
+       END AS reason
+FROM sync_locks l
+JOIN sync_scopes s ON s.id = l.scope_id
+JOIN __recovery_observations o
+  ON o.scope_id = l.scope_id AND o.source_id = s.source_id
+ AND o.locked_by = l.locked_by AND o.locked_at = l.locked_at
+ AND o.expires_at = l.expires_at;
+CREATE TEMP TABLE __recovery_runs (
+  id INTEGER PRIMARY KEY, error_type TEXT NOT NULL, error_message TEXT NOT NULL
+);
+INSERT INTO __recovery_runs
+SELECT r.id, 'StaleLock', 'Recovered stale lock ' || l.locked_by || ': ' || l.reason
+FROM sync_runs r
+JOIN __recovery_current_locks l ON l.scope_id = r.scope_id AND l.source_id = r.source_id
+WHERE r.status = 'running' AND l.reason IS NOT NULL
+  AND json_extract(r.metadata_json, '$.${RUN_FENCE_METADATA_KEY}.owner') = l.locked_by
+  AND json_extract(r.metadata_json, '$.${RUN_FENCE_METADATA_KEY}.locked_at') = l.locked_at;
+-- Select orphans before deleting stale locks. Unfenced legacy runs must first
+-- become genuinely lock-free and old enough; never guess their lock ownership.
+INSERT INTO __recovery_runs
+SELECT r.id, 'StaleRun', 'Recovered running run without an active lock'
+FROM sync_runs r
+JOIN sync_scopes s ON s.id = r.scope_id AND s.source_id = r.source_id
+WHERE r.status = 'running'
+  ${orphanScopeWhere}
+  AND julianday(r.started_at) <= julianday(${quoteSql(orphanCutoffIso)})
+  AND NOT EXISTS (SELECT 1 FROM sync_locks l WHERE l.scope_id = r.scope_id);
+CREATE TEMP TABLE __recovery_counts (cancelled_runs INTEGER, recovered_locks INTEGER);
+INSERT INTO __recovery_counts VALUES (0, 0);
 UPDATE sync_runs
 SET status = 'cancelled',
     finished_at = ${quoteSql(nowIso)},
-    error_type = 'StaleLock',
-    error_message = ${quoteSql(message)}
-WHERE status = 'running'
-  AND scope_id = ${quoteSql(lock.scope_id)};
-DELETE FROM sync_locks
-WHERE scope_id = ${quoteSql(lock.scope_id)}
-  AND locked_by = ${quoteSql(lock.locked_by)};
-`;
-    })
-        .join("\n");
-    const orphanIds = orphanRuns.map((run) => Number(run.id)).filter(Number.isFinite);
-    const orphanSql = orphanIds.length > 0
-        ? `
-UPDATE sync_runs
-SET status = 'cancelled',
-    finished_at = ${quoteSql(nowIso)},
-    error_type = 'StaleRun',
-    error_message = 'Recovered running run without an active lock'
-WHERE id IN (${orphanIds.join(", ")})
+    error_type = (SELECT error_type FROM __recovery_runs WHERE id = sync_runs.id),
+    error_message = (SELECT error_message FROM __recovery_runs WHERE id = sync_runs.id)
+WHERE id IN (SELECT id FROM __recovery_runs)
   AND status = 'running';
-`
-        : "";
-    sqliteExec(dbPath, `
-BEGIN;
-${staleSql}
-${orphanSql}
+UPDATE __recovery_counts SET cancelled_runs = changes();
+DELETE FROM sync_locks
+WHERE EXISTS (
+  SELECT 1 FROM __recovery_current_locks l
+  WHERE l.reason IS NOT NULL AND l.scope_id = sync_locks.scope_id
+    AND l.locked_by = sync_locks.locked_by AND l.locked_at = sync_locks.locked_at
+    AND l.expires_at = sync_locks.expires_at
+);
+UPDATE __recovery_counts SET recovered_locks = changes();
+SELECT recovered_locks, cancelled_runs,
+       (SELECT COUNT(*) FROM __recovery_current_locks
+        WHERE reason IS NULL AND owner_state = 'alive'
+          AND julianday(expires_at) <= julianday(${quoteSql(nowIso)})) AS active_expired_locks
+FROM __recovery_counts;
 COMMIT;
 `, "recover stale sync state");
     return {
-        recovered_locks: staleLocks.length,
-        cancelled_runs: staleLocks.length + orphanRuns.length,
-        active_expired_locks: activeExpiredLocks.length,
+        recovered_locks: Number(rows[0]?.recovered_locks || 0),
+        cancelled_runs: Number(rows[0]?.cancelled_runs || 0),
+        active_expired_locks: Number(rows[0]?.active_expired_locks || 0),
     };
 }
 function ensureInitialized(dbPath) {
@@ -281,6 +296,79 @@ function readScope(dbPath, scopeId) {
         config: row.config_json ? JSON.parse(row.config_json) : {},
         cursor: row.cursor_json ? JSON.parse(row.cursor_json) : null,
     };
+}
+function validateInitialSyncStartMs(value) {
+    // This modern source baseline uses milliseconds, never seconds. Restrict the
+    // range to unambiguous modern millisecond values and four-digit ISO years.
+    if (typeof value !== "number" ||
+        !Number.isSafeInteger(value) ||
+        value < 100_000_000_000 ||
+        value > 253_402_300_799_999 ||
+        !Number.isFinite(new Date(value).getTime())) {
+        throw new Error("initial_sync_start_ms must be a safe modern epoch-millisecond timestamp (100000000000..253402300799999), not seconds");
+    }
+    return value;
+}
+function ensureSourceInitialSyncStart(dbPath, sourceId, candidateStartMs, options = {}) {
+    const candidate = validateInitialSyncStartMs(candidateStartMs);
+    if (options.endMs !== undefined && (!Number.isSafeInteger(options.endMs) || !Number.isFinite(new Date(options.endMs).getTime()))) {
+        throw new Error("initial sync end must be a valid epoch-millisecond timestamp");
+    }
+    const candidateFitsEnd = options.endMs === undefined || candidate <= options.endMs;
+    const sourceSql = quoteSql(sourceId);
+    const now = new Date().toISOString();
+    const hasHistorySql = `(
+    EXISTS (SELECT 1 FROM records WHERE source_id = ${sourceSql})
+    OR EXISTS (SELECT 1 FROM sync_runs WHERE source_id = ${sourceSql})
+    OR EXISTS (SELECT 1 FROM sync_scopes WHERE source_id = ${sourceSql} AND cursor_json IS NOT NULL)
+  )`;
+    const activeSyncSql = `EXISTS (
+    SELECT 1 FROM sync_locks l JOIN sync_scopes s ON s.id = l.scope_id
+    WHERE s.source_id = ${sourceSql}
+  )`;
+    const maintenanceSql = `EXISTS (
+    SELECT 1 FROM maintenance_locks WHERE name = 'global' AND expires_at > ${quoteSql(now)}
+  )`;
+    const rows = sqliteQuery(dbPath, `BEGIN IMMEDIATE;
+     UPDATE sources
+     SET config_json = json_set(config_json, '$.initial_sync_start_ms', ${candidate}),
+         updated_at = ${quoteSql(now)}
+     WHERE id = ${sourceSql}
+       AND enabled = 1
+       AND json_type(config_json) = 'object'
+       AND json_type(config_json, '$.initial_sync_start_ms') IS NULL
+       AND ${candidateFitsEnd ? 1 : 0} = 1
+       AND (${options.explicit === true ? 1 : 0} = 1 OR NOT ${hasHistorySql})
+       AND NOT ${activeSyncSql}
+       AND NOT ${maintenanceSql};
+     SELECT config_json, enabled, ${hasHistorySql} AS has_history,
+            ${activeSyncSql} AS active_sync, ${maintenanceSql} AS maintenance_locked
+     FROM sources WHERE id = ${sourceSql};
+     COMMIT;`, "resolve initial sync baseline");
+    const row = rows[0];
+    if (!row)
+        throw new Error(`source not found: ${sourceId}`);
+    const config = JSON.parse(row.config_json);
+    if (!config || typeof config !== "object" || Array.isArray(config)) {
+        throw new Error("source config must be a JSON object for initial sync baseline");
+    }
+    if (!Object.prototype.hasOwnProperty.call(config, "initial_sync_start_ms")) {
+        if (!candidateFitsEnd)
+            throw new Error("--end must be after the initial sync baseline");
+        if (!row.enabled)
+            throw new Error("cannot initialize sync baseline for a disabled source");
+        if (row.active_sync || row.maintenance_locked)
+            throw new Error("cannot initialize sync baseline while sync or maintenance is active");
+        throw new Error("source has existing sync history but no initial sync baseline; explicitly confirm it with --start <ISO with timezone>");
+    }
+    const baseline = validateInitialSyncStartMs(config.initial_sync_start_ms);
+    if (options.explicit === true && candidate !== baseline) {
+        throw new Error(`--start conflicts with persisted initial sync baseline ${new Date(baseline).toISOString()}`);
+    }
+    if (options.endMs !== undefined && options.endMs < baseline) {
+        throw new Error("--end must be after the persisted initial sync baseline");
+    }
+    return baseline;
 }
 function maintenanceOwner(owner = `pid:${process.pid}`) {
     return owner;
@@ -582,6 +670,24 @@ function normalizeStoredRecords(records, sourceId) {
     }
     return [...deduped.values()];
 }
+/** A repair must not silently choose between unordered conflicting page items. */
+function normalizeBoundedReplayRecords(records, sourceId) {
+    const seen = new Map();
+    for (const original of records) {
+        const incoming = { ...original, external_version: normalizeExternalVersion(original.external_version) };
+        const current = seen.get(incoming.external_id);
+        if (current && (current.raw_json !== incoming.raw_json || current.content_hash !== incoming.content_hash)) {
+            const a = current.external_version;
+            const b = incoming.external_version;
+            if (a === null || b === null || !/^\d+$/.test(a) || !/^\d+$/.test(b) || a === b) {
+                throw new Error("bounded replay response contains ambiguous duplicate facts");
+            }
+        }
+        if (!current || preferIncomingRecord(current, incoming))
+            seen.set(incoming.external_id, incoming);
+    }
+    return normalizeStoredRecords(records, sourceId);
+}
 function numericVersionSql(valueSql) {
     return `(${valueSql} IS NOT NULL AND ${valueSql} <> '' AND ${valueSql} NOT GLOB '*[^0-9]*')`;
 }
@@ -631,7 +737,18 @@ const MUTABLE_RECORD_COLUMNS = [
 function recordDiffSql(existingAlias, incomingAlias) {
     return `(${MUTABLE_RECORD_COLUMNS.map((column) => `${existingAlias}.${column} IS NOT ${incomingAlias}.${column}`).join(" OR ")})`;
 }
-function upsertRecordsSql(records) {
+function strictlyNewerVersionSql(existingAlias, incomingAlias) {
+    const existing = `${existingAlias}.external_version`;
+    const incoming = `${incomingAlias}.external_version`;
+    const oldNumeric = normalizedNumericVersionSql(existing);
+    const newNumeric = normalizedNumericVersionSql(incoming);
+    return `(${numericVersionSql(existing)} AND ${numericVersionSql(incoming)} AND (
+      length(${newNumeric}) > length(${oldNumeric}) OR (
+        length(${newNumeric}) = length(${oldNumeric}) AND ${newNumeric} > ${oldNumeric} COLLATE BINARY
+      )
+  ))`;
+}
+function upsertRecordsSql(records, options = {}) {
     return normalizeStoredRecords(records)
         .map((record) => `
 INSERT INTO records (
@@ -684,10 +801,102 @@ ON CONFLICT(source_id, external_id) DO UPDATE SET
   canonical_json = excluded.canonical_json,
   raw_json = excluded.raw_json,
   updated_at = excluded.updated_at
-WHERE ${versionCanReplaceSql("records", "excluded")}
+WHERE ${(options.strictVersionIncrease ? strictlyNewerVersionSql : versionCanReplaceSql)("records", "excluded")}
   AND ${recordDiffSql("records", "excluded")};
 `)
         .join("\n");
+}
+/** Commit one completely fetched, explicitly bounded repair without touching
+ * normal runs, scope cursors, or freshness markers. Remote work belongs outside
+ * this method; only this short transaction holds a maintenance lease. */
+function commitBoundedReplayRecords(dbPath, options) {
+    const { scope, initialSyncStartMs, startMs, endMs, planId, attemptId, selfIdHash, pages, fetchedCount } = options;
+    validateInitialSyncStartMs(initialSyncStartMs);
+    validateInitialSyncStartMs(startMs);
+    validateInitialSyncStartMs(endMs);
+    if (startMs < initialSyncStartMs || endMs <= startMs)
+        throw new Error("invalid bounded replay window");
+    if (scope.source_id !== "lark.im" || !scope.id.startsWith("lark.im.received.chat.") || scope.enabled !== 1) {
+        throw new Error("bounded replay requires an enabled Lark received scope");
+    }
+    const config = JSON.parse(scope.config_json || "{}");
+    if (!config || typeof config.chat_id !== "string" || !config.chat_id)
+        throw new Error("bounded replay scope has no chat identity");
+    if (!/^[a-f0-9]{64}$/.test(planId) || !/^[a-f0-9]{64}$/.test(selfIdHash) || !attemptId) {
+        throw new Error("invalid bounded replay audit identity");
+    }
+    if (!Number.isSafeInteger(pages) || pages < 1 || !Number.isSafeInteger(fetchedCount) || fetchedCount < 0) {
+        throw new Error("invalid bounded replay fetch evidence");
+    }
+    const records = normalizeBoundedReplayRecords(options.records, scope.source_id);
+    if (records.length > 10_000 || records.length > fetchedCount)
+        throw new Error("bounded replay candidate limit exceeded");
+    for (const record of records) {
+        if (record.record_type !== "lark.im.message" || record.first_seen_scope_id !== scope.id ||
+            record.container_id !== config.chat_id || !Number.isSafeInteger(record.occurred_at_ms) ||
+            record.occurred_at_ms < startMs || record.occurred_at_ms > endMs) {
+            throw new Error("bounded replay candidate is outside the selected scope or window");
+        }
+    }
+    // Never create or migrate a missing database as a side effect of a repair.
+    const preflight = spawnSync("sqlite3", ["-readonly", resolve(dbPath)], {
+        input: ".bail on\nPRAGMA query_only=ON;\nSELECT id FROM bounded_replay_runs LIMIT 0;\n",
+        encoding: "utf8", timeout: 5000,
+    });
+    if (preflight.status !== 0 || preflight.error)
+        throw new Error("bounded replay audit schema unavailable; migrate the existing database first");
+    const auditId = randomUUID();
+    const owner = `pid:${process.pid}:bounded-replay:${auditId}`;
+    const lock = acquireMaintenanceLock(dbPath, { owner, ttlSeconds: 60, reason: "bounded Lark replay commit" });
+    if (!lock.acquired)
+        throw new Error("bounded replay commit blocked by active locks");
+    try {
+        const statements = records.map((record) => `
+      DELETE FROM __replay_before;
+      INSERT INTO __replay_before (existed, same_fact)
+      SELECT EXISTS (SELECT 1 FROM records WHERE source_id=${quoteSql(record.source_id)} AND external_id=${quoteSql(record.external_id)}),
+             EXISTS (SELECT 1 FROM records WHERE source_id=${quoteSql(record.source_id)} AND external_id=${quoteSql(record.external_id)}
+               AND external_version IS ${quoteSql(record.external_version)}
+               AND content_hash IS ${quoteSql(record.content_hash)} AND raw_json IS ${quoteSql(record.raw_json)});
+      ${upsertRecordsSql([record], { strictVersionIncrease: true })}
+      INSERT INTO __replay_effects (changed, existed, same_fact)
+      SELECT changes(), existed, same_fact FROM __replay_before;
+    `).join("\n");
+        const rows = sqliteQuery(dbPath, `
+      BEGIN IMMEDIATE;
+      CREATE TEMP TABLE __replay_guard (allowed INTEGER NOT NULL CHECK (allowed=1));
+      INSERT INTO __replay_guard SELECT CASE WHEN EXISTS (
+        SELECT 1 FROM maintenance_locks WHERE name='global' AND owner=${quoteSql(owner)}
+          AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      ) AND NOT EXISTS (SELECT 1 FROM sync_locks) AND EXISTS (
+        SELECT 1 FROM sync_scopes s JOIN sources src ON src.id=s.source_id
+        WHERE s.id=${quoteSql(scope.id)} AND s.source_id=${quoteSql(scope.source_id)}
+          AND s.enabled=1 AND src.enabled=1 AND s.config_json IS ${quoteSql(scope.config_json)}
+          AND json_extract(src.config_json,'$.initial_sync_start_ms') IS ${initialSyncStartMs}
+      ) THEN 1 ELSE 0 END;
+      CREATE TEMP TABLE __replay_before (existed INTEGER NOT NULL, same_fact INTEGER NOT NULL);
+      CREATE TEMP TABLE __replay_effects (changed INTEGER NOT NULL, existed INTEGER NOT NULL, same_fact INTEGER NOT NULL);
+      ${statements}
+      INSERT INTO bounded_replay_runs (
+        id,plan_id,attempt_id,source_id,scope_id,initial_sync_start_ms,window_start_ms,window_end_ms,self_id_hash,
+        page_count,fetched_count,candidate_count,inserted_count,updated_count,duplicate_count,conflict_count,finished_at
+      ) SELECT ${quoteSql(auditId)},${quoteSql(planId)},${quoteSql(attemptId)},${quoteSql(scope.source_id)},${quoteSql(scope.id)},
+        ${initialSyncStartMs},${startMs},${endMs},${quoteSql(selfIdHash)},${pages},${fetchedCount},${records.length},
+        COALESCE(SUM(changed=1 AND existed=0),0), COALESCE(SUM(changed=1 AND existed=1),0),
+        COALESCE(SUM(changed=0 AND same_fact=1),0), COALESCE(SUM(changed=0 AND same_fact=0),0),
+        strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM __replay_effects;
+      SELECT id AS audit_id,inserted_count AS inserted,updated_count AS updated,
+        duplicate_count AS duplicate,conflict_count AS conflicts FROM bounded_replay_runs WHERE id=${quoteSql(auditId)};
+      COMMIT;
+    `, "commit bounded replay");
+        if (!rows[0])
+            throw new Error("bounded replay commit returned no evidence");
+        return { audit_id: String(rows[0].audit_id), inserted: Number(rows[0].inserted), updated: Number(rows[0].updated),
+            duplicate: Number(rows[0].duplicate), conflicts: Number(rows[0].conflicts) };
+    }
+    finally {
+        releaseMaintenanceLock(dbPath, owner);
+    }
 }
 function countWriteEffects(dbPath, sourceId, records) {
     const normalized = normalizeStoredRecords(records, sourceId);
@@ -873,4 +1082,4 @@ ${incomingRecordsSql(normalizedRecords)}
     };
 }
 const succeedMessageRun = succeedRecordRun;
-export { DEFAULT_HARD_LEASE_SECONDS, acquireLock, acquireMaintenanceLock, countWriteEffects, createRun, ensureInitialized, existingRecordMap, failRun, isMaintenanceLocked, normalizeExternalVersion, normalizeStoredRecords, ownerPid, ownerStartedAtMs, defaultOwnerState, recoverStaleSyncState, quoteSql, readScope, releaseLock, releaseMaintenanceLock, secureDatabasePaths, sqlJson, sqliteExec, sqliteQuery, succeedMessageRun, succeedRecordRun, upsertRecordsSql, };
+export { DEFAULT_HARD_LEASE_SECONDS, acquireLock, acquireMaintenanceLock, countWriteEffects, commitBoundedReplayRecords, normalizeBoundedReplayRecords, createRun, ensureInitialized, ensureSourceInitialSyncStart, existingRecordMap, failRun, isMaintenanceLocked, normalizeExternalVersion, normalizeStoredRecords, ownerPid, ownerStartedAtMs, defaultOwnerState, recoverStaleSyncState, quoteSql, readScope, releaseLock, releaseMaintenanceLock, secureDatabasePaths, sqlJson, sqliteExec, sqliteQuery, succeedMessageRun, succeedRecordRun, upsertRecordsSql, validateInitialSyncStartMs, };

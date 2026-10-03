@@ -23,6 +23,8 @@ function renderLagText(report) {
     "",
     section("Summary"),
     kv([
+      ["Sample method", "first message-list page per hot chat, including replies"],
+      ["Comparison", "message ID presence only; no body/version reconciliation"],
       ["Hot chats", `${report.probe.hot_chats_found}/${report.probe.hot_chats_requested}`],
       ["Remote messages checked", report.probe.remote_messages_checked],
       ["Missing remote messages", report.missing_count],
