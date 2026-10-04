@@ -54,6 +54,18 @@ A recently observed, verified independent foreground phase may be syncing while 
 
 `check --wait` accepts completion only from the currently verified worker instance and database file identity. Step and cycle records carry additive `version: 1`, `instance_id` and `database_key` fields; each step also carries its zero-based `step_index`. The instance must match a current phase whose PID and process start have been verified. A shared cycle number, nearby timestamps or adjacent log lines cannot establish ownership. Multiple unresolved current instances for the service PID prevent binding, including instances associated with another database. This service check uses the latest phase for each instance of that PID from the same bounded log and the same OS observation; it does not change the database-scoped activity classifier. Verified old processes and stopped instances do not block a unique current instance.
 
+Service-instance selection separates disproving an old process identity from proving current work. For a structurally valid event, two clearly different valid process-start timestamps exclude that old instance before inspecting its database identity or phase. This also applies to a legal `database_key: null` event emitted before its database existed. A missing database identity cannot undo an independently established PID reuse. The precedence is:
+
+| Event shape | Event and observed process starts | Database identity | Service-instance selection |
+| --- | --- | --- | --- |
+| Damaged | Any, including apparently different | Any | Retain uncertainty; damaged fields cannot prove an old instance |
+| Valid | Both valid and clearly different | Target, other, or unavailable | Exclude the refuted old instance |
+| Valid | Same or either unavailable | Unavailable | Retain an unresolved possible instance |
+| Valid | Same or either unavailable | Another database | Apply existing phase rules without discarding the instance merely for its database; current or unresolved instances prevent a unique target match |
+| Valid | Same | Target | Still require a live, current phase and a complete bound cycle |
+
+Excluding a refuted instance never establishes a successful cycle by itself. The surviving target still needs every existing database, process, phase and completion check. This precedence is confined to service-instance selection; global Activity classification and its conservative damaged-evidence handling remain unchanged.
+
 A successful completion requires the six ordinary steps, with the optional retention step last, each exactly once and in order. Every step must have literal boolean `ok: true`, exit code zero, no partial result, and valid ordered times; the matching cycle must also have literal `ok: true`, the exact step count and no failed steps. Foreign database or instance events cannot fill missing steps, replace a failed target cycle or alter its unfinished state. Legacy records without these bindings remain readable history and cannot satisfy a wait. If the database is missing at cycle start or its file identity changes during that cycle, completion remains unverified until a later complete, consistently bound cycle.
 
 The public `status` Activity object includes finite `source`, `evidence`, `phase` and `reason` fields in both default and detailed JSON. A verified worker has source `worker` and evidence `verified_worker_phase`; a verified independent invocation has source `foreground` and evidence `recent_foreground_phase`. Waiting retains the worker source. Confirmed stopped activity uses source `none`; unknown activity keeps source and phase `unknown` with evidence `unavailable`.

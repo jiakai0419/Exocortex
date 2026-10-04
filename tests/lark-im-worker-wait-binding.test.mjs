@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs, runCycle, runWorker, writeLog } from "../src/runtime/worker/worker.mjs";
-import { createActivityWriter } from "../src/diagnostics/lark-im-activity-evidence.mjs";
+import { createActivityWriter, validateActivityEventShape } from "../src/diagnostics/lark-im-activity-evidence.mjs";
 import { collectStatusEvidence, serviceTargetEvidence, waitWorkerSummary } from "../src/diagnostics/status-report.mjs";
 import { collectCheckReport } from "../src/diagnostics/check-report.mjs";
 import { summarizeWorkerEvents, cyclePayload } from "../dist/runtime/worker/lark-im-worker-core.js";
@@ -20,11 +20,11 @@ function fixtures(t) {
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const dbA = join(dir, "alpha.sqlite"); const dbB = join(dir, "beta.sqlite");
   writeFileSync(dbA, "invented alpha file identity"); writeFileSync(dbB, "invented beta file identity");
-  function worker(db, instance, success = true, retention = false, beforeChild = () => {}) {
+  function worker(db, instance, success = true, retention = false, beforeChild = () => {}, processStartedAtMs = START - 60000) {
     const logDir = join(dir, instance); let clock = START; let captured;
     const opts = { ...parseArgs(["--max-cycles", "2", "--retention-every-cycles", retention ? "1" : "999"]), db, logDir };
     const activity = createActivityWriter({ db, role: "worker", pid: 4321, instanceId: instance, now: () => ++clock,
-      inspect: () => new Map([[4321, { state: "alive", started_at_ms: START - 60000 }]]),
+      inspect: () => new Map([[4321, { state: "alive", started_at_ms: processStartedAtMs }]]),
       emit: event => writeLog(opts, event, quiet) });
     const stop = new Error("synthetic stop after first waiting phase");
     assert.throws(() => runWorker(opts, { activity, nowMs: () => ++clock,
@@ -160,7 +160,7 @@ test("a database replaced during a real cycle cannot inherit completed steps fro
   const result = evidence(events); assert.equal(result.binding.target_match, "matched"); assert.equal(result.state.ready, false);
 });
 
-async function collectServiceBinding(fixture, events) {
+async function collectServiceBinding(fixture, events, processObservation = { state: "alive", started_at_ms: START - 60000 }) {
   writeFileSync(join(fixture.dir, "worker.jsonl"), events.map(event => JSON.stringify(event)).join("\n") + "\n");
   let now = START + 1000;
   const context = { root: fixture.dir, cwd: fixture.dir, env: {}, provided: new Set(["--wait"]), startedAtMs: START, now: () => now };
@@ -168,7 +168,7 @@ async function collectServiceBinding(fixture, events) {
   const collected = collectStatusEvidence(options, context, { readInstalledServiceConfig: () => ({ status: "installed" }), reportDeps: {
     runCommand: () => ({ status: 0, stdout: "state = running\npid = 4321\n", stderr: "" }), buildStatus: () => sync(),
     readLiveProbeCache: () => null, liveProbeContext: () => null, sqliteJson: () => [],
-    inspectActivityProcesses: pids => new Map(pids.map(pid => [pid, { state: "alive", started_at_ms: START - 60000 }])),
+    inspectActivityProcesses: pids => new Map(processObservation === null ? [] : pids.map(pid => [pid, processObservation])),
   } });
   const result = await collectCheckReport(options, context, { checkDependencies: () => ({ sqlite: true, python: true, live: true, wait: true }),
     collectStatusEvidence: () => collected, sleep: async ms => { now += ms; }, readDatabaseEvidence: () => ({ ok: true, quick_check: "ok" }),
@@ -204,4 +204,81 @@ for (const [name, expected, change] of [
   if (name === "same PID damaged latest instance") assert.equal(collected.report.activity_evidence.integrity, false);
   else assert.equal(collected.report.activity_evidence.events.some(event => event.database_key === foreign.database_key), false,
     "the global activity classifier retains its original selected-database scope");
+});
+
+const PROCESS_START = START - 60000;
+const PRIOR_PROCESS_START = START - 120000;
+const waiting = events => events.findLast(event => event.phase === "waiting");
+
+for (const database of ["target", "foreign", "unavailable"]) {
+  for (const [identity, processStart] of [["different", PRIOR_PROCESS_START], ["same", PROCESS_START], ["unknown", null]]) {
+    for (const [observation, observed] of [["known", { state: "alive", started_at_ms: PROCESS_START }], ["missing", null],
+      ["unknown-start", { state: "alive", started_at_ms: null }], ["unknown-state", { state: "unknown", started_at_ms: PROCESS_START }]]) {
+      test(`instance evidence priority: database=${database}, instance start=${identity}, OS=${observation}`, async t => {
+        const f = fixtures(t); const a = f.worker(f.dbA, "current"); const b = f.worker(f.dbB, "prior");
+        const prior = { ...waiting(b), process_started_at_ms: processStart,
+          database_key: database === "unavailable" ? null : waiting(database === "target" ? a : b).database_key };
+        assert.equal(validateActivityEventShape(prior), true, "null identity is unavailable evidence, not damaged structure");
+        const expected = identity === "different" && observation === "known";
+        const { result, collected } = await collectServiceBinding(f, [...completed(a), waiting(a), prior], observed);
+        assert.equal(collected.binding.target_match, expected ? "matched" : "unknown");
+        assert.equal(result.checks.wait.status, expected ? "passed" : "incomplete");
+        assert.equal(result.exit_code, expected ? 0 : 2);
+        assert.equal(collected.report.activity_evidence.integrity, true);
+        assert.equal(collected.report.activity_evidence.service_worker_events.length, 2, "both append-latest instances must reach the selector");
+        if (expected) assert.equal(collected.binding.worker.instance_id, "current");
+      });
+    }
+  }
+}
+
+for (const [damage, mutate] of [
+  ["wrong version", event => { event.version = "1"; }],
+  ["missing database key", event => { delete event.database_key; }],
+  ["missing parent field", event => { delete event.parent_instance; }],
+  ["invalid phase", event => { event.phase = "invented-invalid-phase"; }],
+  ["invalid interval", event => { event.valid_until = event.updated_at; }],
+]) test(`different process start cannot excuse malformed evidence: ${damage}`, async t => {
+  const f = fixtures(t); const a = f.worker(f.dbA, "current"); const b = f.worker(f.dbB, "prior");
+  const prior = { ...waiting(b), process_started_at_ms: PRIOR_PROCESS_START, database_key: null }; mutate(prior);
+  assert.equal(validateActivityEventShape(prior), false);
+  const { result, collected } = await collectServiceBinding(f, [...completed(a), waiting(a), prior]);
+  assert.equal(collected.report.activity_evidence.integrity, false);
+  assert.equal(collected.binding.target_match, "unknown"); assert.equal(result.checks.wait.status, "incomplete"); assert.equal(result.exit_code, 2);
+});
+
+for (const database of ["target", "foreign", "unavailable"]) test(`a known prior process cannot be revived by expired ${database} database evidence`, async t => {
+  const f = fixtures(t); const a = f.worker(f.dbA, "current"); const b = f.worker(f.dbB, "prior");
+  const prior = { ...waiting(b), process_started_at_ms: PRIOR_PROCESS_START,
+    database_key: database === "unavailable" ? null : waiting(database === "target" ? a : b).database_key,
+    updated_at: new Date(START - 5000).toISOString(), valid_until: new Date(START - 1000).toISOString() };
+  assert.equal(validateActivityEventShape(prior), true);
+  const { result, collected } = await collectServiceBinding(f, [...completed(a), waiting(a), prior]);
+  assert.equal(collected.binding.target_match, "matched"); assert.equal(collected.binding.worker.instance_id, "current");
+  assert.equal(result.checks.wait.status, "passed"); assert.equal(result.exit_code, 0);
+});
+
+test("another PID with legal null database identity does not change the service instance binding", async t => {
+  const f = fixtures(t); const a = f.worker(f.dbA, "current"); const b = f.worker(f.dbB, "unrelated");
+  const unrelated = { ...waiting(b), pid: 9876, database_key: null };
+  assert.equal(validateActivityEventShape(unrelated), true);
+  const { result, collected } = await collectServiceBinding(f, [...completed(a), waiting(a), unrelated]);
+  assert.equal(collected.report.activity_evidence.service_worker_events.length, 1);
+  assert.equal(collected.binding.target_match, "matched"); assert.equal(result.checks.wait.status, "passed"); assert.equal(result.exit_code, 0);
+});
+
+test("a real worker before database initialization cannot block a later process's complete cycle", async t => {
+  const f = fixtures(t); rmSync(f.dbA);
+  const old = f.worker(f.dbA, "before-initialization", true, false, () => {}, PRIOR_PROCESS_START);
+  const oldActivity = old.filter(event => event.type === "lark_im_worker_activity");
+  assert.ok(oldActivity.length > 0); assert.ok(oldActivity.every(event => validateActivityEventShape(event) && event.database_key === null));
+  assert.equal(waiting(old).process_started_at_ms, PRIOR_PROCESS_START);
+  writeFileSync(f.dbA, "new fully synthetic database identity");
+  const current = f.worker(f.dbA, "after-initialization");
+  assert.equal(typeof waiting(current).database_key, "string");
+  const { result, collected } = await collectServiceBinding(f, [...old, ...current]);
+  assert.equal(collected.report.activity_evidence.integrity, true);
+  assert.equal(collected.report.activity_evidence.service_worker_events.length, 2);
+  assert.equal(collected.binding.target_match, "matched"); assert.equal(collected.binding.worker.instance_id, "after-initialization");
+  assert.equal(result.checks.wait.status, "passed"); assert.equal(result.exit_code, 0);
 });

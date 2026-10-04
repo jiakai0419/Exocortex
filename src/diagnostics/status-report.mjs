@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { buildServiceStatusReport, readFileTail, DEFAULT_WORKER_LOG_TAIL_BYTES } from "./lark-im-service-report.mjs";
 import { sanitizeStatusReportForPublicOutput } from "./sync-status-report.mjs";
-import { evaluateActivityEvent } from "./lark-im-activity-evidence.mjs";
+import { compareActivityProcessStarts, evaluateActivityEvent, validateActivityEventShape } from "./lark-im-activity-evidence.mjs";
 import { LABEL, target, readInstalledServiceConfig } from "../runtime/service/launchd.mjs";
 import { publicFailureKind, publicTimestamp } from "./public-safe.mjs";
 import { publicActivity } from "./public-activity.mjs";
@@ -90,6 +90,10 @@ function serviceTargetEvidence(report, nowMs) {
   const serviceEvents = Object.hasOwn(evidence, "service_worker_events") ? evidence.service_worker_events : evidence.events;
   if (!Array.isArray(serviceEvents)) return { target_match: "unknown" };
   const workers = serviceEvents.filter((/** @type {JsonObject} */ event) => event.role === "worker" && event.pid === report.probe.pid)
+    // A legal pre-initialization event may lack a database identity. A clearly
+    // different OS start still refutes that old process; damaged events cannot.
+    .filter((/** @type {JsonObject} */ worker) => !validateActivityEventShape(worker) ||
+      compareActivityProcessStarts(worker.process_started_at_ms, evidence.processes.get(worker.pid)?.started_at_ms) !== "different")
     .map((/** @type {JsonObject} */ worker) => ({ worker,
       phase: evaluateActivityEvent(worker, evidence.processes.get(worker.pid), worker.database_key, nowMs) }))
     .filter((/** @type {JsonObject} */ value) => !["dead", "stopped"].includes(value.phase.state));
