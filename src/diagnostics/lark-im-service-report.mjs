@@ -4,7 +4,6 @@ import { readOnlySqliteJson } from "../storage/sqlite/readonly-query.mjs";
 import { summarizeHealth } from "./sync-status-core.mjs";
 import { summarizeLockEvidence } from "./lark-im-lock-evidence.mjs";
 
-import { spawnSync } from "node:child_process";
 import {
   closeSync,
   existsSync,
@@ -17,7 +16,8 @@ import { summarizeWorkerEvents } from "../../dist/runtime/worker/lark-im-worker-
 import { activityDatabaseKey, inspectActivityProcesses, latestActivityEvents, evaluateActivityEvent, validateActivityEventShape, compareActivityProcessStarts, collectWorkerParentIdentities } from "./lark-im-activity-evidence.mjs";
 import { classifyLarkFailure } from "../adapters/lark-im/transport.mjs";
 import { readLiveProbeCache, liveProbeContext, DEFAULT_LIVE_PROBE_TTL_MS } from "./live-probe-cache.mjs";
-import { diagnosticSubprocessError } from "./public-safe.mjs";
+import { buildStatus } from "./sync-status-report.mjs";
+import { probeService, parseLaunchdState, classifyLaunchdPrint } from "../runtime/service/launchd.mjs";
 
 const DEFAULT_FRESHNESS_MAX_AGE_MS = DEFAULT_LIVE_PROBE_TTL_MS;
 const DEFAULT_STABILITY_WINDOW_MS = 24 * 60 * 60 * 1000;
@@ -50,6 +50,8 @@ const DEFAULT_DB = "data/exocortex.sqlite";
  * @property {(path: string) => JsonObject | null=} liveProbeContext
  * @property {(dbPath: string, sql: string, label: string) => JsonObject[]=} sqliteJson
  * @property {typeof inspectActivityProcesses=} inspectActivityProcesses
+ * @property {(dbPath: string) => JsonObject=} buildStatus
+ * @property {JsonObject=} serviceDeps
  * @property {number=} nowMs
  * @property {() => number=} clock
  * @property {number=} freshnessMaxAgeMs
@@ -69,29 +71,6 @@ const DEFAULT_DB = "data/exocortex.sqlite";
  */
 
 /**
- * @param {string} cmd
- * @param {string[]} args
- * @param {{allowFailure?: boolean}} [options]
- * @returns {SpawnResult}
- */
-function runCommand(cmd, args, options = {}) {
-  const result = spawnSync(cmd, args, {
-    encoding: "utf8",
-    maxBuffer: 20 * 1024 * 1024,
-    timeout: 120_000,
-    killSignal: "SIGKILL",
-  });
-  if ((result.status !== 0 || result.error) && !options.allowFailure) {
-    throw diagnosticSubprocessError(result, "service diagnostic command");
-  }
-  return {
-    ...result,
-    stdout: String(result.stdout || ""),
-    stderr: String(result.stderr || ""),
-  };
-}
-
-/**
  * @param {string} dbPath
  * @param {string} sql
  * @param {string} label
@@ -101,44 +80,6 @@ function sqliteJson(dbPath, sql, label) {
   return readOnlySqliteJson(dbPath, sql, label);
 }
 
-/** @param {string} stdout */
-function parseLaunchdState(stdout) {
-  /** @type {Record<string, string>} */
-  const result = {};
-  for (const line of stdout.split("\n")) {
-    const match = line.trim().match(/^(state|pid|last exit code) = (.+)$/);
-    if (match) result[match[1]] = match[2];
-  }
-  return result;
-}
-
-/**
- * A failed inspection is not evidence that a service is absent. Require both
- * launchctl's missing-service status and its specific diagnostic; missing GUI
- * domains, permission errors, signals and spawn failures remain unknown.
- * @param {{status: number | null, stdout?: string, stderr?: string, error?: Error, signal?: unknown}} result
- * @returns {"loaded" | "absent" | "unknown"}
- */
-function classifyLaunchdPrint(result) {
-  if (result.error || result.signal) return "unknown";
-  if (result.status === 0) return "loaded";
-  if (result.status === 113 && /^Could not find service "[^"\r\n]+" in domain\b/m.test(`${result.stderr || ""}\n${result.stdout || ""}`)) {
-    return "absent";
-  }
-  return "unknown";
-}
-
-/**
- * @param {SpawnResult | {stdout?: string}} result
- * @returns {JsonObject | null}
- */
-function parseJsonOutput(result) {
-  try {
-    return JSON.parse(String(result.stdout || "").trim());
-  } catch {
-    return null;
-  }
-}
 
 /**
  * @param {string} path
@@ -569,18 +510,17 @@ function buildServiceOverview({
  * @param {ServiceStatusReportDeps} [deps]
  */
 function buildServiceStatusReport(opts, deps = {}) {
-  const run = deps.runCommand || runCommand;
   const readWorkerLog = deps.readRecentWorkerEvents || readRecentWorkerEvents;
   const summarize = deps.summarizeWorkerEvents || summarizeWorkerEvents;
   const readFreshnessCache = deps.readLiveProbeCache || readLiveProbeCache;
   const now = () => deps.nowMs ?? (deps.clock || Date.now)();
   const initialDatabaseKey = activityDatabaseKey(opts.db || DEFAULT_DB);
-  const launchd = run("launchctl", ["print", opts.target], { allowFailure: true });
-  const inspection = classifyLaunchdPrint(launchd);
-  const loaded = inspection === "unknown" ? null : inspection === "loaded";
-  const launchdState = loaded ? parseLaunchdState(launchd.stdout || "") : {};
-  const sync = run(process.execPath, ["scripts/sync-status.mjs", "--db", opts.db || DEFAULT_DB, "--format", "json"], { allowFailure: true });
-  const syncStatus = sync.status === 0 && !sync.error && !sync.signal ? parseJsonOutput(sync) : null;
+  const probe = probeService({ ...deps.serviceDeps, target: opts.target, ...(deps.runCommand ? { run: deps.runCommand } : {}) });
+  const inspection = probe.loaded === null ? "unknown" : probe.loaded ? "loaded" : "absent";
+  const loaded = probe.loaded;
+  const launchdState = { state: probe.state, pid: probe.pid, "last exit code": probe.last_exit_code };
+  let syncStatus = null;
+  try { syncStatus = (deps.buildStatus || buildStatus)(opts.db || DEFAULT_DB); } catch { /* unavailable, never raw errors */ }
   const workerLog = readWorkerLog(opts.logDir);
   const liveProbeCachePath = resolve(opts.logDir, "live-probe.json");
   const liveProbe = readFreshnessCache(liveProbeCachePath);
@@ -622,14 +562,14 @@ function buildServiceStatusReport(opts, deps = {}) {
     state: launchdState.state || null,
     pid: launchdState.pid || null,
     last_exit_code: launchdState["last exit code"] || null,
-    command_status: launchd.status,
-    stderr: launchd.stderr || "",
-    stdout: launchd.stdout || "",
+    command_status: probe.command_status,
   };
-  const syncErrorText = syncStatus ? "" : String(sync.stderr || sync.stdout || "sync status unavailable");
+  const syncErrorText = syncStatus ? "" : "sync status unavailable";
 
   return {
     label: opts.label,
+    probe,
+    activity_evidence: activityEvidence,
     service_state: serviceState,
     overview: buildServiceOverview({
       launchd: launchdReport,
@@ -645,7 +585,7 @@ function buildServiceStatusReport(opts, deps = {}) {
     launchd: launchdReport,
     sync: {
       status: syncStatus,
-      command_status: sync.status,
+      command_status: syncStatus ? 0 : 1,
       error_text: syncErrorText,
     },
     worker: {
@@ -673,11 +613,9 @@ export {
   DEFAULT_WORKER_LOG_TAIL_BYTES,
   isCatchingUp,
   eventTimeMs,
-  parseJsonOutput,
   parseLaunchdState,
   readFileTail,
   readRecentWorkerEvents,
-  runCommand,
   sqliteJson,
   summarizeServiceActivity,
   summarizeServiceFreshness,

@@ -79,7 +79,7 @@ function messages(fixture, format, extraArgs = []) {
     SYNTHETIC_NETWORK_MARKER: fixture.networkMarker };
   delete env.FORCE_COLOR;
   const result = spawnSync(process.execPath,
-    [join(ROOT, "scripts/messages.mjs"), "--db", fixture.dbPath, "--format", format, "--limit", "30", ...extraArgs], {
+    [join(ROOT, "bin/exocortex.mjs"), "messages", "--db", fixture.dbPath, "--format", format, "--limit", "30", ...extraArgs], {
       cwd: ROOT, encoding: "utf8", maxBuffer: 5 * 1024 * 1024, timeout: 10_000,
       env,
     });

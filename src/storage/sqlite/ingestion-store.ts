@@ -1,38 +1,13 @@
-import { spawnSync } from "node:child_process";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { initializeDatabase } from "./initialize.js";
 import type { JsonObject, SyncScope, StoredRecord, WriteEffects, InitialSyncStartOptions } from "./ingestion-types.js";
-import { quoteSql, sqlJson, sqliteExec, sqliteQuery, secureDatabasePaths, withPrivateUmask } from "./sqlite-executor.js";
+import { quoteSql, sqlJson, sqliteExec, sqliteQuery, secureDatabasePaths } from "./sqlite-executor.js";
 import { DEFAULT_HARD_LEASE_SECONDS, RUN_FENCE_METADATA_KEY, scopeCursorJson, validateRecordCursor, cursorCanAdvanceSql, checkedRunId, runFenceGuardSql } from "./sync-run-fence.js";
 import { DEFAULT_SYNC_LOCK_OWNER, acquireLock, acquireMaintenanceLock, releaseLock, releaseMaintenanceLock, isMaintenanceLocked, recoverStaleSyncState, ownerPid, ownerStartedAtMs, defaultOwnerState } from "./sync-locks.js";
 import { encodeSourceVersion, normalizeStoredRecords, normalizeBoundedReplayRecords, normalizeExternalVersion, recordWritesSql, existingRecordMap, countWriteEffects, upsertRecordsSql } from "./record-storage.js";
 import { larkRunMetadataEntriesSql, commitBoundedReplayRecords, commitLarkListRun, finishLarkDetailRun, readLarkListProgress, readPendingLarkDetails } from "./lark-ingestion.js";
 const DEFAULT_IMPLICIT_RUN_LOCK_SECONDS = 10 * 60;
-const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
-const INITIALIZER_PATH = resolve(PROJECT_ROOT, "scripts/init-ingestion-core.mjs");
 
-function ensureInitialized(dbPath: string) {
-  const resolvedDbPath = secureDatabasePaths(dbPath);
-  let result;
-  try {
-    result = withPrivateUmask(() =>
-      spawnSync(process.execPath, [INITIALIZER_PATH, "--db", resolvedDbPath], {
-        cwd: PROJECT_ROOT,
-        encoding: "utf8",
-        maxBuffer: 10 * 1024 * 1024,
-      }),
-    );
-  } finally {
-    secureDatabasePaths(resolvedDbPath);
-  }
-  const error = result.error as NodeJS.ErrnoException | undefined;
-  if (error?.code === "ENOENT") {
-    throw new Error(`failed to launch Node initializer (ENOENT): ${process.execPath}`);
-  }
-  if (result.status !== 0 || error) {
-    throw new Error(String(result.stderr || "").trim() || error?.message || "failed to initialize ingestion core");
-  }
-}
+const ensureInitialized = initializeDatabase;
 
 function readScope(dbPath: string, scopeId: string): SyncScope {
   const rows = sqliteQuery(
@@ -137,7 +112,7 @@ function ensureSourceInitialSyncStart(
 function createRun(
   dbPath: string,
   scope: SyncScope,
-  metadata: JsonObject = { runner: "scripts/lark-im-sync.mjs" },
+  metadata: JsonObject = { runner: "bin/exocortex.mjs sync" },
   owner = DEFAULT_SYNC_LOCK_OWNER,
 ) {
   const expectedCursorJson = scopeCursorJson(scope);

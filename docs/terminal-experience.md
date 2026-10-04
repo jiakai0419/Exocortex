@@ -23,7 +23,7 @@
 ## 输出原则
 
 1. 默认输出给人看，`--format json` 给机器读。
-2. 日常入口极简，完整目录隐藏在 `npm run help -- --all`。
+2. 日常入口极简，完整目录由 registry 生成，在 `npm run help -- --all` 查看；机器发现使用 `node bin/exocortex.mjs --help --all --format json`。
 3. 命令、状态和关键数字要一眼可见。
 4. 颜色只用于扫描：命令、状态、分组、提示。
 5. 支持纯文本退化，不能依赖颜色表达唯一含义。
@@ -36,7 +36,7 @@
 共享渲染层：
 
 ```text
-scripts/lib/terminal.mjs
+dist/terminal/index.js
 ```
 
 所有面向人的 terminal 输出应优先使用这里的函数：
@@ -51,20 +51,18 @@ scripts/lib/terminal.mjs
 - `hint`
 - `compact`
 
-脚本可以保留 JSON 输出，但 text 输出应尽量走共享渲染层。
+命令可以保留 JSON 输出，但 text 输出应尽量走共享渲染层。
 
 ## 改造范围
 
 面向人的命令使用共享渲染层：
 
-- `help`
+- `--help`
 - `messages`
-- `lark-im-service status`
-- `lark-im-service tail`
-- `doctor`
-- `sync-status`
-- `lark-im-quality`
-- `lark-im-lag-check`
+- `status` / `status --detail` / `status --logs`
+- `check` 及显式的 live、coverage、backup、wait 扩展
+- `service` 的五种生命周期动作
+- `maintenance` 的七种维护动作
 
 内部命令可以继续优先输出 JSON/JSONL：
 

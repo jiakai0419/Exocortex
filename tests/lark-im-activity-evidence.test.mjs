@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { activityDatabaseKey, createActivityWriter, evaluateActivityEvent, inspectActivityProcesses,
   latestActivityEvents, observeLockOwners, validateActivityEventShape, compareActivityProcessStarts, collectWorkerParentIdentities } from "../src/diagnostics/lark-im-activity-evidence.mjs";
 import { buildServiceOverview, buildServiceStatusReport, readRecentWorkerEvents } from "../src/diagnostics/lark-im-service-report.mjs";
-import { runWorker, parseArgs } from "../src/cli/lark-im-worker-command.mjs";
+import { runWorker, parseArgs } from "../src/runtime/worker/worker.mjs";
 
 const clock = Date.parse("2028-04-12T09:00:00.000Z");
 const start = clock - 60000;
@@ -137,7 +137,7 @@ test("status reevaluates phase deadline after all slow observations", (t) => {
   let now = clock;
   const event = phase({ database_key: activityDatabaseKey(db), valid_until: iso(clock + 1000) });
   const report = buildServiceStatusReport({ label: "synthetic", target: "test/synthetic", logDir: "unused", db }, {
-    clock: () => now, runCommand: (cmd) => ({ status: 0, stdout: cmd === "launchctl" ? "state = running\npid = 8200\n" : JSON.stringify({ health: "ok", locks: [] }), stderr: "" }),
+    clock: () => now, runCommand: () => ({ status: 0, stdout: "state = running\npid = 8200\n", stderr: "" }), buildStatus: () => ({ health: "ok", locks: [] }),
     readRecentWorkerEvents: () => ({ path: "synthetic", exists: true, events: [event] }),
     readLiveProbeCache: () => null, liveProbeContext: () => null, sqliteJson: () => [],
     inspectActivityProcesses: () => { now += 2000; return new Map([[8200, processState]]); },
@@ -164,7 +164,7 @@ test("zombies and suspended processes cannot supply live activity evidence", () 
 });
 
 test("sync CLI emits real stage observations without changing JSON stdout; help emits none", async () => {
-  const { runLarkImSyncCli } = await import("../src/cli/lark-im-sync-command.mjs");
+  const { runLarkImSyncCli } = await import("./helpers/sync-command.mjs");
   const events = [];
   let stdout = "";
   let stderr = "";
@@ -207,7 +207,7 @@ test("public lock projection exposes only safe optional process evidence", async
 test("running history, dead owners and expired reservations stay unverified across status, doctor and service", async () => {
   const { summarizeHealth } = await import("../src/diagnostics/sync-status-core.mjs");
   const { sanitizeStatusReportForPublicOutput } = await import("../src/diagnostics/sync-status-report.mjs");
-  const { buildReport } = await import("../src/diagnostics/doctor-report.mjs");
+  const { isLocalReady } = await import("../src/diagnostics/service-wait-state.mjs");
   for (const locks of [[], [{ locked_at: iso(start), expires_at: iso(clock - 1), owner_state: "dead", owner_observed_at: iso(clock) }],
     [{ locked_at: iso(start), expires_at: iso(clock + 10000), owner_state: "alive", owner_observed_at: iso(clock) }]]) {
     const health = summarizeHealth({ discoveryCursor: { has_more: false }, scopeCounts: { message_enabled: 2 }, locks,
@@ -216,10 +216,7 @@ test("running history, dead owners and expired reservations stay unverified acro
       discovery: { cursor: { has_more: false } }, runs: { by_status: { running: 1, succeeded: 2 } } });
     assert.equal(status.health, "unknown");
     assert.deepEqual(status.current_activity, { state: "unknown", evidence: "database_only", reason: "unverified_sync_history" });
-    const doctor = buildReport({ db: "invented.sqlite", live: false }, { resolvePath: (path) => path,
-      now: () => new Date(clock), runJson: (args) => args[0].includes("sync-status") ? status : { quality: {} } });
-    assert.equal(doctor.overall, "unknown"); assert.equal(doctor.ok, false);
-    assert.doesNotMatch(doctor.findings.join(" "), /currently syncing/);
+    assert.equal(isLocalReady(status), false);
     const unavailable = overview([], { syncStatus: status });
     assert.equal(unavailable.activity.state, "unknown"); assert.equal(unavailable.health.status, "problem");
     const observed = overview([phase()], { syncStatus: status });
@@ -284,11 +281,8 @@ for (const during of ["database query", "OS observation"]) test(`database replac
   const db = join(dir, "replace.sqlite"); writeFileSync(db, "synthetic first generation");
   const replace = () => { renameSync(db, join(dir, "previous.sqlite")); writeFileSync(db, "synthetic next generation"); };
   const report = buildServiceStatusReport({ label: "synthetic", target: "test/synthetic", logDir: dir, db }, {
-    nowMs: clock, runCommand: (cmd) => {
-      if (cmd === "launchctl") return { status: 0, stdout: "state = running\npid = 8200\n", stderr: "" };
-      if (during === "database query") replace();
-      return { status: 0, stdout: JSON.stringify({ health: "ok", locks: [] }), stderr: "" };
-    },
+    nowMs: clock, runCommand: () => ({ status: 0, stdout: "state = running\npid = 8200\n", stderr: "" }),
+    buildStatus: () => { if (during === "database query") replace(); return { health: "ok", locks: [] }; },
     readRecentWorkerEvents: () => ({ path: "synthetic", exists: true, events: [phase({ database_key: activityDatabaseKey(db) })] }),
     readLiveProbeCache: () => null, liveProbeContext: () => null, sqliteJson: () => [],
     inspectActivityProcesses: () => { if (during === "OS observation") replace(); return new Map([[8200, processState]]); },
@@ -304,9 +298,8 @@ function logBackedActivity(t, inputEvents, processes, launchdPid = 8200) {
     ? { ...event, database_key: activityDatabaseKey(db) } : event);
   writeFileSync(join(dir, "worker.jsonl"), events.map((event) => JSON.stringify(event)).join("\n") + "\n");
   const deps = { nowMs: clock,
-    runCommand: (cmd) => ({ status: 0, stdout: cmd === "launchctl"
-      ? launchdPid === null ? "state = waiting\n" : `state = running\npid = ${launchdPid}\n`
-      : JSON.stringify({ health: "ok", locks: [] }), stderr: "" }),
+    runCommand: () => ({ status: 0, stdout: launchdPid === null ? "state = waiting\n" : `state = running\npid = ${launchdPid}\n`, stderr: "" }),
+    buildStatus: () => ({ health: "ok", locks: [] }),
     readLiveProbeCache: () => null, liveProbeContext: () => null, sqliteJson: () => [],
     inspectActivityProcesses: () => processes,
   };
@@ -320,7 +313,7 @@ test("review regression: a syntactically valid but incomplete activity tail cann
 });
 
 test("review regression: an unrelated orphan cannot suppress verified independent foreground activity through service CLI", async (t) => {
-  const { runLarkImServiceCli } = await import("../src/cli/lark-im-service-command.mjs");
+  const { runStatusCommand } = await import("../src/cli/status-command.mjs");
   const { plain } = await import("../dist/terminal/index.js");
   const fixture = logBackedActivity(t, [
     phase({ phase: "waiting" }),
@@ -330,15 +323,16 @@ test("review regression: an unrelated orphan cannot suppress verified independen
   ], new Map([[8200, processState], [8300, { state: "dead" }], [8301, { ...processState, ppid: 1 }], [8400, { ...processState, ppid: 8100 }]]));
   assert.equal(fixture.report().overview.activity.state, "syncing");
   let output = "";
-  assert.equal(runLarkImServiceCli(["status", "--db", fixture.db, "--log-dir", fixture.dir], {
+  assert.equal(await runStatusCommand({ db: fixture.db, logDir: fixture.dir }, { now: () => clock, provided: new Set(), root: fixture.dir, cwd: fixture.dir, env: {}, stdout: { write: (text) => { output += text; } } }, {
+    readInstalledServiceConfig: () => ({ status: "missing" }),
     uid: () => 999, stdout: { write: (text) => { output += text; } },
     buildServiceStatusReport: (opts) => buildServiceStatusReport(opts, fixture.deps),
   }), 0);
-  assert.match(plain(output), /Activity\s+SYNCING foreground sync observed/);
+  assert.match(plain(output), /Activity: SYNCING/);
 });
 
 test("all activity consumers reject missing required fields and malformed types without old-phase fallback", async (t) => {
-  const { runLarkImServiceCli } = await import("../src/cli/lark-im-service-command.mjs");
+  const { runStatusCommand } = await import("../src/cli/status-command.mjs");
   const { plain } = await import("../dist/terminal/index.js");
   const malformed = Object.keys(phase()).map((field) => {
     const event = phase(); delete event[field]; return [field, event];
@@ -357,11 +351,12 @@ test("all activity consumers reject missing required fields and malformed types 
   }
   const fixture = logBackedActivity(t, [phase(), { type: "lark_im_worker_activity", pid: 8200 }], new Map([[8200, processState]]));
   let output = "";
-  runLarkImServiceCli(["status", "--db", fixture.db, "--log-dir", fixture.dir], {
+  await runStatusCommand({ db: fixture.db, logDir: fixture.dir }, { now: () => clock, provided: new Set(), root: fixture.dir, cwd: fixture.dir, env: {}, stdout: { write: (text) => { output += text; } } }, {
+    readInstalledServiceConfig: () => ({ status: "missing" }),
     uid: () => 999, stdout: { write: (text) => { output += text; } },
     buildServiceStatusReport: (opts) => buildServiceStatusReport(opts, fixture.deps),
   });
-  assert.match(plain(output), /Activity\s+UNKNOWN current phase evidence is incomplete/);
+  assert.match(plain(output), /Activity: UNKNOWN/);
 });
 
 test("explicit unknown identity is valid schema, blocks its old phase, and does not poison later real evidence", (t) => {
@@ -435,18 +430,19 @@ test("4531143 regression: a suspended parent with matching start cannot turn its
     phase({ role: "sync", phase: "sync", pid: 8501, instance_id: "unbound-child", parent_instance: null })];
   const fixture = logBackedActivity(t, events, processes, null);
   assert.equal(fixture.report().overview.activity.state, "unknown");
-  const { runLarkImServiceCli } = await import("../src/cli/lark-im-service-command.mjs");
+  const { runStatusCommand } = await import("../src/cli/status-command.mjs");
   const { plain } = await import("../dist/terminal/index.js");
   let output = "";
-  runLarkImServiceCli(["status", "--db", fixture.db, "--log-dir", fixture.dir], {
+  await runStatusCommand({ db: fixture.db, logDir: fixture.dir }, { now: () => clock, provided: new Set(), root: fixture.dir, cwd: fixture.dir, env: {}, stdout: { write: (text) => { output += text; } } }, {
+    readInstalledServiceConfig: () => ({ status: "missing" }),
     uid: () => 999, stdout: { write: (text) => { output += text; } },
     buildServiceStatusReport: (opts) => buildServiceStatusReport(opts, fixture.deps),
   });
-  assert.match(plain(output), /Activity\s+UNKNOWN/); assert.doesNotMatch(plain(output), /foreground sync observed/);
+  assert.match(plain(output), /Activity: UNKNOWN/); assert.doesNotMatch(plain(output), /foreground sync observed/);
 });
 
 test("parent identity and liveness stay separate across 81 log/report/CLI combinations", async (t) => {
-  const { runLarkImServiceCli } = await import("../src/cli/lark-im-service-command.mjs");
+  const { runStatusCommand } = await import("../src/cli/status-command.mjs");
   const { plain } = await import("../dist/terminal/index.js");
   let checked = 0;
   for (const liveness of ["alive", "unknown", "dead"]) {
@@ -469,11 +465,12 @@ test("parent identity and liveness stay separate across 81 log/report/CLI combin
           assert.equal(report.overview.activity.state, expected, label);
           assert.equal(report.overview.activity.evidence === "recent_foreground_phase", expected === "syncing", label);
           let output = "";
-          runLarkImServiceCli(["status", "--db", fixture.db, "--log-dir", fixture.dir], {
+          await runStatusCommand({ db: fixture.db, logDir: fixture.dir }, { now: () => clock, provided: new Set(), root: fixture.dir, cwd: fixture.dir, env: {}, stdout: { write: (text) => { output += text; } } }, {
+    readInstalledServiceConfig: () => ({ status: "missing" }),
             uid: () => 999, stdout: { write: (text) => { output += text; } },
             buildServiceStatusReport: (opts) => buildServiceStatusReport(opts, fixture.deps),
           });
-          assert.match(plain(output), new RegExp(`Activity\\s+${expected.toUpperCase()}`), label);
+          assert.match(plain(output), new RegExp(`Activity: ${expected.toUpperCase()}`), label);
           checked++;
         }
       }

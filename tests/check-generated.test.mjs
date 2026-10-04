@@ -5,7 +5,7 @@ import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync,
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { checkGeneratedFiles, compareGeneratedTrees } from "../scripts/check-generated.mjs";
+import { checkGeneratedFiles, compareGeneratedTrees } from "../src/development/generated-check.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const compilerPath = join(root, "node_modules/typescript/bin/tsc");

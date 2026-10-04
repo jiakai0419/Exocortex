@@ -1,6 +1,6 @@
 # Service status presentation
 
-`lark-im-service status` keeps unsupported scope information in the Sync key/value layout. A single reason shares the count row, for example `Unsupported scopes  4 · restricted_mode (access restricted)`. Multiple reasons appear as indented continuation rows with their individual counts. Nonempty numeric error codes remain visible as `code N`; empty CLI columns and the separate table are removed.
+`status` keeps unsupported scope information in the Sync key/value layout. A single reason shares the count row, for example `Unsupported scopes  4 · restricted_mode (access restricted)`. Multiple reasons appear as indented continuation rows with their individual counts. Nonempty numeric error codes remain visible as `code N`; empty CLI columns and the separate table are removed.
 
 The unsupported-scope layout only changes the text view. Public JSON fields and reason grouping, synchronization behavior, and Activity are unchanged by this layout. Raw remote error messages are not shown. Synthetic regressions cover zero, single and multiple reasons, error-code retention, and terminal control sanitization.
 

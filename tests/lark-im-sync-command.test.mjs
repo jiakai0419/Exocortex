@@ -5,7 +5,7 @@ import {
   executeLarkImSync,
   parseArgs,
   runLarkImSyncCli,
-} from "../src/cli/lark-im-sync-command.mjs";
+} from "./helpers/sync-command.mjs";
 
 function memoryWriter() {
   let text = "";
@@ -76,7 +76,7 @@ test("lark im sync command renders help without touching dependencies", () => {
   });
 
   assert.equal(exitCode, 0);
-  assert.match(stdout.text(), /Usage: node scripts\/lark-im-sync\.mjs/);
+  assert.match(stdout.text(), /Usage: node bin\/exocortex\.mjs sync/);
   assert.equal(stderr.text(), "");
 });
 
@@ -291,7 +291,7 @@ test("lark im sync command fails closed before fetching a profile or running a s
 
   assert.equal(exitCode, 1);
   assert.equal(stdout.text(), "");
-  assert.match(stderr.text(), /requires an explicit initial baseline/);
+  assert.equal(stderr.text(), "sync failed\n");
   assert.deepEqual(calls, ["init", "baseline"]);
 });
 

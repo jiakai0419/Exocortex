@@ -1,7 +1,19 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseArgs as parseWorker, runCycle, runStep } from "../scripts/lark-im-worker.mjs";
-import { parseArgs as parseService, plistXml } from "../scripts/lark-im-service.mjs";
+import { parseArgs as parseWorkerRaw, runCycle, runStep } from "../src/runtime/worker/worker.mjs";
+import { validateWorkerOptions, resolveWorkerPaths, parseWorkerProgramArguments } from "../src/runtime/worker/options.mjs";
+import { createCommandContext } from "../src/cli/context.mjs";
+import { parseRouteOptions } from "../src/cli/registry.mjs";
+const context = createCommandContext({ root: "/synthetic-project", cwd: "/synthetic-project" });
+function parseWorker(argv) {
+  return resolveWorkerPaths(parseWorkerRaw(argv), { root: context.root, cwd: context.cwd, provided: new Set(argv) });
+}
+function parseService([action, ...argv]) {
+  const { options } = parseRouteOptions(`service.${action}`, argv, { context });
+  if (action === "install") validateWorkerOptions(options);
+  return options;
+}
+import { plistXml } from "../src/runtime/service/launchd.mjs";
 
 const numericOptions = [
   "interval-seconds", "received-scopes-per-cycle", "hot-received-scopes-per-cycle",
@@ -10,7 +22,7 @@ const numericOptions = [
   "retention-every-cycles", "adaptive-fair-min", "adaptive-fair-max", "adaptive-target-cycle-seconds",
 ];
 const sharedKeys = [
-  "intervalSeconds", "receivedScopesPerCycle", "hotReceivedScopesPerCycle", "discoveryPagesPerCycle",
+  "db", "intervalSeconds", "receivedScopesPerCycle", "hotReceivedScopesPerCycle", "discoveryPagesPerCycle",
   "hotDiscoveryPagesPerCycle", "maxChatPages", "reconcileIntervalHours", "chatTypes", "logDir",
   "stepTimeoutSeconds", "logMaxBytes", "logKeepFiles", "retentionEveryCycles", "adaptiveFair",
   "adaptiveFairMin", "adaptiveFairMax", "adaptiveTargetCycleSeconds",
@@ -20,8 +32,8 @@ function shared(options) {
 }
 function plistArguments(options) {
   const xml = plistXml(options, {
-    cwd: "/synthetic-project", logDir: options.logDir, nodePath: "/synthetic-bin/node",
-    workerPath: "/synthetic-project/scripts/lark-im-worker.mjs", larkCli: "/synthetic-bin/lark-cli",
+    root: "/synthetic-project", logDir: options.logDir, nodePath: "/synthetic-bin/node",
+    workerPath: "/synthetic-project/src/runtime/worker/main.mjs", larkCli: "/synthetic-bin/lark-cli",
     mkdirSync() {},
   });
   const array = xml.match(/<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/)[1];
@@ -47,7 +59,7 @@ test("service persists adaptive settings through actual plist to worker argument
   assert.deepEqual(shared(worker), shared(options));
   assert.equal(worker.maxCycles, null);
   assert.ok(args.includes("--adaptive-fair"));
-  assert.ok(!args.includes("--once") && !args.includes("--max-cycles") && !args.includes("--db"));
+  assert.ok(!args.includes("--once") && !args.includes("--max-cycles") && args.includes("--db"));
 });
 
 test("inactive adaptive settings remain configurable and persist without enabling adaptation", () => {
@@ -86,9 +98,9 @@ for (const args of [
 }
 
 test("once and max-cycles remain foreground-only and never enter persistent arguments", () => {
-  for (const command of ["install", "start", "stop", "status", "wait-ok"]) {
+  for (const command of ["install", "start", "stop", "restart", "uninstall"]) {
     for (const args of [["--once"], ["--max-cycles", "2"]]) {
-      assert.throws(() => parseService([command, ...args]), /foreground worker only/);
+      assert.throws(() => parseService([command, ...args]), /Unknown option/);
     }
   }
   assert.equal(parseWorker(["--once"]).maxCycles, 1);

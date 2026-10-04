@@ -6,7 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { createSyncRunner } from "../src/adapters/lark-im/sync-runner.mjs";
-import { executeLarkImSync, parseArgs } from "../src/cli/lark-im-sync-command.mjs";
+import { executeLarkImSync, parseArgs } from "./helpers/sync-command.mjs";
 import {
   ensureInitialized,
   ensureSourceInitialSyncStart,

@@ -19,7 +19,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const INITIALIZER = resolve(PROJECT_ROOT, "scripts/init-ingestion-core.mjs");
+const INITIALIZER = resolve(PROJECT_ROOT, "bin/exocortex.mjs");
 
 function tempDir(t) {
   const dir = mkdtempSync(join(tmpdir(), "exocortex-init-test-"));
@@ -38,7 +38,7 @@ function sqliteJson(dbPath, sql) {
 
 function runInitializer(dbPath, cwd, env = process.env) {
   return new Promise((resolveResult) => {
-    const child = spawn(process.execPath, [INITIALIZER, "--db", dbPath], {
+    const child = spawn(process.execPath, [INITIALIZER, "maintenance", "init", "--db", dbPath, "--format", "json"], {
       cwd,
       env,
       stdio: ["ignore", "pipe", "pipe"],
@@ -112,7 +112,7 @@ test("concurrent initializers serialize, all succeed, and apply every migration 
 test("initializer reports a readable sqlite3 ENOENT and removes its serialization lock", (t) => {
   const dir = tempDir(t);
   const dbPath = join(dir, "missing-sqlite.sqlite");
-  const result = spawnSync(process.execPath, [INITIALIZER, "--db", dbPath], {
+  const result = spawnSync(process.execPath, [INITIALIZER, "maintenance", "init", "--db", dbPath, "--format", "json"], {
     cwd: dir,
     env: { ...process.env, PATH: "" },
     encoding: "utf8",
@@ -122,4 +122,37 @@ test("initializer reports a readable sqlite3 ENOENT and removes its serializatio
   assert.match(result.stderr, /sqlite3 executable not found \(ENOENT\)/);
   assert.doesNotMatch(result.stderr, /Cannot read properties/);
   assert.equal(existsSync(`${dbPath}.init.lock`), false);
+});
+
+test("importing the initializer is inert and every call restores umask", async (t) => {
+  const { initializeDatabase } = await import("../dist/storage/sqlite/initialize.js");
+  const dir = tempDir(t);
+  const previous = process.umask(0o022);
+  try {
+    initializeDatabase(join(dir, "created", "invented.sqlite"));
+    assert.equal(process.umask(), 0o022);
+    assert.throws(() => initializeDatabase(join(dir, "created", "invented.sqlite", "cannot-be-directory")));
+    assert.equal(process.umask(), 0o022);
+  } finally { process.umask(previous); }
+  const moduleUrl = new URL("../dist/storage/sqlite/initialize.js", import.meta.url).href;
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval",
+    `process.umask(0o022); await import(${JSON.stringify(moduleUrl)}); process.stdout.write(String(process.umask()));`], { cwd:dir, encoding:"utf8" });
+  assert.equal(result.status,0,result.stderr);
+  assert.equal(Number(result.stdout),0o022);
+});
+
+test("failed migration rolls back its transaction, releases the pre-schema lock and restores umask", async (t) => {
+  const { mkdirSync, writeFileSync } = await import("node:fs");
+  const { initializeDatabase } = await import("../dist/storage/sqlite/initialize.js");
+  const dir=tempDir(t), migrations=join(dir,"invented-migrations"), db=join(dir,"database","synthetic.sqlite");
+  mkdirSync(migrations);
+  writeFileSync(join(migrations,"001_invented.sql"), "CREATE TABLE invented_records (value TEXT); INSERT INTO invented_records VALUES ('invented'); SELECT * FROM nonexistent_fixture_table;");
+  const previous=process.umask(0o027);
+  try {
+    assert.throws(() => initializeDatabase(db,{migrationsDir:migrations}),/nonexistent_fixture_table/);
+    assert.equal(process.umask(),0o027);
+    assert.equal(existsSync(`${db}.init.lock`),false);
+    assert.deepEqual(sqliteJson(db,"SELECT name FROM sqlite_master WHERE name='invented_records';"),[]);
+    assert.deepEqual(sqliteJson(db,"SELECT * FROM schema_migrations;"),[]);
+  } finally { process.umask(previous); }
 });

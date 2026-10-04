@@ -6,10 +6,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { plain } from "../dist/terminal/index.js";
-import {
-  parseArgs,
-  runSyncStatusCli,
-} from "../src/cli/sync-status-command.mjs";
 import { buildStatus, sanitizeStatusReportForPublicOutput, sqliteJson as readStatusRows } from "../src/diagnostics/sync-status-report.mjs";
 import { renderSyncStatusText as renderText } from "../src/terminal/sync-status-view.mjs";
 import { ensureInitialized, quoteSql } from "../dist/storage/sqlite/ingestion-store.js";
@@ -88,87 +84,6 @@ function statusFixture(overrides = {}) {
     ...overrides,
   };
 }
-
-test("sync status command renders help without touching dependencies", () => {
-  const stdout = memoryWriter();
-  const stderr = memoryWriter();
-  const exitCode = runSyncStatusCli(["--help"], {
-    stdout: stdout.stream,
-    stderr: stderr.stream,
-    deps: {
-      existsSync: () => {
-        throw new Error("should not check db");
-      },
-    },
-  });
-
-  assert.equal(exitCode, 0);
-  assert.match(stdout.text(), /Usage: node scripts\/sync-status\.mjs/);
-  assert.equal(stderr.text(), "");
-});
-
-test("sync status command emits injected status as json", () => {
-  const stdout = memoryWriter();
-  const stderr = memoryWriter();
-  const calls = [];
-  const privateSentinel = "PRIVATE_STATUS_SENTINEL";
-  const privateId = `scope_${"x".repeat(80)}`;
-  const exitCode = runSyncStatusCli(["--db", "custom.sqlite", "--format", "json"], {
-    stdout: stdout.stream,
-    stderr: stderr.stream,
-    deps: {
-      resolvePath: (dbPath) => `/abs/${dbPath}`,
-      existsSync: (dbPath) => {
-        calls.push(["exists", dbPath]);
-        return true;
-      },
-      buildStatus: (dbPath) => {
-        calls.push(["build", dbPath]);
-        return statusFixture({
-          db_path: dbPath,
-          health: "ok",
-          discovery: { cursor: { has_more: false, page_token: privateSentinel }, complete: true },
-          runs: {
-            by_status: { failed: 1 },
-            recent: [{ status: "failed", scope_id: privateId, error_message: privateSentinel }],
-          },
-          locks: [{ scope_id: privateId, locked_by: privateSentinel }],
-        });
-      },
-    },
-  });
-
-  assert.equal(exitCode, 0);
-  assert.equal(stderr.text(), "");
-  const payload = JSON.parse(stdout.text());
-  assert.equal(payload.db_path, undefined);
-  assert.equal(stdout.text().includes("/abs/custom.sqlite"), false);
-  assert.doesNotMatch(stdout.text(), new RegExp(privateSentinel));
-  assert.doesNotMatch(stdout.text(), new RegExp(privateId));
-  assert.equal(payload.health, "ok");
-  assert.deepEqual(calls, [
-    ["exists", "/abs/custom.sqlite"],
-    ["build", "/abs/custom.sqlite"],
-  ]);
-});
-
-test("sync status command reports missing database as a terminal error", () => {
-  const stdout = memoryWriter();
-  const stderr = memoryWriter();
-  const exitCode = runSyncStatusCli(["--db", "missing.sqlite"], {
-    stdout: stdout.stream,
-    stderr: stderr.stream,
-    deps: {
-      resolvePath: (dbPath) => `/abs/${dbPath}`,
-      existsSync: () => false,
-    },
-  });
-
-  assert.equal(exitCode, 1);
-  assert.equal(stdout.text(), "");
-  assert.match(plain(stderr.text()), /database not found/);
-  assert.doesNotMatch(stderr.text(), /\/abs\/missing\.sqlite/);
-});
 
 test("renderText shows summary, unsupported reasons, recovery, and recent failures", () => {
   const output = plain(renderText(statusFixture()));
@@ -438,10 +353,4 @@ test("malformed aggregate values stay unavailable rather than becoming an empty 
   assert.equal(report.health, "needs_attention");
   assert.equal(report.details.evidence, "unavailable");
   assert.equal(report.details.pending_count, null);
-});
-
-test("parseArgs validates format and missing values", () => {
-  assert.deepEqual(parseArgs(["--format", "json"]), { db: "data/exocortex.sqlite", format: "json" });
-  assert.throws(() => parseArgs(["--format", "yaml"]), /--format must be text or json/);
-  assert.throws(() => parseArgs(["--db"]), /--db requires a value/);
 });

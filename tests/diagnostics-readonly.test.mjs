@@ -12,8 +12,10 @@ import { collectQualityReport } from "../src/diagnostics/lark-im-quality-report.
 import { loadMessages } from "../src/diagnostics/messages-report.mjs";
 import { collectLagReport } from "../src/diagnostics/lark-im-lag-report.mjs";
 import { buildServiceStatusReport } from "../src/diagnostics/lark-im-service-report.mjs";
-import { executeDoctor } from "../src/cli/doctor-command.mjs";
-import { executeSyncRepair, parseArgs as parseRepairArgs } from "../src/cli/sync-repair-command.mjs";
+import { collectCheckReport } from "../src/diagnostics/check-report.mjs";
+import { createCommandContext } from "../src/cli/context.mjs";
+import { executeSyncRepair } from "../src/maintenance/repair.mjs";
+import { parseRouteOptions } from "../src/cli/registry.mjs";
 
 function fixture(t, journalMode = "DELETE") {
   const dir = mkdtempSync(join(tmpdir(), "exocortex-readonly-"));
@@ -85,7 +87,7 @@ function seedStaleState(db) {
   assert.equal(seed.status, 0, seed.stderr);
 }
 
-function exerciseDiagnostics(dir, db) {
+async function exerciseDiagnostics(dir, db) {
   const status = buildStatus(db);
   assert.equal(status.health, "unknown");
   assert.equal(status.current_activity.reason, "unverified_sync_history");
@@ -96,14 +98,24 @@ function exerciseDiagnostics(dir, db) {
     fetchRecentChatMessages: () => { throw new Error("must not be called"); },
   });
   assert.equal(lag.status, "inconclusive");
-  const report = executeDoctor({ db, live: false, hotChats: 1, messagesPerChat: 1, format: "json" });
-  assert.equal(report.overall, "unknown");
+  const report = await collectCheckReport({ db, live: false, logDir: dir }, createCommandContext({
+    root: dir, cwd: dir, now: () => Date.parse("2030-01-03T12:00:00Z"),
+  }), {
+    collectLagReport: () => { throw new Error("default check must not read remote data"); },
+    collectStatusEvidence: () => { throw new Error("default check must not inspect or change service state"); },
+    writeLiveProbeCache: () => { throw new Error("default check must not write a cache"); },
+  });
+  assert.equal(report.checks.sync.status, "incomplete");
+  assert.equal(report.checks.sync.evidence.health, "unknown");
+  assert.equal(report.checks.database.status, "passed");
+  assert.equal(report.checks.quality.status, "passed");
+  assert.equal(report.exit_code, 2);
   assert.equal(report.ok, false);
   buildServiceStatusReport({ db, label: "test", target: "test", logDir: dir }, {
-    runCommand: (_cmd, args) => {
-      if (args[0] === "print") return { status: 1, stdout: "", stderr: "", pid: 0, output: [], signal: null };
-      assert.deepEqual(args, ["scripts/sync-status.mjs", "--db", db, "--format", "json"]);
-      return { status: 0, stdout: JSON.stringify(buildStatus(db)), stderr: "", pid: 0, output: [], signal: null };
+    runCommand: (cmd, args) => {
+      assert.equal(cmd, "launchctl");
+      assert.deepEqual(args, ["print", "test"]);
+      return { status: 1, stdout: "", stderr: "", signal: null };
     },
   });
   assert.equal(executeSyncRepair({ db, apply: false }).preview.expired_locks, 1);
@@ -114,27 +126,33 @@ function assertWritesRejected(db) {
   assert.throws(() => readOnlySqliteJson(db, "DELETE FROM sync_scopes;", "test"), /failed/);
 }
 
-test("rollback-journal diagnostics preserve business data, database bytes, permissions and exact file layout", (t) => {
+test("rollback-journal diagnostics preserve business data, database bytes, permissions and exact file layout", async (t) => {
   const { dir, db } = fixture(t);
   seedStaleState(db);
   chmodSync(dir, 0o755);
   chmodSync(db, 0o644);
   const businessBefore = businessSnapshot(db);
   const before = snapshot(dir, db);
-  exerciseDiagnostics(dir, db);
+  await exerciseDiagnostics(dir, db);
   assert.equal(businessSnapshot(db), businessBefore);
   assert.deepEqual(snapshot(dir, db), before);
 });
 
-test("missing databases and missing tables remain untouched; SQLite rejects DML and DDL", (t) => {
+test("missing databases and missing tables remain untouched; SQLite rejects DML and DDL", async (t) => {
   const { dir, db } = fixture(t);
   const missing = join(dir, "absent", "missing.sqlite");
   assert.throws(() => readOnlySqliteJson(missing, "SELECT 1;", "test"), /failed/);
   assert.throws(() => executeSyncRepair({ db: missing, apply: false }), /failed/);
+  const missingReport = await collectCheckReport({ db: missing }, createCommandContext({ root: dir, cwd: dir }));
+  assert.equal(missingReport.exit_code, 1);
+  for (const key of ["database", "sync", "quality"]) assert.equal(missingReport.checks[key].status, "unavailable");
   assert.equal(existsSync(join(dir, "absent")), false);
   const empty = join(dir, "empty.sqlite");
   writeFileSync(empty, "");
   assert.throws(() => buildStatus(empty), /failed/);
+  const emptyReport = await collectCheckReport({ db: empty }, createCommandContext({ root: dir, cwd: dir }));
+  assert.equal(emptyReport.exit_code, 1);
+  assert.equal(emptyReport.checks.sync.status, "unavailable");
   assert.equal(statSync(empty).size, 0);
   const businessBefore = businessSnapshot(db);
   const before = snapshot(dir, db);
@@ -143,7 +161,7 @@ test("missing databases and missing tables remain untouched; SQLite rejects DML 
   assert.deepEqual(snapshot(dir, db), before);
 });
 
-test("WAL-header diagnostics stay read-only with missing coordination files", (t) => {
+test("WAL-header diagnostics stay read-only with missing coordination files", async (t) => {
   const { dir, db } = fixture(t);
   seedStaleState(db);
   const businessBefore = businessSnapshot(db);
@@ -162,7 +180,7 @@ test("WAL-header diagnostics stay read-only with missing coordination files", (t
   const before = snapshot(dir, db);
   assert.deepEqual(before.files, [basename(db)]);
   try {
-    exerciseDiagnostics(dir, db);
+    await exerciseDiagnostics(dir, db);
   } catch (error) {
     // Some SQLite builds cannot open WAL databases read-only without existing
     // sidecars. Confirm that exact engine limitation independently, and require
@@ -217,7 +235,7 @@ con.close()
     assert.equal(before.sha256, mainBeforeWriter, "synthetic marker must exist only in uncheckpointed WAL frames");
     const businessBefore = businessSnapshot(db);
     assert.deepEqual(readOnlySqliteJson(db, markerQuery, "read synthetic WAL marker"), [{ value: 1 }]);
-    exerciseDiagnostics(dir, db);
+    await exerciseDiagnostics(dir, db);
     assertWritesRejected(db);
     assert.equal(businessSnapshot(db), businessBefore);
     assertWalUnchanged(before, snapshot(dir, db), db);
@@ -234,7 +252,7 @@ test("repair only calls recovery after an explicit apply flag", () => {
     sqliteJson: () => [{ locks: 2, expired_locks: 1, running_runs: 2 }],
     recoverStaleSyncState: () => { throw new Error("mutation forbidden"); },
   };
-  assert.equal(parseRepairArgs([]).apply, false);
+  assert.equal(parseRouteOptions("maintenance.repair", []).options.apply, false);
   const preview = executeSyncRepair({ db: "synthetic.sqlite", apply: false }, deps);
   assert.equal(preview.applied, false);
   assert.match(preview.note, /owner liveness.*not evaluated/);

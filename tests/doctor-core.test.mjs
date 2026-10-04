@@ -8,7 +8,6 @@ import {
   normalizeLiveResult,
   overallStatus,
 } from "../src/diagnostics/doctor-core.mjs";
-import { overallStatus as shimOverallStatus } from "../scripts/lib/doctor-core.mjs";
 
 function localState(overrides = {}) {
   return {
@@ -33,7 +32,6 @@ test("keychain failures keep live unavailable but cannot make a nonzero doctor r
   assert.equal(live.reason, "keychain_unavailable");
   assert.match(live.hint, /background service can still be healthy/);
   assert.equal(overallStatus(localState({ live })), "needs_attention");
-  assert.equal(shimOverallStatus(localState({ live })), "needs_attention");
   assert.deepEqual(buildFindings(localState({ live })), ["live lag probe command returned a nonzero exit status", "live lag probe unavailable in this shell"]);
 });
 

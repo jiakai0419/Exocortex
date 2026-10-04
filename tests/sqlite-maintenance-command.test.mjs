@@ -24,11 +24,29 @@ import test from "node:test";
 import { plain } from "../dist/terminal/index.js";
 import {
   executeSqliteMaintenance,
-  parseArgs,
   pruneBackups,
-  renderSqliteMaintenanceText,
-  runSqliteMaintenanceCli,
-} from "../src/cli/sqlite-maintenance-command.mjs";
+} from "../src/storage/sqlite/maintenance.mjs";
+
+import { renderSqliteMaintenanceText } from "../src/terminal/sqlite-maintenance-view.mjs";
+import { runMaintenanceCommand } from "../src/cli/maintenance-command.mjs";
+import { createCommandContext } from "../src/cli/context.mjs";
+import { parseRouteOptions } from "../src/cli/registry.mjs";
+
+// Existing domain fixtures use compact argument-shaped data. This helper has no
+// validation policy; public parsing is tested against the shared registry.
+function fixtureOptions([action, ...args]) {
+  const options = { action, db: "data/exocortex.sqlite", backupDir: "backups/private", backup: null,
+    latest: false, format: "text", dryRun: true, backupKeepCount: 7, backupKeepDays: 30 };
+  const fields = { "--db": "db", "--backup-dir": "backupDir", "--backup": "backup", "--format": "format",
+    "--backup-keep-count": "backupKeepCount", "--backup-keep-days": "backupKeepDays" };
+  for (let index=0; index<args.length; index++) {
+    const arg=args[index];
+    if (arg === "--apply") options.dryRun=false;
+    else if (arg === "--latest") options.latest=true;
+    else { const value=args[++index]; options[fields[arg]]=arg.startsWith("--backup-keep-") ? Number(value) : value; }
+  }
+  return options;
+}
 
 function tempDir(t) {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "exocortex-sqlite-maintenance-test-")));
@@ -113,37 +131,12 @@ function installSchema(dbPath) {
   );
 }
 
-test("sqlite maintenance parseArgs keeps public maintenance commands explicit", () => {
-  assert.equal(parseArgs(["check"]).action, "check");
-  assert.equal(parseArgs(["backup", "--backup-dir", "private-backups"]).backupDir, "private-backups");
-  assert.deepEqual(parseArgs(["prune-runs"]), {
-    action: "prune-runs",
-    db: "data/exocortex.sqlite",
-    backupDir: "backups/private",
-    backup: null,
-    latest: false,
-    format: "text",
-    dryRun: true,
-    backupKeepCount: 7,
-    backupKeepDays: 30,
-  });
-  assert.equal(parseArgs(["prune-runs", "--apply"]).dryRun, false);
-  assert.equal(parseArgs(["prune-runs", "--dry-run"]).dryRun, true);
-  assert.deepEqual(parseArgs(["verify", "--latest", "--format", "json"]), {
-    action: "verify",
-    db: "data/exocortex.sqlite",
-    backupDir: "backups/private",
-    backup: null,
-    latest: true,
-    format: "json",
-    dryRun: true,
-    backupKeepCount: 7,
-    backupKeepDays: 30,
-  });
-  assert.equal(parseArgs(["--help"]).help, true);
-  assert.throws(() => parseArgs(["repair"]), /action must be check, backup, verify, prune-runs, or compact/);
-  assert.throws(() => parseArgs(["check", "--apply"]), /--apply is only supported for prune-runs/);
-  assert.throws(() => parseArgs(["verify", "--latest", "--backup", "x.sqlite"]), /use either --latest or --backup/);
+test("maintenance registry keeps write and preview routes explicit", () => {
+  assert.equal(parseRouteOptions("maintenance.prune-runs", []).options.apply, false);
+  assert.equal(parseRouteOptions("maintenance.compact", []).options.apply, false);
+  assert.equal(parseRouteOptions("maintenance.compact", ["--apply"]).options.apply, true);
+  assert.throws(() => parseRouteOptions("maintenance.backup", ["--apply"]));
+  assert.throws(() => parseRouteOptions("maintenance.prune-runs", ["--dry-run"]));
 });
 
 test("sqlite maintenance check reports integrity and public-safe counts", (t) => {
@@ -151,7 +144,7 @@ test("sqlite maintenance check reports integrity and public-safe counts", (t) =>
   const dbPath = join(dir, "shape.sqlite");
   installSchema(dbPath);
 
-  const report = executeSqliteMaintenance(parseArgs(["check", "--db", dbPath]), { cwd: dir });
+  const report = executeSqliteMaintenance(fixtureOptions(["check", "--db", dbPath]), { cwd: dir });
   const rendered = plain(renderSqliteMaintenanceText(report));
 
   assert.equal(report.ok, true);
@@ -169,7 +162,7 @@ test("sqlite maintenance backup creates a verified private backup and verify lat
   const backupDir = join(dir, "backups", "private");
   installSchema(dbPath);
 
-  const backup = executeSqliteMaintenance(parseArgs(["backup", "--db", dbPath, "--backup-dir", backupDir]), {
+  const backup = executeSqliteMaintenance(fixtureOptions(["backup", "--db", dbPath, "--backup-dir", backupDir]), {
     cwd: dir,
     now: () => new Date("2027-01-15T08:00:00.000Z"),
   });
@@ -180,7 +173,7 @@ test("sqlite maintenance backup creates a verified private backup and verify lat
   assert.equal(statSync(join(dir, backup.backup_path)).mode & 0o777, 0o600);
   assert.equal(statSync(`${join(dir, backup.backup_path)}.manifest.json`).mode & 0o777, 0o600);
 
-  const verify = executeSqliteMaintenance(parseArgs(["verify", "--latest", "--db", dbPath, "--backup-dir", backupDir]), {
+  const verify = executeSqliteMaintenance(fixtureOptions(["verify", "--latest", "--db", dbPath, "--backup-dir", backupDir]), {
     cwd: dir,
   });
   assert.equal(verify.ok, true);
@@ -192,7 +185,7 @@ test("sqlite maintenance verify is independent of source growth and detects same
   const dbPath = join(dir, "shape.sqlite");
   const backupDir = join(dir, "backups", "private");
   installSchema(dbPath);
-  const backup = executeSqliteMaintenance(parseArgs(["backup", "--db", dbPath, "--backup-dir", backupDir]), {
+  const backup = executeSqliteMaintenance(fixtureOptions(["backup", "--db", dbPath, "--backup-dir", backupDir]), {
     cwd: dir,
     now: () => new Date("2027-01-15T08:00:00.000Z"),
   });
@@ -202,7 +195,7 @@ test("sqlite maintenance verify is independent of source growth and detects same
     "INSERT INTO records (source_id, first_seen_scope_id) VALUES ('shape.source', 'shape.scope');",
     "mutate source",
   );
-  const verify = executeSqliteMaintenance(parseArgs(["verify", "--db", dbPath, "--backup", join(dir, backup.backup_path)]), {
+  const verify = executeSqliteMaintenance(fixtureOptions(["verify", "--db", dbPath, "--backup", join(dir, backup.backup_path)]), {
     cwd: dir,
   });
 
@@ -215,13 +208,13 @@ test("sqlite maintenance verify is independent of source growth and detects same
     "UPDATE sync_runs SET started_at = '2030-01-01T00:00:00.000Z' WHERE id = 1;",
     "tamper backup without changing counts",
   );
-  const tampered = executeSqliteMaintenance(parseArgs(["verify", "--backup", backupPath]), { cwd: dir });
+  const tampered = executeSqliteMaintenance(fixtureOptions(["verify", "--backup", backupPath]), { cwd: dir });
   assert.equal(tampered.ok, false);
   assert.equal(tampered.manifest.status, "mismatch");
   assert.equal(tampered.manifest.checks.sha256, false);
 
   rmSync(`${backupPath}.manifest.json`);
-  const missingManifest = executeSqliteMaintenance(parseArgs(["verify", "--backup", backupPath]), { cwd: dir });
+  const missingManifest = executeSqliteMaintenance(fixtureOptions(["verify", "--backup", backupPath]), { cwd: dir });
   assert.equal(missingManifest.ok, false);
   assert.equal(missingManifest.manifest.status, "missing");
 });
@@ -233,14 +226,14 @@ test("a failed new backup is discarded without pruning the last verified backup"
   installSchema(dbPath);
 
   const first = executeSqliteMaintenance(
-    parseArgs(["backup", "--db", dbPath, "--backup-dir", backupDir, "--backup-keep-count", "1"]),
+    fixtureOptions(["backup", "--db", dbPath, "--backup-dir", backupDir, "--backup-keep-count", "1"]),
     { cwd: dir, now: () => new Date("2027-01-15T08:00:00.000Z") },
   );
   assert.equal(first.ok, true);
   const firstName = first.backup_path.split("/").at(-1);
 
   const failed = executeSqliteMaintenance(
-    parseArgs(["backup", "--db", dbPath, "--backup-dir", backupDir, "--backup-keep-count", "1"]),
+    fixtureOptions(["backup", "--db", dbPath, "--backup-dir", backupDir, "--backup-keep-count", "1"]),
     {
       cwd: dir,
       now: () => new Date("2027-01-16T08:00:00.000Z"),
@@ -285,7 +278,7 @@ test("sqlite maintenance prune-runs only removes old succeeded no-op runs when a
   );
 
   const now = () => new Date("2027-01-15T08:00:00.000Z");
-  const dryRun = executeSqliteMaintenance(parseArgs(["prune-runs", "--db", dbPath]), { cwd: dir, now });
+  const dryRun = executeSqliteMaintenance(fixtureOptions(["prune-runs", "--db", dbPath]), { cwd: dir, now });
   const rendered = plain(renderSqliteMaintenanceText(dryRun));
   assert.equal(dryRun.ok, true);
   assert.equal(dryRun.prune.dry_run, true);
@@ -295,7 +288,7 @@ test("sqlite maintenance prune-runs only removes old succeeded no-op runs when a
   assert.match(rendered, /Run retention/);
   assert.match(rendered, /dry-run/);
 
-  const applied = executeSqliteMaintenance(parseArgs(["prune-runs", "--apply", "--db", dbPath]), {
+  const applied = executeSqliteMaintenance(fixtureOptions(["prune-runs", "--apply", "--db", dbPath]), {
     cwd: dir,
     now,
   });
@@ -315,7 +308,7 @@ test("sqlite maintenance prune-runs apply uses the maintenance lock", (t) => {
   installSchema(dbPath);
 
   const calls = [];
-  const report = executeSqliteMaintenance(parseArgs(["prune-runs", "--apply", "--db", dbPath]), {
+  const report = executeSqliteMaintenance(fixtureOptions(["prune-runs", "--apply", "--db", dbPath]), {
     cwd: dir,
     now: () => new Date("2027-01-15T08:00:00.000Z"),
     acquireMaintenanceLock: (_path, opts) => {
@@ -340,7 +333,7 @@ test("sqlite maintenance prune-runs apply refuses active sync locks", (t) => {
 
   assert.throws(
     () =>
-      executeSqliteMaintenance(parseArgs(["prune-runs", "--apply", "--db", dbPath]), {
+      executeSqliteMaintenance(fixtureOptions(["prune-runs", "--apply", "--db", dbPath]), {
         cwd: dir,
         now: () => new Date("2027-01-15T08:00:00.000Z"),
         acquireMaintenanceLock: () => ({ acquired: false, reason: "sync_locks_active", active_sync_locks: 2 }),
@@ -349,54 +342,27 @@ test("sqlite maintenance prune-runs apply refuses active sync locks", (t) => {
   );
 });
 
-test("sqlite maintenance CLI renders text, json, help, and errors", (t) => {
-  const dir = tempDir(t);
-  const dbPath = join(dir, "shape.sqlite");
-  installSchema(dbPath);
-
-  const stdout = memoryWriter();
-  const stderr = memoryWriter();
-  const exitText = runSqliteMaintenanceCli(["check", "--db", dbPath], {
-    stdout: stdout.stream,
-    stderr: stderr.stream,
-    deps: { cwd: dir },
-  });
-  assert.equal(exitText, 0);
-  assert.equal(stderr.text(), "");
-  assert.match(plain(stdout.text()), /SQLite maintenance OK/);
-
-  const jsonOut = memoryWriter();
-  assert.equal(runSqliteMaintenanceCli(["check", "--db", dbPath, "--format", "json"], {
-    stdout: jsonOut.stream,
-    deps: { cwd: dir },
-  }), 0);
-  assert.equal(JSON.parse(jsonOut.text()).check.counts.records, 1);
-
-  const helpOut = memoryWriter();
-  assert.equal(runSqliteMaintenanceCli(["--help"], { stdout: helpOut.stream }), 0);
-  assert.match(helpOut.text(), /Usage: node scripts\/sqlite-maintenance\.mjs/);
-
-  const err = memoryWriter();
-  assert.equal(runSqliteMaintenanceCli(["verify", "--db", dbPath], {
-    stderr: err.stream,
-    deps: { cwd: dir },
-  }), 1);
-  assert.match(plain(err.text()), /verify requires --latest or --backup/);
-
-  const privatePathError = memoryWriter();
-  const privatePath = join(dir, "PRIVATE-SENTINEL", "missing.sqlite");
-  assert.equal(runSqliteMaintenanceCli(["check", "--db", privatePath], {
-    stderr: privatePathError.stream,
-    deps: { cwd: dir },
-  }), 1);
-  assert.doesNotMatch(privatePathError.text(), /PRIVATE-SENTINEL|missing\.sqlite/);
-  assert.match(plain(privatePathError.text()), /database not found/);
+test("maintenance CLI renders preview text/json and safe errors", (t) => {
+  const dir=tempDir(t), dbPath=join(dir,"shape.sqlite"); installSchema(dbPath);
+  for (const format of ["text","json"]) {
+    const stdout=memoryWriter(), stderr=memoryWriter();
+    const context=createCommandContext({ root:dir, cwd:dir, stdout:stdout.stream, stderr:stderr.stream });
+    assert.equal(runMaintenanceCommand({ action:"compact", db:dbPath, format, apply:false },context),0);
+    assert.equal(stderr.text(),"");
+    if (format === "json") assert.equal(JSON.parse(stdout.text()).dry_run,true);
+    else assert.match(plain(stdout.text()),/SQLite maintenance OK/);
+  }
+  const error=memoryWriter();
+  const context=createCommandContext({ root:dir, cwd:dir, stdout:memoryWriter().stream, stderr:error.stream });
+  assert.equal(runMaintenanceCommand({ action:"compact", db:join(dir,"PRIVATE-SENTINEL","missing.sqlite"), format:"json" },context),1);
+  assert.doesNotMatch(error.text(),/PRIVATE-SENTINEL|missing\.sqlite/);
+  assert.match(error.text(),/database not found/);
 });
 
 test("sqlite maintenance reports a readable missing sqlite3 error", () => {
   assert.throws(
     () =>
-      executeSqliteMaintenance(parseArgs(["check", "--db", "missing.sqlite"]), {
+      executeSqliteMaintenance(fixtureOptions(["check", "--db", "missing.sqlite"]), {
         existsSync: () => true,
         statSync: () => ({ size: 0 }),
         spawnSync: () => {
@@ -410,7 +376,7 @@ test("sqlite maintenance reports a readable missing sqlite3 error", () => {
 });
 
 function backupFor(dbPath, backupDir, cwd, extraArgs = [], deps = {}) {
-  return executeSqliteMaintenance(parseArgs(["backup", "--db", dbPath, "--backup-dir", backupDir, ...extraArgs]), { cwd, ...deps });
+  return executeSqliteMaintenance(fixtureOptions(["backup", "--db", dbPath, "--backup-dir", backupDir, ...extraArgs]), { cwd, ...deps });
 }
 
 function reportBackupPath(dir, report) { return join(dir, report.backup_path); }
@@ -445,7 +411,7 @@ test("retention and latest isolate source databases sharing a directory and neve
   assert.equal(mode(`${foreign}.manifest.json`), 0o644);
   assert.equal(mode(shared), 0o755);
   utimesSync(firstB, new Date(Date.now() + 10000), new Date(Date.now() + 10000));
-  const latest = executeSqliteMaintenance(parseArgs(["verify", "--latest", "--db", sourceA, "--backup-dir", shared]), { cwd: dir });
+  const latest = executeSqliteMaintenance(fixtureOptions(["verify", "--latest", "--db", sourceA, "--backup-dir", shared]), { cwd: dir });
   assert.equal(reportBackupPath(dir, latest), secondA);
   assert.equal(latest.ok, true);
   assert.notEqual(manifestAt(secondA).source_db_id, manifestAt(firstB).source_db_id);
@@ -559,9 +525,9 @@ test("retention skips symlinks, hard links, corrupt manifests and unowned SQLite
   assert.equal(mode(foreignManifest), 0o644);
   assert.equal(readFileSync(foreignManifest, "utf8"), "foreign manifest");
   assert.equal(sqliteJson(dbPath, "SELECT count(*) AS n FROM records;", "source alias protected")[0].n, 1);
-  assert.throws(() => executeSqliteMaintenance(parseArgs(["verify", "--db", dbPath, "--backup", symbolic]), { cwd: dir }), /not a symbolic link/);
-  assert.throws(() => executeSqliteMaintenance(parseArgs(["verify", "--db", dbPath, "--backup", sourceLink]), { cwd: dir }), /must not alias the source database/);
-  const verifyManifestLink = executeSqliteMaintenance(parseArgs(["verify", "--db", dbPath, "--backup", manifestLink]), { cwd: dir });
+  assert.throws(() => executeSqliteMaintenance(fixtureOptions(["verify", "--db", dbPath, "--backup", symbolic]), { cwd: dir }), /not a symbolic link/);
+  assert.throws(() => executeSqliteMaintenance(fixtureOptions(["verify", "--db", dbPath, "--backup", sourceLink]), { cwd: dir }), /must not alias the source database/);
+  const verifyManifestLink = executeSqliteMaintenance(fixtureOptions(["verify", "--db", dbPath, "--backup", manifestLink]), { cwd: dir });
   assert.equal(verifyManifestLink.manifest.status, "invalid");
 });
 
@@ -586,7 +552,7 @@ test("legacy backup explicit verify and read-only maintenance leave file and dir
   ];
   for (const args of commands) {
     const spawned = [];
-    const report = executeSqliteMaintenance(parseArgs(args), {
+    const report = executeSqliteMaintenance(fixtureOptions(args), {
       cwd: dir,
       chmodSync() { assert.fail("read-only maintenance must not chmod"); },
       spawnSync(cmd, cliArgs, opts) { spawned.push(cliArgs); return spawnSync(cmd, cliArgs, opts); },
@@ -606,7 +572,7 @@ test("legacy backup explicit verify and read-only maintenance leave file and dir
   assert.equal(existsSync(legacy), true);
   rmSync(valid);
   rmSync(`${valid}.manifest.json`);
-  assert.throws(() => executeSqliteMaintenance(parseArgs(["verify", "--latest", "--db", dbPath, "--backup-dir", backupDir]), { cwd: dir }), /no owned SQLite backups found; use --backup for legacy/);
+  assert.throws(() => executeSqliteMaintenance(fixtureOptions(["verify", "--latest", "--db", dbPath, "--backup-dir", backupDir]), { cwd: dir }), /no owned SQLite backups found; use --backup for legacy/);
 });
 
 test("source ownership survives inode replacement and resolves symbolic source aliases", (t) => {
@@ -624,7 +590,7 @@ test("source ownership survives inode replacement and resolves symbolic source a
   symlinkSync(dbPath, alias);
   const second = reportBackupPath(dir, backupFor(alias, backupDir, dir));
   assert.equal(manifestAt(second).source_db_id, firstId);
-  const latest = executeSqliteMaintenance(parseArgs(["verify", "--latest", "--db", dbPath, "--backup-dir", backupDir]), { cwd: dir });
+  const latest = executeSqliteMaintenance(fixtureOptions(["verify", "--latest", "--db", dbPath, "--backup-dir", backupDir]), { cwd: dir });
   assert.equal(reportBackupPath(dir, latest), second);
   assert.equal(latest.ok, true);
 });
@@ -687,8 +653,8 @@ test("mutating maintenance rejects missing or invalid sources before writable lo
   const backupDir = join(dir, "backups");
   let locks = 0;
   const deps = { cwd: dir, acquireMaintenanceLock() { locks += 1; return { acquired: true }; } };
-  for (const action of [["backup"], ["compact"], ["prune-runs", "--apply"]]) {
-    assert.throws(() => executeSqliteMaintenance(parseArgs([...action, "--db", missingSource, "--backup-dir", backupDir]), deps), /database not found/);
+  for (const action of [["backup"], ["compact", "--apply"], ["prune-runs", "--apply"]]) {
+    assert.throws(() => executeSqliteMaintenance(fixtureOptions([...action, "--db", missingSource, "--backup-dir", backupDir]), deps), /database not found/);
     assert.equal(existsSync(missingSource), false);
     assert.equal(existsSync(missingParent), false);
     assert.equal(existsSync(backupDir), false);
@@ -696,8 +662,8 @@ test("mutating maintenance rejects missing or invalid sources before writable lo
   const invalidSource = join(dir, "incomplete.sqlite");
   sqliteExec(invalidSource, "CREATE TABLE foreign_data (n INTEGER);", "unrelated schema");
   const bytes = readFileSync(invalidSource);
-  for (const action of [["backup"], ["compact"], ["prune-runs", "--apply"]]) {
-    const report = executeSqliteMaintenance(parseArgs([...action, "--db", invalidSource, "--backup-dir", backupDir]), deps);
+  for (const action of [["backup"], ["compact", "--apply"], ["prune-runs", "--apply"]]) {
+    const report = executeSqliteMaintenance(fixtureOptions([...action, "--db", invalidSource, "--backup-dir", backupDir]), deps);
     assert.equal(report.ok, false);
     assert.ok(report.source_check.missing_tables.length);
     assert.deepEqual(readFileSync(invalidSource), bytes);

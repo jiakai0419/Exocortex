@@ -8,7 +8,7 @@ import test from "node:test";
 
 import { createLarkImAdapter } from "../src/adapters/lark-im/adapter.mjs";
 import { createSyncRunner } from "../src/adapters/lark-im/sync-runner.mjs";
-import { evaluateWaitOkState } from "../src/cli/lark-im-service-command.mjs";
+import { evaluateWaitState } from "../src/diagnostics/service-wait-state.mjs";
 import { buildServiceOverview } from "../src/diagnostics/lark-im-service-report.mjs";
 import { buildStatus } from "../src/diagnostics/sync-status-report.mjs";
 import { readOnlySqliteJson } from "../src/storage/sqlite/readonly-query.mjs";
@@ -103,12 +103,12 @@ function assertCommittedDebtIsVisible(dbPath) {
   assert.equal(after.runs.by_status.failed, 2);
   assert.equal(after.health, "catching_up");
   const nowMs = Date.now();
-  const workerSummary = { last_cycle: { cycle: 2, at: new Date(nowMs).toISOString(), ok: true },
+  const workerSummary = { last_cycle: { cycle: 2, at: new Date(nowMs).toISOString(), started_at: new Date(nowMs - 1).toISOString(), complete: true, ok: true },
     in_progress: false, unfinished_cycle: false };
   const overview = buildServiceOverview({ launchd: { loaded: true, state: "running", pid: 4321 },
     syncStatus: after, workerSummary, nowMs });
   assert.equal(overview.health.status, "catching_up");
-  const waiting = evaluateWaitOkState(nowMs - 1, after, workerSummary);
+  const waiting = evaluateWaitState(nowMs - 1, after, workerSummary, { status: "running", target_match: "matched" });
   assert.equal(waiting.newOkCycle, true, "fixture must independently satisfy the successful-cycle requirement");
   assert.equal(waiting.healthReady, false);
   assert.equal(waiting.ready, false);

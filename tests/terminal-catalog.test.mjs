@@ -1,64 +1,50 @@
 import assert from "node:assert/strict";
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import test from "node:test";
+import { COMMANDS, GROUPS, commandCatalog, renderHelp } from "../src/cli/registry.mjs";
 
-import { COMMANDS, GROUPS, filteredCommands } from "../scripts/help.mjs";
-
-test("terminal catalog lists every script command", () => {
-  const scripts = readdirSync("scripts")
-    .filter((name) => name.endsWith(".mjs") || name.endsWith(".py"))
-    .map((name) => `scripts/${name}`)
-    .sort();
-  const catalogedScripts = COMMANDS.filter((item) => item.file.startsWith("scripts/"))
-    .map((item) => item.file)
-    .sort();
-
-  assert.deepEqual(catalogedScripts, scripts);
+test("public catalog contains exactly six groups and sixteen canonical routes", () => {
+  assert.deepEqual(GROUPS.map(({id}) => id), ["messages", "status", "check", "sync", "service", "maintenance"]);
+  assert.deepEqual(COMMANDS.map(({id}) => id), ["messages", "status", "check", "sync", "service.install", "service.start", "service.stop", "service.restart", "service.uninstall", "maintenance.init", "maintenance.backup", "maintenance.enrich", "maintenance.repair", "maintenance.replay", "maintenance.prune-runs", "maintenance.compact"]);
+  assert.equal(new Set(COMMANDS.map(({id}) => id)).size, 16);
 });
 
-test("coverage help names Python and an explicit endpoint without adding a daily command", () => {
-  const entries = filteredCommands({ all: false, group: null, command: "coverage-check" });
-  assert.equal(entries.length, 1);
-  assert.match(entries[0].command, /^python3 -B .* --target /);
-  assert.match(entries[0].summary, /without writing/);
-  assert.notEqual(entries[0].core, true);
+test("coverage remains an explicit fixed-endpoint check with one internal Python implementation", () => {
+  const check = COMMANDS.find(({id}) => id === "check");
+  assert.ok(check.options.some(({flag}) => flag === "--through"));
+  assert.ok(existsSync("tools/coverage/lark-im-coverage-check.py"));
+  assert.ok(!GROUPS.some(({id}) => /coverage|probe|worker/.test(id)));
 });
 
-test("development verification composes only local checks and is discoverable outside daily help", () => {
+test("development verification uses the one developer entry and retains all required checks", () => {
   const scripts = JSON.parse(readFileSync("package.json", "utf8")).scripts;
-  const steps = scripts.verify.split(" && ");
-  const required = new Set(["npm run build", "npm run typecheck", "npm run check", "npm test", "npm run build:check"]);
-  assert.equal(steps.length, required.size);
-  assert.deepEqual(new Set(steps), required);
-  for (const name of ["build", "typecheck", "check", "test", "build:check"]) {
-    assert.doesNotMatch(scripts[name], /maintenance|lark-im-service|launchctl/);
-  }
-  const [entry] = filteredCommands({ all: false, group: "development", command: "npm run verify" });
-  assert.equal(entry?.command, "npm run verify");
-  assert.notEqual(entry.core, true);
-});
-
-test("terminal catalog entries have valid groups and examples", () => {
-  const groupIds = new Set(GROUPS.map((group) => group.id));
-  const commands = new Set();
-
-  for (const item of COMMANDS) {
-    assert.ok(groupIds.has(item.group), `${item.command} has unknown group`);
-    assert.ok(item.command, "command is required");
-    assert.ok(item.file, `${item.command} file is required`);
-    assert.ok(item.summary, `${item.command} summary is required`);
-    assert.ok(Array.isArray(item.examples) && item.examples.length > 0, `${item.command} needs examples`);
-    assert.equal(commands.has(item.command), false, `${item.command} is duplicated`);
-    commands.add(item.command);
+  assert.equal(scripts.verify, "node tools/verify.mjs");
+  assert.equal(scripts.help, "node bin/exocortex.mjs --help");
+  assert.equal(scripts.exo, "node bin/exocortex.mjs");
+  assert.equal(scripts["build:check"], "node tools/verify.mjs --generated-only");
+  for (const name of ["build", "typecheck", "check", "test", "build:check", "verify"]) {
+    assert.doesNotMatch(scripts[name], /maintenance|service|launchctl/);
   }
 });
 
-test("default terminal help shows only the core daily commands", () => {
-  const commands = filteredCommands({ all: false, group: null, command: null }).map((item) => item.command);
+test("catalog owns complete option metadata and explicit effects and privacy modes", () => {
+  const catalog = commandCatalog();
+  for (const entry of catalog.commands) {
+    assert.ok(GROUPS.some(({id}) => id === entry.group));
+    assert.ok(entry.summary && entry.example && entry.effects.length && entry.privacy);
+    assert.equal(new Set(entry.options.map(({flag}) => flag)).size, entry.options.length);
+    assert.ok(entry.options.every(({flag,key,type,description}) => flag.startsWith("--") && key && type && description));
+  }
+  assert.equal(catalog.commands.find(({id}) => id === "messages").privacy, "private");
+  assert.ok(catalog.commands.find(({id}) => id === "status").modes.some(({when,privacy}) => when === "--logs" && privacy === "private"));
+});
 
-  assert.deepEqual(commands, [
-    "npm run help",
-    "node scripts/messages.mjs --limit 20",
-    "node scripts/lark-im-service.mjs status",
-  ]);
+test("daily help leads with reading and status while research and worker remain internal", () => {
+  const text = renderHelp();
+  assert.ok(text.indexOf("messages") < text.indexOf("check --help"));
+  assert.ok(text.indexOf("status") < text.indexOf("check --help"));
+  assert.doesNotMatch(text, /probe|worker|tools\//);
+  const json = JSON.parse(renderHelp({all:true,options:{format:"json"}}));
+  assert.equal(json.commands.length,16);
+  assert.ok(json.commands.find(({id}) => id === "check").options.some(({flag}) => flag === "--write-live-cache"));
 });

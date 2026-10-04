@@ -1,5 +1,7 @@
 # Node reliability fixes
 
+> Historical implementation and regression record for the reliability candidates before CLI v2. Counterexamples remain relevant; command names, lifecycle recipes and test counts below describe those candidates, not current acceptance. Current commands and changed defaults are documented in [Operations](operations.md), [CLI migration](cli-migration.md) and [the command catalog](commands.md).
+
 ## Scope and implementation plan
 
 This change covers three reliability fixes on the existing Node implementation, plus the explicitly scoped status and card-reading follow-ups below.

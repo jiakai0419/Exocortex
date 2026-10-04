@@ -10,7 +10,7 @@ This design extends the existing Node worker, its bounded local JSONL log and re
 | Service activity | Treats an unexpired reservation as active work; falls back to completed history for idle | Evaluate current phase, process identity and deadlines; retain unknown when evidence is unavailable |
 | Sync-lock snapshot | Owner already contains PID and process-start time, but public projection discards it | Read-only strict owner inspection while projecting the same snapshot; expose only an additive safe owner-state enum |
 | Worker restart | Cycle numbers restart and old events survive | Bind activity to a worker instance, process-start evidence and database; compare the observed process identity |
-| Database-only status and doctor | `running` rows and locks were treated as current work | Return unknown activity with explicit database-only evidence; legacy `health: syncing` is unverified without a phase |
+| Database-only sync report and check | `running` rows and locks were treated as current work | Return unknown activity with explicit database-only evidence; legacy `health: syncing` is unverified without a phase |
 | Terminal/JSON | Existing activity status has `syncing`, `idle`, `unknown` | Preserve this compatibility field; add exact `state` (`syncing`, `waiting`, `stopped`, `unknown`) and optional phase/cycle/update evidence |
 
 ## Evidence and transitions
@@ -52,7 +52,7 @@ A recently observed, verified independent foreground phase may be syncing while 
 
 ## Consistency between diagnostic entry points
 
-`sync-status` has a coherent database snapshot but does not collect worker phases. Its additive `current_activity` therefore explicitly says `state: unknown`, `evidence: database_only`, and distinguishes `unverified_sync_history` from `phase_not_collected`. A running row or lock makes its health unknown rather than syncing. `doctor` preserves that uncertainty, returns `ok: false` for this unknown state and never calls a legacy database-only `health: syncing` current work. Local readiness without outstanding running history remains a data-health result, not an activity claim.
+The shared sync report used by `status --detail` and `check` has a coherent database snapshot but does not collect worker phases. Its additive `current_activity` therefore explicitly says `state: unknown`, `evidence: database_only`, and distinguishes `unverified_sync_history` from `phase_not_collected`. A running row or lock makes its health unknown rather than syncing. `check` preserves that uncertainty, returns `ok: false` for this unknown state and never calls a legacy database-only `health: syncing` current work. Local readiness without outstanding running history remains a data-health result, not an activity claim.
 
 Service status has additional bounded phase and OS observations and can consequently establish syncing/waiting where database-only diagnostics cannot. It re-evaluates the existing historical health function without treating running counts as current work. A verified phase can explain database-only unknown history, but failed-only history, initial or unsuccessful scopes, incomplete detail debt and source-coverage limitations remain independent health problems. All three entry points share the rule that reservations and historical running rows never prove current activity.
 
@@ -89,7 +89,7 @@ All clocks, PIDs, start times, database names, events and locks in tests are new
 | Same-path file replacement, symlink alias, missing file, and replacement during diagnostic sampling | Old phases cannot prove work on the replacement; aliases agree; unavailable or changing identity is unknown |
 | Other database, malformed activity, rotated/truncated evidence | No positive current-state claim |
 | Worker returns/throws during a cycle | Final stopped event; failures remain historical health evidence |
-| Legacy running row with no lease; expired reservation; live/dead owner | Status and doctor remain unverified, doctor does not return true; service requires independent phase evidence |
+| Legacy running row with no lease; expired reservation; live/dead owner | The sync report and check remain unverified; check does not pass; service requires independent phase evidence |
 | Public JSON compatibility | Existing fields keep meanings; optional new state/evidence contains no identifiers or paths |
 
 Run focused worker, activity, service and terminal tests, then the repository build, typecheck, syntax, full suite and generated-file consistency checks. This local candidate changes no production process, log, database or service configuration. Optional phase writes never interrupt business synchronization. A failed append cannot reliably retract an earlier observation through that same failed log channel; its existing finite validity window remains the upper bound, so the display is an observation rather than an atomic process trace. A later authorized restart is required before an existing worker can emit the new phase events; legacy logs remain readable but cannot prove a current phase.

@@ -34,14 +34,5 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
-      - name: Syntax check
-        run: npm run check
-
-      - name: Generated files
-        run: npm run build:check
-
-      - name: Type check
-        run: npm run typecheck
-
-      - name: Test
-        run: npm test
+      - name: Build, typecheck, syntax, tests and generated files
+        run: npm run verify

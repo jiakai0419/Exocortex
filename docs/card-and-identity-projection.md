@@ -44,7 +44,7 @@ sender 持久投影新增 `canonical.sender_id_type`。姓名 SQL 合并只有 e
 
 历史补全采用明确的 sender-only 路径：必须同时指定 `--sender-only --sender-id <open_id>`，只选择一个 actor，不增加 record/scope 泛化选择。`--limit` 默认 50、最大 100；SQL 先按目标身份及缺名或 ID 占位筛选，再按 `occurred_at_ms ASC, id ASC` 截定候选。排除已知姓名、权威 clear、无 actor、app 及 typed 冲突；先验证 row/canonical/raw 的可信 sender 身份一致，零候选零网络，不查询 self 或额外 profile。
 
-查询复用 resolver/transport，保留 30-ID 联系人批次但本模式唯一用户目标为 1；整轮远端预算 30 秒，每请求 timeout/retryBudget 不超过剩余预算与 5 秒的较小值，`retries=0`。群成员 fallback 整轮最多 3 个候选 chat、5 页（每页 100）；限额、截止或仍有 `has_more` 时明确 unresolved。contact 名只能用于同账号目标 actor 的选中记录，member 名只用于对应 chat。网络在维护锁外；短事务按原快照 CAS 并使用共享 merge，仅补充必要的 canonical.sender_id_type 身份元数据，并更新 sender_name/source/confidence 与 updated_at，保留 raw/hash/version/body/chat/partner 等其他字段。`first_seen_scope_id` 不能充当完整会话归属。`--dry-run` 是显式远端补全预览，不是离线模式。以上选择与数量参数已由集成任务确认冻结，不得按一次样本临时放宽。
+查询复用 resolver/transport，保留 30-ID 联系人批次但本模式唯一用户目标为 1；整轮远端预算 30 秒，每请求 timeout/retryBudget 不超过剩余预算与 5 秒的较小值，`retries=0`。群成员 fallback 整轮最多 3 个候选 chat、5 页（每页 100）；限额、截止或仍有 `has_more` 时明确 unresolved。contact 名只能用于同账号目标 actor 的选中记录，member 名只用于对应 chat。网络在维护锁外；短事务按原快照 CAS 并使用共享 merge，仅补充必要的 canonical.sender_id_type 身份元数据，并更新 sender_name/source/confidence 与 updated_at，保留 raw/hash/version/body/chat/partner 等其他字段。`first_seen_scope_id` 不能充当完整会话归属。`maintenance enrich --target records` 默认预览，仍可读取远端；`--apply` 才提交，不是离线模式。以上选择与数量参数已由集成任务确认冻结，不得按一次样本临时放宽。
 
 联系人、群成员、应用名和机器人回退四类查询与匹配规则仅在 `name-resolver.mjs` 实现。常规同步及 record enrich 调用相同规则；脚本只将私有 `onLookup` 事件映射到既有计数和显式 `--unsafe-details` 字段，回调失败不改变姓名结果。`--probe-apps` 使用明确的 `forceRefresh` 绕过并驱逐应用正向缓存；强制查询失败保持 unknown，允许下次重试，绝不制造 clear。默认五分钟 TTL、1000 项容量及 positive-only 缓存规则保持。
 
@@ -83,7 +83,7 @@ sender 持久投影新增 `canonical.sender_id_type`。姓名 SQL 合并只有 e
 | `src/adapters/lark-im/message-record.mjs` | sender 身份、姓名来源、raw/hash 与入库投影 | 持久化 sender_id_type，与上述命名空间规则及共享身份函数对齐；不改 raw 语义 |
 | `src/storage/sqlite/lark-name-projection.ts`、`ingestion-store.ts` | 同步/补全共用姓名合并、版本与事务/快照保护 | 补 namespace+actor+chat 继承门槛与旧类型兼容；复用 unknown/clear/同版本改善，不另建卡片姓名写入规则 |
 | `src/diagnostics/messages-report.mjs`、`src/terminal/messages-view.mjs` | 只读历史展示及 JSON/文本出口 | 同解析器、无网络/回写；行边界与 partial 说明在最终 CLI 保持一致 |
-| `scripts/lark-im-enrich-records.mjs` | 显式历史补全、共享 SQL merge、维护锁与并发比较 | 联系人与成员请求委托共享 resolver，常规路径保留 recent 扫描和诊断；新增精确有界 sender-only，先按缺名/身份筛选再 LIMIT，统一 dry-run、CAS 与失败语义；不将常规 --limit 冒充定位/总预算 |
+| `src/maintenance/enrich-records.mjs` | 显式历史补全、共享 SQL merge、维护锁与并发比较 | 联系人与成员请求委托共享 resolver，常规路径保留 recent 扫描和诊断；新增精确有界 sender-only，先按缺名/身份筛选再 LIMIT，统一预览、CAS 与失败语义；不将常规 --limit 冒充定位/总预算 |
 
 优先在这些现有职责内加入小型纯函数或共享规则，不新增模板调度、全局身份服务或解析框架。实现依照先定设计与合成反例的顺序；生产 worker、数据、部署和 push 均不属于本轮实施范围。
 

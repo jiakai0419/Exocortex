@@ -18,7 +18,7 @@ import unittest
 from unittest import mock
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / 'scripts/lark-im-coverage-check.py'
+SCRIPT = Path(__file__).resolve().parents[1] / 'tools/coverage/lark-im-coverage-check.py'
 SPEC = importlib.util.spec_from_file_location('coverage_check', SCRIPT)
 check = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(check)
@@ -173,7 +173,7 @@ class CoverageTests(unittest.TestCase):
         return check.inspect_database(self.path, target)
 
     def detail_schema(self):
-        migration = SCRIPT.parent.parent / 'migrations/009_lark_im_detail_progress.sql'
+        migration = check.ROOT / 'migrations/009_lark_im_detail_progress.sql'
         self.con.executescript(migration.read_text())
 
     def detail_task(self, occurred=MID, status='pending', scope=RECEIVED, retry='2001-01-01T00:00:00.000Z'):
@@ -700,7 +700,7 @@ class CoverageTests(unittest.TestCase):
                     self.assertEqual(check.main(['--target', iso(END)]), 0)
                 inspect.assert_called_once()
                 args, kwargs = inspect.call_args
-                self.assertEqual(Path(args[0]), SCRIPT.parent.parent / 'data/exocortex.sqlite')
+                self.assertEqual(Path(args[0]), check.ROOT / 'data/exocortex.sqlite')
                 self.assertEqual(args[1] if len(args) > 1 else kwargs['target_ms'], END)
                 cycles.assert_not_called()
         self.assertTrue(json.loads(output.getvalue())['coverage']['initial_baseline_complete'])

@@ -9,31 +9,15 @@
     "strict": true,
     "noImplicitAny": false,
     "skipLibCheck": true,
-    "types": ["node"]
+    "types": [
+      "node"
+    ]
   },
   "include": [
-    "scripts/help.mjs",
-    "scripts/doctor.mjs",
-    "scripts/sync-status.mjs",
-    "scripts/messages.mjs",
-    "scripts/maintenance-check.mjs",
-    "scripts/lark-im-service.mjs",
-    "scripts/lark-im-worker.mjs",
-    "scripts/lark-im-sync.mjs",
-    "src/core/**/*.ts",
-    "src/terminal/index.ts",
-    "src/cli/*.mjs",
-    "src/diagnostics/*.mjs",
-    "src/terminal/*.mjs",
-    "src/adapters/lark-im/*.mjs",
-    "src/runtime/worker/lark-im-worker-core.ts",
-    "src/storage/sqlite/ingestion-store.ts",
-    "scripts/lib/lark-im-core.mjs",
-    "scripts/lib/ingestion-store.mjs",
-    "scripts/lib/lark-im-adapter.mjs",
-    "scripts/lib/lark-im-worker-core.mjs",
-    "scripts/lib/sync-status-core.mjs",
-    "scripts/lib/doctor-core.mjs",
-    "scripts/lib/terminal.mjs"
+    "bin/**/*.mjs",
+    "tools/**/*.mjs",
+    "src/**/*.ts",
+    "src/**/*.mjs",
+    "scripts/lark-im-worker.mjs"
   ]
 }

@@ -7,12 +7,11 @@ import test from "node:test";
 
 import {
   parseArgs,
-  parsePositiveInt,
   runCycle,
   runStep,
   runWorker,
   writeLog,
-} from "../scripts/lark-im-worker.mjs";
+} from "../src/runtime/worker/worker.mjs";
 
 function spawnResult(overrides = {}) {
   return {
@@ -104,9 +103,14 @@ test("lark im worker parseArgs accepts once and worker tuning options", () => {
 });
 
 test("lark im worker parseArgs rejects unsafe option shapes", () => {
-  assert.throws(() => parsePositiveInt("0", "max-cycles"), /max-cycles must be positive/);
+  assert.throws(() => parseArgs(["--max-cycles", "0"]), /max-cycles must be a positive/);
   assert.throws(() => parseArgs(["--interval-seconds"]), /--interval-seconds requires a value/);
-  assert.throws(() => parseArgs(["--unknown", "1"]), /Unknown option: --unknown/);
+  assert.throws(() => parseArgs(["--unknown", "1"]), /Unknown option or unexpected command argument/);
+  assert.throws(() => parseArgs(["--SYNTHETIC_PRIVATE_WORKER_TOKEN"]), (error) => {
+    assert.equal(error.message, "Unknown option or unexpected command argument");
+    assert.doesNotMatch(error.message, /SYNTHETIC_PRIVATE/);
+    return true;
+  });
 });
 
 test("runStep invokes lark-im-sync with node and compacts JSON summaries", () => {
@@ -141,8 +145,8 @@ test("runStep invokes lark-im-sync with node and compacts JSON summaries", () =>
 
   assert.equal(calls.length, 1);
   assert.equal(calls[0][0], "/usr/local/bin/node");
-  assert.match(calls[0][1][0], /\/scripts\/lark-im-sync\.mjs$/);
-  assert.deepEqual(calls[0][1].slice(1), ["--scope", "sent", "--db", "custom.sqlite"]);
+  assert.match(calls[0][1][0], /\/bin\/exocortex\.mjs$/);
+  assert.deepEqual(calls[0][1].slice(1), ["sync", "--scope", "sent", "--db", "custom.sqlite"]);
   assert.deepEqual(calls[0][2], {
     encoding: "utf8",
     maxBuffer: 100 * 1024 * 1024,
@@ -443,5 +447,5 @@ test("lark im worker direct CLI help and argument errors keep exit codes stable"
     encoding: "utf8",
   });
   assert.equal(error.status, 1);
-  assert.match(error.stderr, /Unknown option: --unknown/);
+  assert.match(error.stderr, /Unknown option or unexpected command argument/);
 });

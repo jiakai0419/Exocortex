@@ -41,6 +41,9 @@ type SyncSummary = {
     discovery?: RunSummary | null;
     received?: RunSummary[];
     transport?: JsonObject;
+    partial?: boolean;
+    incomplete?: boolean;
+    details?: RunSummary[];
 };
 type AdaptiveFairOptions = {
     receivedScopesPerCycle: number;
@@ -144,6 +147,8 @@ declare function compactSummary(summary: SyncSummary | null | undefined): {
     received: {
         failed: number;
         failed_scope_ids: (string | undefined)[];
+        pending_details?: number | undefined;
+        incomplete?: boolean | undefined;
         skipped?: number | undefined;
         scopes: number;
         scanned: number;
@@ -154,6 +159,17 @@ declare function compactSummary(summary: SyncSummary | null | undefined): {
         ok: boolean;
     } | null;
     transport?: JsonObject | null | undefined;
+    details?: ({
+        run_id: number | null | undefined;
+        ok: boolean | undefined;
+        scanned: number | undefined;
+        records: number | undefined;
+        inserted: number | undefined;
+        updated: number | undefined;
+        duplicate: number | undefined;
+    } | null)[] | undefined;
+    incomplete?: boolean | undefined;
+    partial?: boolean | undefined;
     ok: boolean | undefined;
 } | null;
 declare function cyclePayload(cycle: number, steps: WorkerEvent[], now?: () => string): WorkerCyclePayload;

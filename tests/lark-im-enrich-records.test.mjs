@@ -91,6 +91,7 @@ function quoteSql(value) {
 
 function installFakeLarkCli(dir, { dbPath = null, beforeSelfSql = "", assertNoMaintenanceLock = false,
   denyLookups = false, contactUsers = null, paginateContacts = false, memberItems = null, callLogPath = null,
+  contactErrorIds = [], memberErrorChats = [],
   applicationResponse = null, applicationError = "", botResponse = null, botError = "" } = {}) {
   const path = join(dir, "fake-lark-cli.mjs");
   writeFileSync(
@@ -123,6 +124,14 @@ if (args.join(" ") === "contact +get-user --as user --format json") {
 if (${JSON.stringify(denyLookups)}) {
   process.stderr.write('synthetic permission denied');
   process.exit(1);
+}
+if (args[0] === 'contact' && args[1] === '+search-user'
+  && (args[args.indexOf('--user-ids') + 1] || '').split(',').some(id => ${JSON.stringify(contactErrorIds)}.includes(id))) {
+  process.stderr.write('synthetic permission denied'); process.exit(1);
+}
+if (args[0] === 'im' && args[1] === 'chat.members' && args[2] === 'get'
+  && ${JSON.stringify(memberErrorChats)}.includes(JSON.parse(args[args.indexOf('--params') + 1]).chat_id)) {
+  process.stderr.write('synthetic permission denied'); process.exit(1);
 }
 if (args[0] === 'api' && args[2]?.startsWith('/open-apis/application/v6/applications/')) {
   const error = ${JSON.stringify(applicationError)};
@@ -271,7 +280,7 @@ test("scope and record metadata independently name synthetic rooms without expos
 
   const result = spawnSync(
     process.execPath,
-    ["scripts/lark-im-enrich-records.mjs", "--db", dbPath, "--limit", "10"],
+    ["bin/exocortex.mjs", "maintenance", "enrich", "--target", "records", "--format", "json", "--apply", "--db", dbPath, "--limit", "10"],
     {
       cwd: process.cwd(),
       env: isolatedEnvironment(dir, fakeLarkCli),
@@ -302,7 +311,7 @@ test("scope and record metadata independently name synthetic rooms without expos
 
   const unsafe = spawnSync(
     process.execPath,
-    ["scripts/lark-im-enrich-records.mjs", "--db", dbPath, "--limit", "10", "--unsafe-details"],
+    ["bin/exocortex.mjs", "maintenance", "enrich", "--target", "records", "--format", "json", "--apply", "--db", dbPath, "--limit", "10", "--unsafe-details"],
     {
       cwd: process.cwd(),
       env: isolatedEnvironment(dir, fakeLarkCli),
@@ -332,7 +341,7 @@ function enrichmentFixture(t, options = {}) {
 }
 
 function runEnrichment(fixture, args = [], env = {}) {
-  return spawnSync(process.execPath, ["scripts/lark-im-enrich-records.mjs", "--db", fixture.dbPath, ...args], {
+  return spawnSync(process.execPath, ["bin/exocortex.mjs", "maintenance", "enrich", "--target", "records", "--format", "json", "--db", fixture.dbPath, ...(args.includes("--dry-run") ? [] : ["--apply"]), ...args.filter((arg) => arg !== "--dry-run")], {
     cwd: process.cwd(),
     env: isolatedEnvironment(fixture.dir || dirname(fixture.dbPath), fixture.fakeLarkCli, env),
     encoding: "utf8",
@@ -416,7 +425,7 @@ for (const [label, update] of concurrentChanges) {
       beforeSelfSql: `UPDATE records SET ${update}, updated_at = ${quoteSql(CONCURRENT_AT)};`,
     });
     const result = runEnrichment(fixture);
-    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.status, 2, result.stderr);
     const summary = JSON.parse(result.stdout);
     assert.equal(summary.ok, true);
     assert.equal(summary.planned, 1);
@@ -449,7 +458,7 @@ test("a full newer source snapshot survives enrichment while unchanged rows can 
   });
   insertRecord(fixture.dbPath, { key: "uncontended", ordinal: 6 });
   const result = runEnrichment(fixture);
-  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.status, 2, result.stderr);
   const summary = JSON.parse(result.stdout);
   assert.equal(summary.planned, 2);
   assert.equal(summary.updated, 1);
@@ -468,7 +477,7 @@ test("a full newer source snapshot survives enrichment while unchanged rows can 
 test("enrichment does not resurrect a record deleted during lookup", (t) => {
   const fixture = enrichmentFixture(t, { beforeSelfSql: "DELETE FROM records;" });
   const result = runEnrichment(fixture);
-  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.status, 2, result.stderr);
   const summary = JSON.parse(result.stdout);
   assert.equal(summary.updated, 0);
   assert.equal(summary.skipped_conflicts, 1);
@@ -793,12 +802,14 @@ test("ordinary enrichment retries a permission failure on a later run and fills 
   });
   const before = readRecords(fixture.dbPath)[0];
   const denied = runEnrichment(fixture);
-  assert.equal(denied.status, 0, denied.stderr);
+  assert.equal(denied.status, 2, denied.stderr);
+  assert.equal(JSON.parse(denied.stdout).unresolved_name_targets, 1);
   assert.equal(JSON.parse(readRecords(fixture.dbPath)[0].canonical_json).sender_name, null);
   installFakeLarkCli(fixture.dir, { dbPath: fixture.dbPath, assertNoMaintenanceLock: true,
     contactUsers: [{ open_id: personId, name: "Synthetic Pottery Reader" }] });
   const recovered = runEnrichment(fixture);
   assert.equal(recovered.status, 0, recovered.stderr);
+  assert.equal(JSON.parse(recovered.stdout).unresolved_name_targets, 0);
   assert.equal(JSON.parse(recovered.stdout).updated, 1);
   const after = readRecords(fixture.dbPath)[0];
   assert.equal(JSON.parse(after.canonical_json).sender_name, "Synthetic Pottery Reader");
@@ -946,7 +957,8 @@ test("ordinary sender alias remains unknown through permission failure and can r
     { name: ENRICHMENT_ALIASES.user_id, display_name: ENRICHMENT_ALIASES.union_id }, { denyLookups: true });
   const before = readRecords(fixture.dbPath)[0];
   const denied = runEnrichment(fixture);
-  assert.equal(denied.status, 0, denied.stderr);
+  assert.equal(denied.status, 2, denied.stderr);
+  assert.equal(JSON.parse(denied.stdout).unresolved_name_targets, 1);
   assert.equal(JSON.parse(readRecords(fixture.dbPath)[0].canonical_json).sender_name, null);
   installFakeLarkCli(fixture.dir, { dbPath: fixture.dbPath, assertNoMaintenanceLock: true,
     contactUsers: [{ open_id: ENRICHMENT_ALIASES.open_id, name: ALIAS_PERSON }], callLogPath: fixture.callsPath });
@@ -1116,4 +1128,83 @@ test("a failed shared bot lookup remains counted and does not erase an existing 
   assert.equal(summary.app_fallback_failures, 1);
   assert.doesNotMatch(result.stdout, /private text|synthetic service unavailable/);
   assert.deepEqual(readRecords(fixture.dbPath), before);
+});
+
+test("a failed contact lookup followed by a member name is a complete result", (t) => {
+  const id = "ou_fixture_fallback_painter";
+  const fixture = enrichmentFixture(t, { contactErrorIds: [id],
+    memberItems: [{ member_id: id, name: "Synthetic Paint Reader" }],
+    record: { sender: { id, sender_type: "user" }, canonical: { chat_name: LAB.room.name } } });
+  const result = runEnrichment(fixture);
+  assert.equal(result.status, 0, result.stderr);
+  const report = JSON.parse(result.stdout);
+  assert.equal(report.contact_lookup_failures, 1);
+  assert.equal(report.unresolved_name_targets, 0);
+  assert.equal(report.partial, false);
+  assert.equal(JSON.parse(readRecords(fixture.dbPath)[0].canonical_json).sender_name, "Synthetic Paint Reader");
+});
+
+test("an app permission failure followed by a bot name is a complete result", (t) => {
+  const fixture = enrichmentFixture(t, { applicationError: "synthetic permission denied",
+    botResponse: { items: [{ app_id: LAB.app.id, bot_name: "Synthetic Sand Counter" }] },
+    record: { sender: { id: LAB.app.id, sender_type: "app" }, canonical: { chat_name: LAB.room.name } } });
+  const result = runEnrichment(fixture);
+  assert.equal(result.status, 0, result.stderr);
+  const report = JSON.parse(result.stdout);
+  assert.equal(report.app_lookup_permission_denied, 1);
+  assert.equal(report.unresolved_name_targets, 0);
+  assert.equal(report.partial, false);
+});
+
+test("a failed contact batch does not count unknown targets from a successful batch", (t) => {
+  const id = ordinal => `ou_fixture_batch_reader_${ordinal}`;
+  const record = ordinal => ({ key: `batch_${ordinal}`, ordinal, sender: { id: id(ordinal), sender_type: "user" },
+    canonical: { chat_name: LAB.room.name, chat_type: "p2p" } });
+  const fixture = enrichmentFixture(t, { contactErrorIds: [id(31)], contactUsers: [], record: record(1) });
+  for (let ordinal = 2; ordinal <= 31; ordinal++) insertRecord(fixture.dbPath, record(ordinal));
+  const result = runEnrichment(fixture);
+  assert.equal(result.status, 2, result.stderr);
+  const report = JSON.parse(result.stdout);
+  assert.equal(report.contact_ids_requested, 31);
+  assert.equal(report.contact_lookup_failures, 1);
+  assert.equal(report.unresolved_name_targets, 30);
+  assert.equal(readRecords(fixture.dbPath).filter(row => JSON.parse(row.canonical_json).sender_name === null).length, 31);
+});
+
+test("member failures are scoped to the requested chat even for the same person", (t) => {
+  const id = "ou_fixture_two_rooms_reader";
+  const fixture = enrichmentFixture(t, { contactUsers: [], memberErrorChats: [LAB.room.id],
+    memberItems: [{ member_id: id, name: "Synthetic Two Rooms Reader" }],
+    record: { sender: { id, sender_type: "user" }, canonical: { chat_name: LAB.room.name } } });
+  insertRecord(fixture.dbPath, { key: "other_room", ordinal: 2, room: LAB.shelf,
+    sender: { id, sender_type: "user" }, canonical: { chat_name: LAB.shelf.name } });
+  const result = runEnrichment(fixture);
+  assert.equal(result.status, 2, result.stderr);
+  assert.equal(JSON.parse(result.stdout).unresolved_name_targets, 1);
+  const names = readRecords(fixture.dbPath).map(row => JSON.parse(row.canonical_json).sender_name);
+  assert.deepEqual(names, [null, "Synthetic Two Rooms Reader"]);
+});
+
+test("unsupported app identities do not inherit another app's failed bot request", (t) => {
+  const fixture = enrichmentFixture(t, { applicationError: "synthetic permission denied", botError: "synthetic unavailable",
+    record: { sender: { id: LAB.app.id, sender_type: "app" }, canonical: { chat_name: LAB.room.name } } });
+  insertRecord(fixture.dbPath, { key: "unsupported_app", ordinal: 2,
+    sender: { id: "unsupported_fixture_app", sender_type: "app" }, canonical: { chat_name: LAB.room.name } });
+  const result = runEnrichment(fixture);
+  assert.equal(result.status, 2, result.stderr);
+  assert.equal(JSON.parse(result.stdout).unresolved_name_targets, 1);
+});
+
+test("failed partner lookup counts unknown targets while authoritative clears remain complete", (t) => {
+  const id = "ou_fixture_partner_palette_reader";
+  const fixture = enrichmentFixture(t, { contactErrorIds: [id], record: {
+    canonical: { chat_name: LAB.room.name, chat_partner: { open_id: id, name: null, name_state: "cleared" } } } });
+  const cleared = runEnrichment(fixture);
+  assert.equal(cleared.status, 0, cleared.stderr);
+  assert.equal(JSON.parse(cleared.stdout).unresolved_name_targets, 0);
+  insertRecord(fixture.dbPath, { key: "unknown_partner", ordinal: 2,
+    canonical: { chat_name: LAB.room.name, chat_partner: { open_id: id, name: null } } });
+  const unknown = runEnrichment(fixture);
+  assert.equal(unknown.status, 2, unknown.stderr);
+  assert.equal(JSON.parse(unknown.stdout).unresolved_name_targets, 1);
 });

@@ -11,7 +11,7 @@ const START = Date.UTC(2044, 4, 6, 7, 8, 9);
 const SELF = "ou_synthetic_cursor_self";
 const OTHER = "ou_synthetic_cursor_other";
 
-function probe(t, entries, self = SELF) {
+function probe(t, entries, self = SELF, api = "native") {
   const directory = mkdtempSync(join(tmpdir(), "exocortex-cursor-probe-test-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const home = join(directory, "home");
@@ -25,17 +25,20 @@ function probe(t, entries, self = SELF) {
   writeFileSync(cli, `#!/usr/bin/env node
 const args = process.argv.slice(2);
 let result;
-if (args[0] === "contact" && args[1] === "+get-user") result = ${JSON.stringify(self ? { open_id: self } : {})};
+if (args[0] === "--version") result = "1.2.3";
+else if (args[0] === "contact" && args[1] === "+get-user") result = ${JSON.stringify(self ? { open_id: self } : {})};
 else if (args[1] === "+chat-list") result = { chats: [{ chat_id: "oc_synthetic_cursor_room" }] };
 else if (args[1] === "+chat-messages-list") result = { messages: ${JSON.stringify(messages)} };
 else if (args[1] === "+messages-search") result = { messages: [] };
+else if (args[0] === "api" && args[2] === "/open-apis/im/v1/messages") result = { code: 0, data: { items: ${JSON.stringify(messages)} } };
+else if (args[0] === "api" && args[2] === "/open-apis/im/v1/messages/search") result = { code: 0, data: { items: [] } };
 else process.exit(97);
 process.stdout.write(JSON.stringify(result));
 `);
   chmodSync(cli, 0o700);
   const output = join(directory, "report.json");
-  const result = spawnSync(process.execPath, ["scripts/lark-im-cursor-probe.mjs",
-    "--start", new Date(START).toISOString(), "--end", new Date(START + 60_000).toISOString(), "--out", output], {
+  const result = spawnSync(process.execPath, ["tools/probes/cursors.mjs",
+    "--api", api, "--start", new Date(START).toISOString(), "--end", new Date(START + 60_000).toISOString(), "--output", output], {
     cwd: process.cwd(), encoding: "utf8", timeout: 10_000,
     env: { PATH: [dirname(process.execPath), "/usr/bin", "/bin"].join(":"), HOME: home,
       XDG_CONFIG_HOME: home, XDG_CACHE_HOME: home, XDG_DATA_HOME: home, TMPDIR: directory,
@@ -85,4 +88,11 @@ test("an all-sent page yields an empty received summary", (t) => {
 test("unknown self identity preserves the complete summary", (t) => {
   const { all, received } = probe(t, [[20, OTHER], [10, OTHER]], null);
   assert.deepEqual(received, all);
+});
+
+// Explicit convenience comparison keeps the original response-family counterexample.
+test("convenience comparison retains filtered ordering semantics", (t) => {
+  const { received } = probe(t, [[30, OTHER], [40, SELF], [20, OTHER]], SELF, "convenience");
+  assert.equal(received.count, 2);
+  assert.equal(received.order.monotonic_create_time_asc, false);
 });

@@ -5,26 +5,11 @@ import { join } from "node:path";
 import test from "node:test";
 import { normalizeApiMessage } from "../src/adapters/lark-im/raw-message.mjs";
 
-import {
-  bodyFromMessage,
-  compareRecordToCursor,
-  createRun,
-  cursorAfter,
-  ensureInitialized,
-  failRun,
-  messageWindow,
-  parseArgs,
-  parseLarkTimeMs,
-  prepareChatWindowRecords,
-  prepareRecords,
-  readScope,
-  recordFromMessage,
-  shouldSkipCompletedDiscovery,
-  shouldSkipReconcile,
-  sqliteQuery,
-  succeedMessageRun,
-  succeedUnsupportedRun,
-} from "../scripts/lark-im-sync.mjs";
+import { bodyFromMessage, compareRecordToCursor, cursorAfter, messageWindow, parseLarkTimeMs,
+  prepareRecords, recordFromMessage } from "../src/adapters/lark-im/core.mjs";
+import { createRun, ensureInitialized, failRun, readScope, sqliteQuery, succeedMessageRun } from "../dist/storage/sqlite/ingestion-store.js";
+import { prepareChatWindowRecords, shouldSkipCompletedDiscovery, shouldSkipReconcile, succeedUnsupportedRun } from "../src/adapters/lark-im/sync-runner.mjs";
+import { parseArgs } from "./helpers/sync-command.mjs";
 
 function message(id, occurredAtMs, overrides = {}) {
   return {

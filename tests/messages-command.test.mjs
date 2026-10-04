@@ -2,10 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { plain } from "../dist/terminal/index.js";
-import {
-  parseArgs,
-  runMessagesCli,
-} from "../src/cli/messages-command.mjs";
+import { runCli } from "../bin/exocortex.mjs";
+import { createCommandContext } from "../src/cli/context.mjs";
+import { parseRouteOptions } from "../src/cli/registry.mjs";
+const parseArgs = (argv) => parseRouteOptions("messages", argv, { context: createCommandContext({ root: "/synthetic/project" }) });
+const runMessagesCli = (argv, io = {}) => runCli(["messages", ...argv], io);
 import {
   enrichRow,
   loadMessages,
@@ -43,23 +44,23 @@ function row(overrides = {}) {
 }
 
 test("messages command parseArgs keeps the public CLI stable", () => {
-  assert.deepEqual(parseArgs([]), {
-    db: "data/exocortex.sqlite",
+  assert.deepEqual(parseArgs([]).options, {
+    db: "/synthetic/project/data/exocortex.sqlite",
     direction: "all",
     limit: 30,
     search: "",
     format: "text",
   });
-  assert.deepEqual(parseArgs(["--direction", "sent", "--limit", "5", "--search", "needle", "--format", "json"]), {
-    db: "data/exocortex.sqlite",
+  assert.deepEqual(parseArgs(["--direction", "sent", "--limit", "5", "--search", "needle", "--format", "json"]).options, {
+    db: "/synthetic/project/data/exocortex.sqlite",
     direction: "sent",
     limit: 5,
     search: "needle",
     format: "json",
   });
   assert.equal(parseArgs(["--help"]).help, true);
-  assert.throws(() => parseArgs(["--limit", "0"]), /limit must be positive/);
-  assert.throws(() => parseArgs(["--direction", "mine"]), /--direction must be all, sent, or received/);
+  assert.throws(() => parseArgs(["--limit", "0"]), /limit must be a positive/);
+  assert.throws(() => parseArgs(["--direction", "mine"]), /--direction must be all, sent, received/);
 });
 
 test("messages report enriches p2p recipients and senderless system messages", () => {
@@ -161,7 +162,7 @@ test("messages text rendering neutralizes remote terminal controls", () => {
   assert.match(plain(output), /safe-red-end/);
 });
 
-test("messages CLI renders text, json, help, and dependency errors", () => {
+test("messages CLI renders text, json, help, and dependency errors", async () => {
   const message = enrichRow(row({
     canonical_json: JSON.stringify({
       chat_type: "group",
@@ -174,7 +175,7 @@ test("messages CLI renders text, json, help, and dependency errors", () => {
   }));
   const stdout = memoryWriter();
   const stderr = memoryWriter();
-  const exitText = runMessagesCli(["--limit", "1"], {
+  const exitText = await runMessagesCli(["--limit", "1"], {
     stdout: stdout.stream,
     stderr: stderr.stream,
     deps: {
@@ -189,7 +190,7 @@ test("messages CLI renders text, json, help, and dependency errors", () => {
   assert.match(plain(stdout.text()), /Sender User/);
 
   const jsonOut = memoryWriter();
-  const exitJson = runMessagesCli(["--format", "json"], {
+  const exitJson = await runMessagesCli(["--format", "json"], {
     stdout: jsonOut.stream,
     deps: {
       resolvePath: (dbPath) => `/abs/${dbPath}`,
@@ -201,11 +202,11 @@ test("messages CLI renders text, json, help, and dependency errors", () => {
   assert.equal(JSON.parse(jsonOut.text())[0].display.sender, "Sender User");
 
   const helpOut = memoryWriter();
-  assert.equal(runMessagesCli(["--help"], { stdout: helpOut.stream }), 0);
-  assert.match(helpOut.text(), /Usage: node scripts\/messages\.mjs/);
+  assert.equal(await runMessagesCli(["--help"], { stdout: helpOut.stream }), 0);
+  assert.match(helpOut.text(), /Usage: node bin\/exocortex\.mjs messages/);
 
   const errorOut = memoryWriter();
-  const exitError = runMessagesCli(["--db", "missing.sqlite"], {
+  const exitError = await runMessagesCli(["--db", "missing.sqlite"], {
     stderr: errorOut.stream,
     deps: {
       resolvePath: (dbPath) => `/abs/${dbPath}`,

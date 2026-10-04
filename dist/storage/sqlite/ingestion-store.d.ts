@@ -1,10 +1,11 @@
+import { initializeDatabase } from "./initialize.js";
 import type { JsonObject, SyncScope, StoredRecord, WriteEffects, InitialSyncStartOptions } from "./ingestion-types.js";
 import { quoteSql, sqlJson, sqliteExec, sqliteQuery, secureDatabasePaths } from "./sqlite-executor.js";
 import { DEFAULT_HARD_LEASE_SECONDS, runFenceGuardSql } from "./sync-run-fence.js";
 import { acquireLock, acquireMaintenanceLock, releaseLock, releaseMaintenanceLock, isMaintenanceLocked, recoverStaleSyncState, ownerPid, ownerStartedAtMs, defaultOwnerState } from "./sync-locks.js";
 import { encodeSourceVersion, normalizeStoredRecords, normalizeBoundedReplayRecords, normalizeExternalVersion, existingRecordMap, countWriteEffects, upsertRecordsSql } from "./record-storage.js";
 import { commitBoundedReplayRecords, commitLarkListRun, finishLarkDetailRun, readLarkListProgress, readPendingLarkDetails } from "./lark-ingestion.js";
-declare function ensureInitialized(dbPath: string): void;
+declare const ensureInitialized: typeof initializeDatabase;
 declare function readScope(dbPath: string, scopeId: string): SyncScope;
 declare function validateInitialSyncStartMs(value: unknown): number;
 declare function ensureSourceInitialSyncStart(dbPath: string, sourceId: string, candidateStartMs: number, options?: InitialSyncStartOptions): number;

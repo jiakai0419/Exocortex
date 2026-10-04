@@ -5,12 +5,13 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "build:check": "node scripts/check-generated.mjs",
-    "check": "npm run build && node scripts/check-syntax.mjs",
-    "help": "node scripts/help.mjs",
+    "build:check": "node tools/verify.mjs --generated-only",
+    "check": "npm run build && node tools/check-syntax.mjs",
+    "help": "node bin/exocortex.mjs --help",
     "test": "npm run build && node --test --test-concurrency=4 tests/*.test.mjs",
     "typecheck": "tsc -p tsconfig.json",
-    "verify": "npm run build && npm run typecheck && npm run check && npm test && npm run build:check"
+    "verify": "node tools/verify.mjs",
+    "exo": "node bin/exocortex.mjs"
   },
   "devDependencies": {
     "@types/node": "^25.9.3",

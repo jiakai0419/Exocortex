@@ -2,11 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { plain } from "../dist/terminal/index.js";
-import {
-  parseArgs,
-  runLagCheckCli,
-  sanitizeLagReportForPublicOutput,
-} from "../src/cli/lark-im-lag-command.mjs";
+import { sanitizeLagReportForPublicOutput } from "../src/diagnostics/lark-im-lag-core.mjs";
 import {
   collectLagReport,
   fetchHotChats,
@@ -89,44 +85,6 @@ function healthyReport(overrides = {}) {
   };
 }
 
-test("lag command parseArgs keeps explicit time windows stable", () => {
-  const parsed = parseArgs([
-    "--db",
-    "custom.sqlite",
-    "--chat-pages",
-    "3",
-    "--hot-chats",
-    "4",
-    "--messages-per-chat",
-    "2",
-    "--start",
-    "2001-09-09T01:46:40+00:00",
-    "--end",
-    "2001-09-09T01:51:40+00:00",
-    "--format",
-    "json",
-  ]);
-
-  assert.equal(parsed.db, "custom.sqlite");
-  assert.equal(parsed.chatPages, 3);
-  assert.equal(parsed.hotChats, 4);
-  assert.equal(parsed.messagesPerChat, 2);
-  assert.equal(parsed.startMs, 1000000000000);
-  assert.equal(parsed.endMs, 1000000300000);
-  assert.equal(parsed.format, "json");
-  assert.equal(parsed.unsafeDetails, false);
-  assert.equal(parseArgs(["--unsafe-details"]).unsafeDetails, true);
-  assert.equal(parseArgs(["--help"]).help, true);
-  assert.throws(() => parseArgs(["--hot-chats", "0"]), /hot-chats must be a positive integer/);
-  assert.throws(() => parseArgs(["--hot-chats", "20junk"]), /positive integer/);
-  assert.throws(() => parseArgs(["--messages-per-chat", "4.9"]), /positive integer/);
-  assert.throws(() => parseArgs(["--format", "yaml"]), /--format must be text or json/);
-  assert.throws(
-    () => parseArgs(["--start", "2001-09-09T01:51:40Z", "--end", "2001-09-09T01:46:40Z"]),
-    /--end must be after --start/,
-  );
-});
-
 test("lag hot-chat probe covers group and p2p chats", () => {
   const calls = [];
   const chats = fetchHotChats(opts(), {
@@ -208,87 +166,6 @@ test("lag report separates restricted chats from remote probe errors", () => {
   assert.equal(failed.status, "needs_attention");
   assert.equal(failed.probe.probe_errors, 2);
   assert.match(plain(renderLagText(failed)), /Probe errors/);
-});
-
-test("lag check CLI renders text, json, help, and dependency errors", () => {
-  const stdout = memoryWriter();
-  const stderr = memoryWriter();
-  const exitText = runLagCheckCli(["--start", opts().start, "--end", opts().end], {
-    stdout: stdout.stream,
-    stderr: stderr.stream,
-    deps: {
-      resolvePath: (dbPath) => `/abs/${dbPath}`,
-      existsSync: () => true,
-      collect: () => healthyReport(),
-    },
-  });
-
-  assert.equal(exitText, 0);
-  assert.equal(stderr.text(), "");
-  assert.match(plain(stdout.text()), /Lark IM lag check OK/);
-  assert.doesNotMatch(plain(stdout.text()), /Synthetic Room 2/);
-  assert.doesNotMatch(plain(stdout.text()), /Synthetic App/);
-  assert.doesNotMatch(plain(stdout.text()), /Unit test card/);
-
-  const unsafeOut = memoryWriter();
-  const exitUnsafe = runLagCheckCli(["--start", opts().start, "--end", opts().end, "--unsafe-details"], {
-    stdout: unsafeOut.stream,
-    deps: {
-      resolvePath: (dbPath) => `/abs/${dbPath}`,
-      existsSync: () => true,
-      collect: () => healthyReport(),
-    },
-  });
-  assert.equal(exitUnsafe, 0);
-  assert.match(plain(unsafeOut.text()), /Synthetic Room 2/);
-  assert.match(plain(unsafeOut.text()), /Synthetic App/);
-  assert.match(plain(unsafeOut.text()), /Unit test card/);
-
-  const delayed = healthyReport({ ok: false, status: "delayed", missing_count: 1 });
-  const jsonOut = memoryWriter();
-  const exitJson = runLagCheckCli(["--start", opts().start, "--end", opts().end, "--format", "json"], {
-    stdout: jsonOut.stream,
-    deps: {
-      resolvePath: (dbPath) => `/abs/${dbPath}`,
-      existsSync: () => true,
-      collect: () => delayed,
-    },
-  });
-  assert.equal(exitJson, 2);
-  const jsonReport = JSON.parse(jsonOut.text());
-  assert.equal(jsonReport.status, "delayed");
-  assert.equal(jsonReport.latest_remote.chat_name, "<redacted>");
-  assert.equal(jsonReport.latest_remote.sender_name, "<redacted>");
-  assert.equal(jsonReport.latest_remote.body, "<redacted>");
-  assert.equal(jsonOut.text().includes("Synthetic Room 2"), false);
-
-  const helpOut = memoryWriter();
-  assert.equal(runLagCheckCli(["--help"], { stdout: helpOut.stream }), 0);
-  assert.match(helpOut.text(), /Usage: node scripts\/lark-im-lag-check\.mjs/);
-
-  const missingDb = memoryWriter();
-  assert.equal(runLagCheckCli(["--db", "missing.sqlite"], {
-    stderr: missingDb.stream,
-    deps: {
-      resolvePath: (dbPath) => `/abs/${dbPath}`,
-      existsSync: () => false,
-    },
-  }), 1);
-  assert.match(plain(missingDb.text()), /database not found/);
-
-  const keychain = memoryWriter();
-  assert.equal(runLagCheckCli(["--start", opts().start, "--end", opts().end], {
-    stderr: keychain.stream,
-    deps: {
-      resolvePath: (dbPath) => `/abs/${dbPath}`,
-      existsSync: () => true,
-      collect: () => {
-        throw new Error("keychain Get failed: keychain not initialized");
-      },
-    },
-  }), 1);
-  assert.match(plain(keychain.text()), /keychain not initialized/);
-  assert.doesNotMatch(keychain.text(), /keychain Get failed/);
 });
 
 test("lag public sanitizer removes local metadata and message excerpts", () => {

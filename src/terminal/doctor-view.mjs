@@ -108,7 +108,7 @@ function renderDoctorText(report) {
     if (report.live.hint) liveRows.push(["Hint", report.live.hint]);
     lines.push(kv(liveRows));
   } else {
-    lines.push(hint("Live", "skipped. Run node scripts/doctor.mjs --live to compare recent remote hot messages."));
+    lines.push(hint("Live", "skipped. Run node bin/exocortex.mjs check --live to compare recent remote hot messages."));
   }
 
   if (report.findings.length > 0) {

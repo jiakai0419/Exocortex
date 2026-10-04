@@ -8,7 +8,6 @@ import {
   buildServiceOverview,
   collectRecentFailureKinds,
   classifyLaunchdPrint,
-  parseJsonOutput,
   parseLaunchdState,
   summarizeWorkerStability,
   summarizeServiceFreshness,
@@ -165,11 +164,9 @@ test("service status report parses launchd, sync status, and worker log summary"
             stdout: "state = running\npid = 123\nlast exit code = 0\n",
           });
         }
-        if (cmd === process.execPath) {
-          return spawnResult({ stdout: JSON.stringify(syncStatusFixture()) });
-        }
         throw new Error(`unexpected command: ${cmd}`);
       },
+      buildStatus: () => syncStatusFixture(),
       readRecentWorkerEvents: (logDir) => ({
         path: `${logDir}/worker.jsonl`,
         exists: true,
@@ -198,7 +195,7 @@ test("service status report parses launchd, sync status, and worker log summary"
   assert.equal(report.label, "com.example.worker");
   assert.equal(report.service_state, "running");
   assert.equal(report.launchd.loaded, true);
-  assert.equal(report.launchd.pid, "123");
+  assert.equal(report.launchd.pid, 123);
   assert.equal(report.sync.status.health, "ok_with_history");
   assert.equal(report.overview.service.status, "running");
   assert.equal(report.overview.health.status, "ok");
@@ -215,7 +212,6 @@ test("service status report parses launchd, sync status, and worker log summary"
   assert.deepEqual(report.stability.failures.by_kind, [{ kind: "rate_limited", count: 1 }]);
   assert.deepEqual(calls, [
     ["launchctl", "print", "gui/501/com.example.worker"],
-    [process.execPath, "scripts/sync-status.mjs", "--db", "data/exocortex.sqlite", "--format", "json"],
   ]);
 });
 
@@ -296,7 +292,7 @@ test("service status report preserves not-loaded and sync-unavailable states", (
   assert.equal(report.overview.health.status, "problem");
   assert.equal(report.overview.activity.status, "unknown");
   assert.equal(report.sync.status, null);
-  assert.match(report.sync.error_text, /sync unavailable/);
+  assert.match(report.sync.error_text, /sync status unavailable/);
   assert.equal(report.worker.log.exists, false);
 });
 
@@ -532,14 +528,12 @@ test("service status text never exposes an absolute worker log path", () => {
   assert.doesNotMatch(output, /PRIVATE-SENTINEL|\/private\//);
 });
 
-test("service status helpers parse launchd and json output", () => {
+test("service status reexports the shared launchd parser", () => {
   assert.deepEqual(parseLaunchdState("state = running\npid = 123\nlast exit code = 0\n"), {
     state: "running",
     pid: "123",
     "last exit code": "0",
   });
-  assert.deepEqual(parseJsonOutput({ stdout: "{\"ok\":true}" }), { ok: true });
-  assert.equal(parseJsonOutput({ stdout: "not json" }), null);
 });
 
 test("freshness requires a bound nonempty sample with a current bounded lease", () => {
@@ -582,7 +576,8 @@ test("unavailable launchd inspection is UNKNOWN in report and view, not stopped"
   const report = buildServiceStatusReport(
     { label: "com.example.worker", target: "gui/501/com.example.worker", logDir: "logs/test" },
     {
-      runCommand: (cmd) => cmd === "launchctl" ? spawnResult({ status: 1, stderr: "Operation not permitted" }) : spawnResult({ stdout: JSON.stringify(syncStatusFixture()) }),
+      runCommand: () => spawnResult({ status: 1, stderr: "Operation not permitted" }),
+      buildStatus: () => syncStatusFixture(),
       readRecentWorkerEvents: () => ({ path: "worker.jsonl", exists: false, events: [] }),
       readLiveProbeCache: () => null,
       liveProbeContext: () => null,
@@ -691,11 +686,12 @@ test("verified current phase permits recovery activity after a failed historical
   assert.match(overview.health.detail, /does not verify remote freshness/);
 });
 
-test("failed sync subprocess cannot establish activity with otherwise valid JSON", () => {
+test("failed direct sync inspection cannot establish activity", () => {
   const report = buildServiceStatusReport(
     { label: "com.example.worker", target: "gui/501/com.example.worker", logDir: "logs/test" },
     {
-      runCommand: (cmd) => cmd === "launchctl" ? spawnResult({ stdout: "state = running\n" }) : spawnResult({ status: 1, stdout: JSON.stringify(syncStatusFixture()) }),
+      runCommand: () => spawnResult({ stdout: "state = running\n" }),
+      buildStatus: () => { throw new Error("PRIVATE_SYNC_READ_FAILURE"); },
       readRecentWorkerEvents: () => ({ path: "worker.jsonl", exists: false, events: [] }),
       readLiveProbeCache: () => null,
       liveProbeContext: () => null,
@@ -715,12 +711,12 @@ test("service evaluates a foreground lease acquired during a slow sync query aga
     { label: "com.example.worker", target: "gui/501/com.example.worker", logDir: "logs/test" },
     {
       clock: () => clockMs,
-      runCommand: (cmd) => {
-        if (cmd === "launchctl") return spawnResult({ status: 113, stderr: 'Could not find service "com.example.worker" in domain for user gui: 501' });
+      runCommand: () => spawnResult({ status: 113, stderr: 'Could not find service "com.example.worker" in domain for user gui: 501' }),
+      buildStatus: () => {
         clockMs += 1000;
-        return spawnResult({ stdout: JSON.stringify(syncStatusFixture({ health: "syncing", locks: [{
+        return syncStatusFixture({ health: "syncing", locks: [{
           locked_at: new Date(startedAt + 500).toISOString(), expires_at: new Date(startedAt + 10000).toISOString(),
-        }] })) });
+        }] });
       },
       readRecentWorkerEvents: () => ({ path: "worker.jsonl", exists: false, events: [] }),
       readLiveProbeCache: () => null,
@@ -747,11 +743,8 @@ test("service expires a lease that crosses its normal or hard deadline during a 
       { label: "com.example.worker", target: "gui/501/com.example.worker", logDir: "logs/test" },
       {
         clock: () => clockMs,
-        runCommand: (cmd) => {
-          if (cmd === "launchctl") return spawnResult({ stdout: "state = running\n" });
-          clockMs += 1000;
-          return spawnResult({ stdout: JSON.stringify(syncStatusFixture({ health: "syncing", locks: [lease] })) });
-        },
+        runCommand: () => spawnResult({ stdout: "state = running\n" }),
+        buildStatus: () => { clockMs += 1000; return syncStatusFixture({ health: "syncing", locks: [lease] }); },
         readRecentWorkerEvents: () => ({ path: "worker.jsonl", exists: false, events: [] }),
         readLiveProbeCache: () => null,
         liveProbeContext: () => null,
@@ -772,9 +765,10 @@ test("service reads its evaluation clock after optional evidence queries, while 
       {
         ...(fixedClock ? { nowMs: startedAt } : {}),
         clock: () => clockMs,
-        runCommand: (cmd) => cmd === "launchctl" ? spawnResult({ stdout: "state = running\n" }) : spawnResult({ stdout: JSON.stringify(syncStatusFixture({ health: "syncing", locks: [{
+        runCommand: () => spawnResult({ stdout: "state = running\n" }),
+        buildStatus: () => syncStatusFixture({ health: "syncing", locks: [{
           locked_at: new Date(startedAt - 1000).toISOString(), expires_at: new Date(startedAt + 500).toISOString(),
-        }] })) }),
+        }] }),
         readRecentWorkerEvents: () => ({ path: "worker.jsonl", exists: false, events: [] }),
         readLiveProbeCache: () => null,
         liveProbeContext: () => null,

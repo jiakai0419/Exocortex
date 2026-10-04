@@ -1,6 +1,6 @@
 # Language and Refactor Plan
 
-> 历史规划：本文保留早期 Node/TypeScript 模块规划，不是当前文件清单。部分 .mjs 路径已迁为 .ts；现行入口、配置与维护流程见 [Operations](operations.md)，现行事务与来源边界见 [Storage contracts](storage-contracts.md)。下文阶段状态和“当前”描述仅代表写作时点，不构成新迁移授权。
+> 历史规划：本文保留早期 Node/TypeScript 模块规划，不是当前文件清单。部分 .mjs 路径已迁为 .ts；现行入口、配置与维护流程见 [Operations](operations.md)，现行事务与来源边界见 [Storage contracts](storage-contracts.md)。下文阶段状态和“当前”描述仅代表写作时点，不构成新迁移授权。 CLI v2 的现行命令与旧路径退役状态见 [CLI migration](cli-migration.md)；本文中的旧入口只作历史记录。
 
 ## 结论
 

@@ -142,8 +142,9 @@ function insertRow(fixture, { id = 1, ordinal = id, actor = TARGET, chat = CHAT,
 }
 
 function run(fixture, args = [], { exactArgs = false, audit = false } = {}) {
-  const result = spawnSync(process.execPath, ["scripts/lark-im-enrich-records.mjs", "--db", fixture.db,
-    ...(exactArgs ? [] : ["--sender-only", "--sender-id", TARGET]), ...args], {
+  const result = spawnSync(process.execPath, ["bin/exocortex.mjs", "maintenance", "enrich", "--target", "records", "--format", "json", "--db", fixture.db,
+    ...(exactArgs ? [] : ["--sender-only", "--sender-id", TARGET]),
+    ...(args.includes("--dry-run") ? [] : ["--apply"]), ...args.filter((arg) => arg !== "--dry-run")], {
     cwd: process.cwd(), encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 40_000,
     env: { PATH: SAFE_PATH, HOME: join(fixture.dir, "home"), XDG_CONFIG_HOME: join(fixture.dir, "config"),
       XDG_CACHE_HOME: join(fixture.dir, "cache"), XDG_DATA_HOME: join(fixture.dir, "data"),
@@ -223,7 +224,7 @@ test("oldest-first limited batches expose remaining candidates and reach the nex
   insertRow(f, { id: 1, ordinal: 100 });
   insertRow(f, { id: 2, ordinal: 1 });
   const before = readRows(f);
-  const first = summary(run(f, ["--limit", "1"]), 1);
+  const first = summary(run(f, ["--limit", "1"]), 2);
   assert.equal(first.scanned, 1);
   assert.equal(first.updated, 1);
   assert.equal(first.has_more_candidates, true);
@@ -297,7 +298,7 @@ test("failed name lookups leave the exact record unchanged, then recover at the 
   const f = fixture(t, { contact: "deny", members: "deny" });
   insertRow(f);
   const before = readRows(f);
-  const failed = summary(run(f), 1);
+  const failed = summary(run(f), 2);
   assert.equal(failed.unresolved, 1);
   assert.equal(failed.resolved, 0);
   assert.equal(failed.planned, 0);
@@ -320,7 +321,7 @@ test("lookup responses for unrelated identities cannot supply the selected sende
   const f = fixture(t, { contact: "success", contactUsers: [{ open_id: OTHER, name: PERSON }], members: "deny" });
   insertRow(f);
   const before = readRows(f);
-  const output = summary(run(f), 1);
+  const output = summary(run(f), 2);
   assert.equal(output.unresolved, 1);
   assert.equal(output.updated, 0);
   assert.deepEqual(readRows(f), before);
@@ -335,7 +336,7 @@ for (const [label, response] of [
     const f = fixture(t, { contact: "empty", members: "success", ...response });
     insertRow(f);
     const before = readRows(f);
-    const output = summary(run(f), 1);
+    const output = summary(run(f), 2);
     assert.equal(output.unresolved, 1);
     assert.equal(output.resolved, 0);
     assert.equal(output.updated, 0);
@@ -358,7 +359,7 @@ test("a member list still continuing after five pages stays unresolved without u
   const f = fixture(t, { contact: "empty", members: "forever" });
   insertRow(f);
   const before = readRows(f);
-  const output = summary(run(f, [], { audit: true }), 1);
+  const output = summary(run(f, [], { audit: true }), 2);
   assert.equal(output.unresolved, 1);
   assert.equal(output.updated, 0);
   assert.deepEqual(readRows(f), before);
@@ -384,7 +385,7 @@ test("the five-page member budget is shared across all chats in a round", (t) =>
   const f = fixture(t, { contact: "empty", members: "forever" });
   insertRow(f, { id: 1, chat: firstChat });
   insertRow(f, { id: 2, chat: secondChat });
-  const output = summary(run(f), 1);
+  const output = summary(run(f), 2);
   assert.equal(output.updated, 0);
   const members = assertTargetCalls(f).filter(call => call.kind === "members");
   assert.equal(members.length, 5);
@@ -394,7 +395,7 @@ test("the five-page member budget is shared across all chats in a round", (t) =>
 test("at most three distinct chats are queried for one sender in a round", (t) => {
   const f = fixture(t, { contact: "empty", members: "empty" });
   for (let id = 1; id <= 5; id += 1) insertRow(f, { id, chat: `oc_synthetic_budget_chat_${id}` });
-  const output = summary(run(f), 1);
+  const output = summary(run(f), 2);
   assert.equal(output.updated, 0);
   const members = assertTargetCalls(f).filter(call => call.kind === "members");
   assert.equal(members.length, 3);
@@ -423,7 +424,7 @@ for (const [label, mutation, field, expected] of [
     const f = fixture(t, { contact: "success", mutateSql: `UPDATE records SET ${mutation} WHERE id=1;` });
     insertRow(f);
     const before = readRows(f)[0];
-    const output = summary(run(f), 1);
+    const output = summary(run(f), 2);
     assert.equal(output.skipped_conflicts, 1, JSON.stringify(output));
     assert.equal(output.updated, 0);
     assert.deepEqual(readRows(f)[0], { ...before, [field]: expected });
@@ -445,7 +446,7 @@ test("an active sync lock blocks sender writes without deleting or bypassing tha
 test("sender-only defaults to fifty eligible rows and honestly reports more candidates", (t) => {
   const f = fixture(t);
   for (let id = 1; id <= 51; id += 1) insertRow(f, { id });
-  const output = summary(run(f), 1);
+  const output = summary(run(f), 2);
   assert.equal(output.scanned, 50);
   assert.equal(output.updated, 50);
   assert.equal(output.has_more_candidates, true);
@@ -534,7 +535,7 @@ test("sender alias remains unknown after denied lookup and recovers later withou
   const f = fixture(t, { contact: "deny", members: "deny" });
   insertRow(f, { rawSender: { ...SOURCE_ALIASES, name: SOURCE_ALIASES.user_id, display_name: SOURCE_ALIASES.union_id } });
   const before = readRows(f)[0];
-  const denied = summary(run(f), 1);
+  const denied = summary(run(f), 2);
   assert.equal(denied.unresolved, 1);
   assert.equal(denied.updated, 0);
   assert.deepEqual(readRows(f)[0], before);
@@ -548,7 +549,7 @@ test("sender alias correction obeys CAS if source version changes during the rel
   const f = fixture(t, { contact: "success", mutateSql: `UPDATE records SET external_version='${changedVersion}' WHERE id=1;` });
   insertRow(f, { rawSender: { ...SOURCE_ALIASES, name: SOURCE_ALIASES.user_id } });
   const before = readRows(f)[0];
-  const output = summary(run(f), 1);
+  const output = summary(run(f), 2);
   assert.equal(output.skipped_conflicts, 1);
   assert.equal(output.updated, 0);
   assert.deepEqual(readRows(f)[0], { ...before, external_version: changedVersion });
@@ -598,7 +599,7 @@ test("sender remote alias echoes from contact and member remain unwritten and ca
     members: "success", memberName: SOURCE_ALIASES.union_id });
   insertRow(f, { rawSender: { ...SOURCE_ALIASES } });
   const before = readRows(f)[0];
-  const unresolved = summary(run(f), 1);
+  const unresolved = summary(run(f), 2);
   assert.equal(unresolved.unresolved, 1);
   assert.equal(unresolved.updated, 0);
   assert.deepEqual(readRows(f)[0], before);
@@ -612,7 +613,7 @@ test("sender remote alias member echo is unknown even when contact returns no pe
   const f = fixture(t, { contact: "empty", members: "success", memberName: SOURCE_ALIASES.user_id });
   insertRow(f, { rawSender: { ...SOURCE_ALIASES } });
   const before = readRows(f)[0];
-  const output = summary(run(f), 1);
+  const output = summary(run(f), 2);
   assert.equal(output.unresolved, 1);
   assert.equal(output.updated, 0);
   assert.deepEqual(readRows(f)[0], before);

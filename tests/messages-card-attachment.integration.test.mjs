@@ -138,7 +138,7 @@ function snapshot({ dir, db }) {
 function messages(fixture, format) {
   const env = { ...process.env, NO_COLOR: "1", LARK_CLI: fixture.noNetworkCli, SYNTHETIC_NETWORK_MARKER: fixture.networkMarker };
   delete env.FORCE_COLOR;
-  const result = spawnSync(process.execPath, [join(ROOT, "scripts/messages.mjs"), "--db", fixture.db, "--format", format], {
+  const result = spawnSync(process.execPath, [join(ROOT, "bin/exocortex.mjs"), "messages", "--db", fixture.db, "--format", format], {
     cwd: ROOT, encoding: "utf8", timeout: 10_000, maxBuffer: 2 * 1024 * 1024, env,
   });
   assert.equal(result.status, 0, result.stderr);

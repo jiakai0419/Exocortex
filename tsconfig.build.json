@@ -1,7 +1,7 @@
 {
   "extends": "./tsconfig.json",
   "compilerOptions": {
-    "allowJs": false,
+    "allowJs": true,
     "checkJs": false,
     "declaration": true,
     "emitDeclarationOnly": false,
@@ -13,6 +13,7 @@
     "src/core/**/*.ts",
     "src/terminal/**/*.ts",
     "src/runtime/worker/**/*.ts",
-    "src/storage/sqlite/**/*.ts"
+    "src/storage/sqlite/**/*.ts",
+    "src/runtime/worker/options.mjs"
   ]
 }

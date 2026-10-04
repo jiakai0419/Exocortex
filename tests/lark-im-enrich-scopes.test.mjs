@@ -86,7 +86,7 @@ function addScope(dbPath, suffix, overrides = {}) {
 }
 
 function run(fixture, args = [], env = {}) {
-  return spawnSync(process.execPath, ["scripts/lark-im-enrich-scopes.mjs", "--db", fixture.dbPath, ...args], {
+  return spawnSync(process.execPath, ["bin/exocortex.mjs", "maintenance", "enrich", "--target", "scopes", "--format", "json", "--db", fixture.dbPath, ...(args.includes("--dry-run") ? [] : ["--apply"]), ...args.filter((arg) => arg !== "--dry-run")], {
     cwd: process.cwd(),
     env: { ...process.env, LARK_CLI: fixture.fakeLarkCli, ...env },
     encoding: "utf8",
@@ -133,7 +133,7 @@ for (const [name, mutation] of [
   test(`scope enrichment skips concurrent ${name} changes`, (t) => {
     const f = fixture(t, { beforeLookupSql: `UPDATE sync_scopes SET ${mutation};` });
     const result = run(f);
-    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.status, 2, result.stderr);
     const summary = JSON.parse(result.stdout);
     assert.equal(summary.ok, true);
     assert.equal(summary.planned, 1);
@@ -155,7 +155,7 @@ test("partial conflicts preserve new discovery config while unchanged scopes are
     WHERE id = 'lark.im.received.chat.a';` });
   addScope(f.dbPath, "b");
   const result = run(f);
-  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.status, 2, result.stderr);
   const summary = JSON.parse(result.stdout);
   assert.equal(summary.planned, 2);
   assert.equal(summary.updated, 1);
@@ -184,7 +184,7 @@ test("a cursor-only advance is preserved when the config CAS still matches", (t)
 test("a deleted scope is counted as a conflict and not recreated", (t) => {
   const f = fixture(t, { beforeLookupSql: "DELETE FROM records; DELETE FROM sync_scopes;" });
   const result = run(f);
-  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.status, 2, result.stderr);
   assert.equal(JSON.parse(result.stdout).skipped_conflicts, 1);
   assert.deepEqual(scopes(f.dbPath), []);
   assert.deepEqual(locks(f.dbPath), []);
@@ -217,7 +217,7 @@ for (const mode of ["fail", "empty"]) {
     chmodSync(f.dbPath, 0o644);
     const before = readFileSync(f.dbPath);
     const result = run(f);
-    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.status, mode === "fail" ? 2 : 0, result.stderr);
     const summary = JSON.parse(result.stdout);
     assert.equal(summary.planned, 0);
     assert.equal(summary.updated, 0);
@@ -267,7 +267,7 @@ require("node:module").syncBuiltinESMExports();
 `);
     const before = readFileSync(f.dbPath);
     const result = run(f, [], { NODE_OPTIONS: `--require=${preload}` });
-    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.status, mode === "success" ? 0 : 2, result.stderr);
     const calls = readFileSync(audit, "utf8").trim().split("\n").map((line) => JSON.parse(line));
     assert.equal(calls.length, 1);
     assert.ok(calls[0].timeout > 0 && calls[0].timeout <= 5000);

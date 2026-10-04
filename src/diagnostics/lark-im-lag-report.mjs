@@ -44,16 +44,18 @@ function sqliteJson(dbPath, sql, label) {
   return readOnlySqliteJson(dbPath, sql, label);
 }
 
-/** @param {string[]} args */
-function runLark(args) {
-  const bin = process.env.LARK_CLI || "lark-cli";
-  const result = spawnSync(bin, args, {
+/** @param {string[]} args @param {{env?: NodeJS.ProcessEnv, spawnSync?: typeof spawnSync}} [deps] */
+function runLark(args, deps = {}) {
+  const env = deps.env || process.env;
+  const bin = env.LARK_CLI || "lark-cli";
+  const result = (deps.spawnSync || spawnSync)(bin, args, {
     encoding: "utf8",
+    env,
     maxBuffer: 100 * 1024 * 1024,
     timeout: 120_000,
     killSignal: "SIGKILL",
   });
-  if (result.status !== 0 || result.error) {
+  if (result.status !== 0 || result.error || result.signal) {
     const stderr = String(result.stderr || "");
     const spawnError = /** @type {NodeJS.ErrnoException | undefined} */ (result.error);
     if (/"code"\s*:\s*231203|Restricted Mode|don't allow copying or forwarding messages/i.test(stderr)) {

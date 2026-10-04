@@ -4,7 +4,16 @@ import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { executeLarkImReplay, parseArgs, parseReplayTime, runLarkImReplayCli } from "../src/cli/lark-im-replay-command.mjs";
+import { executeLarkImReplay, validateReplayOptions, parseReplayTime } from "../src/maintenance/replay.mjs";
+import { runMaintenanceCommand } from "../src/cli/maintenance-command.mjs";
+import { parseRouteOptions } from "../src/cli/registry.mjs";
+import { createCommandContext } from "../src/cli/context.mjs";
+function parseArgs(argv) { return validateReplayOptions(parseRouteOptions("maintenance.replay",argv).options); }
+function runReplay(argv, io) {
+  const parsed=parseRouteOptions("maintenance.replay",argv);
+  return runMaintenanceCommand(parsed.options, { ...createCommandContext({ stdout:io.stdout, stderr:io.stderr,
+    now:io.deps.now }), provided:parsed.provided, deps:io.deps });
+}
 import { chatScopeId } from "../src/adapters/lark-im/core.mjs";
 import { normalizeApiMessage } from "../src/adapters/lark-im/raw-message.mjs";
 import { prepareChatWindowRecords } from "../src/adapters/lark-im/sync-runner.mjs";
@@ -71,9 +80,7 @@ test("explicit timezone times, calendar validity and one to three unique scopes 
   for (const chats of [[],[CHAT,CHAT],[CHAT,"oc_2","oc_3","oc_4"]]) assert.throws(()=>options("/synthetic",{chats}));
   assert.throws(()=>options("/synthetic",{start:END,end:START}));
   assert.throws(()=>parseArgs(["--db","/synthetic","--scope-id",SCOPE,"--start",START,"--end",END,"--apply","--dry-run"]));
-  let output = "";
-  assert.equal(runLarkImReplayCli(["--help"],{stdout:{write:(text)=>{output+=text;}},deps:{getSelfProfile:()=>{throw new Error("no lookup");}}}),0);
-  assert.match(output,/dry-run/);
+  assert.equal(parseRouteOptions("maintenance.replay",["--help"]).help,true);
 });
 
 test("inserts three synthetic thread replies, retains the root and repeats idempotently without changing normal evidence", (t) => {
@@ -321,9 +328,9 @@ test("CLI summaries expose conflicts and failures using nonzero status without p
   const {db}=fixture(t);
   let stdout="",stderr="";
   const argv=["--db",db,"--scope-id",SCOPE,"--start",START,"--end",END,"--apply"];
-  const code=runLarkImReplayCli(argv,{stdout:{write:(value)=>{stdout+=value;}},stderr:{write:(value)=>{stderr+=value;}},
+  const code=runReplay(argv,{stdout:{write:(value)=>{stdout+=value;}},stderr:{write:(value)=>{stderr+=value;}},
     deps:{getSelfProfile:()=>SELF,fetchChatMessages:()=>{throw new Error("secret-synthetic-body");},now:()=>END_MS+1000}});
-  assert.equal(code,1); assert.equal(stderr,""); assert.equal(JSON.parse(stdout).ok,false);
+  assert.equal(code,2); assert.equal(stderr,""); assert.equal(JSON.parse(stdout).ok,false);
   assert.doesNotMatch(stdout,/secret-synthetic-body/);
   assertNoRepair(db);
 });

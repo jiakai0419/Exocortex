@@ -1,4 +1,4 @@
-import { WORKER_DEFAULTS } from "./lark-im-worker-options.js";
+import { WORKER_DEFAULTS } from "./options.mjs";
 const TRANSPORT_COUNTERS = [
     "calls", "attempts", "retries", "rate_limits", "timeouts", "wait_ms",
     "max_retry_after_ms", "cooldown_until_ms", "exhausted",
@@ -241,6 +241,8 @@ function compactRun(run) {
         inserted: run.inserted,
         updated: run.updated,
         duplicate: run.duplicate,
+        ...Object.fromEntries(["list_complete", "details_complete", "incomplete", "pending_details", "detail_attempts"]
+            .filter((key) => run[key] !== undefined).map((key) => [key, run[key]])),
     };
 }
 function compactSummary(summary) {
@@ -260,6 +262,9 @@ function compactSummary(summary) {
     }), initialReceivedTotals);
     return {
         ok: summary.ok,
+        ...(summary.partial ? { partial: true } : {}),
+        ...(summary.incomplete ? { incomplete: true } : {}),
+        ...(summary.details ? { details: summary.details.map(compactRun) } : {}),
         ...(summary.transport ? { transport: compactTransportStats(summary.transport) } : {}),
         window: summary.window,
         sent: compactRun(summary.sent),
@@ -281,6 +286,10 @@ function compactSummary(summary) {
                 ok: receivedFailures.length === 0,
                 ...receivedTotals,
                 ...(receivedSkipped > 0 ? { skipped: receivedSkipped } : {}),
+                ...(received.some((run) => run.pending_details !== undefined) ? {
+                    pending_details: received.reduce((sum, run) => sum + finiteNonNegative(run.pending_details), 0),
+                    incomplete: received.some((run) => run.incomplete === true),
+                } : {}),
                 failed: receivedFailures.length,
                 failed_scope_ids: receivedFailures.slice(0, 5).map((run) => run.scope_id),
             }

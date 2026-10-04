@@ -11,7 +11,6 @@ import {
   runCycleWithRunner,
   summarizeWorkerEvents,
 } from "../dist/runtime/worker/lark-im-worker-core.js";
-import { summarizeWorkerEvents as shimSummarizeWorkerEvents } from "../scripts/lib/lark-im-worker-core.mjs";
 
 function opts(overrides = {}) {
   return {
@@ -355,7 +354,7 @@ test("summarizeWorkerEvents keeps the latest failure visible", () => {
   assert.equal(summary.last_failure.name, "received-hot");
   assert.equal(summary.last_failure.cycle, 1);
   assert.equal(summary.last_failure.age_ms, 175_000);
-  assert.equal(shimSummarizeWorkerEvents([], Date.parse("2026-06-14T00:03:00.000Z")).has_events, false);
+  assert.equal(summarizeWorkerEvents([], Date.parse("2026-06-14T00:03:00.000Z")).has_events, false);
 });
 
 test("old, recent, future and malformed unfinished step history never proves active work", () => {

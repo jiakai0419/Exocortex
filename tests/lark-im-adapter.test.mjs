@@ -8,7 +8,6 @@ import {
   isRestrictedModeError,
   isTransientLarkFailure,
 } from "../src/adapters/lark-im/adapter.mjs";
-import { createLarkImAdapter as shimCreateLarkImAdapter } from "../scripts/lib/lark-im-adapter.mjs";
 import { recordFromMessage } from "../src/adapters/lark-im/core.mjs";
 
 function adapterOpts(overrides = {}) {
@@ -27,10 +26,6 @@ function commandValue(args, flag) {
   const index = args.indexOf(flag);
   return index >= 0 ? args[index + 1] : "";
 }
-
-test("lark im adapter shim re-exports the src implementation", () => {
-  assert.equal(shimCreateLarkImAdapter, createLarkImAdapter);
-});
 
 test("single-chat metadata uses the shared bounded naming lookup and discovery name precedence", () => {
   const chatId = "oc_synthetic_metadata";

@@ -6,7 +6,7 @@ import test from "node:test";
 
 import { createLarkImAdapter } from "../src/adapters/lark-im/adapter.mjs";
 import { createSyncRunner } from "../src/adapters/lark-im/sync-runner.mjs";
-import { runLarkImSyncCli } from "../src/cli/lark-im-sync-command.mjs";
+import { runLarkImSyncCli } from "./helpers/sync-command.mjs";
 import {
   ensureInitialized,
   quoteSql,
@@ -223,7 +223,7 @@ test("independent detail retry continues to a healthy root after another root re
     return page([healthyRoot, child]);
   });
   const retried = detailsCli(dbPath, restarted, ["--detail-limit", "2", "--detail-scope", RECEIVED_SCOPE]);
-  assert.equal(retried.exitCode, 1, "remaining detail debt must remain visible in the CLI status");
+  assert.equal(retried.exitCode, 2, "remaining detail debt must remain visible in the CLI status");
   assert.deepEqual(requested, [blockedRoot, healthyRoot].map((root) => `/open-apis/im/v1/messages/${root.message_id}`));
   const after = tasks(dbPath, RECEIVED_SCOPE);
   assert.deepEqual(after.map((task) => [task.message_id, task.status]),
@@ -464,7 +464,7 @@ test("details-only invocation with deferred debt reports incomplete without any 
   sqliteExec(dbPath, "UPDATE lark_im_detail_tasks SET retry_at='2999-01-01T00:00:00.000Z';");
   const prior = tasks(dbPath, RECEIVED_SCOPE)[0];
   const deferred = detailsCli(dbPath, makeRunner(() => assert.fail("deferred detail made a remote request")));
-  assert.equal(deferred.exitCode, 1);
+  assert.equal(deferred.exitCode, 2);
   assert.ok(deferred.summary.details.some((result) => result.pending_details === 1 && result.detail_attempts === 0));
   assert.equal(tasks(dbPath, RECEIVED_SCOPE)[0].attempt_count, prior.attempt_count);
   assert.equal(readScope(dbPath, RECEIVED_SCOPE).cursor, null);

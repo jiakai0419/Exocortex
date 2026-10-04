@@ -4,7 +4,7 @@ This describes the current Node candidate, not production acceptance. [Operation
 
 ## Transactions and leases
 
-Normal sync, discovery and detail completion share `runFenceGuardSql` and a **20-minute hard lease**. The fence executes inside the same `BEGIN IMMEDIATE` transaction as records, statistics, scope state and cursor effects. It checks the running run, source/scope identity, owner and acquisition timestamp, the transaction's SQLite clock, unchanged cursor, and enabled source/scope. An earlier JavaScript check is only an early exit; it cannot replace this guard.
+Normal sync, discovery and detail completion share `runFenceGuardSql` and a **20-minute hard lease**. The fence executes inside the same write transaction as records, statistics, scope state and cursor effects. It checks the running run, source/scope identity, owner and acquisition timestamp, the transaction's SQLite clock, unchanged cursor, and enabled source/scope. An earlier JavaScript check is only an early exit; it cannot replace this guard.
 
 Creating a run and acquiring its lock also require an enabled source/scope. A persisted initial baseline does not authorize a disabled source. Normal sync and bounded replay therefore share the same enable/disable boundary. If disable happens after fetch, writes fail atomically. `failRun` can close an otherwise valid owned run after disable, without saving records or advancing the cursor. Replaced owners, expired hard leases and changed cursors still reject it.
 
@@ -14,11 +14,13 @@ The soft lock expiry, hard lease and process liveness are different evidence. No
 
 ## Module ownership
 
-The stable compatibility entrypoint remains `scripts/lib/ingestion-store.mjs`. Implementation modules depend on the small modules below, never back on the public facade.
+Runtime consumers import the compiled facade `dist/storage/sqlite/ingestion-store.js` directly. Implementation modules depend on the small modules below, never back on the public facade. Explicit initialization lives in `src/storage/sqlite/initialize.ts`; its pre-schema initialization lock and permission setup are shared by initialization callers, not duplicated by the CLI.
 
 | Module under `src/storage/sqlite` | Responsibility |
 | --- | --- |
 | `ingestion-store.ts` | Public facade, initialization/baseline and generic run lifecycle |
+| `initialize.ts` | Explicit schema initialization with its pre-schema lock, private-path setup and restored umask |
+| `maintenance.mjs` | Database checks, backup validation/ownership, run retention and compaction workflows |
 | `ingestion-types.ts` | Shared internal record, scope and result types |
 | `sqlite-executor.ts` | Quoting, JSON, private file permissions and one SQLite subprocess implementation; exec/query select output form |
 | `sync-locks.ts` | Acquisition, recovery and maintenance owner/lease handling |
@@ -63,7 +65,7 @@ Shared classification does not combine time budgets: a CLI subprocess defaults t
 
 Contact/member/application/bot lookup rules belong to the existing name resolver. Record enrichment consumes those rules and maps optional private observations into its existing diagnostics; scope enrichment consumes the adapter's single-chat metadata response. The two workflows retain distinct candidate selection and CAS updates. An explicit application probe bypasses its positive cache, while failed refresh remains unknown and retryable. See [identity and projection](card-and-identity-projection.md) for the complete evidence contract.
 
-Worker and service use one default/validation module with an explicit persistence whitelist. Adaptive options can be installed in the long-running service; `--once`, `--max-cycles` and a diagnostic database override cannot enter its plist. Steps, cycles and `wait-ok` use the same injected observation clock in tests and the system clock by default. Service rollback and diagnostic exit semantics are documented in [Operations](operations.md).
+Worker and service use one default/validation module with an explicit persistence whitelist. Adaptive options and the resolved database path can be installed in the long-running service; `--once` and `--max-cycles` cannot enter its plist. A `status --db` diagnostic override does not change that installed configuration. Steps, cycles and `check --wait` use the same injected observation clock in tests and the system clock by default. Service lifecycle and diagnostic exit semantics are documented in [Operations](operations.md).
 
 Normal message preparation converts each message once. Equal-time/equal-ID candidates retain the previous received-before-sent ordering and stable order within each group, so a same-version duplicate still selects the same final record. The cursor probe recomputes count and order after filtering self messages. Filtered records retain their original page positions; the original-page summary and paging probes still describe the complete upstream page. Test fixture helpers share setup and read-only assertions, while individual synthetic counterexamples remain in their own suites.
 
@@ -75,4 +77,4 @@ The full test command limits concurrent test files to four. Integration fixtures
 
 `npm run build:check` compiles into a newly created temporary directory, compares the complete output file set and bytes with `dist`, and removes its temporary output in `finally`. Missing declarations, stale content and orphan generated files fail the check, even when Git considers `dist` clean. The check does not repair or rewrite `dist`; ordinary `npm run build` does write it. `npm run verify` composes the required development checks without calling service lifecycle operations and belongs in an isolated checkout. The existing runtime maintenance recipe must stop the service before a build or test. History documents remain design records and link here rather than claiming to describe current behavior.
 
-Local synthetic checks do not authorize account queries, production data changes, publication or deployment. Real sender lookup can remain unresolved when remote evidence is insufficient. No Rust rewrite or independent CLI entrypoint migration is introduced by these changes.
+Local synthetic checks do not authorize account queries, production data changes, publication or deployment. Real sender lookup can remain unresolved when remote evidence is insufficient. The Node implementation remains in place; CLI v2 changes its entrypoints while preserving these storage contracts. See [CLI migration](cli-migration.md) for retirement gates and behavior differences.

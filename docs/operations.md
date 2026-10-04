@@ -1,8 +1,8 @@
 # Exocortex Operations
 
-> 本文描述候选代码的操作契约，不代表这些修改已部署或完成真实运行验收。历史 baseline 不能代替当前机器的独立验收。`maintenance-check` 默认包含构建、测试与服务重启，不属于只读诊断。
+> 本文描述候选代码的操作契约，不代表这些修改已部署或完成真实运行验收。历史 baseline 不能代替当前机器的独立验收。CLI v2 的默认检查只读；服务生命周期与开发验证分开。命令与参数以 [生成目录](commands.md) 为准，旧入口和默认差异见 [迁移清单](cli-migration.md)。
 
-显式 `--start` 必须带时区，其起点持久化到 `sources.config_json.initial_sync_start_ms`。空新库省略 `--start` 时，首次运行以当日本地零点建立持久基线；有数据但缺基线的旧库必须显式确认。不同的 `--start` 不能改写已有基线；已有 cursor 继续优先，无 cursor 的 scope 跨日或后来发现时使用同一基线。
+显式 `sync --start` 必须带时区，其起点持久化到 `sources.config_json.initial_sync_start_ms`。空新库省略 `--start` 时，首次运行以当日本地零点建立持久基线；有数据但缺基线的旧库必须显式确认。不同的 `--start` 不能改写已有基线；已有 cursor 继续优先，无 cursor 的 scope 跨日或后来发现时使用同一基线。
 
 这份文档回答一个问题：
 
@@ -30,7 +30,7 @@ npm ci
 npm run verify
 ```
 
-`verify` 是开发配方：顺序运行 build、typecheck、check、test 和 build:check，不调用 service 或 maintenance 命令。构建仍写当前 `dist`，只应在隔离开发 checkout 执行。下文 `maintenance-check` 保留兼容的默认停服/检查/启动流程，不能把它当作这个开发配方的别名。
+`verify` 是开发配方：完成 build、typecheck、syntax、test 和生成物对照，不调用 service 或 maintenance 命令。构建仍写当前 `dist`，只应在隔离开发 checkout 执行。运行维护按下文显式停服、替换已验证候选、启动及验收；检查命令不会代为重启。
 
 自动测试使用合成数据与临时目录。真实同步前由本人安装并授权官方 lark-cli，确认账号、读取范围、数据库路径和带时区的首次起点；凭据与个人运行数据不进入仓库。初始化与同步是显式写操作，默认诊断不会创建 schema。替换运行代码前，应停止旧 worker 并确认子进程退出，保存独立一致性备份与原代码/配置；参见 [Safe Runtime Maintenance](#safe-runtime-maintenance)。后台周期、本地状态、固定窗口覆盖和远端采样分别验收，单个绿灯不能证明全量完整。
 
@@ -45,13 +45,13 @@ npm run help
 查看核心命令入口。
 
 ```bash
-node scripts/messages.mjs --limit 20
+node bin/exocortex.mjs messages --limit 20
 ```
 
 查看最近同步到本地的消息。
 
 ```bash
-node scripts/lark-im-service.mjs status
+node bin/exocortex.mjs status
 ```
 
 查看后台同步服务是否在运行，以及当前同步状态。
@@ -64,7 +64,7 @@ npm run help -- --all
 
 ## Status Model
 
-`lark-im-service status` 的主状态分成四层，避免把进程、同步、实时活动和远端对照混在一起。
+`status` 的主状态分成四层，避免把进程、同步、实时活动和远端对照混在一起。
 
 ### Service
 
@@ -79,9 +79,11 @@ STOPPED  LaunchAgent 未加载，或已加载但 worker 进程没起来。
 
 另有 `UNKNOWN`：无法确认 launchd 状态。只有成功的 `launchctl print` 或明确的 service-not-found 结果才能判定加载或未加载；权限错误、命令启动失败和其他异常不能当作 STOPPED。细节里继续展示 LaunchAgent loaded、PID 和 last exit。
 
-`start` 的成功输出为 `start requested`，表示 bootstrap/kickstart 请求已接受，是否持续运行仍需查看 status 与后续周期。kickstart 失败会非零退出。`stop` 与 `uninstall` 必须确认 job 已不存在；无法检查时失败，uninstall 保留 plist。
+`service install` 只校验并原子保存配置，不启动服务。正在运行的配置若不同则拒绝覆盖，需先显式 stop；相同配置可直接保留。`--db`、日志目录及共同 WorkerConfig 都解析后固化；`--once` / `--max-cycles` 不进入常驻配置。
 
-`install` 在修改前分别读取旧 plist 和 launchd 的 loaded/absent 状态；unknown 或已加载但旧 plist 缺失时拒绝替换。新文件先校验，已加载的旧 job 确认停止后才替换。bootstrap/kickstart 失败时，先确认新 job 已卸载，再恢复旧文件及权限；仅原先 loaded 时重新 bootstrap/kickstart 并确认 loaded，原先 absent 的安装保持 absent。不能确认卸载时仍尝试恢复文件，但不叠加启动；恢复或清理失败会明确报告 `rollback incomplete` / `staging cleanup failed`，不能把磁盘文件恢复当成 launchd 状态恢复。它不会恢复数据库，也不代替后续周期验收。
+`service start` 是 ensure-running：已确认运行时不更换实例；已加载但未运行时请求非强制 kickstart，未加载时 bootstrap 后启动。无法检查时失败。`service restart` 才明确执行 stop → start。启动返回 0 只表示请求已接受，持续运行与新周期用 `check --wait` 验收。
+
+`stop` 与 `uninstall` 必须确认 job absent；unknown 不能冒充停止，uninstall 在停止或确认失败时保留 plist。安装校验、文件替换与回滚失败都显式报告，不把磁盘配置恢复等同于进程恢复。现有安装配置的迁移门槛见 [W](cli-migration.md#worker-切换门槛-w)。
 
 ### Health
 
@@ -93,7 +95,7 @@ CATCHING UP  正在追赶，还不能说完整。
 PROBLEM      当前有需要处理的问题。
 ```
 
-`OK_WITH_HISTORY` 保留为内部诊断事实，历史失败仍在 `sync_runs`。Service 总览把 `NOT_READY / UNKNOWN / NEEDS_ATTENTION` 映射为 `PROBLEM`。观察到同步活动时也可能显示 `OK`，这不证明同步完整；消息质量由独立 quality 检查或 doctor 组合报告。
+`OK_WITH_HISTORY` 保留为内部诊断事实，历史失败仍在 `sync_runs`。Service 总览把 `NOT_READY / UNKNOWN / NEEDS_ATTENTION` 映射为 `PROBLEM`。观察到同步活动时也可能显示 `OK`，这不证明同步完整；`check` 另按本地 ready、零详情欠账、质量和数据库证据验收。
 
 ### Activity
 
@@ -108,7 +110,7 @@ UNKNOWN  缺阶段、过期、进程检查失败、重启身份变化或证据�
 
 锁表示互斥，遗留 running 行和未结束的历史 cycle 都不能单独证明当前活动。当前阶段按日志追加顺序、实例及数据库绑定选择，不按可重置的周期号或最大时间戳猜测。worker 步骤使用真实子进程硬超时；间隔使用下次运行时间。独立前台没有整体硬期限，只在真实阶段转换后的五秒观察窗口内可证明活跃，长阻塞后诚实显示 UNKNOWN。新 worker 启动后才会产生这些阶段；旧日志不能补造它们。
 
-Service STOPPED 仍可同时存在独立前台 Activity SYNCING。`sync-status` 和 doctor 只读取数据库证据，其 `current_activity.evidence=database_only` 不能证明阶段；锁或遗留 run 导致 UNKNOWN，不再声称 currently syncing。Service 另有阶段与 OS 观察，因此可得出更具体结果；这些检查并非原子 OS 快照，期限按最终观察时间校验。公共 JSON 保留兼容 `status`（waiting/stopped 对应 idle），新增精确 `state` 和有限时间证据，不公开进程或原始锁标识。Activity 不证明健康、完整覆盖或远端新鲜度。
+Service STOPPED 仍可同时存在独立前台 Activity SYNCING。共享 sync report 只读取数据库证据，其 `current_activity.evidence=database_only` 不能证明阶段；锁或遗留 run 导致 UNKNOWN，不再声称 currently syncing。Service 另有阶段与 OS 观察，因此可得出更具体结果；这些检查并非原子 OS 快照，期限按最终观察时间校验。公共 JSON 保留兼容 `status`（waiting/stopped 对应 idle），新增精确 `state` 和有限时间证据，不公开进程或原始锁标识。Activity 不证明健康、完整覆盖或远端新鲜度。
 
 ### Freshness
 
@@ -120,26 +122,26 @@ BEHIND   有效样本中发现远端消息尚未入库。
 UNKNOWN  缺缓存、已过期、数据库不匹配、旧缓存或采样无结论。
 ```
 
-Service status 不联网，只读取 `logs/lark-im/live-probe.json`。`doctor --live` 默认只做本次采样；同时加 `--write-live-cache` 才显式写入 v2 缓存。摘要绑定数据库 canonical path 与文件身份的哈希和 `source_id=lark.im`，记录 `recent_hot_messages` 范围、window、sample count、checked_at、expires_at；默认 TTL 为 **五分钟**，不保存 ID、人名、群名、链接或正文。
+`status` 不联网，只读取 `logs/lark-im/live-probe.json`。`check --live` 默认 chat-pages=5、hot-chats=5、messages-per-chat=3，窗口为当日本地零点到调用时刻；只做本次采样；同时加 `--write-live-cache` 才显式写入 v2 缓存。摘要绑定数据库 canonical path 与文件身份的哈希和 `source_id=lark.im`，记录 `recent_hot_messages` 范围、window、sample count、checked_at、expires_at；默认 TTL 为 **五分钟**，不保存 ID、人名、群名、链接或正文。
 
 数据库/来源匹配不等于当前远端账号身份匹配。结果单列 `auth_identity=unknown`，缓存中 `auth_identity_verified=false`；不会额外申请账号授权。切换账号后不得据此复用上一账号 cursor。旧 v1 healthy 缓存不能升级为 SAMPLED；全空样本必须是 INCONCLUSIVE。`restricted_mode` 是被排除会话的原因，与缓存缺失/过期导致的 UNKNOWN 分开解释。
 
 在已授权且能访问 lark-cli Keychain 的环境中，先给 `PROBE_START_ISO`、`PROBE_END_ISO` 设置明确的近期时间窗口，再运行受控采样：
 
 ```bash
-node scripts/doctor.mjs --db /absolute/path/to/exocortex.sqlite \
+node bin/exocortex.mjs check --db /absolute/path/to/exocortex.sqlite \
   --live --chat-pages 1 --hot-chats 1 --messages-per-chat 3 \
   --start "$PROBE_START_ISO" --end "$PROBE_END_ISO" \
   --write-live-cache --format json
 ```
 
-缓存写入执行项目的 `logs/lark-im/live-probe.json`，service 的 log directory 必须对应。去掉 `--write-live-cache` 即仅查看本次结果。有效样本在 service 中显示 SAMPLED，并展示范围、窗口、数量、检查/失效时间及身份未知；五分钟后回到 UNKNOWN 是预期行为。`UNAVAILABLE / keychain_unavailable` 只说明当前 shell 未完成远端采样，不等于后台同步故障。doctor 保留本地 health 证据，但任何子命令非零退出都不能给出绿色整体结果。
+缓存写入安装 root 的 `logs/lark-im/live-probe.json`，service 的 log directory 必须对应。去掉 `--write-live-cache` 即仅查看本次结果。有效样本在 service 中显示 SAMPLED，并展示范围、窗口、数量、检查/失效时间及身份未知；五分钟后回到 UNKNOWN 是预期行为。`UNAVAILABLE / keychain_unavailable` 只说明当前 shell 未完成远端采样，不等于后台同步故障。`check` 保留本地 health 证据，采样不可用或执行失败不能给出绿色整体结果。
 
-Doctor 在公共字段投影前保留子进程退出码。exit 1、启动错误或信号终止即使同时输出健康 JSON，也属于 command failure；quality/live 的 exit 2 可保留结构化诊断，但不能把其中的健康声明当成通过。公共 JSON 包含受限的 `exit_status` 和原因，不保留原始 stderr；合法 delayed 仍展示 delayed。
+`check` 直接调用共享报告，不通过已退役的诊断子 CLI 拼接结果。执行失败、信号、坏 JSON 或有效但未满足的证据不能被健康字段覆盖。公共结果使用有限原因、状态和计数，不透出原始 stderr；本地与远端分项保留各自观察时间。
 
 ### Recent cycles (up to 24h)
 
-`lark-im-service status` 展示请求窗口内保留的 worker 日志证据，不把它当作服务运行时长或完整监控覆盖。
+`status` 展示请求窗口内保留的 worker 日志证据，不把它当作服务运行时长或完整监控覆盖。
 
 ```text
 Statistics range             例如 Today 03:11–07:26 · 4h15m；同日省略重复日期，跨日保留两端。
@@ -159,7 +161,7 @@ Failures                     窗口内失败 cycle、失败 step 和可分类失
 
 `Received scopes` 保留已启用会话总数与尚无消息游标的会话数。`Chat list review`（会话列表盘点，对应 reconcile）展示名单盘点状态及快照的 `completed_at`；没有完成时间证据时明确未知，不能用后来更新游标的时间替代。`Active chat refresh`（活跃会话刷新，对应 hot discovery）显示最近一次成功刷新时间，不把它叫作任务开始时间或最新消息时间。分页等技术字段仍保留在详细诊断中，不增加重复会话计数。
 
-这两种发现当前默认都通过 `im +chat-list --as user --exclude-muted --types group,p2p --sort active_time --page-size 100` 读取未静音群聊和私聊名单，并不是无限范围的全部会话。reconcile 默认每个 cycle 续读一页，直到 `has_more=false`，最后一页成功后在事务中记录完成时间；完成后至少间隔配置的复核周期（默认 24 小时）再开始。hot discovery 每个 cycle 从首页刷新，代码默认最多五页；当前部署通过 `--hot-discovery-pages-per-cycle 1` 限为一页，这不是代码默认值。它展示拉取成功后、提交前采集并随成功事务保存的刷新时间。两者都只是会话名单，不表示这些会话的消息已扫描完整。
+这两种发现当前默认都通过 `im +chat-list --as user --exclude-muted --types group,p2p --sort active_time --page-size 100` 读取未静音群聊和私聊名单，并不是无限范围的全部会话。reconcile 默认每个 cycle 续读一页，直到 `has_more=false`，最后一页成功后在事务中记录完成时间；完成后至少间隔配置的复核周期（默认 24 小时）再开始。hot discovery 每个 cycle 从首页刷新，代码默认最多五页；显式 `--hot-discovery-pages-per-cycle 1` 可限为一页；这不是代码默认值。它展示拉取成功后、提交前采集并随成功事务保存的刷新时间。两者都只是会话名单，不表示这些会话的消息已扫描完整。
 
 整体 `Health` 只在 Overview 显示一次。正常租约不另列 `Locks`，也不作为 Activity 正判。过期、超过硬期限、未来开始时间或无效时间区间等已有时间戳证据会显示原因与诊断检查建议；过期不能证明进程已死亡，租约存在也不能证明进程存活或存在等待。没有阻塞证据时不声称正在等待，不猜等待时长。详细诊断仍保留原有数量、时间等信息，不默认增加原始持有者标识。
 
@@ -180,34 +182,38 @@ rate_limited
 可以用下面命令查看最近历史失败的分类：
 
 ```bash
-node scripts/lark-im-service.mjs status
-node scripts/lark-im-quality.mjs
-node scripts/sync-status.mjs
+node bin/exocortex.mjs status
+node bin/exocortex.mjs check
+node bin/exocortex.mjs status --detail
 ```
 
 ## Read-only Diagnostics and Explicit Repair
 
-默认 `sync-status`、`doctor`、`lark-im-quality`、`messages`、`lark-im-service status` 的 SQLite 查询使用已有库上的 `-readonly` 与 `query_only`，不 recovery、不执行 DDL/DML、不 chmod、不写 freshness cache。缺库或缺表会失败，不自动初始化。Messages 仍是展示本人私有内容的阅读入口。`--live` 与 lag-check 会读取远端，显式缓存写入另由 `--write-live-cache` 控制。
+默认 `status`、`messages` 和 `check` 在既有库上只读查询，不 recovery、DDL/DML、chmod、写缓存或控制服务。缺库或缺表会失败，不自动初始化。Messages 保留私有正文；`status --logs` 显式增加私有日志，默认摘要和 JSON 是白名单投影。
 
-Doctor 的 LOCAL_READY 只表示本地证据；CATCHING_UP 表示本地追赶事实；旧式仅凭 run/lock 的 SYNCING 会降为 UNKNOWN；NOT_READY/UNKNOWN/NEEDS_ATTENTION 不能作为完成验收。空库或缺少发现/成功消息 scope 证据是 NOT_READY，只有失败记录是 NEEDS_ATTENTION。非空有界 live 样本通过时可显示 SAMPLED；若本地仍在追赶或缺少当前活动证据，overall 保留相应的 CATCHING_UP / UNKNOWN 状态，live 部分单独展示样本。
+`check` 固定聚合 database、sync、quality 三块。默认通过要求本地 ready（内部 ok/ok_with_history）、详情证据可用且 pending=0、质量与数据库通过，不要求服务运行。catching_up、未满足或证据不足返回 2；参数、必需依赖、读取/执行失败返回 1。成功读取的 `status` 可以返回 0 而 Health 为 PROBLEM；这与严格验收不同。
+
+四种显式扩展为 `--live`、`--through`、`--backup` / `--latest-backup`、`--wait`。先校验所有参数和所需依赖；需要等待时先等待，再取得最终本地快照，检查 coverage/backup，最后 live，只有显式要求才写 cache。等待失败保留本地证据，live/cache 标记 skipped。Sync 的欠债、列表水位、runs、locks 仍来自同一 SQLite 快照；其他分项注明各自时点。
+
+`--wait` 默认每 5 秒轮询，最多 180 秒，要求运行中的服务、调用后新的完整成功 cycle、无 in_progress/unfinished，且最终本地验收通过。旧成功、有效锁或启动请求接受都不能替代新周期。它不 start 或 restart；没有服务时用默认 check 验本地事实。
 
 只读查看遗留锁/run 的结构计数：
 
 ```bash
-node scripts/sync-repair.mjs --db /absolute/path/to/exocortex.sqlite --format json
+node bin/exocortex.mjs maintenance repair --db /absolute/path/to/exocortex.sqlite --format json
 ```
 
 预览不判断 owner 存活，也不代表候选一定会被修复。确认需要恢复、停止 worker 并确认无并行同步/维护后，再显式执行：
 
 ```bash
-node scripts/sync-repair.mjs --db /absolute/path/to/exocortex.sqlite --apply --format json
+node bin/exocortex.mjs maintenance repair --db /absolute/path/to/exocortex.sqlite --apply --format json
 ```
 
-Apply 在事务中检查 owner/lease/run 条件并报告实际变更计数，不回灌旧库或回退 cursor。默认只读诊断不调用 recovery；同步写路径在取得 scope 锁前仍会执行该 scope 的 stale recovery，显式 repair 不是唯一恢复入口。Service 的 `--db` 只支持 status/wait-ok 并传入诊断查询，不改变已安装 worker 的配置。
+Apply 在事务中检查 owner/lease/run 条件并报告实际变更计数，不回灌旧库或回退 cursor。默认只读诊断不调用 recovery；同步写路径在取得 scope 锁前仍会执行该 scope 的 stale recovery，显式 repair 不是唯一恢复入口。`status --db` 与 `check --db` 只改变诊断目标，不改变已安装 worker 配置；与服务实际数据库的匹配未知时如实报告。
 
 ## Initial Catch-Up Done
 
-初始追赶完成需要同时满足发现、进度和实际扫描覆盖要求；单独的 doctor 绿灯或 cursor 终点不足以证明首日没有遗漏：
+初始追赶完成需要同时满足发现、进度和实际扫描覆盖要求；单独的本地 check 通过或 cursor 终点不足以证明首日没有遗漏：
 
 ```text
 received_without_cursor = 0
@@ -216,15 +222,15 @@ source.initial_sync_start_ms = 已确认的持久基线
 各启用 sent/received scope 的成功窗口从基线连续覆盖到固定验收终点
 ```
 
-每次验收固定自己的终点。工具检查成功 run 的实际 `window_start` / `window_end` 及前后 cursor；允许边界重放和重叠，缺口、失败窗口或缺少证据不能算完成。禁用/不支持 scope 单独列出。候选版本的 doctor、sync-status 和 service status 已移除 recovery，但仍不能替代覆盖验收。
+每次验收固定自己的终点。工具检查成功 run 的实际 `window_start` / `window_end` 及前后 cursor；允许边界重放和重叠，缺口、失败窗口或缺少证据不能算完成。禁用/不支持 scope 单独列出。默认 check 与 status 不执行 recovery，但仍不能替代覆盖验收。
 
 先将 `COVERAGE_TARGET_ISO` 设置为带时区的验收终点，再使用项目内的只读验收工具：
 
 ```sh
-python3 -B scripts/lark-im-coverage-check.py --target "$COVERAGE_TARGET_ISO"
+node bin/exocortex.mjs check --through "$COVERAGE_TARGET_ISO"
 ```
 
-`--db` 默认定位脚本所在项目的 `data/exocortex.sqlite`；起点自动读取该库的持久基线，`--target` 必须是显式带时区的 ISO 时间且晚于起点。以后部署应选择自己的目标时间，不复用历史验收日期。退出码 `0` 表示完整覆盖，`2` 表示未完成或检查错误；结合聚合 JSON 中原因判断。缺库或缺基线时失败，工具不负责 seed、不创建数据库，也不修改权限、游标或运行状态。新库的基线由首次同步初始化。
+默认 DB 相对安装 root 为 `data/exocortex.sqlite`；显式相对 `--db` 按当前 cwd 解析。`--through` 必须是带时区的固定 ISO 终点且晚于持久基线，等待期间也不漂移。内部唯一 Python 覆盖实现从保留的成功窗口独立取证；主命令把未完成映射为 2，读取/依赖/解析错误映射为 1，并保留 coverage 分项。缺库或缺基线不会 seed、建库、改权限或游标。
 
 ## Restart After Downtime
 
@@ -265,185 +271,71 @@ periodic reconcile     -> 定期完整复核会话集合，处理冷门会话和
 
 ## Safe Runtime Maintenance
 
-当前 LaunchAgent 直接运行工作区里的脚本和 `dist` 文件。修改这些 runtime 路径时，如果 worker 正好在中间态 import 文件，可能出现一次短暂失败。失败不会推进错误 Cursor，但会污染最近 worker 日志，也会让维护过程更难判断。
+开发验证、运行代码切换、服务重启和运行验收是四个明确步骤。`npm run verify` 会写当前 `dist`，应先在隔离 checkout 完成；`check` 只读已有运行证据，不构建、不修复、不重启。开发任务见 [Development](development.md)。
 
-因此，凡是改这些路径，先暂停 worker：
-
-```text
-scripts/
-src/
-dist/
-package.json
-tsconfig*.json
-migrations/
-```
-
-推荐维护流程：
+运行 worker 会继续 import 安装根中的 `bin`、`src`、`dist` 和配置。不要逐文件覆盖仍在运行的代码。授权切换时先保存原代码与配置、独立一致性数据库备份，再停止旧 worker 并确认其子进程和独立前台同步均已退出：
 
 ```bash
-node scripts/lark-im-service.mjs stop
+node bin/exocortex.mjs service stop
+node bin/exocortex.mjs status
 ```
 
-确认服务真的卸载：
+`stop` 必须确认 absent；权限不足或 unknown 时停止切换，不能继续改运行文件。launchd 停止不证明独立前台同步已退出；还应核对进程身份与写入 fence，确认没有活跃写者。未知任务不能强杀，证据不足时停止切换。随后一次性放入已经验证的完整候选；若变更安装配置，用明确参数执行 `service install`，它只安装不启动。还需核对已安装 plist 的 worker 路径及完整参数，不能仅凭生成器的合成测试宣称真实切换完成。
 
 ```bash
-node scripts/lark-im-service.mjs status
+node bin/exocortex.mjs service start
+node bin/exocortex.mjs check --wait --timeout-seconds 180
+node bin/exocortex.mjs status --detail
 ```
 
-预期 `LaunchAgent / Loaded` 显示 `NOT LOADED`。如果 `stop` 报 `Operation not permitted`，说明当前 shell 没有权限卸载 LaunchAgent；不要继续改 runtime 路径，先切到有权限的普通终端或授权当前操作。
+检查失败时保留分项证据；不要把启动请求接受当作验收。需要回退时恢复此次切换前的代码和配置，**不覆盖回灌旧数据库**，避免丢失运行期间的新记录和游标进度。唯一旧 worker 桥的删除条件见 [迁移清单](cli-migration.md#worker-切换门槛-w)。
 
-然后修改代码并跑检查：
+### 检查、重启、等待分别执行
+
+只做当前本地检查：
 
 ```bash
-npm run typecheck
-npm run check
-npm test
-npm run build:check
+node bin/exocortex.mjs check
 ```
 
-检查通过后重新启动并等待一个新的完整成功 cycle：
+确实要更换运行实例时，明确重启，再等待调用后的新周期：
 
 ```bash
-node scripts/lark-im-service.mjs start
-node scripts/lark-im-service.mjs wait-ok
+node bin/exocortex.mjs service restart
+node bin/exocortex.mjs check --wait
 ```
 
-最后复查：
+远端采样另行显式请求；无授权、零样本或请求失败都不能当作通过：
 
 ```bash
-node scripts/doctor.mjs
-node scripts/lark-im-service.mjs status
+node bin/exocortex.mjs check --live
 ```
 
-如果只修改文档、测试或不会被 worker import 的旁路工具，可以不暂停 worker。但一旦不确定，就按上面的维护流程处理。
+服务已停止而希望保持停止时，只运行默认 `check`。没有 `check --restart`、`check --all` 或隐藏的构建/重启配方。需要等待后同时验证固定目标和样本，可以组合 `check --wait --through "$COVERAGE_TARGET_ISO" --live`；终点固定，等待失败后不继续远端采样或写缓存。
 
-写入 SQLite 私有库的维护动作必须通过全局 maintenance lock，避免维护命令和后台同步同时写库，制造 `database is locked` 的瞬时失败。典型写库维护包括：
+### 业务数据维护
+
+`maintenance init` 和 `maintenance backup` 是明确写操作。其他维护动词默认预览，审阅后加 `--apply` 才写；enrich/replay 的预览仍会读取有界远端数据，不能当作离线模拟。记录和 scope 补全必须明确目标，没有隐式 all：
 
 ```bash
-node scripts/lark-im-enrich-scopes.mjs --limit 100
-node scripts/lark-im-enrich-records.mjs --limit 3000 --probe-apps
-node scripts/sqlite-maintenance.mjs prune-runs --apply
+node bin/exocortex.mjs maintenance enrich --target scopes --limit 50
+node bin/exocortex.mjs maintenance enrich --target scopes --limit 50 --apply
+node bin/exocortex.mjs maintenance enrich --target records --limit 100 --probe-apps
+node bin/exocortex.mjs maintenance enrich --target records --limit 100 --probe-apps --apply
 ```
 
-这些命令会在写库前获取全局维护锁。维护锁存在时，worker 的 sync step 会跳过本轮而不是创建 failed run；如果维护命令启动时已经有 active sync lock，它会失败并提示稍后重试。
+远端解析发生在锁外，实际提交才取短维护锁并在同一事务内复查 lease、原快照和 CAS。维护锁使 worker 跳过当前写步骤，不制造 failed run；已有 sync lock 时维护操作失败并提示稍后重试。初始化需要 schema 前独立锁，不套用尚不存在的维护表。
 
-常规流程可以不手动停止 worker：
+常规备份和预览：
 
 ```bash
-node scripts/sqlite-maintenance.mjs backup
-node scripts/sqlite-maintenance.mjs verify --latest
-node scripts/sqlite-maintenance.mjs prune-runs --apply
-node scripts/sqlite-maintenance.mjs check
-node scripts/doctor.mjs
+node bin/exocortex.mjs maintenance backup
+node bin/exocortex.mjs check --latest-backup
+node bin/exocortex.mjs maintenance prune-runs
+node bin/exocortex.mjs maintenance compact
 ```
 
-如果连续遇到 active sync lock，或者要执行较长时间的 repair，再使用保守流程：
-
-```bash
-node scripts/lark-im-service.mjs stop
-```
-
-执行写库维护和检查：
-
-```bash
-node scripts/sqlite-maintenance.mjs backup
-node scripts/sqlite-maintenance.mjs verify --latest
-node scripts/sqlite-maintenance.mjs prune-runs --apply
-node scripts/sqlite-maintenance.mjs check
-```
-
-然后恢复并等待一个新成功 cycle：
-
-```bash
-node scripts/lark-im-service.mjs start
-node scripts/lark-im-service.mjs wait-ok
-node scripts/doctor.mjs
-```
-
-全局维护锁有 TTL。正常退出会释放；异常退出后，后续维护或 worker 会在 TTL 过期后回收。
-
-### Maintenance Check Command
-
-为了避免每次维护后靠人记住一串验收命令，项目提供一个非日常维护入口：
-
-```bash
-node scripts/maintenance-check.mjs
-```
-
-它不会进入默认三命令，只出现在完整命令目录：
-
-```bash
-npm run help -- --all
-```
-
-默认流程：
-
-```text
-git status
-node scripts/lark-im-service.mjs stop
-npm run check
-npm run build:check
-npm run typecheck
-npm test
-node scripts/lark-im-service.mjs start
-node scripts/lark-im-service.mjs wait-ok
-node scripts/doctor.mjs
-node scripts/lark-im-service.mjs status
-```
-
-`git status` 只提示工作区是否干净，不作为失败。`check` 与 `test` 会构建当前 `dist`；`build:check` 仅在临时目录构建并比较。维护流程必须先成功 stop，再执行本地检查。stop 无法确认时不构建；构建或检查失败后不启动部分生成的代码，服务保持停止，报告后续步骤 skipped。检查通过后才 start、`wait-ok`、`doctor` 和最终 `status`。这会产生明确维护停机窗口；独立前台同步应按 Safe Runtime Maintenance 另外结束，launchd stop 不代表不存在独立前台进程。
-
-需要真实远端对照时加：
-
-```bash
-node scripts/maintenance-check.mjs --live
-```
-
-`--live` 会额外运行 `node scripts/doctor.mjs --live`，需要当前 shell 能访问 `lark-cli` auth/keychain；它不会自动刷新 service freshness 缓存。服务已停止且希望保持停止时，可运行检查和诊断：
-
-```bash
-node scripts/maintenance-check.mjs --no-restart
-```
-
-此时先用 launchd 检查确认 job absent，才允许本地构建；loaded 或 unknown 会失败且跳过构建，不擅自 stop。若本地检查已独立完成、只需在运行服务上诊断，使用 `--no-restart --skip-local-checks`。最终 status 仍保留 STOPPED 的非零语义，不把未运行服务算作维护验收通过。
-
-`maintenance-check --live` 内部使用 JSON 形式读取 live doctor 结果，只保留 public-safe 的结构化摘要，例如：
-
-```text
-overall
-live_status
-live_reason
-live_missing_count
-live_lag_ms
-live_exit_status
-command_exit_status
-findings_count
-```
-
-所有步骤的 JSON 与文本输出都只保留命令、状态、耗时、退出码和受限分类；原始 stdout/stderr（包括 npm、git、service 和解析失败的 doctor 输出）不进入公共报告。Live 摘要的枚举、数值均校验，findings 仅保留数量，避免任意子命令文本绕过边界。需要排查具体构建输出时，在合适的私有终端单独运行报告中的失败命令。
-
-如果 `doctor` 或 `doctor --live` 失败，`maintenance-check` 仍会继续运行最后的：
-
-```bash
-node scripts/lark-im-service.mjs status
-```
-
-这样可以区分“后台同步服务已经坏了”和“诊断/live probe 本身失败”。本命令目前不对 live probe 自动重试；如果失败，需要先看结构化原因，再决定是否重跑或修复。
-
-`maintenance-check` 不直接修复消息记录，但会构建、测试并默认重启 worker；worker 恢复后正常写库，因此这不是只读入口。若它因为 data quality 失败，先显式运行对应 maintenance repair，例如：
-
-```bash
-node scripts/lark-im-enrich-scopes.mjs --limit 100
-node scripts/lark-im-enrich-records.mjs --limit 3000 --probe-apps
-```
-
-然后重新运行：
-
-```bash
-node scripts/maintenance-check.mjs --live
-```
-
-这样可以把“验收失败”和“修复动作”分开，避免后台验收命令悄悄写入私有运行数据。
+确认计划后再对相应动作加 `--apply`。连续锁冲突或较长修复可先显式 stop，检查无独立同步后维护，完成再 start 和 `check --wait`。维护锁有 TTL，正常退出释放；过期只是恢复条件之一，不证明 owner 已死。
 
 ## Public-Safe Command Output
 
@@ -454,34 +346,33 @@ product output      为本机使用者展示真实消息，例如 messages。
 diagnostic output   为维护、验收、排障展示系统状态。
 ```
 
-`node scripts/messages.mjs --limit 20` 是产品阅读命令，会显示本地消息内容、群名和人员名。它的输出默认不适合复制到公开 issue、文档或 CI 日志。
+`node bin/exocortex.mjs messages --limit 20` 是产品阅读命令，会显示本地消息内容、群名和人员名。它的输出默认不适合复制到公开 issue、文档或 CI 日志。
 
-维护和诊断命令默认应该 public-safe，只展示状态、计数、时间、脱敏原因和必要摘要，不展示真实 chat id、人名、群名、应用名、链接或消息正文。当前这类命令包括：
+诊断与维护默认只展示状态、计数、时间和有限原因，不输出真实身份、姓名、正文或原始错误 payload：
 
 ```bash
-node scripts/doctor.mjs
-node scripts/doctor.mjs --live
-node scripts/sync-status.mjs
-node scripts/lark-im-service.mjs status
-node scripts/lark-im-quality.mjs
-node scripts/lark-im-lag-check.mjs
-node scripts/lark-im-enrich-records.mjs
-node scripts/lark-im-enrich-scopes.mjs
-node scripts/maintenance-check.mjs
+node bin/exocortex.mjs status
+node bin/exocortex.mjs status --detail --format json
+node bin/exocortex.mjs check
+node bin/exocortex.mjs check --live
+node bin/exocortex.mjs maintenance enrich --target records
+node bin/exocortex.mjs maintenance enrich --target scopes
 ```
+
+`status --logs --lines 20` 是显式私有日志读取，帮助和输出都标为 private。默认 status JSON 不暴露 launchctl 原文、内部 cache_path 或原始报告。
 
 少数命令支持显式打开本地明细：
 
 ```bash
-node scripts/lark-im-lag-check.mjs --unsafe-details
-node scripts/lark-im-enrich-records.mjs --unsafe-details
+node bin/exocortex.mjs check --live --unsafe-details
+node bin/exocortex.mjs maintenance enrich --target records --unsafe-details
 ```
 
 `--unsafe-details` 的含义是：输出可能包含真实本地 ID、群名、人名、应用名、消息片段或远端错误细节，只能用于本机临时排障，不要复制进公开仓库、CI artifact 或聊天记录。
 
 ## SQLite Private Durability
 
-候选版本的 backup v2 manifest 绑定源库身份；保留清理只处理经过验证且属于该源库的备份，不扫描删除同目录任意 SQLite。无归属信息的 legacy 备份不参与自动清理或 latest 选择，只能显式指定路径 verify。Records/scopes 富化使用条件写入，快照已变化时记录冲突而不覆盖新状态。富化的 `--dry-run` 不写库，但仍可能调用只读远端 API，不是离线模拟。
+候选版本的 backup v2 manifest 绑定源库身份；保留清理只处理经过验证且属于该源库的备份，不扫描删除同目录任意 SQLite。无归属信息的 legacy 备份不参与自动清理或 latest 选择，只能显式 `check --backup <path>` 验证。Records/scopes 富化使用条件写入，快照已变化时记录冲突而不覆盖新状态。富化默认预览不写库，但仍可能调用只读远端 API，不是离线模拟。
 
 本地 SQLite 是当前衍我的私有记忆库。同步链路健康之后，需要定期确认它本身没有损坏，并且能生成可验证的本地备份。
 
@@ -494,11 +385,11 @@ npm run help -- --all
 当前维护入口：
 
 ```bash
-node scripts/sqlite-maintenance.mjs check
-node scripts/sqlite-maintenance.mjs backup
-node scripts/sqlite-maintenance.mjs verify --latest
-node scripts/sqlite-maintenance.mjs prune-runs
-node scripts/sqlite-maintenance.mjs compact
+node bin/exocortex.mjs check
+node bin/exocortex.mjs maintenance backup
+node bin/exocortex.mjs check --latest-backup
+node bin/exocortex.mjs maintenance prune-runs
+node bin/exocortex.mjs maintenance compact
 ```
 
 `check` 会检查：
@@ -520,7 +411,7 @@ backups/private/
 
 `backup` 会先取得全局 maintenance lock，生成一致快照，移除快照里的临时 lock，再写入同名的私有 manifest。manifest 记录快照自身的 SHA-256、大小和创建时计数；备份和 manifest 均强制为 `0600`。新建备份目录以 `0700` 创建；已有目录必须是真目录、不能是符号链接、不能允许组或其他用户写入，代码不会把已有 `0755` 目录自动改成 `0700`。只有新快照完整通过 integrity、计数和 manifest 校验后才会执行保留清理；失败的新快照会被丢弃，不能挤掉旧的可用恢复点。默认保留最近 7 份且不超过 30 天，可用 `--backup-keep-count` / `--backup-keep-days` 调整。
 
-`verify --latest` 会打开最新备份，重新跑 integrity / foreign-key check，并核对该快照自己的 manifest、SHA-256、大小和计数。它不再把历史快照和持续变化的当前数据库比较，因此当前库后来新增消息不会让有效旧备份误报失败；备份内容即使保持行数不变，只要发生变化也会被 hash 检出。没有 manifest 的旧备份会明确报告为不可验证，而不是冒充验证成功。输出只包含状态、相对路径、计数和校验结果，不展示消息内容、人名、群名、链接或 raw payload。
+`check --latest-backup` 会打开最新同源备份，重新跑 integrity / foreign-key check，并核对该快照自己的 manifest、SHA-256、大小和计数。它不再把历史快照和持续变化的当前数据库比较，因此当前库后来新增消息不会让有效旧备份误报失败；备份内容即使保持行数不变，只要发生变化也会被 hash 检出。没有 manifest 的旧备份会明确报告为不可验证，而不是冒充验证成功。显式 `check --backup <path>` 在源库缺失或损坏时仍独立校验副本；源库失败使总体退出 1，但不抹去 `checks.backup` 结果。legacy v1 有效副本可显式验证，归属不能证明时为 unknown，不进入 latest 或同源清理。输出只包含状态、相对路径、计数和校验结果，不展示消息内容、人名、群名、链接或 raw payload。
 
 `prune-runs` 用来控制 `sync_runs` 的长期增长。规则保持简单：
 
@@ -530,19 +421,19 @@ backups/private/
 
 也就是处理空轮询和 duplicate-only 轮询，但必须同时满足：没有写入、没有更新，且没有被任何 scope 当作 `last_success_run_id` 引用。它不删除 `running`、`failed`、`cancelled`、有实际数据变化的成功 run，或当前 scope 引用的最新成功 run。后台 worker 默认每 1440 个 cycle 自动执行一次该保留策略，避免运行历史再次无限增长。
 
-默认只 dry-run：
+默认只预览：
 
 ```bash
-node scripts/sqlite-maintenance.mjs prune-runs
+node bin/exocortex.mjs maintenance prune-runs
 ```
 
 确认候选数量合理后，才显式执行：
 
 ```bash
-node scripts/sqlite-maintenance.mjs prune-runs --apply
+node bin/exocortex.mjs maintenance prune-runs --apply
 ```
 
-`prune-runs --apply` 只删除运行日志，不删除 `records` 消息事实，也不推进或修改 cursor。它会通过全局 maintenance lock 和后台同步写入互斥；如果正好有 active sync lock，稍后重试即可。删除后的空闲页不会自动缩小文件；需要实际回收空间时，显式运行 `node scripts/sqlite-maintenance.mjs compact`，该动作同样受 maintenance lock 保护。
+`prune-runs --apply` 只删除运行日志，不删除 `records` 消息事实，也不推进或修改 cursor。它会通过全局 maintenance lock 和后台同步写入互斥；如果正好有 active sync lock，稍后重试即可。删除后的空闲页不会自动缩小文件；需要实际回收空间时，显式运行 `node bin/exocortex.mjs maintenance compact --apply`，该动作同样受 maintenance lock 保护。
 
 SQLite 数据库、WAL/SHM、备份、worker 日志和 live probe cache 都属于私有运行数据。写路径负责私有权限初始化；默认诊断和缓存读取不 chmod。显式缓存写入使用 `0700` 目录及 `0600` 文件。LaunchAgent 同时配置 `Umask=63`；worker JSONL 按 10 MiB 轮转并默认保留 5 个历史文件，launchd stdout 指向 `/dev/null`，避免和 `worker.jsonl` 重复落盘。
 
@@ -551,16 +442,16 @@ SQLite 数据库、WAL/SHM、备份、worker 日志和 live probe cache 都属�
 先看总状态：
 
 ```bash
-node scripts/doctor.mjs
+node bin/exocortex.mjs check
 ```
 
 如果想对比远端热消息：
 
 ```bash
-node scripts/doctor.mjs --live
+node bin/exocortex.mjs check --live
 ```
 
-如果 `--live` 显示 `UNAVAILABLE / keychain_unavailable`，说明当前 shell 读不到 keychain。它不是同步系统故障，但失败的采样子命令使 doctor 整体非零退出；本地 health 证据仍单独保留。需要真实 live 验证时，在能访问 keychain 的普通终端环境里运行同一个命令。
+如果 `--live` 显示 `UNAVAILABLE / keychain_unavailable`，说明当前 shell 读不到 keychain。它不是同步系统故障，但采样不可用或失败使 check 整体非零退出；本地 health 证据仍单独保留。需要真实 live 验证时，在能访问 keychain 的普通终端环境里运行同一个命令。
 
 新增自动化测试输入必须从零构造，使用假 CLI 与临时数据库；真实运行数据及其脱敏派生样例不得作为测试输入。
 
@@ -577,12 +468,12 @@ Received chat scope 的列表读取可能进入 unsupported 状态。它表示�
 - `bot_user_out_of_chat`：lark-cli 返回 `230002` / `Bot/User can NOT be out of the chat.`。同步器不推断用户是退群、被移出，还是切换身份；只按 lark-cli 的实际返回记录。
 - `restricted_mode`：飞书返回保密模式/不允许复制转发一类错误。
 
-这些 scope 不应该让 worker 每轮失败。它们会出现在 `node scripts/lark-im-service.mjs status` 和 `node scripts/lark-im-quality.mjs` 的 unsupported reasons 中，用于诊断。
+这些 scope 不应该让 worker 每轮失败。它们会出现在 `node bin/exocortex.mjs status` 和 `node bin/exocortex.mjs check` 的 unsupported reasons 中，用于诊断。
 
 看后台服务：
 
 ```bash
-node scripts/lark-im-service.mjs status
+node bin/exocortex.mjs status
 ```
 
 `status` 会同时展示三层信息：
@@ -590,60 +481,59 @@ node scripts/lark-im-service.mjs status
 ```text
 LaunchAgent -> 后台服务是否被 macOS 托管、PID、退出码
 Sync        -> 本地同步状态、records、scopes、discovery/reconcile
-Worker      -> 最近完整 cycle、最近 step、是否正在跑、最近失败、日志路径
+Worker      -> 最近完整 cycle、最近 step、当前活动及有限失败摘要
 ```
 
 ### Data Quality
 
 Sender name quality 分三类：
 
-- actionable sender gaps：用户 sender 缺名，或应用 sender 还没有被 resolver 判定为无法安全解析。它们会让 `doctor` 进入 `NEEDS ATTENTION`。
+- actionable sender gaps：用户 sender 缺名，或应用 sender 还没有被 resolver 判定为无法安全解析。它们使 `check` 的 quality 分项不能通过。
 - system senderless messages：飞书系统消息天然可能没有 sender，不算同步故障。
 - unresolved app sender names：官方应用 API 无权限，且会话机器人列表无法唯一匹配时，不强行猜名字；保留 unresolved 标记，作为质量报告里的 advisory。
 
 看最近 worker 日志：
 
 ```bash
-node scripts/lark-im-service.mjs tail
+node bin/exocortex.mjs status --logs --lines 20
 ```
 
 重启后台服务：
 
 ```bash
-node scripts/lark-im-service.mjs restart
+node bin/exocortex.mjs service restart
 ```
 
 重启后等待一个完整成功 cycle：
 
 ```bash
-node scripts/lark-im-service.mjs wait-ok
+node bin/exocortex.mjs check --wait
 ```
 
 ## Acceptance Check
 
 候选代码需独立部署验收。
 
-当初始 catch-up 完成，v0 可以用这组命令验收：
+开发检查先在隔离 checkout 运行 `npm run verify`。部署后另在授权环境执行本地、新周期、固定目标和可选远端验收：
 
 ```bash
-npm test
-npm run check
-node scripts/doctor.mjs
-node scripts/doctor.mjs --live
-node scripts/messages.mjs --limit 20
-node scripts/lark-im-service.mjs status
-node scripts/lark-im-service.mjs wait-ok
+node bin/exocortex.mjs check
+node bin/exocortex.mjs check --wait
+node bin/exocortex.mjs check --through "$COVERAGE_TARGET_ISO"
+node bin/exocortex.mjs check --live
+node bin/exocortex.mjs messages --limit 20
+node bin/exocortex.mjs status --detail
 ```
 
 预期：
 
 - 测试和检查通过。
-- `doctor` 的本地证据为 LOCAL_READY；NOT_READY/UNKNOWN/NEEDS_ATTENTION 不算完成。
+- `check` 的 database/sync/quality 均通过；unknown、欠债、catching_up 或质量问题不能作为验收完成。
 - 固定终点的 coverage-check 确认成功窗口连续覆盖，单次成功 cycle 不足以证明完整。
-- `doctor --live` 获得非空、窗口明确、无 missing 的样本；全空、不可用和错误均不能算远端通过。
+- `check --live` 获得非空、窗口明确、无 missing 的样本；全空、不可用和错误均不能算远端通过。
 - 如需 service 展示样本，显式写缓存并在五分钟内检查 SAMPLED 及范围，当前认证主体仍未知。
-- `sync-status` 中 `Discovery`、`Hot discovery`、`Reconcile` 分别能看出 initial、hot 和周期复核状态。
-- `lark-im-service status` 中 `Worker` 区域能看出最近 cycle 在持续推进。
+- `status --detail` 中 `Discovery`、`Hot discovery`、`Reconcile` 分别能看出 initial、hot 和周期复核状态。
+- `status` 中 `Worker` 区域能看出最近 cycle 在持续推进。
 - 最近消息能正常展示发送人、群名和消息内容。
 - 后台服务是 active。
 
@@ -678,7 +568,7 @@ node scripts/lark-im-service.mjs wait-ok
 
 联系人按 30 个 ID 一批，显式请求 page-size 30，避免 CLI 默认只返回 20 条且不自动翻页。消息搜索按官方上限最多 30 条，received 历史仍最多 50 条；原有游标分页、时间窗口和过滤不变。resolver 只在内存缓存成功解析的直接 user/app/chat-member 名称：总容量 1000、TTL 5 分钟，成员按会话隔离，不缓存失败或机器人推断。
 
-worker 默认仍使用固定批量；显式 `--adaptive-fair` 才启用自适应。前台 worker 与 `lark-im-service install` 使用相同默认值、正整数及参数关系校验；以下参数可用于任一入口：
+worker 默认仍使用固定批量；显式 `--adaptive-fair` 才启用自适应。前台 worker 与 `service install` 使用相同默认值、正整数及参数关系校验；以下参数可用于任一入口：
 
 ```sh
 --received-scopes-per-cycle 25 --interval-seconds 30 \
@@ -690,7 +580,7 @@ worker 默认仍使用固定批量；显式 `--adaptive-fair` 才启用自适应
 
 `summary.transport` 的 calls/attempts/retries 是外层 CLI 命令计数，不是 HTTP 请求数。worker 的 scheduler 事件记录有效批量、下一批量、决策原因和耗时。正常摘要以及出错时的专用 transport 摘要都保留脱敏计数和操作冷却，不写远端正文、token 或真实资源 ID。
 
-调整 LaunchAgent 前应停止单实例、检查子进程退出、用 SQLite 原生 backup 保存独立副本，并备份当前代码及 plist。`service install` 将共同配置及 adaptive 开关、min、max、target 写入 plist；`start/restart` 沿用已安装配置。重新 install 时应显式提供要保留的非默认参数。`--once` 与 `--max-cycles` 仅用于前台 worker，service 拒绝这两个参数，持久化白名单也不会包含它们。`--db` 仍仅用于 service 的 status/wait-ok，不改变后台数据库。部署后以新 PID、多个完整周期、只读数据库与固定目标覆盖检查验收。退化时恢复此次部署前代码和配置，**不要恢复旧数据库**，以免丢失部署期间的新记录与游标进度。
+调整 LaunchAgent 前应停止单实例、检查子进程退出、用 SQLite 原生 backup 保存独立副本，并备份当前代码及 plist。`service install` 将共同配置及 adaptive 开关、min、max、target 写入 plist；`start/restart` 沿用已安装配置。重新 install 时应显式提供要保留的非默认参数。`--once` 与 `--max-cycles` 仅用于前台 worker，service 拒绝这两个参数，持久化白名单也不会包含它们。`service install --db` 固化后台数据库；`status --db` 与 `check --db` 仅覆盖诊断目标。部署后以新 PID、多个完整周期、只读数据库与固定目标覆盖检查验收。退化时恢复此次部署前代码和配置，**不要恢复旧数据库**，以免丢失部署期间的新记录与游标进度。
 
 ## 原始消息与有界回填
 
@@ -726,32 +616,34 @@ received 直接分页读取原生消息列表，显式请求 `only_thread_root_m
 
 正常同步分开提交列表覆盖与完整内容覆盖。完整 list/search/mget 分页返回普通消息和合并根；迁移 009 的 `lark_im_list_progress` 保存连续列表水位，`lark_im_detail_tasks` 保存每个根的原始描述、指纹、版本、尝试次数、下次重试时间及安全错误分类。普通消息、待办、列表水位与 run 元数据在同一租约和代际校验事务提交。列表本身不完整时全部不提交。详情失败不覆盖已入库的完整根，不禁用会话，也不回退列表水位；进程重启后继续从持久化水位读取普通消息。
 
-有欠账时 `sync_scopes.cursor_json`、完整覆盖窗口和最近成功标记不前进；部分 run 仅发出 `list_window_*`，并明确 `list_complete=true/details_complete=false/window_complete=false`。全部待办解决后，事务将完整游标推进到已经连续扫描的列表水位，并发出 `coverage_mode=list_checkpoint_and_details` 的闭合证据。目标时间及之前仍有当前待办时，覆盖检查不得凭历史成功报告完成。状态报告公开 `details` 和 `list_progress` 的汇总；pending details 使 health 保持 `catching_up`，Service 和 `wait-ok` 同样拒绝完整健康结论。
+有欠账时 `sync_scopes.cursor_json`、完整覆盖窗口和最近成功标记不前进；部分 run 仅发出 `list_window_*`，并明确 `list_complete=true/details_complete=false/window_complete=false`。全部待办解决后，事务将完整游标推进到已经连续扫描的列表水位，并发出 `coverage_mode=list_checkpoint_and_details` 的闭合证据。目标时间及之前仍有当前待办时，覆盖检查不得凭历史成功报告完成。状态报告公开 `details` 和 `list_progress` 的汇总；pending details 使 health 保持 `catching_up`，Service 和 `check --wait` 同样拒绝完整健康结论。
 
-状态报告在同一只读 SQLite 快照内采集欠账、列表水位、records、scope、discovery、run 和 lock，Service health 与 `wait-ok` 使用该一致报告。表结构预查只选择查询分支，最终快照再次核对结构与迁移标记；并发迁移或证据缺失时失败关闭，不把它解释为零欠账。报告是某一时点的快照，之后提交的写入会在下次报告中出现；不得拼接旧的零欠账与新提交的未完整水位。该诊断不初始化数据库、不执行恢复，也不修改业务数据。
+状态报告在同一只读 SQLite 快照内采集欠账、列表水位、records、scope、discovery、run 和 lock，Service health 与 `check --wait` 使用该一致报告。表结构预查只选择查询分支，最终快照再次核对结构与迁移标记；并发迁移或证据缺失时失败关闭，不把它解释为零欠账。报告是某一时点的快照，之后提交的写入会在下次报告中出现；不得拼接旧的零欠账与新提交的未完整水位。该诊断不初始化数据库、不执行恢复，也不修改业务数据。
 
 每次成功列表提交后至多尝试一个到期详情根。详情有独立 30 秒总请求预算、50 页、1000 项、64 层上限，不进入列表二分；失败按每根 60 秒指数退避，上限 24 小时，无最大失败次数。已完成指纹收据避免包含式边界反复重开相同欠账；新版根重新排队，详情重试先验证权威当前根，拒绝身份变化、版本倒退、同版本冲突及未展开根。旧完整正文会一直保留到完整新版本可替换。
 
 独立详情入口只处理持久化的到期待办，不重新抓取列表，并遵守退避：
 
 ```sh
-node scripts/lark-im-sync.mjs --scope details --detail-limit 5
+node bin/exocortex.mjs sync --scope details --detail-limit 5
 ```
 
-`--detail-limit` 默认 5、最大 20；可用 `--detail-scope <stored-scope-id>` 限定本地 scope。整次详情批次共享 30 秒请求预算，某个根失败后只要仍有预算就处理后续根；锁定 scope 不占实际任务名额，从最多 `max(3×limit, limit+20)` 个候选补位。持续锁竞争下，候选范围外的 scope 可能延期；非请求事务开销不包含在远端请求截止保证内。仍有欠账（包括尚未到期）时退出码为 1，不能将“本次无到期任务”解释为已完成。正常轮询也会自动重试，无需独立命令才能继续列表。此次实现不自动重新启用历史上已禁用的 scope。
+`--detail-limit` 默认 5、最大 20；可用 `--detail-scope <stored-scope-id>` 限定本地 scope。整次详情批次共享 30 秒请求预算，某个根失败后只要仍有预算就处理后续根；锁定 scope 不占实际任务名额，从最多 `max(3×limit, limit+20)` 个候选补位。持续锁竞争下，候选范围外的 scope 可能延期；非请求事务开销不包含在远端请求截止保证内。仍有欠账（包括尚未到期）时规范 sync 退出码为 2，不能将“本次无到期任务”解释为已完成。正常轮询也会自动重试，无需独立命令才能继续列表。此次实现不自动重新启用历史上已禁用的 scope。
 
 每个列表窗口共享 180 秒请求预算。页数超限沿用分钟边界二分；只有整个列表窗口总时间预算耗尽时，正常同步才直接收缩到起点之后的首个分钟边界，并至多再试一次该最小前缀。单次普通网络超时、限流或权限错误不触发缩窗。最小前缀仍超限则失败且不推进列表或完整游标。worker 的 600 秒步骤上限仍有效，分页二分与姓名查询也占步骤时间，不保证每次运行都进展。有界回填及严格 `fetch*Messages` 路径仍要求整个窗口完整，不使用列表欠账提交路径。
 
 ### 姓名投影合并
 
-同步入库和 `lark-im-enrich-records` 使用同一姓名合并规则。空值或失败的 lookup 表示 unknown，不能抹掉同一发送者、会话或会话对方的已知姓名与来源。明确的 `*_name_state=cleared`（对方姓名为 `chat_partner.name_state`）表示权威清空；普通空 lookup 不产生此标记，也不能复活已清空的姓名。来自 `scope_config` 或 `local_history` 的会话名只是历史证据，可填未知字段，不能覆盖已知姓名或显式清空；原始消息提供的新会话名可更新。同一规则同时用于同步与补全。身份变化时不继承旧身份的姓名。
+同步入库和 `maintenance enrich --target records` 使用同一姓名合并规则。空值或失败的 lookup 表示 unknown，不能抹掉同一发送者、会话或会话对方的已知姓名与来源。明确的 `*_name_state=cleared`（对方姓名为 `chat_partner.name_state`）表示权威清空；普通空 lookup 不产生此标记，也不能复活已清空的姓名。来自 `scope_config` 或 `local_history` 的会话名只是历史证据，可填未知字段，不能覆盖已知姓名或显式清空；原始消息提供的新会话名可更新。同一规则同时用于同步与补全。身份变化时不继承旧身份的姓名。
+
+常规 records 补全只将实际尝试、支持该身份类型、查询明确失败且全部 fallback 后仍未知的姓名目标计入 `unresolved_name_targets`，并返回部分完成（退出码 2）。失败按具体目标或请求批次归属，不能把一个失败扩散到其他联系人或会话。既有姓名、权威清空和成功 fallback 不计入该欠账；没有尝试、不支持或正常返回未知也不自动算作失败。对已有姓名的强制应用探测失败仍保留诊断计数，但可以退出 0；退出 0 不表示每次可选探测都成功。依赖或数据库结构缺失等无法执行的维护返回 1，并保留安全的结构化失败报告。
 
 姓名属于可补全投影，`raw_json` 与 source content hash 仍保留原始内容语义。同 raw/hash/version 的未知姓名重放保持幂等；同版本解析得到姓名或改善投影仍可更新。合并不取消原有版本防回退和补全的并发比较检查。有界回填的严格更高版本规则保持独立。
 
 旧游标覆盖仅证明成功扫描窗口连续，不能证明旧 CLI 展开策略没有漏消息。明确选样对账后，可在停止 worker、完成一致备份和显式迁移后执行：
 
 ```sh
-node scripts/lark-im-replay.mjs --db data/exocortex.sqlite \
+node bin/exocortex.mjs maintenance replay --db data/exocortex.sqlite \
   --scope-id '<已确认的 received scope>' \
   --start '<带时区的固定起点>' --end '<带时区的固定终点>'
 # 审阅预览后，以完全相同参数加 --apply。
@@ -771,13 +663,13 @@ live freshness 对热会话原始列表的首屏（含回复）仅做消息 ID �
 
 ### 精确补全历史发送者
 
-联系人与群成员请求由同一 `name-resolver.mjs` 实现，在线同步、常规 enrich 和 sender-only 模式共享 30-ID 批次、显式 page-size、localized_name 归一化、self seed 优先和失败重试语义。姓名若等于原消息的任一明确 ID alias，或远端响应自身的 ID，按未知处理，不抑制成员 fallback；这也适用于历史姓名占位的候选筛选。常规 enrich 保留其扫描范围、dry-run、诊断和事务提交；单次请求最多五秒，它仍可能包含许多批次。
+联系人与群成员请求由同一 `name-resolver.mjs` 实现，在线同步、常规 enrich 和 sender-only 模式共享 30-ID 批次、显式 page-size、localized_name 归一化、self seed 优先和失败重试语义。姓名若等于原消息的任一明确 ID alias，或远端响应自身的 ID，按未知处理，不抑制成员 fallback；这也适用于历史姓名占位的候选筛选。常规 enrich 保留其扫描范围、预览、诊断和事务提交；单次请求最多五秒，它仍可能包含许多批次。
 
 单目标修复使用 `--sender-only --sender-id`，需提前从可信记录取得确切 open ID。以下示例中的变量由操作者设置，不从姓名或截图猜 ID：
 
 ```bash
-node scripts/lark-im-enrich-records.mjs --db "$DB_PATH" \
-  --sender-only --sender-id "$TARGET_OPEN_ID" --limit 50 --dry-run
+node bin/exocortex.mjs maintenance enrich --target records --db "$DB_PATH" \
+  --sender-only --sender-id "$TARGET_OPEN_ID" --limit 50
 ```
 
-此预览会发起有界只读远端查询，不写业务数据或获取维护锁。默认最多 50、上限 100 条，先筛选匹配且缺名记录再截断；总远端预算 30 秒、每次最多五秒、最多三个群和五页。零候选不联网。报告区分 unresolved、预算/页数限制、更多候选与提交冲突，未完成返回非零，不能把 updated=0 当作已修复。若预览确有可靠姓名，去掉 `--dry-run` 才是显式业务写入，需相应操作授权；只更新 sender 投影及必要身份类型，保留 raw/hash/source version/body。详情见 [共同设计](card-and-identity-projection.md)。
+此预览会发起有界只读远端查询，不写业务数据或获取维护锁。默认最多 50、上限 100 条，先筛选匹配且缺名记录再截断；总远端预算 30 秒、每次最多五秒、最多三个群和五页。零候选不联网。报告区分 unresolved、预算/页数限制、更多候选与提交冲突，未完成返回非零，不能把 updated=0 当作已修复。若预览确有可靠姓名，加上 `--apply` 才是显式业务写入，需相应操作授权；只更新 sender 投影及必要身份类型，保留 raw/hash/source version/body。详情见 [共同设计](card-and-identity-projection.md)。

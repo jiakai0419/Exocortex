@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { plain as shimPlain } from "../scripts/lib/terminal.mjs";
 import {
   compact,
   kv,
@@ -21,7 +20,7 @@ test("terminal rendering exposes plain text for styled status labels", () => {
   assert.equal(plain(statusBadge("idle")), "IDLE");
   assert.equal(plain(statusBadge("verified")), "VERIFIED");
   assert.equal(plain(statusBadge("behind")), "BEHIND");
-  assert.equal(shimPlain(statusBadge("ok")), "OK");
+  assert.equal(plain(statusBadge("ok")), "OK");
 });
 
 test("terminal kv and table helpers produce aligned readable text", () => {

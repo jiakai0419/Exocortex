@@ -1,41 +1,6 @@
 #!/usr/bin/env node
-
-// @ts-check
-
-import { pathToFileURL } from "node:url";
-import {
-  main,
-  parseArgs,
-  parsePositiveInt,
-  runCycle,
-  runStep,
-  runWorker,
-  rotateLogIfNeeded,
-  sleepSeconds,
-  usage,
-  writeLog,
-} from "../src/cli/lark-im-worker-command.mjs";
-
-export {
-  main,
-  parseArgs,
-  parsePositiveInt,
-  runCycle,
-  runStep,
-  runWorker,
-  rotateLogIfNeeded,
-  sleepSeconds,
-  usage,
-  writeLog,
-};
-
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  try {
-    const exitCode = main();
-    if (exitCode !== 0) process.exit(exitCode);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    process.stderr.write(`${message}\n`);
-    process.exit(1);
-  }
-}
+// Temporary migration bridge W: remove after the installed LaunchAgent uses the
+// internal runtime entrypoint. Preserve the old cwd defaults and JSONL protocol.
+import { main } from "../src/runtime/worker/worker.mjs";
+try { process.exitCode = main(process.argv.slice(2), { legacyPaths: true }); }
+catch (error) { process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = 1; }
