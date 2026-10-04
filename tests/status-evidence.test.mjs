@@ -197,7 +197,8 @@ test("malformed completion results stay unverified instead of becoming a failed 
       serviceDeps({ readRecentWorkerEvents: () => ({ path: marker, exists: true, events, activity_integrity: true }) }));
     const result = publicStatusReport(collected(report), {});
     assert.equal(result.worker.last_cycle.result_valid, true);
-    assert.equal(result.health.reason, ok ? "local_ready" : "last_cycle_failed");
+    assert.equal(result.worker.last_cycle.ok, ok, "explicit history results stay available");
+    assert.equal(result.health.reason, "local_ready", "unbound history cannot replace selected database health");
   }
 });
 

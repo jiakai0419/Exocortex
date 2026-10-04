@@ -99,7 +99,8 @@ test("status restores safe stability, lease warnings, sampled window and worker 
   const f = fixture(); assert.equal(await runStatusCommand(options({ format: "text", detail: true }), f.context, deps(r)), 0);
   assert.match(f.output(), /log\s+truncated/); assert.match(f.output(), /Completed rounds\s+2 succeeded · 1 failed · 3 total/);
   assert.match(f.output(), /Success spacing\s+Longest observed interval 4s/); assert.match(f.output(), /Permission denied · 1/); assert.match(f.output(), /expired x1/);
-  assert.match(f.output(), /Sample matched · 3 recent active-chat messages/); assert.match(f.output(), /Sample window/); assert.match(f.output(), /Latest task\s+Sent messages · Succeeded/);
+  assert.match(f.output(), /Sample matched · 3 messages/); assert.match(f.output(), /Sample window/); assert.match(f.output(), /Sample limits\s+Recent active-chat sample only/);
+  assert.match(f.output(), /Latest task\s+Sent messages · Succeeded/);
   assert.doesNotMatch(f.output(), new RegExp(marker));
 });
 test("unrecognized status enum and timestamp evidence cannot disclose private values or imply a zero interval", async () => {
@@ -110,30 +111,42 @@ test("unrecognized status enum and timestamp evidence cannot disclose private va
   assert.match(f.output(), /Success spacing\s+Unavailable; need two successful rounds/); assert.doesNotMatch(f.output(), /Leases:/); assert.doesNotMatch(f.output(), new RegExp(marker));
 });
 
-test("default text preserves existing service health instead of upgrading a failed cycle with local ready", async () => {
+test("status keeps local health independent of an unbound failed cycle while retaining that history", async () => {
   const { buildServiceOverview } = await import("../src/diagnostics/lark-im-service-report.mjs");
   const local = sync({ details: { evidence: "available", pending_count: 0, due_count: 0, scopes_pending: 0 }, list_progress: { evidence: "available", scopes: 1, invalid_cursor_scopes: 0 } });
   const workerSummary = { last_cycle: { cycle: 3, ok: false, at: new Date(at - 1000).toISOString() } };
   const overview = buildServiceOverview({ launchd: { loaded: true, state: "running", pid: 1234 }, syncStatus: local, workerSummary, nowMs: at });
-  assert.equal(overview.health.status, "problem");
+  assert.equal(overview.health.status, "ok");
+  assert.equal(overview.health.reason, "local_ready");
   const r = report({ probe: { status: "running", pid: 1234 }, overview, sync: { status: local }, worker: { summary: workerSummary, log: { events: [] } } });
   const f = fixture(); assert.equal(await runStatusCommand(options({ format: "text", detail: true }), f.context, deps(r)), 0);
-  assert.match(f.output(), /Local health\s+NEEDS ATTENTION/); assert.doesNotMatch(f.output(), /Local health\s+OK/);
+  assert.match(f.output(), /Local health\s+OK/); assert.doesNotMatch(f.output(), /Local health\s+NEEDS ATTENTION/);
+  assert.match(f.output(), /Latest round\s+Failed/);
+  const json = fixture(); assert.equal(await runStatusCommand(options(), json.context, deps(r)), 0);
+  const value = JSON.parse(json.output());
+  assert.equal(value.health.status, "ok"); assert.equal(value.worker.last_cycle.ok, false);
+  assert.equal(value.worker.database_binding, "unverified");
+  const compact = fixture(); assert.equal(await runStatusCommand(options({ format: "text" }), compact.context, deps(r)), 0);
+  const text = plain(compact.output()).replace(/\s+/g, " ");
+  assert.match(text, /Local health\s+OK/);
+  assert.match(text, /Background log\s+Failure recorded.*database unverified/);
+  assert.doesNotMatch(text, /Local health\s+NEEDS ATTENTION|Latest round/);
 });
 for (const [unsupported, reasons] of [[0, []], [4, [{ reason: "restricted_mode", error_code: 231203, count: 4 }]],
   [5, [{ reason: "restricted_mode", error_code: 231203, count: 3 }, { reason: "bot_user_out_of_chat", error_code: 230002, count: 2 }]]]) {
-  test(`detailed status retains unified Coverage rows for ${reasons.length} unsupported reasons`, async () => {
+  test(`detailed status retains progress and ${reasons.length} unsupported reasons`, async () => {
     const r = report(); r.sync.status = sync({ records: { total: 8, by_direction: [{ direction: "sent", count: 3 }, { direction: "received", count: 5 }] },
       scopes: { received_enabled: 7, received_without_cursor: 1, received_unsupported: unsupported, unsupported_reasons: reasons },
       hot_discovery: { ran: true, cursor_updated_at: new Date(at - 3000).toISOString(), raw: marker },
       reconcile: { complete: true, cursor: { completed_at: new Date(at - 6000).toISOString(), raw: marker } } });
     r.overview.leases = { evidence: "available", total: 1, occupied_count: 1, abnormal_count: 0, reasons: [] };
     const f = fixture(); assert.equal(await runStatusCommand(options({ format: "text", detail: true }), f.context, deps(r)), 0); const output = plain(f.output());
-    assert.match(output, /Stored messages\s+8 total · 3 sent · 5 received/); assert.match(output, /Received chats\s+7 enabled · 1 awaiting a full-content cursor/);
+    assert.match(output, /Messages & progress/);
+    assert.match(output, /Stored messages\s+8 total · 3 sent · 5 received/); assert.match(output, /Received chats\s+7 enabled · 1 with no content checkpoint/);
     assert.match(output, /Active chat refresh\s+Last success/); assert.match(output, /Chat list review\s+Complete ·/);
     assert.doesNotMatch(output, /Leases:|Warning|PRIVATE_STATUS_SENTINEL/);
-    if (reasons.length === 0) assert.match(output, /Restricted chats\s+0/);
-    else if (reasons.length === 1) assert.match(output, /Restricted chats\s+4 · access restricted · code 231203/);
-    else { assert.match(output, /Restricted chats\s+5/); assert.match(output, /Restriction\s+3 · access restricted · code 231203/); assert.match(output, /Restriction\s+2 · bot or user is outside the conversation · code\s+230002/); }
+    if (reasons.length === 0) assert.match(output, /Restricted chats\s+0 excluded/);
+    else if (reasons.length === 1) { assert.match(output, /Restricted chats\s+4 excluded/); assert.match(output, /Restriction\s+4 · access restricted · code 231203/); }
+    else { assert.match(output, /Restricted chats\s+5 excluded/); assert.match(output, /Restriction\s+3 · access restricted · code 231203/); assert.match(output, /Restriction\s+2 · not a conversation member · code\s+230002/); }
   });
 }

@@ -14,7 +14,7 @@ const unavailableFreshness = (reason) => ({ status: "unknown", reason, auth_iden
 export const STATUS_SCREEN_SCENARIOS = Object.freeze([
   "healthy", "syncing", "catching_up", "empty", "stopped", "failed", "old_history",
   "unavailable", "legacy", "truncated", "sampled", "behind", "expired", "invalid_history",
-  "foreground_stopped", "expired_phase", "old_instance_history",
+  "foreground_stopped", "expired_phase", "old_instance_history", "unbound_failure",
 ]);
 
 export function rawStatusScreenFixture(name = "healthy") {
@@ -65,6 +65,13 @@ export function rawStatusScreenFixture(name = "healthy") {
     Object.assign(activity, { status: "syncing", state: "syncing", phase: "step", step: "discover-reconcile", reason: "worker_phase_observed" });
     worker.unfinished_cycle = true;
   }
+  if (name === "unbound_failure") {
+    worker.last_cycle = summaryEvent(-35_000, 4, false);
+    worker.last_failure = { ...summaryEvent(-36_000, 4, false), type: "lark_im_worker_step", name: "received-hot" };
+    Object.assign(stability.cycles, { ok: 3, failed: 1 });
+    Object.assign(stability.failures, { failed_cycles: 1, failed_steps: 1, by_step: [{ name: "received-hot", count: 1 }] });
+    stability.last_success = summaryEvent(-80_000, 3);
+  }
   if (name === "catching_up") {
     Object.assign(sync, { health: "catching_up" });
     Object.assign(report.overview.health, { status: "catching_up", reason: "details_pending" });
@@ -105,8 +112,9 @@ export function rawStatusScreenFixture(name = "healthy") {
     Object.assign(worker, { unfinished_cycle: true, last_step: { ...summaryEvent(-HOUR, 93), name: "received-catchup" } });
   }
   if (name === "failed") {
-    Object.assign(report.overview.health, { status: "problem", reason: "last_cycle_failed" });
-    sync.runs.by_status.failed = 15;
+    Object.assign(report.overview.health, { status: "problem", reason: "no_successful_runs" });
+    sync.health = "needs_attention";
+    sync.runs.by_status = { failed: 15 };
     worker.last_cycle = summaryEvent(-35_000, 4, false);
     worker.last_step = { ...summaryEvent(-36_000, 4, false), name: "received-hot" };
     worker.last_failure = { ...worker.last_step, type: "lark_im_worker_step" };

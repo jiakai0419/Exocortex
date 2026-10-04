@@ -328,7 +328,7 @@ test("review regression: an unrelated orphan cannot suppress verified independen
     uid: () => 999, stdout: { write: (text) => { output += text; } },
     buildServiceStatusReport: (opts) => buildServiceStatusReport(opts, fixture.deps),
   }), 0);
-  assert.match(plain(output), /Current work\s+Syncing · verified foreground command/);
+  assert.match(plain(output), /Current work\s+Syncing · foreground command/);
 });
 
 test("all activity consumers reject missing required fields and malformed types without old-phase fallback", async (t) => {

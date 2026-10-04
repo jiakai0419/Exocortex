@@ -175,13 +175,14 @@ function displayBody(body, canonical, raw) {
  * display.body contract remain unchanged; missing evidence never reinterprets
  * an old human-readable fallback as native card JSON.
  * @param {Row} raw
+ * @param {import("../adapters/lark-im/card-content.mjs").CardRenderOptions} [options]
  */
-function displayCard(raw) {
+function displayCard(raw, options) {
   const native = raw.raw_api && typeof raw.raw_api === "object" && !Array.isArray(raw.raw_api)
     ? raw.raw_api : raw;
   const content = native.body && typeof native.body === "object" && !Array.isArray(native.body)
     ? native.body.content : native.content;
-  return renderCardContent(content, native.mentions);
+  return renderCardContent(content, native.mentions, options);
 }
 
 /**
@@ -243,6 +244,7 @@ function enrichRow(row) {
 export {
   buildWhere,
   displayBody,
+  displayCard,
   enrichRow,
   isInvalidRenderedContent,
   loadMessages,

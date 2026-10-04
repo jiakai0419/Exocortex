@@ -143,14 +143,14 @@ node bin/exocortex.mjs check --db /absolute/path/to/exocortex.sqlite \
 
 ### Status 的整屏层级与历史口径
 
-公共 `status` 按当前判断、同步进度、需处理项、近期历史排列；`--detail` 使用同样的标题和键值布局，并补充 Diagnostics，不直接拼接 JSON。字段契约与从零合成整屏见 [Status screen design](status-screen-design.md)。
+默认 `status` 只呈现运行、当前工作、存量、已知待办及问题；`--detail` 补充历史、证据及操作入口。字段契约与从零合成整屏见 [Status screen design](status-screen-design.md)。
 
-- **Health & current work**：Local health 仅指本地同步检查；不是质量检查或远端完整性保证。Background 单列服务运行及所选数据库关联。Current work 只使用已验证 Activity，并翻译当前任务名；Unconfirmed 旁解释缺失或冲突证据。
-- **Coverage**：分别显示保存的消息、收到的会话、消息列表最落后水位、详情欠账和会话名单完成情况。收到的会话数不与包含 sent 的消息源分母混用；列表进度不等于完整内容覆盖。Restricted chats 保留原因、数量、错误码。缓存远端样本过期不等于后台失败。
-- **Attention**：给出对应诊断入口；所有建议命令都须沿用本次 status 的 `--db` 和 `--log-dir` 值，界面只说明这一要求，不输出私有路径。没有或过期的远端样本单列为 Optional sample，不作为必须处理的问题；旧成功、未收尾历史和租约都不直接建议 repair 或 restart。`check --live` 取得本次样本，只有显式增加 `--write-live-cache` 才更新供后续 status 使用的缓存。
-- **Recent history**：worker 日志的轮次/任务和所选数据库的失败运行独立统计。日志未验证绑定所选数据库，轮次号也会因重启重置，因此不以轮次号当全局身份。
+- **Health & current work**：本地健康、后台运行和已验证工作。正常结果不重复实现证据；无法确认后台是否服务所选数据库时明确显示。健康来自服务、所选库及当前活动，不受未绑定 worker 历史结果升级或降级。
+- **Messages & progress**：保存的消息、启用接收会话、尚无内容检查点的会话、未完成名单及详情欠账、受限会话和缓存样本。详情来源包含全局发送源，不能称为会话数量。原始最旧列表检查点只在详情显示；默认仍显示列表证据不可用或无效。不会用列表位置替代持久起点到固定终点的连续成功窗口覆盖；本次不新增覆盖查询、缓存或 status 参数，既有 `check --through` 保持原样。
+- **Problems**：仅在有事实时出现，显示正数/不可查询的数据库失败、预约异常及明确归属的日志失败提示。受限、详情债和其他已显示状态不重复列一遍。正常零失败、命令建议和目标参数提示放到详情。
+- **Background history / Diagnostics**：只在详情显示。worker 日志未绑定所选数据库；窗口、完成轮次、失败任务和旧结果都保留。原始最旧列表检查点、正常关联证据、远端样本范围/身份边界也在详情。所有命令沿用本次 `--db` / `--log-dir`，不打印私有路径。`check --live` 取得本次样本，显式加 `--write-live-cache` 才更新 status 缓存。
 
-默认显示日志请求回看长度、窗口内事件首末时间及部分/截断状态。detail 给出请求窗口的精确端点、最长成功间隔、最新已完成任务和有步骤却未见收尾的历史。只有旧事件时明确“窗口内无事件”，旧结果仍带日期；未来或无效时间不能写成刚刚成功。成功间隔只计算窗口内相邻成功完成，不包括窗口边界，不代表停机时长。少于两个成功时不可用。
+详情显示日志请求回看长度、窗口内事件首末时间及部分/截断状态、最长成功间隔、最新已完成任务和未收尾历史。只有旧事件时明确窗口内无事件，旧结果仍带日期；未来或无效时间不能写成刚刚成功。成功间隔不是停机时长，少于两次成功不可用。默认日志失败提示也标明数据库归属未经验证，不能当作当前库发生故障。
 
 日志只读当前 `worker.jsonl` 最多 8 MiB、20,000 个非空行，不读轮转历史。达到回看左边界也不证明连续运行或无遗漏。数据库失败统计只计算保留的 `sync_runs` 中 `status=failed` 且开始时间位于其独立闭区间内的行，按安全类别聚合；查询失败显示不可用，不能说零失败。查询先冻结截止时间，活动仍在全部读取结束后验证有效期。JSON 中既有 `stability.failures.by_kind` 保留兼容语义，新 `failure_runs` 给出来源、时间基础和精确窗口。
 
@@ -450,7 +450,7 @@ node bin/exocortex.mjs check --live
 
 ### Unsupported Chat Scopes
 
-公共 status 在 Coverage 中显示 `Restricted chats`：单原因与总数同行，多原因逐行保留数量与非空错误码；公共 JSON 仍保留原有 unsupported 原因分组。
+公共 status 在 Messages & progress 中用一行 `Restricted chats` 合并受限数量、排除范围及原因，不重复操作提示；`--detail` 展开每种原因的数量与非空错误码。公共 JSON 保留原有 unsupported 原因分组。
 
 Received chat scope 的列表读取可能进入 unsupported 状态。它表示同步器识别到当前 lark-cli 身份不能读取会话列表，后续会暂停这个 scope，但本地已同步的 records 会保留。单条合并转发的详情失败不证明整个会话不可读取，不会禁用 scope。
 
@@ -469,13 +469,14 @@ Received chat scope 的列表读取可能进入 unsupported 状态。它表示�
 node bin/exocortex.mjs status
 ```
 
-`status` 按四个区域展示信息；`--detail` 另补 Diagnostics：
+`status` 默认分为两个区域，仅有附加问题时显示 Problems；历史和诊断在详情：
 
 ```text
 Health & current work -> 本地同步健康、后台服务与已验证的当前工作
-Coverage              -> 消息、会话进度、内容欠账、名单状态与远端样本
-Attention             -> 需处理项、可选采样及沿用同一目标的诊断提示
-Recent history        -> 日志中的完成轮次、已完成任务及有限失败摘要
+Messages & progress   -> 存量、已知会话/内容待办、详情欠账与受限范围
+Problems              -> 有问题时显示附加事实
+Background history    -> --detail：未绑定日志的统计和时间口径
+Diagnostics           -> --detail：底层证据、零失败与操作入口
 ```
 
 ### Data Quality
@@ -527,7 +528,7 @@ node bin/exocortex.mjs status --detail
 - `check --live` 获得非空、窗口明确、无 missing 的样本；全空、不可用和错误均不能算远端通过。
 - 如需 service 展示样本，显式写缓存并在五分钟内检查 SAMPLED 及范围，当前认证主体仍未知。
 - `status --detail` 中 `Conversation list`、`Active chat refresh`、`Chat list review` 分别能看出 initial、hot 和周期复核状态。
-- `status` 的 `Recent history` 显示日志中最近完成的轮次；当前是否同步须查看 `Health & current work`，不能用历史推进替代当前阶段证据。
+- `status --detail` 的 `Background history` 显示日志中最近完成的轮次；当前是否同步须查看 `Health & current work`，不能用历史推进替代当前阶段证据。
 - 最近消息能正常展示发送人、群名和消息内容。
 - 后台服务是 active。
 
@@ -580,7 +581,7 @@ worker 默认仍使用固定批量；显式 `--adaptive-fair` 才启用自适应
 
 received 直接分页读取原生消息列表，显式请求 `only_thread_root_messages=false`；sent 先搜索 ID，再以 mget 严格核对全部详情。错误信封、缺详情、重复详情、循环分页 token 或不完整分页均使窗口失败，不推进游标。查询的秒级边界向外取整，最终记录按原始毫秒起止裁剪。search 时间按官方契约使用无小数秒的 ISO8601。
 
-原始 `body.content`、`update_time`、root/parent/thread 关系进入 `raw_json`。正文是可重建投影，canonical 保留 `content_rendering` 状态与版本。卡片使用下述有界文本投影；图片和未知结构保留原始 JSON 并明确标注未完整渲染，不会凭空补用户姓名。合并转发的完整原生子项进入 `raw_api_expansions`，子项不冒充当前会话里的独立消息。
+原始 `body.content`、`update_time`、root/parent/thread 关系进入 `raw_json`。正文是可重建投影，canonical 保留 `content_rendering` 状态与版本。卡片使用下述有界文本投影；图片和未知结构保留原始 JSON 与解析状态；默认文本不追加通用 partial 尾注，不会凭空补用户姓名。合并转发的完整原生子项进入 `raw_api_expansions`，子项不冒充当前会话里的独立消息。
 
 ### 卡片阅读与原始数据契约
 
@@ -590,7 +591,7 @@ received 直接分页读取原生消息列表，显式请求 `only_thread_root_m
 
 人类文本输出按标题、副标题、段落、字段和导航按钮分行，卡片不再经过普通消息的 240 字符单行压缩；`br` 节点和独立块边界保留为实际换行，行内节点与尾部有语义的文本仍按原顺序展示。解析器只处理明确支持的文本与布局节点，包括 `property` 包装、选定语言的 `i18nContent` / `i18nElements`、常见文本/Markdown、分栏、字段、容器的 `extra` 和按钮。明确没有可用导航链接的动作按钮默认收起，不执行回调，完整节点仍保留在 raw；有安全 HTTP(S) 地址的导航按钮继续显示。导航链接支持直接字符串地址及原生 `link.url = {url: string}` 的明确包装；按钮的直接地址与 `multi_url` 中默认、桌面、iOS、Android 地址分别显示；未配置的平台槽可为空，非空无效值不能被其他有效链接掩盖。它是文本投影，不是完整飞书客户端：图片、图表、未知可见节点、无效链接和解析超限仍明确提示，不将原始 JSON 倾倒到文本界面。
 
-人员提及只接受同条原始消息中明确且无歧义的对应。除了直接匹配 `mentions` 的 ID，还读取 `body.content` 包装中的 `json_attachment.at_users`：卡片原生引用通过 `at_users` 的自有字典键或条目的 `user_id` 对应 `mention_key`，再连接同条消息的 `mentions` 取姓名。缺失或冲突的映射保持未知，不按出现顺序、ID 前缀或相似姓名猜测，不使用其他消息、缓存或联网查询补充。只有未解析提及时，在原位置显示未知提及占位，JSON 中仍保留 `status=partial` 和 `reason=unresolved_card_mention`，不再重复追加整行通用说明；同时存在其他关键缺失时，仍显示相应说明。
+人员提及只接受同条原始消息中明确且无歧义的对应。除了直接匹配 `mentions` 的 ID，还读取 `body.content` 包装中的 `json_attachment.at_users`：卡片原生引用通过 `at_users` 的自有字典键或条目的 `user_id` 对应 `mention_key`，再连接同条消息的 `mentions` 取姓名。缺失或冲突的映射保持未知，不按出现顺序、ID 前缀或相似姓名猜测，不使用其他消息、缓存或联网查询补充。只有未解析提及时，在原位置显示未知提及占位，JSON 中仍保留 `status=partial` 和 `reason=unresolved_card_mention`，不再重复追加整行通用说明；同时存在其他关键缺失时，JSON 保留其状态与原因，文本保留可解析正文及具体位置未知标记，不追加笼统尾注。
 
 `--format json` 保留已有 `body`、`canonical`、`raw`、对应 JSON 字符串与 `display.body` 的含义；卡片只新增 `display.card = {text, status, reason, version}`。展示版本为 3，旧记录 canonical 中的历史渲染版本不会被阅读命令改写。普通消息仍使用原有展示。新同步的卡片也调用同一解析器，派生正文和渲染元数据可以改善，但 source `raw_json`、content hash 与源版本不因文本投影变化而变化；同版本投影改善仍遵守已有入库比较规则。
 
@@ -602,7 +603,7 @@ received 直接分页读取原生消息列表，显式请求 `only_thread_root_m
 
 ### 卡片动作状态的读取边界
 
-卡片视图显示已存原始快照中的可见内容，收起动作按钮不表示动作已完成。人读结果经过筛选后只要含卡片，标题区就提示一次“卡片来自已采集的 API 快照，可能与客户端当前状态不同。”；无卡片时不提示，多卡不重复，JSON 与源正文不添加此说明。`messages --help` 简述同一限制，不把消息时间当作采集或实时状态核验时间。正常同步按 `create_time` 推进列表游标，不按 `update_time` 回查旧卡片；普通 `interactive` 卡片不进入合并转发详情队列，`--scope details` 不能用于刷新它们。本次没有新增卡片状态轮询，也不保证实时审批状态或与客户端当前视图一致。
+卡片视图显示已存原始快照中的可见内容，收起动作按钮不表示动作已完成。默认 `messages` 标题后直接显示按消息发生时间倒序读取的正文，不附排序或快照提示；顺序与 API 快照边界保留在 `messages --help`。文本视图不显示渲染器生成的通用 partial 尾注，结构 `hr` 只留段落空白；真实正文、代码或 Markdown 字面的 `---` 保留，不做字符串全局替换。真实资源截断在触发位置标明，标记仍计入16,000字符预算。JSON 的 `display.card.text/status/reason` 和原始正文保持原语义，不把消息时间当作采集或实时状态核验时间。正常同步按 `create_time` 推进列表游标，不按 `update_time` 回查旧卡片；普通 `interactive` 卡片不进入合并转发详情队列，`--scope details` 不能用于刷新它们。本次没有新增卡片状态轮询，也不保证实时审批状态或与客户端当前视图一致。
 
 状态不一致时，先核对同一条消息的本地 raw 是否包含目标可见状态，再检查 `display.card` 的投影与状态。经授权的单条只读 GET/mget 对比可用于区分原始快照变化与 API 视图差异；应使用同一身份和 `raw_card_content`，比较源版本、原文内容与投影，不把客户端显示、单个按钮标签或解析成功当作远端状态证明。一次限定单条消息的核查中，同身份 GET 与 mget 返回的卡片内容均与本地结构一致，API 快照没有提供客户端显示的处理状态。这只能说明该次读取没有相应证据，不能直接归因于本地解析遗漏，也不能推广为所有卡片的 API 行为；不同接口返回仍可能需要进一步核对。
 

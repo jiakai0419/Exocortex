@@ -204,6 +204,97 @@ test("node and output caps remain global across all blocks", () => {
   assert.doesNotMatch(long.text, /HIDDEN_AFTER_OUTPUT_CAP/);
 });
 
+test("omitting partial notices changes only presentation while keeping parse limits and diagnostics", () => {
+  let deep = paragraph("INVENTED_HIDDEN_DEEP");
+  for (let index = 0; index < 30; index += 1) deep = { tag: "column", elements: [deep] };
+  const sources = [
+    card(paragraph("Invented known text"), { tag: "invented_unsupported_tile" }),
+    card(paragraph("Before bounded depth"), deep),
+    card(...Array.from({ length: 3000 }, () => paragraph("x"))),
+    card(...Array.from({ length: 3000 }, () => ({ tag: "hr" }))),
+    card(paragraph("v".repeat(20_000)), paragraph("INVENTED_HIDDEN_AFTER_OUTPUT")),
+    card(paragraph("Before bounded input"), paragraph("x".repeat(256 * 1024 + 1))),
+  ];
+  for (const source of sources) {
+    const stored = renderCardContent(source);
+    const readable = renderCardContent(source, [], { includePartialNotice: false, includeDecorativeSeparators: false });
+    const { text: storedText, ...storedDiagnostics } = stored;
+    const { text: readableText, ...readableDiagnostics } = readable;
+    assert.deepEqual(readableDiagnostics, storedDiagnostics);
+    assert.equal(readable.status, "partial");
+    assert.match(storedText, /部分内容未展开/);
+    assert.doesNotMatch(readableText, /部分内容未展开|INVENTED_HIDDEN_DEEP|INVENTED_HIDDEN_AFTER_OUTPUT/);
+    assert.ok(readableText.length > 0 && readableText.length <= 16_000);
+    assert.deepEqual(renderCardContent(source), stored, "optional reading projection cannot mutate default projections");
+  }
+});
+
+test("omitting partial notices still explains cards with no readable content", () => {
+  for (const source of ["{invented malformed json", { elements: [] }, { elements: [{ tag: "invented_unknown_widget" }] }]) {
+    assert.deepEqual(renderCardContent(source, [], { includePartialNotice: false }), renderCardContent(source));
+  }
+});
+
+test("compact card text reserves output budget for the exact truncation boundary", () => {
+  const marker = "[正文在此达到展示上限]";
+  const source = { elements: [text("x".repeat(16_010)), text("Invented critical final instruction")] };
+  const machine = renderCardContent(source);
+  assert.equal(machine.reason, "card_output_limit");
+  assert.match(machine.text, /\[卡片部分内容未展开：正文超过展示上限\]$/);
+  const readable = renderCardContent(source, [], { includePartialNotice: false });
+  assert.equal(readable.text, `${"x".repeat(16_000 - marker.length)}${marker}`);
+  assert.equal(readable.text.length, 16_000);
+  assert.doesNotMatch(readable.text, /Invented critical final instruction|部分内容未展开/);
+  assert.deepEqual(renderCardContent(source), machine);
+  assert.equal(renderCardContent({ elements: [text("x".repeat(16_000))] }, [], { includePartialNotice: false }).text,
+    "x".repeat(16_000), "an exact fit must not claim omitted content");
+});
+
+test("compact depth limits mark only the omitted branch before readable siblings", () => {
+  let deep = text("INVENTED_HIDDEN_DEEP_BRANCH");
+  for (let index = 0; index < 30; index += 1) deep = { tag: "column", elements: [deep] };
+  const source = { elements: [text("Invented opening"), deep, text("Invented readable sibling")] };
+  const readable = renderCardContent(source, [], { includePartialNotice: false });
+  assert.equal(readable.text, "Invented opening\n[此处嵌套超过解析深度上限]\nInvented readable sibling");
+  assert.equal(readable.reason, "card_depth_limit");
+  assert.doesNotMatch(readable.text, /INVENTED_HIDDEN_DEEP_BRANCH|部分内容未展开/);
+});
+
+test("compact input limits identify omitted values without parsing oversized prefixes", () => {
+  const marker = "[此处输入超过解析上限]";
+  const source = { elements: [text("Invented opening"), text("INVENTED_PRIVATE_INPUT".repeat(15_000))] };
+  const readable = renderCardContent(source, [], { includePartialNotice: false });
+  assert.equal(readable.text, `Invented opening\n${marker}`);
+  assert.equal(readable.reason, "card_input_limit");
+  const serialized = renderCardContent(JSON.stringify(source), [], { includePartialNotice: false });
+  assert.equal(serialized.text, marker, "whole-input rejection is marked at the root");
+  assert.doesNotMatch(readable.text + serialized.text, /INVENTED_PRIVATE_INPUT|部分内容未展开/);
+});
+
+test("compact node limits describe the parse boundary even when remaining nodes are decorations", () => {
+  for (const elements of [Array.from({ length: 3000 }, () => text("xy")),
+    Array.from({ length: 3000 }, () => ({ tag: "hr" }))]) {
+    const source = { elements };
+    const readable = renderCardContent(source, [], { includePartialNotice: false, includeDecorativeSeparators: false });
+    assert.equal(readable.reason, "card_node_limit");
+    assert.match(readable.text, /\[解析在此达到元素数量上限\]$/);
+    assert.ok(readable.text.length <= 16_000);
+    assert.doesNotMatch(readable.text, /部分内容未展开|正文在此/);
+  }
+});
+
+test("compact limit markers preserve identical source text and stay bounded when several limits coincide", () => {
+  const literal = "[正文在此达到展示上限]";
+  let deep = text("INVENTED_HIDDEN_BRANCH");
+  for (let index = 0; index < 30; index += 1) deep = { tag: "column", elements: [deep] };
+  const source = { elements: [text(literal), text("x".repeat(15_960)), deep, text("INVENTED_HIDDEN_AFTER_CAP")] };
+  const readable = renderCardContent(source, [], { includePartialNotice: false });
+  assert.ok(readable.text.startsWith(literal));
+  assert.ok(readable.text.length <= 16_000);
+  assert.match(readable.text, /\[正文在此达到展示上限\]$/);
+  assert.doesNotMatch(readable.text, /INVENTED_HIDDEN_|部分内容未展开/);
+});
+
 test("oversized serialized input and cumulative nested parsing fail without dumping input", () => {
   const oversized = JSON.stringify(card(paragraph("INVENTED_LARGE_RAW".repeat(20_000))));
   const result = renderCardContent(oversized);

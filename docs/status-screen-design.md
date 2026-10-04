@@ -7,22 +7,55 @@ screenshots, accounts, paths, IDs or log excerpts belong in this document or Git
 
 ## Reading order and visual grammar
 
-1. **Exocortex status**: one observation time and the local IANA time zone.
-2. **Health & current work**: local health, background service association, and
-   process-verified activity. A passing local health check does not verify remote
-   freshness. Unavailable evidence is explained, not collapsed into `UNKNOWN`.
-3. **Coverage**: stored messages, initial conversation discovery, enabled received
-   conversations still awaiting a full-content cursor, message list progress,
-   detail retries, current chat refresh/review, and cached remote sample evidence.
-4. **Attention**: actionable limitations and failures with a next diagnostic;
-   missing or expired remote samples are optional checks, not required action;
-   no invented automatic recovery or claim that a stopped service must be started.
-5. **Recent history**: completed background rounds, latest task/round results,
-   failed steps, success spacing and incomplete history. Logs never establish
-   current work. Database failed runs have a separate explicitly labelled source
-   and time window.
-6. `--detail` adds readable **Diagnostics**, not a raw JSON block. `--format json`
-   retains the complete machine projection; `--logs` remains explicitly private.
+The default screen answers five questions: is local collection running, what is
+working now, what is stored, what list work remains, and what needs attention.
+Normal implementation evidence and commands belong in `--detail` / help.
+
+1. **Exocortex status**: one final observation time and local IANA time zone.
+2. **Health & current work**: local health, background service, verified activity.
+   A normal result has no repeated qualification. Database association is shown
+   only when it cannot be established (always available in detail).
+3. **Messages & progress**: retained messages, enabled received conversations,
+   content-checkpoint gaps and independent detail debt.
+   Received conversation counts do not include the global sent-message source.
+   Missing/invalid list evidence remains visible; raw checkpoint times are detail-only.
+   Restricted conversations appear once, as a collection limit. Remote sample
+   state remains compact; missing/expired sampling is not a local failure.
+4. **Problems**, only when needed: database failure records, unavailable failure
+   statistics, abnormal/unavailable reservations, or independently attributed
+   background-log failures. Do not repeat facts already visible above or add an
+   empty “no required action” section.
+5. **Background history**, detail only: unbound worker-log statistics and their
+   exact observation limits. **Diagnostics** adds raw checkpoint summaries,
+   detailed source reasons, evidence timing, database failure windows, commands
+   and target-preservation instructions. No raw JSON or private identities.
+6. `--format json` preserves every existing field and meaning. `--logs` remains
+   explicitly private.
+
+### Default-versus-detail decisions
+
+Normal health has no `local sync checks only` suffix. A matched database has no
+`selected database verified` suffix. Oldest list checkpoint, command targets,
+optional remote-sample commands, zero database failures and all normal log
+history move to detail. Restricted counts and their exclusion appear once.
+Unavailable, positive or malformed evidence is never converted into normal zero.
+Unbound log failures remain diagnostic facts with their source stated; they
+cannot lower or raise the selected database's health, even if recent and explicit.
+
+### Progress contract
+
+Default progress is limited to known facts: initial conversation discovery not
+yet complete, enabled received scopes without a content checkpoint, message
+sources without a successful sync, and pending message details with retry counts.
+A content checkpoint's presence is not fixed-target completeness. Pending detail
+sources include the global sent scope and are never called conversation counts.
+
+The raw oldest list checkpoint moves to detail. It summarizes only existing
+tracked rows; it does not prove every conversation is covered through that time.
+No rolling checkpoint ratio, fixed-target coverage option, cache or additional
+query is introduced. Existing `check --through` remains unchanged. Continuous
+successful-window coverage from the persisted baseline is a separate validation;
+the default screen must not substitute list positions for that result.
 
 Every section uses the same colored heading, two-space indent and aligned keys.
 Labels have sentence case. Color reinforces meaning but conveys no unique fact.
@@ -52,7 +85,7 @@ clipped, and errors/categories are not silently limited to three entries.
 | Conversation discovery | Initial full conversation-list cursor and completion time | Remaining pages are backlog, not proof discovery is currently running |
 | Received conversations | Enabled received scopes and scopes missing full-content cursors | Scope = received conversation in this adapter; presence of cursor is not fixed-target complete coverage |
 | Message sources | Enabled message scopes (sent plus received) without a successful run | Kept separate from received conversation counts |
-| List progress | Count of tracked message scopes and oldest continuous list cursor | A list frontier is not full message-content coverage; invalid or legacy evidence stays explicit |
+| List progress | Default shows unavailable/invalid evidence; detail shows tracked source count and oldest checkpoint | Existing tracked rows only, not full message-content or continuous interval coverage |
 | Message details | Pending content tasks, due retries, affected scopes, oldest pending and next retry | Pending content prevents a complete-content claim; no data/legacy is not zero |
 | Restricted chats | Disabled received scopes by finite public reason and numeric code | A source-access limitation, not a worker crash; no raw remote error |
 | Active chat refresh / chat review | Last successful cursor update / reconciliation completion | A completed list review is not proof of message freshness |
@@ -73,64 +106,45 @@ upper bound. Activity is still evaluated after all reads, so an expired phase
 cannot survive a slow query. The database range is not silently relabelled as the
 shorter log range. Future and malformed
 history must not become recent successful work; malformed result booleans remain
-unclassified and never turn into a failure merely through truthiness. Such
-unverified log results are history diagnostics and do not override independently
-established target health, even when the log contains a foreign or old instance. Existing JSON fields keep their
+unclassified and never turn into a failure merely through truthiness. All
+unbound log results are history diagnostics and do not override independently
+established target health, including explicit true/false results from a foreign,
+old or seemingly current instance. Existing JSON fields keep their
 meaning; additive source/window/evidence fields explain legacy `by_kind`.
 
-Default text keeps important diagnosis visible, including unsupported source
-counts, debt, unavailable evidence and historical failures. `--detail` adds
-supporting timestamps, counts, history and lease breakdowns, while preserving the
-same screen order. Neither mode includes raw DB keys, scope IDs, owners, private
-paths or raw errors. All actions are suggestions; `status` remains read-only. Every suggested command
-requires the same `--db` and `--log-dir` values as the invoking status command.
-The screen says this explicitly instead of interpolating private paths or implying
-that a bare follow-up may safely switch to the defaults. No-argument invocations
-keep the same defaults. A missing/expired sample does not create a required-action
-item: the screen separately labels a new live sample as optional.
+Default text keeps unsupported source counts, detail debt and unavailable evidence
+visible once. Database failures appear by default only when positive or unknown;
+zero is available in detail. Unbound log failure notices are explicitly labelled
+as background-log evidence with database association unverified. The complete
+log history and its window remain in detail. Neither mode includes raw DB keys,
+scope IDs, owners, private paths or raw errors. `status` stays read-only.
+Commands in detail require the same `--db` and `--log-dir` values; that requirement
+appears beside commands without printing private paths. Missing/expired samples
+remain optional, with no command suggestions in the default screen.
 
-## Synthetic whole-screen target (plain, 96 columns)
+## Synthetic whole-screen target (plain, 80 columns)
+
+The following invented target precedes implementation; generated exact examples
+are maintained separately in [whole-screen examples](status-screen-examples.md).
 
 ```text
 Exocortex status
 Observed Today 12:00:00 · UTC
 
 Health & current work
-  Local health         OK · local service and database checks passed
-  Background           Running · selected database verified
-  Current work         Syncing · reviewing the conversation list
-  Phase observed       Today 11:59:52 · evidence valid until Today 12:00:30
+  Local health       OK
+  Background         Running
+  Current work       Waiting · between background rounds
 
-Coverage
-  Stored messages      240 total · 40 sent · 200 received
-  Conversation list    Initial discovery complete · Today 08:00:00
-  Received chats       12 enabled · 0 awaiting a full-content cursor
-  Message sources      13 enabled · 0 without a successful sync
-  Message lists        13 tracked · oldest list cursor Today 11:50:00
-  Message details      0 pending · 0 due for retry
-  Restricted chats     1 · access restricted · code 230100
-  Active chat refresh  Last success Today 11:59:40
-  Chat list review     Complete · Today 11:45:00
-  Remote sample        Not verified · cached sample expired
-
-Attention
-  Coverage limits      Restricted chats are excluded from enabled-chat progress.
-  Command targets      Keep this invocation's --db and --log-dir values on all commands.
-  Optional sample      npm run exo -- check --live for a new remote sample.
-
-Recent history
-  Worker log           Last 24h requested · retained observations Today 08:00–12:00
-  Log completeness     Partial window · earlier observations unavailable
-  Completed rounds     15 succeeded · 0 failed · 15 total
-  Latest round         Succeeded · Today 11:58:40 (1m 20s ago)
-  Latest task          Conversation list review succeeded · Today 11:59:40 (20s ago)
-  Success spacing      Longest observed interval 4m30s
-  Failed tasks         0 in the log window
-  Open history         A round has task records but no completion record; see Current work.
-  Database failures    0 retained failed runs · started in the last 24h
-  Database window      2029-12-31 12:00–2030-01-01 12:00
+Messages & progress
+  Stored messages    240 total · 40 sent · 200 received
+  Received chats     12 enabled
+  Message details    2 pending · 1 due for retry · 1 source
+  Restricted chats   1 excluded · access restricted
+  Remote sample      Not verified · cached sample expired
 ```
 
-This example defines the information hierarchy, not a pixel-exact golden. [Generated whole-screen examples](status-screen-examples.md) and terminal-width tests accompany implementation, including
-healthy waiting, catch-up, empty database, stopped service, failures, old-only
-history, missing evidence, color/no-color, 40-column output and DST transitions.
+Counts/times are invented. Known debt is not a fixed-target completion measure.
+Scenarios cover waiting, syncing, missing/invalid progress, detail debt, empty DB,
+stopped service, failures, old/unbound logs,
+missing evidence, 40-column output, color/no-color and DST.

@@ -24,11 +24,19 @@ const EXPLANATIONS = {
   unsupported_card_link: "不支持的链接已省略",
   card_no_visible_content: "没有可识别正文",
 };
+const LOCAL_LIMIT_NOTICES = {
+  card_input_limit: "[此处输入超过解析上限]",
+  card_output_limit: "[正文在此达到展示上限]",
+  card_node_limit: "[解析在此达到元素数量上限]",
+  card_depth_limit: "[此处嵌套超过解析深度上限]",
+  card_cycle: "[此处为循环结构，已停止展开]",
+};
 
 /** @typedef {Record<string, any>} JsonObject */
 /** @typedef {{parent: Identity | null, ids: Map<string, string>, name: string | null, conflict: boolean}} Identity */
 /** @typedef {keyof typeof EXPLANATIONS} Reason */
 /** @typedef {{text: string, status: "rendered" | "partial" | "structured_fallback", reason: string | null, version: 3, omitted_actions?: number}} CardRenderResult */
+/** @typedef {{includePartialNotice?: boolean, includeDecorativeSeparators?: boolean}} CardRenderOptions */
 
 /** @param {unknown} value @returns {value is JsonObject} */
 function object(value) {
@@ -92,9 +100,10 @@ function cleanText(text) {
  * Raw source evidence belongs to the caller and is never changed or dumped.
  * @param {unknown} content
  * @param {unknown} [mentions]
+ * @param {CardRenderOptions} [options]
  * @returns {CardRenderResult}
  */
-function renderCardContent(content, mentions = []) {
+function renderCardContent(content, mentions = [], options = {}) {
   /** @type {Set<Reason>} */
   const reasons = new Set();
   const active = new WeakSet();
@@ -121,7 +130,24 @@ function renderCardContent(content, mentions = []) {
   let stopped = false;
   let omittedActions = 0;
   /** @param {Reason} reason */
-  const mark = (reason) => { reasons.add(reason); };
+  const mark = (reason) => {
+    reasons.add(reason);
+    // The output cap is handled by emit at the exact display boundary, and
+    // mention expansion has its own inline placeholder. Other traversal caps
+    // mark the omitted branch immediately, before any readable sibling.
+    if (reason !== "card_output_limit" && options.includePartialNotice === false &&
+        Object.hasOwn(LOCAL_LIMIT_NOTICES, reason) && !stopped) {
+      const marker = LOCAL_LIMIT_NOTICES[/** @type {keyof typeof LOCAL_LIMIT_NOTICES} */ (reason)];
+      contentEmissions += 1;
+      if (output.length + marker.length <= MAX_OUTPUT_CHARS) output += marker;
+      else {
+        const suffix = `${marker}${LOCAL_LIMIT_NOTICES.card_output_limit}`;
+        output = `${output.slice(0, MAX_OUTPUT_CHARS - suffix.length)}${suffix}`;
+        reasons.add("card_output_limit");
+        stopped = true;
+      }
+    }
+  };
 
   /** Read data properties only: inherited or accessor content is not source text.
    * @param {unknown} value @param {string} key @returns {any}
@@ -181,7 +207,14 @@ function renderCardContent(content, mentions = []) {
     // explicit br emission still records overflow against the same limit.
     if (boundary && remaining === 0) return;
     output += text.slice(0, Math.max(remaining, 0));
-    if (text.length > remaining) { mark("card_output_limit"); stopped = true; }
+    if (text.length > remaining) {
+      mark("card_output_limit");
+      if (options.includePartialNotice === false) {
+        const marker = LOCAL_LIMIT_NOTICES.card_output_limit;
+        output = `${output.slice(0, MAX_OUTPUT_CHARS - marker.length)}${marker}`;
+      }
+      stopped = true;
+    }
   }
   function lineBreak() { if (output && !output.endsWith("\n")) emit("\n", true); }
 
@@ -470,7 +503,7 @@ function renderCardContent(content, mentions = []) {
           let projected;
           if (cost > remainingExpansion) {
             mark("card_output_limit");
-            projected = "@提及未展开";
+            projected = options.includePartialNotice === false ? "@提及未展开[提及在此达到展开上限]" : "@提及未展开";
           } else {
             remainingExpansion -= cost;
             projected = mention(identity);
@@ -748,7 +781,12 @@ function renderCardContent(content, mentions = []) {
       } else if (tag === "br") {
         emit("\n");
       } else if (tag === "hr") {
-        lineBreak(); emit("---"); lineBreak();
+        lineBreak();
+        if (options.includeDecorativeSeparators === false) {
+          if (output && !output.endsWith("\n\n")) emit("\n", true);
+        } else {
+          emit("---"); lineBreak();
+        }
       } else if (tag === "") {
         // Untagged native property nodes and common field wrappers have only
         // these presentation slots; never search arbitrary descendants.
@@ -859,6 +897,12 @@ function renderCardContent(content, mentions = []) {
     return { text: output, status: "partial", reason, version: 3, ...omissions };
   }
   const status = output ? "partial" : "structured_fallback";
+  // Human message reading can omit a result-level partial notice without
+  // stripping matching source text or weakening local missing-value markers.
+  // Default projections (including stored and JSON content) stay unchanged.
+  if (output && options.includePartialNotice === false) {
+    return { text: output, status, reason, version: 3, ...omissions };
+  }
   const marker = `[卡片${output ? "部分内容未展开" : "未展开"}：${EXPLANATIONS[reason]}]`;
   return { text: `${output.slice(0, Math.max(0, MAX_OUTPUT_CHARS - marker.length - 1))}${output ? "\n" : ""}${marker}`,
     status, reason, version: 3, ...omissions };

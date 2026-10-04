@@ -54,7 +54,8 @@ function exercise(t, cases) {
     assert.equal(JSON.stringify(original.raw), sourceBefore);
     assert.deepEqual(normalized.raw_api, original.raw);
     assert.equal(JSON.parse(current.canonical_json).content_rendering.version, 3);
-    for (const line of projected.text.split("\n").filter(Boolean)) assert.ok(text.includes(line), `${original.name}: real text CLI lost a projected line`);
+    const readableText = cases[index].readableText ?? projected.text;
+    for (const line of readableText.split("\n").filter(Boolean)) assert.ok(text.includes(line), `${original.name}: real text CLI lost a readable source line`);
     cases[index].check(projected, text, historical);
   }
   // Includes DB bytes, timestamps/mode, every stored field (hash/version too),
@@ -111,12 +112,13 @@ test("an explicitly chosen empty string or array does not borrow lower languages
 test("malformed outer maps and unknown languages stay partial without hiding their evidence behind fallback", (t) => {
   exercise(t, [null, "", [], { zz_invented: "UNKNOWN_LANGUAGE_MUST_STAY_HIDDEN" }, { zh_cn: {} }].map((value, index) => ({
     name: `malformed_${index}`, card: { header: { title: plain("Readable anchor") }, elements: [plain("DEFAULT_MUST_STAY_HIDDEN", { i18nContent: value })] },
+    readableText: "Readable anchor",
     check(card, text) {
       assert.equal(card.status, "partial");
       assert.equal(card.reason, "unsupported_card_structure");
       assert.match(card.text, /^Readable anchor\n/);
       assert.match(card.text, /部分内容未展开/);
-      assert.doesNotMatch(text, /MUST_STAY_HIDDEN/);
+      assert.doesNotMatch(text, /MUST_STAY_HIDDEN|部分内容未展开/);
     },
   })));
 });
@@ -124,12 +126,12 @@ test("malformed outer maps and unknown languages stay partial without hiding the
 test("a malformed preferred language may expose a valid alternative but remains partial", (t) => {
   exercise(t, [{ name: "invalid_then_readable", card: { elements: [plain("DEFAULT_MUST_STAY_HIDDEN", {
     i18nContent: { zh_cn: 42, en_us: "Readable alternative", ja_jp: "LOWER_LANGUAGE_MUST_STAY_HIDDEN" },
-  })] }, check(card, text) {
+  })] }, readableText: "Readable alternative", check(card, text) {
     assert.equal(card.status, "partial");
     assert.equal(card.reason, "unsupported_card_structure");
     assert.match(card.text, /^Readable alternative\n/);
     assert.match(card.text, /部分内容未展开/);
-    assert.doesNotMatch(text, /MUST_STAY_HIDDEN/);
+    assert.doesNotMatch(text, /MUST_STAY_HIDDEN|部分内容未展开/);
   } }]);
 });
 

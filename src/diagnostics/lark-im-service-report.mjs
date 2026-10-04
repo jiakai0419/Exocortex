@@ -303,10 +303,14 @@ function isCatchingUp(syncStatus) {
 }
 
 /**
+ * Health uses the selected database snapshot, OS service state and verified
+ * current activity. Worker summaries describe unbound retained log history;
+ * even an explicit failed completion cannot change the selected target's health.
+ * The legacy workerSummary input remains accepted for callers, but is not used.
  * @param {{service: {status: ServiceRuntimeStatus}, syncStatus: JsonObject | null, syncErrorText?: string, workerSummary: JsonObject, activity?: {status: ServiceActivityStatus}}} input
  * @returns {{status: ServiceHealthStatus, detail: string, reason: string}}
  */
-function summarizeServiceHealth({ service, syncStatus, syncErrorText = "", workerSummary, activity }) {
+function summarizeServiceHealth({ service, syncStatus, syncErrorText = "", activity }) {
   if (service.status === "unknown") return { status: "problem", reason: "service_state_unavailable", detail: "background service state is unavailable" };
   if (service.status !== "running") return { status: "problem", reason: "service_stopped", detail: "background service is stopped" };
   if (!syncStatus) return { status: "problem", reason: "sync_status_unavailable", detail: syncErrorText || "sync status unavailable" };
@@ -331,11 +335,6 @@ function summarizeServiceHealth({ service, syncStatus, syncErrorText = "", worke
       : databasePhaseUnknown ? "unfinished_runs_unverified"
       : rawHealth === "needs_attention" ? "no_successful_runs" : "health_unavailable";
     return { status: "problem", reason, detail: syncStatus.health_detail || rawHealth };
-  }
-  // Unbound log history cannot turn an unknown result into a target-health
-  // failure. Keep it visible in history without using the legacy false coercion.
-  if (workerSummary.last_cycle?.ok === false && workerSummary.last_cycle.result_valid !== false && activity?.status !== "syncing") {
-    return { status: "problem", reason: "last_cycle_failed", detail: "last worker cycle failed" };
   }
   if (isCatchingUp(syncStatus) || historicalHealth === "catching_up") {
     if (Number(syncStatus.details?.pending_count || 0) > 0) {
