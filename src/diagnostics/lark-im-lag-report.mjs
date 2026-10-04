@@ -221,6 +221,7 @@ function loadExistingRecords(dbPath, messageIds, deps = {}) {
     `SELECT external_id, occurred_at_ms
      FROM records
      WHERE source_id = 'lark.im'
+       AND record_type = 'lark.im.message'
        AND external_id IN (${messageIds.map((id) => quoteSql(id)).join(", ")});`,
     "load existing records",
   );

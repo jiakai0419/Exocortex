@@ -53,7 +53,7 @@ function quoteSql(value) {
 
 /** @param {MessageOptions} opts */
 function buildWhere(opts) {
-  const clauses = [];
+  const clauses = ["r.source_id = 'lark.im'", "r.record_type = 'lark.im.message'"];
   if (opts.direction !== "all") clauses.push(`direction = ${quoteSql(opts.direction)}`);
   if (opts.search) clauses.push(`body LIKE ${quoteSql(`%${opts.search}%`)}`);
   return clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";

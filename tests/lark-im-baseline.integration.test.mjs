@@ -183,7 +183,8 @@ test("seeding refuses disabled sources and active maintenance or source sync loc
       assert.throws(() => ensureSourceInitialSyncStart(dbPath, SOURCE, DAY_ONE, { explicit: true }));
       assert.deepEqual(sourceConfig(dbPath), {});
       setSourceConfig(dbPath, { initial_sync_start_ms: DAY_ONE });
-      assert.equal(ensureSourceInitialSyncStart(dbPath, SOURCE, DAY_TWO), DAY_ONE);
+      if (name === "disabled") assert.throws(() => ensureSourceInitialSyncStart(dbPath, SOURCE, DAY_TWO), /disabled/);
+      else assert.equal(ensureSourceInitialSyncStart(dbPath, SOURCE, DAY_TWO), DAY_ONE);
     });
   }
 });

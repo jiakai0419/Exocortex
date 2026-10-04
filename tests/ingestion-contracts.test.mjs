@@ -79,3 +79,16 @@ for (const mode of ["records", "partial-records", "list"]) {
     assert.deepEqual(snapshot(db), before);
   });
 }
+
+test("shared fence uses the transaction clock, independent of completion timestamps", (t) => {
+  const { db, scope } = fixture(t);
+  const runId = store.createRun(db, scope);
+  const guard = (finish) => store.sqliteQuery(db, `BEGIN IMMEDIATE;
+    ${store.runFenceGuardSql(scope, runId, finish, { assert: true })}
+    SELECT count(*) AS n FROM __run_fence_guard; COMMIT;`);
+  assert.equal(guard("2099-01-01T00:00:00Z")[0].n, 1, "future display clocks do not expire a current lease");
+  const lockedAt = new Date(Date.now() - 21 * 60_000).toISOString();
+  store.sqliteExec(db, `UPDATE sync_locks SET locked_at=${store.quoteSql(lockedAt)};
+    UPDATE sync_runs SET metadata_json=json_set(metadata_json,'$.__run_fence.locked_at',${store.quoteSql(lockedAt)});`);
+  assert.throws(() => guard("2000-01-01T00:00:00Z"), /CHECK constraint/, "old display clocks cannot extend a stale lease");
+});
