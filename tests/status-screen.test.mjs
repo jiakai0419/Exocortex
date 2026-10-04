@@ -98,10 +98,10 @@ for (const name of STATUS_SCREEN_SCENARIOS) {
 }
 
 test("Problems is conditional and does not duplicate work, progress or sample status", () => {
-  for (const scenario of STATUS_SCREEN_SCENARIOS.filter((name) => !["failed", "unavailable", "unbound_failure"].includes(name))) {
+  for (const scenario of STATUS_SCREEN_SCENARIOS.filter((name) => !["failed", "unavailable"].includes(name))) {
     assert.equal(hasSection(text(scenario), "Problems"), false, `${scenario} has no independent problem row`);
   }
-  for (const scenario of ["failed", "unavailable", "unbound_failure"]) {
+  for (const scenario of ["failed", "unavailable"]) {
     assert.equal(hasSection(text(scenario), "Problems"), true, `${scenario} must expose its independent problems`);
   }
 });
@@ -223,8 +223,7 @@ test("failures preserve all categories, numeric counts and abnormal reservations
   assert.match(problems, /15.*(?:failed|failure)/i);
   for (const pattern of [/permission|access denied/i, /timeout|timed out/i, /rate limit/i, /service unavailable/i, /unclassified|unknown failure/i]) assert.match(problems, pattern);
   assert.match(problems, /reservation|lease|lock/i);
-  assert.match(problems, /(?:background log|worker log).*(?:fail|failure)/i);
-  assert.match(problems, /database.*(?:unverified|not verified)/i);
+  assert.doesNotMatch(problems, /Background log|Worker log|database unverified/i);
   assert.match(output, /expired/i);
   assert.match(output, /future/i);
 });
@@ -256,18 +255,39 @@ test("zero database failures move to detail while missing or malformed counts re
   }
 });
 
-test("unbound failed history stays attributed to the background log beside healthy selected-database evidence", () => {
-  const report = statusScreenFixture("healthy");
-  report.worker.last_cycle = { cycle: 20, ok: false, at: new Date(STATUS_SCREEN_NOW - 30_000).toISOString(), age_ms: 30_000,
-    result_valid: true, timestamp_valid: true };
-  Object.assign(report.stability.cycles, { total: 5, ok: 4, failed: 1 });
-  const output = plain(renderStatusText(report, { columns: 96, stream }));
-  assert.match(section(output, "Health & current work"), /^Local health OK /);
-  const problems = section(output, "Problems");
-  assert.match(problems, /(?:Background log|Worker log).*(?:failed|failure)/i);
-  assert.match(problems, /database.*(?:unverified|not verified)/i);
-  assert.doesNotMatch(problems, /Database failures|current database.*failed|selected database.*failed/i);
-  assertDefaultNoiseAbsent(output);
+test("unbound failures stay detail-only, including two-day-old foreign history and aggregate-only failures", () => {
+  for (const age of [30_000, 2 * 24 * 3_600_000, null]) {
+    const report = statusScreenFixture("healthy", { detail: true });
+    report.worker.last_cycle = age === null ? null : { cycle: 20, ok: false,
+      at: new Date(STATUS_SCREEN_NOW - age).toISOString(), age_ms: age,
+      result_valid: true, timestamp_valid: true };
+    report.worker.last_failure = report.worker.last_cycle;
+    if (age === 2 * 24 * 3_600_000) {
+      report.stability.observed_events = 0;
+      report.stability.cycles = { total: 0, ok: 0, failed: 0 };
+      report.stability.last_success = null;
+    } else Object.assign(report.stability.cycles, { total: 5, ok: 4, failed: 1 });
+    const output = plain(renderStatusText({ ...report, detail: undefined }, { columns: 96, stream }));
+    assert.match(section(output, "Health & current work"), /^Local health OK .*Current work Waiting /);
+    assert.equal(report.failure_runs.failed_runs, 0);
+    assert.equal(report.worker.database_binding, "unverified");
+    assert.equal(hasSection(output, "Problems"), false);
+    assert.doesNotMatch(output, /Background log|Failure recorded|database unverified|Failed tasks/i);
+    assertDefaultNoiseAbsent(output);
+    const history = section(plain(renderStatusText(report, { columns: 96, stream })), "Background history");
+    assert.match(history, /database association is not verified/i);
+    if (age !== null) assert.match(history, /Latest round Failed/);
+    else assert.match(history, /Completed rounds 4 succeeded.*1 failed/);
+    if (age === 2 * 24 * 3_600_000) assert.match(history, /2032-02-02/);
+
+    // Hiding unbound history must not hide independently selected DB evidence.
+    for (const database of [{ evidence: "available", failed_runs: 2 }, { evidence: "unavailable", failed_runs: null }]) {
+      const result = { ...report, detail: undefined, failure_runs: { ...report.failure_runs, ...database } };
+      const problems = section(plain(renderStatusText(result, { columns: 96, stream })), "Problems");
+      assert.match(problems, database.evidence === "available" ? /Database failures 2 retained failed runs/ : /Database failures.*unavailable/);
+      assert.doesNotMatch(problems, /Background log|Worker log|database unverified/i);
+    }
+  }
 });
 
 test("old-only history is dated, window statistics stay empty, and current work stays unconfirmed", () => {

@@ -125,11 +125,6 @@ export function renderStatusText(report, options = {}) {
     problems.push(["Failure window", range(failureRuns.window_started_at, failureRuns.window_ended_at)]);
     for (const row of failureRuns.by_kind || []) problems.push(["Failure category", `${failure(row.kind)} · ${number(row.count)}`]);
   }
-  // Log failures are observations about an unbound log, never target-health facts.
-  const logFailure = placed(worker.last_cycle) && worker.last_cycle.result_valid !== false && worker.last_cycle.ok === false ? worker.last_cycle
-    : placed(worker.last_failure) && worker.last_failure.result_valid !== false && worker.last_failure.ok === false ? worker.last_failure : null;
-  if (!detailed && logFailure) problems.push(["Background log", `Failure recorded ${timed(logFailure.at)} · database unverified`]);
-  else if (!detailed && (stability.cycles?.failed > 0 || stability.failures?.failed_steps > 0)) problems.push(["Background log", "Failures recorded in retained log · database unverified"]);
   if (problems.length) {
     screen.heading("Problems");
     for (const [label, value] of problems) screen.row(label, value);

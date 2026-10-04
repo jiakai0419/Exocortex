@@ -129,7 +129,7 @@ test("status keeps local health independent of an unbound failed cycle while ret
   const compact = fixture(); assert.equal(await runStatusCommand(options({ format: "text" }), compact.context, deps(r)), 0);
   const text = plain(compact.output()).replace(/\s+/g, " ");
   assert.match(text, /Local health\s+OK/);
-  assert.match(text, /Background log\s+Failure recorded.*database unverified/);
+  assert.doesNotMatch(text, /Background log|Background history|Failure recorded|database unverified/);
   assert.doesNotMatch(text, /Local health\s+NEEDS ATTENTION|Latest round/);
 });
 for (const [unsupported, reasons] of [[0, []], [4, [{ reason: "restricted_mode", error_code: 231203, count: 4 }]],

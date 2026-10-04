@@ -22,8 +22,8 @@ Normal implementation evidence and commands belong in `--detail` / help.
    Restricted conversations appear once, as a collection limit. Remote sample
    state remains compact; missing/expired sampling is not a local failure.
 4. **Problems**, only when needed: database failure records, unavailable failure
-   statistics, abnormal/unavailable reservations, or independently attributed
-   background-log failures. Do not repeat facts already visible above or add an
+   statistics, or abnormal/unavailable reservations. Do not repeat facts already
+   visible above or add an
    empty “no required action” section.
 5. **Background history**, detail only: unbound worker-log statistics and their
    exact observation limits. **Diagnostics** adds raw checkpoint summaries,
@@ -36,11 +36,11 @@ Normal implementation evidence and commands belong in `--detail` / help.
 
 Normal health has no `local sync checks only` suffix. A matched database has no
 `selected database verified` suffix. Oldest list checkpoint, command targets,
-optional remote-sample commands, zero database failures and all normal log
-history move to detail. Restricted counts and their exclusion appear once.
+optional remote-sample commands, zero database failures and all unbound log
+history (including failures) move to detail. Restricted counts and their exclusion appear once.
 Unavailable, positive or malformed evidence is never converted into normal zero.
-Unbound log failures remain diagnostic facts with their source stated; they
-cannot lower or raise the selected database's health, even if recent and explicit.
+Unbound log failures remain detail-only diagnostic facts with their source stated;
+they cannot lower or raise the selected database's health, even if recent and explicit.
 
 ### Progress contract
 
@@ -114,9 +114,8 @@ meaning; additive source/window/evidence fields explain legacy `by_kind`.
 
 Default text keeps unsupported source counts, detail debt and unavailable evidence
 visible once. Database failures appear by default only when positive or unknown;
-zero is available in detail. Unbound log failure notices are explicitly labelled
-as background-log evidence with database association unverified. The complete
-log history and its window remain in detail. Neither mode includes raw DB keys,
+zero is available in detail. All unbound log history, including explicit failures
+and failure totals, remains in detail with its source and observation window. Neither mode includes raw DB keys,
 scope IDs, owners, private paths or raw errors. `status` stays read-only.
 Commands in detail require the same `--db` and `--log-dir` values; that requirement
 appears beside commands without printing private paths. Missing/expired samples
