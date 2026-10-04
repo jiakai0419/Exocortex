@@ -51,15 +51,53 @@ export function run(cmd, args, options = {}, deps = {}) {
   return normalized;
 }
 
-/** @param {string} stdout */
+/** Read only direct service properties, never a nested group's state or PID.
+ * launchctl uses whole-line `key = {` / `}` delimiters; braces in scalar
+ * values are ordinary text. Flat, uniformly indented diagnostic fixtures are
+ * also accepted. Ambiguous or incomplete structure supplies no runtime facts.
+ * @param {string} stdout */
 export function parseLaunchdState(stdout) {
   /** @type {Record<string, string>} */
   const result = {};
-  for (const line of stdout.split("\n")) {
-    const match = line.trim().match(/^(state|pid|last exit code) = (.+)$/);
-    if (match) result[match[1]] = match[2];
+  const lines = stdout.split("\n").filter((line) => line.trim() && !/^\s*(?:#|\/\/)/.test(line));
+  if (!lines.length) return result;
+  const opens = (/** @type {string} */ line) => /^[^{}=]+\s*=\s*\{$/.test(line.trim());
+  const indentation = (/** @type {string} */ line) => line.match(/^[ \t]*/)?.[0] || "";
+  const property = /^(state|pid|last exit code)\s*=\s*(.*)$/;
+  const wrapped = opens(lines[0]);
+  if (wrapped && property.test(lines[0].trim())) return {};
+  /** @type {{indent: string, childIndent: string | null}[]} */
+  const scopes = wrapped ? [{ indent: indentation(lines[0]), childIndent: null }] : [];
+  const flatIndent = indentation(lines[0]);
+  for (const line of lines.slice(wrapped ? 1 : 0)) {
+    const text = line.trim();
+    const indent = indentation(line);
+    if (wrapped) {
+      const scope = scopes.at(-1);
+      if (!scope) return {};
+      if (text === "}") {
+        if (indent !== scope.indent) return {};
+        scopes.pop();
+        continue;
+      }
+      if (!indent.startsWith(scope.indent) || indent.length <= scope.indent.length) return {};
+      if (scope.childIndent === null) scope.childIndent = indent;
+      if (indent !== scope.childIndent) return {};
+      if (opens(line)) {
+        if (scopes.length === 1 && property.test(text)) return {};
+        scopes.push({ indent, childIndent: null });
+        continue;
+      }
+      if (text === "{") return {};
+      if (scopes.length !== 1) continue;
+    } else if (indent !== flatIndent || opens(line) || text === "}" || text === "{") return {};
+    const match = text.match(property);
+    if (match) {
+      if (!match[2] || Object.hasOwn(result, match[1])) return {};
+      result[match[1]] = match[2];
+    }
   }
-  return result;
+  return scopes.length ? {} : result;
 }
 
 /** @param {{status: number | null, stdout?: string, stderr?: string, error?: unknown, signal?: unknown}} result

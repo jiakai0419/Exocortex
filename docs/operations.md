@@ -79,6 +79,8 @@ STOPPED  LaunchAgent 未加载，或已加载但 worker 进程没起来。
 
 另有 `UNKNOWN`：无法确认 launchd 状态。只有成功的 `launchctl print` 或明确的 service-not-found 结果才能判定加载或未加载；权限错误、命令启动失败和其他异常不能当作 STOPPED。细节里继续展示 LaunchAgent loaded、PID 和 last exit。
 
+`launchctl print` 中只有服务自身的直接 `state`、`pid` 和 `last exit code` 字段能证明运行状态；嵌套资源组或子进程的同名字段不能覆盖或补齐它们。结构未闭合、缩进歧义或重复直接字段不提供肯定运行证据；查询成功仍可证明已加载，但不能据此声称正在运行或完成新周期。
+
 `service install` 只校验并原子保存配置，不启动服务。正在运行的配置若不同则拒绝覆盖，需先显式 stop；相同配置可直接保留。`--db`、日志目录及共同 WorkerConfig 都解析后固化；`--once` / `--max-cycles` 不进入常驻配置。
 
 `service start` 是 ensure-running：已确认运行时不更换实例；已加载但未运行时请求非强制 kickstart，未加载时 bootstrap 后启动。无法检查时失败。`service restart` 才明确执行 stop → start。启动返回 0 只表示请求已接受，持续运行与新周期用 `check --wait` 验收。
