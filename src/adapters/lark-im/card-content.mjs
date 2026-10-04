@@ -1,7 +1,5 @@
 // @ts-check
 
-import { stripVTControlCharacters } from "node:util";
-
 const MAX_INPUT_CHARS = 256 * 1024;
 const MAX_OUTPUT_CHARS = 16_000;
 const MAX_NODES = 2048;
@@ -33,13 +31,45 @@ function object(value) {
 
 /** Remote text cannot supply terminal escapes or text-direction controls. @param {string} text */
 function cleanText(text) {
-  return stripVTControlCharacters(text
-    .replace(/(?:\u001B\]|\u009D)[\s\S]*?(?:\u0007|\u001B\\|\u009C)/g, "")
-    .replace(/(?:\u001B\[|\u009B)[0-?]*[ -/]*[@-~]/g, ""))
-    .replace(/[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, "")
-    .replace(/\r\n?/g, "\n")
-    .replace(/[\u2028\u2029]/g, "\n")
-    .replace(/[\u0000-\u0009\u000B-\u001F\u007F-\u009F]/g, " ");
+  const parts = [];
+  // Each input character is consumed once. Unterminated OSC/control strings
+  // consume their remaining payload; another opener cannot restart a search.
+  let state = "text";
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (state === "osc" || state === "string") {
+      if (code === 0x9c || state === "osc" && code === 0x07) state = "text";
+      else if (code === 0x1b && text[index + 1] === "\\") { state = "text"; index += 1; }
+      continue;
+    }
+    if (state === "csi") {
+      if (code === 0x1b) state = "escape";
+      else if (code === 0x9d) state = "osc";
+      else if (code === 0x90 || code === 0x98 || code === 0x9e || code === 0x9f) state = "string";
+      else if (code >= 0x40 && code <= 0x7e) state = "text";
+      continue;
+    }
+    if (state === "escape") {
+      if (code === 0x5d) state = "osc";
+      else if (code === 0x5b) state = "csi";
+      else if (code === 0x50 || code === 0x58 || code === 0x5e || code === 0x5f) state = "string";
+      else if (code >= 0x30 && code <= 0x7e) state = "text";
+      continue;
+    }
+    if (code === 0x1b) { state = "escape"; continue; }
+    if (code === 0x9d) { state = "osc"; continue; }
+    if (code === 0x9b) { state = "csi"; continue; }
+    if (code === 0x90 || code === 0x98 || code === 0x9e || code === 0x9f) { state = "string"; continue; }
+    if (code === 0x061c || code === 0x200e || code === 0x200f ||
+        code >= 0x202a && code <= 0x202e || code >= 0x2066 && code <= 0x2069) continue;
+    if (code === 0x0d) {
+      parts.push("\n");
+      if (text[index + 1] === "\n") index += 1;
+    } else if (code === 0x0a || code === 0x2028 || code === 0x2029) parts.push("\n");
+    else if (code < 0x20 || code >= 0x7f && code <= 0x9f) parts.push(" ");
+    else parts.push(text[index]);
+  }
+  return parts.join("");
 }
 
 /**
@@ -56,6 +86,9 @@ function renderCardContent(content, mentions = []) {
   const active = new WeakSet();
   /** @type {Map<string, string | null>} */
   const names = new Map();
+  /** Cache by name, so aliases do not repeat URL work or duplicate large strings.
+   * @type {Map<string, string>} */
+  const formattedNames = new Map();
   let parseChars = 0;
   let textChars = 0;
   let nodes = 0;
@@ -135,7 +168,16 @@ function renderCardContent(content, mentions = []) {
   /** @param {string} id */
   function mention(id) {
     const name = names.get(id);
-    if (name) return `@${safeLinks(name)}`;
+    if (name) {
+      let formatted = formattedNames.get(name);
+      if (formatted === undefined) {
+        // One extra character lets the caller distinguish a full result from
+        // a projection that must carry the explicit output-limit marker.
+        formatted = `@${safeLinks(name)}`.slice(0, MAX_OUTPUT_CHARS + 1);
+        formattedNames.set(name, formatted);
+      }
+      return formatted;
+    }
     mark("unresolved_card_mention");
     return "@未知用户";
   }
@@ -145,8 +187,19 @@ function renderCardContent(content, mentions = []) {
    */
   function visibleText(value) {
     let text = boundedRawText(value);
+    let remainingExpansion = Math.max(0, MAX_OUTPUT_CHARS - output.length);
     text = text.replace(/<at\s+id=["']([^"'<>]*)["']\s*>[^<]*<\/at>|@_user_\d+\b/gi,
-      (matched, id) => mention(id ?? matched));
+      (matched, id) => {
+        if (remainingExpansion === 0) { mark("card_output_limit"); return ""; }
+        const replacement = mention(id ?? matched);
+        const retained = replacement.slice(0, remainingExpansion);
+        remainingExpansion -= retained.length;
+        if (retained.length < replacement.length) mark("card_output_limit");
+        return retained;
+      });
+    // Original text is input-bounded; all inserted names together are bounded
+    // by the remaining output budget. Keep the whole original URL syntax for
+    // redaction rather than truncating a destination before it is inspected.
     return safeLinks(cleanText(text));
   }
 
@@ -160,7 +213,10 @@ function renderCardContent(content, mentions = []) {
     let labelStart = -1;
     for (let index = 0; index < text.length; index += 1) {
       if (text[index] === "\n") labelStart = -1;
-      else if (text[index] === "[") labelStart = index;
+      // Keep the whole possible label, including IPv6 brackets in a URL label.
+      // Restarting at its inner '[' would split off the scheme and allow the
+      // remaining query to evade URL projection.
+      else if (text[index] === "[" && labelStart < 0) labelStart = index;
       else if (text[index] === "]" && labelStart >= 0 && text[index + 1] === "(") {
         let nesting = 1;
         let excessive = false;
@@ -176,29 +232,36 @@ function renderCardContent(content, mentions = []) {
         }
         const label = text.slice(labelStart + 1, index);
         const start = labelStart > copiedUntil && text[labelStart - 1] === "!" ? labelStart - 1 : labelStart;
-        parts.push(text.slice(copiedUntil, start));
+        parts.push(bareLinks(text.slice(copiedUntil, start)));
+        const safeLabel = bareLinks(label);
         if (nesting !== 0 || excessive) {
           mark("unsupported_card_link");
-          parts.push(`${label}（[不支持的链接]）`);
+          parts.push(`${safeLabel}（[不支持的链接]）`);
         } else {
           const url = text.slice(index + 2, end).trim().replace(/^<([^>]*)>$/, "$1")
             .replace(/\s+["'][^"']*["']$/, "").replace(/\\([\\()[\]])/g, "$1");
-          parts.push(`${label}（链接：${safeUrl(url)}）`);
+          parts.push(`${safeLabel}（链接：${safeUrl(url)}）`);
         }
         copiedUntil = nesting === 0 ? end + 1 : end;
         index = copiedUntil - 1;
         labelStart = -1;
       }
     }
-    parts.push(text.slice(copiedUntil));
+    parts.push(bareLinks(text.slice(copiedUntil)));
     return parts.join("");
   }
 
   /** @param {string} text */
-  function safeLinks(text) {
-    return markdownLinks(text).replace(/\b(?:[a-z][a-z0-9+.-]{1,31}:\/\/|(?:javascript|vbscript|data|file|mailto|tel):)[^\s<>\uFF08\uFF09\]]+/gi,
+  function bareLinks(text) {
+    // Delimit only at whitespace: brackets, angle brackets and full-width
+    // punctuation can all occur in URL queries. Project each original token
+    // once before adding display markers; never rescan generated link text.
+    return text.replace(/\b(?:[a-z][a-z0-9+.-]{1,31}:\/\/|(?:javascript|vbscript|data|file|mailto|tel):)\S+/gi,
       (url) => safeUrl(url));
   }
+
+  /** @param {string} text */
+  function safeLinks(text) { return markdownLinks(text); }
 
   /** @param {unknown} value @param {number} depth @param {(item: unknown, depth: number) => void} visit */
   function each(value, depth, visit) {
@@ -257,7 +320,40 @@ function renderCardContent(content, mentions = []) {
     if (actions !== undefined) { each(actions, depth + 1, block); recognized = true; }
     const childColumns = read(payload, "columns");
     if (childColumns !== undefined) { each(childColumns, depth + 1, block); recognized = true; }
+    const extra = read(payload, "extra");
+    if (extra !== undefined) { block(extra, depth + 1); recognized = true; }
     if (!recognized) mark("unsupported_card_structure");
+  }
+
+  /** Display the finite native button URL slots without treating callback data
+   * as a link or silently ignoring a malformed platform destination.
+   * @param {JsonObject} payload @param {boolean} label
+   */
+  function buttonLinks(payload, label) {
+    let linked = false;
+    const url = read(payload, "url") ?? read(payload, "href");
+    if (typeof url === "string") {
+      emit(`${label ? " " : ""}（链接：${safeUrl(boundedText(url))}）`);
+      linked = true;
+    } else if (url !== undefined) mark("unsupported_card_structure");
+    const multi = read(payload, "multi_url");
+    if (multi !== undefined) {
+      if (!object(multi)) mark("unsupported_card_structure");
+      else {
+        let recognized = false;
+        for (const [slot, platform] of [["url", "默认"], ["pc_url", "桌面"], ["ios_url", "iOS"], ["android_url", "Android"]]) {
+          const destination = read(multi, slot);
+          if (destination === undefined || destination === null || destination === "") continue;
+          recognized = true;
+          if (typeof destination !== "string") { mark("unsupported_card_structure"); continue; }
+          lineBreak();
+          emit(`${platform}链接：${safeUrl(boundedText(destination))}`);
+          linked = true;
+        }
+        if (!recognized) mark("unsupported_card_structure");
+      }
+    }
+    if (!label && !linked) mark("unsupported_card_structure");
   }
 
   /** @param {unknown} value @param {number} depth @param {boolean} inLine */
@@ -278,9 +374,7 @@ function renderCardContent(content, mentions = []) {
       } else if (tag === "button" || tag === "a" || tag === "link") {
         if (!inLine) lineBreak();
         const label = textSlots(payload, depth);
-        const url = read(payload, "url") ?? read(payload, "href");
-        if (typeof url === "string") emit(`${label ? " " : ""}（链接：${safeUrl(boundedText(url))}）`);
-        else if (url !== undefined || !label) mark("unsupported_card_structure");
+        buttonLinks(payload, label);
       } else if (CONTAINER_TAGS.has(tag)) {
         container(payload, depth, tag === "column" || tag === "column_set");
       } else if (tag === "hr") {
@@ -288,8 +382,10 @@ function renderCardContent(content, mentions = []) {
       } else if (tag === "") {
         // Untagged native property nodes and common field wrappers have only
         // these presentation slots; never search arbitrary descendants.
-        if (["elements", "fields", "actions", "columns"].some((key) => read(payload, key) !== undefined)) {
+        if (["elements", "fields", "actions", "columns", "extra"].some((key) => read(payload, key) !== undefined)) {
           container(payload, depth);
+        } else if (["url", "href", "multi_url"].some((key) => read(payload, key) !== undefined)) {
+          buttonLinks(payload, textSlots(payload, depth));
         } else if (!textSlots(payload, depth)) mark("unsupported_card_structure");
       } else mark("unsupported_card_structure");
     });
@@ -331,6 +427,8 @@ function renderCardContent(content, mentions = []) {
         const title = read(headerPayload, "title");
         if (title !== undefined) block(title, wrapperDepth + 1);
         else mark("unsupported_card_structure");
+        const subtitle = read(headerPayload, "subtitle");
+        if (subtitle !== undefined) block(subtitle, wrapperDepth + 1);
       }
       const body = read(card, "body");
       const bodyPayload = read(body, "property") ?? body;
