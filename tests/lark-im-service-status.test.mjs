@@ -445,20 +445,45 @@ test("service status recent failure kind aggregation is public-safe", () => {
         return [
           { error_message: '{"error":{"type":"api","code":9499,"message":"too many request"}}' },
           { error_message: "TLS handshake timeout" },
-          { error_message: "permission denied" },
+          { error_message: "permission denied SYNTHETIC_PRIVATE_FAILURE /invented/private-fixture" },
+          { error_message: "unrecognized SYNTHETIC_PRIVATE_FAILURE /invented/private-fixture" },
         ];
       },
     },
   );
 
   assert.deepEqual(kinds, {
-    failed_runs: 3,
+    failed_runs: 4,
     by_kind: [
       { kind: "network_timeout", count: 1 },
+      { kind: "permission_denied", count: 1 },
       { kind: "rate_limited", count: 1 },
       { kind: "unknown", count: 1 },
     ],
   });
+  assert.doesNotMatch(JSON.stringify(kinds), /SYNTHETIC_PRIVATE_FAILURE|private-fixture|permission denied/);
+});
+
+test("service failure aggregation preserves shared classification priority and genuine unknowns", () => {
+  const cases = [
+    ['{"error":{"code":210508,"message":"synthetic diagnostic"}}', "permission_denied"],
+    ["lark-cli failed: kind=unknown code=210508", "permission_denied"],
+    ...[2200, 1663].map((code) => [JSON.stringify({ error: { type: "api", code,
+      message: "Internal Error: permission denied" } }), "internal_error"]),
+    ["HTTP 429 permission denied", "rate_limited"],
+    ["TLS handshake timeout: permission denied", "network_timeout"],
+    ["HTTP 503 permission denied", "service_unavailable"],
+    ['{"code":231203,"message":"permission denied"}', "restricted_mode"],
+    ['{"code":230002,"message":"permission denied"}', "bot_user_out_of_chat"],
+    ["lark-cli failed: kind=unknown code=2200", "unknown"],
+    ["lark-cli failed: kind=permission_denied-extra", "unknown"],
+    ["", "unknown"],
+  ];
+  for (const [error_message, kind] of cases) {
+    const result = collectRecentFailureKinds("synthetic.sqlite", Date.parse("2026-06-20T12:00:00Z"), 3600000,
+      { sqliteJson: () => [{ error_message }] });
+    assert.deepEqual(result, { failed_runs: 1, by_kind: [{ kind, count: 1 }] }, error_message);
+  }
 });
 
 test("service status view renders sync failure and missing worker log", () => {
