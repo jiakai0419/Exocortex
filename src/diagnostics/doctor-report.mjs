@@ -71,30 +71,28 @@ function runJson(args, okStatuses = new Set([0]), deps = {}) {
     timeout: timeoutMs,
     killSignal: "SIGKILL",
   });
-  const status = result.status ?? 1;
+  const status = Number.isSafeInteger(result.status) ? Number(result.status) : 1;
   const stdout = String(result.stdout || "").trim();
   const stderr = String(result.stderr || "").trim();
-  if (stdout) {
-    try {
-      const json = JSON.parse(stdout);
-      if (!okStatuses.has(status)) json._command_status = status;
-      return json;
-    } catch {
-      if (okStatuses.has(status)) {
-        throw new Error("diagnostic command returned invalid JSON");
-      }
-    }
-  }
-  if (!okStatuses.has(status)) {
+  if (!okStatuses.has(status) || result.error || result.signal) {
     return {
       ok: false,
       status: "command_failed",
-      exit_status: status,
+      exit_status: status || 1,
       reason: publicCommandFailureReason(
         `${result.error?.code || ""}\n${result.error?.message || ""}\n${stderr}\n${stdout}`,
       ),
     };
   }
+  if (stdout) {
+    let json;
+    try { json = JSON.parse(stdout); } catch { /* handled below */ }
+    if (!json || typeof json !== "object" || Array.isArray(json)) {
+      throw new Error("diagnostic command returned invalid JSON");
+    }
+    return { ...json, exit_status: status };
+  }
+  if (status !== 0) return { ok: false, status: "command_failed", exit_status: status, reason: "command_failed" };
   return {};
 }
 
@@ -108,10 +106,15 @@ function buildReport(opts, deps = {}) {
   const dbPath = resolvePath(opts.db);
   const readJson = deps.runJson || runJson;
   const now = deps.now || (() => new Date());
-  const status = sanitizeStatusReportForPublicOutput(
+  // Public projections cannot erase the operating-system outcome. Exit 2 is a
+  // diagnostic protocol result, but still cannot substantiate healthy output.
+  const project = (sanitize, raw) => ({ ...sanitize(raw),
+    ...(Number.isSafeInteger(raw.exit_status) ? { exit_status: raw.exit_status } : {}),
+  });
+  const status = project(sanitizeStatusReportForPublicOutput,
     readJson(["scripts/sync-status.mjs", "--db", dbPath, "--format", "json"]),
   );
-  const quality = sanitizeQualityReportForPublicOutput(
+  const quality = project(sanitizeQualityReportForPublicOutput,
     readJson(
       ["scripts/lark-im-quality.mjs", "--db", dbPath, "--format", "json"],
       new Set([0, 2]),
@@ -119,7 +122,7 @@ function buildReport(opts, deps = {}) {
   );
   const live = opts.live
     ? normalizeLiveResult(
-        sanitizeLagReportForPublicOutput(
+        project(sanitizeLagReportForPublicOutput,
           readJson(
             [
               "scripts/lark-im-lag-check.mjs",

@@ -1,3 +1,5 @@
+import { WORKER_DEFAULTS } from "./lark-im-worker-options.js";
+
 type JsonObject = Record<string, any>;
 
 type WorkerCycleOptions = {
@@ -131,8 +133,8 @@ function compactTransportStats(input: unknown): JsonObject | null {
 }
 
 function createAdaptiveFairState(opts: AdaptiveFairOptions): AdaptiveFairState {
-  const min = opts.adaptiveFairMin ?? 10;
-  const max = opts.adaptiveFairMax ?? 50;
+  const min = opts.adaptiveFairMin ?? WORKER_DEFAULTS.adaptiveFairMin;
+  const max = opts.adaptiveFairMax ?? WORKER_DEFAULTS.adaptiveFairMax;
   return { batch: Math.max(min, Math.min(max, opts.receivedScopesPerCycle)), healthyCycles: 0 };
 }
 
@@ -141,8 +143,8 @@ function adaptiveFairDecision(
   observation: AdaptiveCycleObservation,
   opts: AdaptiveFairOptions,
 ) {
-  const min = opts.adaptiveFairMin ?? 10;
-  const max = opts.adaptiveFairMax ?? 50;
+  const min = opts.adaptiveFairMin ?? WORKER_DEFAULTS.adaptiveFairMin;
+  const max = opts.adaptiveFairMax ?? WORKER_DEFAULTS.adaptiveFairMax;
   const steps = observation.steps || [];
   const complete = REQUIRED_CYCLE_STEPS.every((name) => steps.some((step) =>
     step.name === name && step.ok === true && hasTransportObservation(step.summary?.transport),
@@ -155,12 +157,12 @@ function adaptiveFairDecision(
   const scopes = Math.max(0, finiteNonNegative(fair?.summary?.received?.scopes) -
     finiteNonNegative(fair?.summary?.received?.skipped));
   const cycleMs = finiteNonNegative(observation.durationMs);
-  const intervalMs = (opts.intervalSeconds ?? 60) * 1000;
-  const targetMs = (opts.adaptiveTargetCycleSeconds ?? 90) * 1000;
+  const intervalMs = (opts.intervalSeconds ?? WORKER_DEFAULTS.intervalSeconds) * 1000;
+  const targetMs = (opts.adaptiveTargetCycleSeconds ?? WORKER_DEFAULTS.adaptiveTargetCycleSeconds) * 1000;
   const otherMs = fairMs === null ? cycleMs : Math.max(0, cycleMs - fairMs);
   const fairBudgetMs = Math.max(0, Math.min(
     targetMs - intervalMs - otherMs,
-    (opts.stepTimeoutSeconds ?? 600) * 1000 * 0.8,
+    (opts.stepTimeoutSeconds ?? WORKER_DEFAULTS.stepTimeoutSeconds) * 1000 * 0.8,
   ));
   const perScopeMs = fairMs !== null && scopes > 0 ? fairMs / scopes : null;
   const budgetBatch = perScopeMs === null ? null : Math.max(min, Math.min(max, Math.floor(fairBudgetMs / perScopeMs)));
@@ -254,7 +256,7 @@ type WorkerStepRunner = (name: string, args: string[], command?: "sync" | "maint
 type WorkerLogWriter = (opts: WorkerCycleOptions, payload: WorkerEvent | WorkerCyclePayload) => void;
 
 function buildCycleStepSpecs(opts: WorkerCycleOptions, cycle = 1): WorkerStepSpec[] {
-  const chatTypes = opts.chatTypes || "group,p2p";
+  const chatTypes = opts.chatTypes || WORKER_DEFAULTS.chatTypes;
   const steps: WorkerStepSpec[] = [
     {
       name: "sent",
@@ -340,7 +342,7 @@ function buildCycleStepSpecs(opts: WorkerCycleOptions, cycle = 1): WorkerStepSpe
       ],
     },
   ];
-  const retentionEveryCycles = Number(opts.retentionEveryCycles || 1440);
+  const retentionEveryCycles = Number(opts.retentionEveryCycles || WORKER_DEFAULTS.retentionEveryCycles);
   if (retentionEveryCycles > 0 && cycle % retentionEveryCycles === 0) {
     steps.push({
       name: "retention",

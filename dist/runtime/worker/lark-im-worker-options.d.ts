@@ -1,0 +1,45 @@
+declare const defaults: {
+    intervalSeconds: number;
+    receivedScopesPerCycle: number;
+    hotReceivedScopesPerCycle: number;
+    discoveryPagesPerCycle: number;
+    hotDiscoveryPagesPerCycle: number;
+    maxChatPages: number;
+    reconcileIntervalHours: number;
+    chatTypes: string;
+    logDir: string;
+    stepTimeoutSeconds: number;
+    logMaxBytes: number;
+    logKeepFiles: number;
+    retentionEveryCycles: number;
+    adaptiveFair: boolean;
+    adaptiveFairMin: number;
+    adaptiveFairMax: number;
+    adaptiveTargetCycleSeconds: number;
+};
+export type WorkerSettings = typeof defaults;
+export declare const WORKER_DEFAULTS: Readonly<{
+    intervalSeconds: number;
+    receivedScopesPerCycle: number;
+    hotReceivedScopesPerCycle: number;
+    discoveryPagesPerCycle: number;
+    hotDiscoveryPagesPerCycle: number;
+    maxChatPages: number;
+    reconcileIntervalHours: number;
+    chatTypes: string;
+    logDir: string;
+    stepTimeoutSeconds: number;
+    logMaxBytes: number;
+    logKeepFiles: number;
+    retentionEveryCycles: number;
+    adaptiveFair: boolean;
+    adaptiveFairMin: number;
+    adaptiveFairMax: number;
+    adaptiveTargetCycleSeconds: number;
+}>;
+export declare function parsePositiveInt(value: unknown, name: string): number;
+/** Return the consumed argument count, or zero when the entrypoint owns it. */
+export declare function applyWorkerOption(opts: WorkerSettings, arg: string, value?: string): 0 | 1 | 2;
+export declare function validateWorkerOptions(opts: WorkerSettings): void;
+export declare function workerProgramArguments(opts: WorkerSettings): string[];
+export {};

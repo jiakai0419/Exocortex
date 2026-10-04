@@ -17,7 +17,6 @@
 保留现有代码不等于已经解决所有可靠性问题：
 
 - coverage-check 从保留的 `sync_runs` 重建覆盖；清理旧 run 会失去窗口证明，即使记录和 cursor 未变。worker 默认每 1440 个周期自动执行 `prune-runs --apply`，当前 CLI 不接受间隔 0，没有永久禁用开关。调大间隔只能延期，不能解决证据丢失；需要长期连续覆盖证明时，这仍是未解决限制。
-- doctor 子命令非零退出但输出合法健康 JSON 时，可能仍显示本地就绪；不能只靠 doctor 验收。
 - 姓名查询受远端可见性和有界群成员扫描限制；ID 回显或失败保持未知。单目标 sender-only 补全有整轮预算，常规 enrich 的记录扫描上限不等于整轮时间上限。
 - 非整分钟初始基线在短首轮成功后，游标向下取整可能落到基线之前；后续窗口可能包含起点前记录。整分钟起点不触发此特定边界，非整分钟使用仍需修复。
 - SQLite 只读查询禁止业务写入，不保证活跃 WAL 的共享内存协调文件逐字节不变。
@@ -83,6 +82,8 @@ STOPPED  LaunchAgent 未加载，或已加载但 worker 进程没起来。
 
 `start` 的成功输出为 `start requested`，表示 bootstrap/kickstart 请求已接受，是否持续运行仍需查看 status 与后续周期。kickstart 失败会非零退出。`stop` 与 `uninstall` 必须确认 job 已不存在；无法检查时失败，uninstall 保留 plist。
 
+`install` 在修改前分别读取旧 plist 和 launchd 的 loaded/absent 状态；unknown 或已加载但旧 plist 缺失时拒绝替换。新文件先校验，已加载的旧 job 确认停止后才替换。bootstrap/kickstart 失败时，先确认新 job 已卸载，再恢复旧文件及权限；仅原先 loaded 时重新 bootstrap/kickstart 并确认 loaded，原先 absent 的安装保持 absent。不能确认卸载时仍尝试恢复文件，但不叠加启动；恢复或清理失败会明确报告 `rollback incomplete` / `staging cleanup failed`，不能把磁盘文件恢复当成 launchd 状态恢复。它不会恢复数据库，也不代替后续周期验收。
+
 ### Health
 
 当前本地同步证据是否满足要求，不证明远端全量完整性。
@@ -133,7 +134,9 @@ node scripts/doctor.mjs --db /absolute/path/to/exocortex.sqlite \
   --write-live-cache --format json
 ```
 
-缓存写入执行项目的 `logs/lark-im/live-probe.json`，service 的 log directory 必须对应。去掉 `--write-live-cache` 即仅查看本次结果。有效样本在 service 中显示 SAMPLED，并展示范围、窗口、数量、检查/失效时间及身份未知；五分钟后回到 UNKNOWN 是预期行为。`UNAVAILABLE / keychain_unavailable` 只说明当前 shell 未完成远端采样，本地仍可能是 LOCAL_READY。
+缓存写入执行项目的 `logs/lark-im/live-probe.json`，service 的 log directory 必须对应。去掉 `--write-live-cache` 即仅查看本次结果。有效样本在 service 中显示 SAMPLED，并展示范围、窗口、数量、检查/失效时间及身份未知；五分钟后回到 UNKNOWN 是预期行为。`UNAVAILABLE / keychain_unavailable` 只说明当前 shell 未完成远端采样，不等于后台同步故障。doctor 保留本地 health 证据，但任何子命令非零退出都不能给出绿色整体结果。
+
+Doctor 在公共字段投影前保留子进程退出码。exit 1、启动错误或信号终止即使同时输出健康 JSON，也属于 command failure；quality/live 的 exit 2 可保留结构化诊断，但不能把其中的健康声明当成通过。公共 JSON 包含受限的 `exit_status` 和原因，不保留原始 stderr；合法 delayed 仍展示 delayed。
 
 ### Recent cycles (up to 24h)
 
@@ -378,17 +381,18 @@ npm run help -- --all
 
 ```text
 git status
+node scripts/lark-im-service.mjs stop
 npm run check
 npm run build:check
 npm run typecheck
 npm test
-node scripts/lark-im-service.mjs restart
+node scripts/lark-im-service.mjs start
 node scripts/lark-im-service.mjs wait-ok
 node scripts/doctor.mjs
 node scripts/lark-im-service.mjs status
 ```
 
-`git status` 只提示工作区是否干净，不作为失败；本地检查、服务重启、`wait-ok`、`doctor` 和最终 `status` 是验收步骤。前置必需步骤失败后，后续步骤会跳过，避免在代码没通过检查时重启服务。
+`git status` 只提示工作区是否干净，不作为失败。`check`、`build:check` 和 `test` 可能生成 `dist`，因此必须先成功 stop，再执行本地检查。stop 无法确认时不构建；构建或检查失败后不启动部分生成的代码，服务保持停止，报告后续步骤 skipped。检查通过后才 start、`wait-ok`、`doctor` 和最终 `status`。这会产生明确维护停机窗口；独立前台同步应按 Safe Runtime Maintenance 另外结束，launchd stop 不代表不存在独立前台进程。
 
 需要真实远端对照时加：
 
@@ -396,11 +400,13 @@ node scripts/lark-im-service.mjs status
 node scripts/maintenance-check.mjs --live
 ```
 
-`--live` 会额外运行 `node scripts/doctor.mjs --live`，需要当前 shell 能访问 `lark-cli` auth/keychain；它不会自动刷新 service freshness 缓存。只想跑检查和诊断、不重启后台服务时：
+`--live` 会额外运行 `node scripts/doctor.mjs --live`，需要当前 shell 能访问 `lark-cli` auth/keychain；它不会自动刷新 service freshness 缓存。服务已停止且希望保持停止时，可运行检查和诊断：
 
 ```bash
 node scripts/maintenance-check.mjs --no-restart
 ```
+
+此时先用 launchd 检查确认 job absent，才允许本地构建；loaded 或 unknown 会失败且跳过构建，不擅自 stop。若本地检查已独立完成、只需在运行服务上诊断，使用 `--no-restart --skip-local-checks`。最终 status 仍保留 STOPPED 的非零语义，不把未运行服务算作维护验收通过。
 
 `maintenance-check --live` 内部使用 JSON 形式读取 live doctor 结果，只保留 public-safe 的结构化摘要，例如：
 
@@ -411,9 +417,11 @@ live_reason
 live_missing_count
 live_lag_ms
 live_exit_status
+command_exit_status
+findings_count
 ```
 
-它不会把完整 live probe JSON、消息样本、群名、人名、链接、原始 stderr 或本地数据库路径写进失败摘要。
+所有步骤的 JSON 与文本输出都只保留命令、状态、耗时、退出码和受限分类；原始 stdout/stderr（包括 npm、git、service 和解析失败的 doctor 输出）不进入公共报告。Live 摘要的枚举、数值均校验，findings 仅保留数量，避免任意子命令文本绕过边界。需要排查具体构建输出时，在合适的私有终端单独运行报告中的失败命令。
 
 如果 `doctor` 或 `doctor --live` 失败，`maintenance-check` 仍会继续运行最后的：
 
@@ -553,7 +561,7 @@ node scripts/doctor.mjs
 node scripts/doctor.mjs --live
 ```
 
-如果 `--live` 显示 `UNAVAILABLE / keychain_unavailable`，说明当前 shell 读不到 keychain。它不是同步系统故障。需要真实 live 验证时，在能访问 keychain 的普通终端环境里运行同一个命令。
+如果 `--live` 显示 `UNAVAILABLE / keychain_unavailable`，说明当前 shell 读不到 keychain。它不是同步系统故障，但失败的采样子命令使 doctor 整体非零退出；本地 health 证据仍单独保留。需要真实 live 验证时，在能访问 keychain 的普通终端环境里运行同一个命令。
 
 新增自动化测试输入必须从零构造，使用假 CLI 与临时数据库；真实运行数据及其脱敏派生样例不得作为测试输入。
 
@@ -671,7 +679,7 @@ node scripts/lark-im-service.mjs wait-ok
 
 联系人按 30 个 ID 一批，显式请求 page-size 30，避免 CLI 默认只返回 20 条且不自动翻页。消息搜索按官方上限最多 30 条，received 历史仍最多 50 条；原有游标分页、时间窗口和过滤不变。resolver 只在内存缓存成功解析的直接 user/app/chat-member 名称：总容量 1000、TTL 5 分钟，成员按会话隔离，不缓存失败或机器人推断。
 
-worker 默认仍使用固定批量；显式 `--adaptive-fair` 才启用自适应。示例 worker 参数：
+worker 默认仍使用固定批量；显式 `--adaptive-fair` 才启用自适应。前台 worker 与 `lark-im-service install` 使用相同默认值、正整数及参数关系校验；以下参数可用于任一入口：
 
 ```sh
 --received-scopes-per-cycle 25 --interval-seconds 30 \
@@ -679,11 +687,11 @@ worker 默认仍使用固定批量；显式 `--adaptive-fair` 才启用自适应
 --adaptive-target-cycle-seconds 90
 ```
 
-目标周期包括实际工作和休眠。连续两个完整健康周期后最多加 5，并按已观测的 fair 每 scope 耗时和其他步骤耗时限制下一轮预算；失败、已暴露的限流、超时或重试耗尽会减半，最低 10。缺少统计不能作为提速依据。它是吞吐/延迟控制，不是 QPS limiter；成功也不证明 CLI 内部没有限流。
+目标周期包括实际工作和休眠。连续两个完整健康周期后最多加 5，并按已观测的 fair 每 scope 耗时和其他步骤耗时限制下一轮预算；失败、已暴露的限流、超时或重试耗尽会减半，最低为 `--adaptive-fair-min`（默认 10）。缺少统计不能作为提速依据。它是吞吐/延迟控制，不是 QPS limiter；成功也不证明 CLI 内部没有限流。
 
 `summary.transport` 的 calls/attempts/retries 是外层 CLI 命令计数，不是 HTTP 请求数。worker 的 scheduler 事件记录有效批量、下一批量、决策原因和耗时。正常摘要以及出错时的专用 transport 摘要都保留脱敏计数和操作冷却，不写远端正文、token 或真实资源 ID。
 
-调整 LaunchAgent 前应停止单实例、检查子进程退出、用 SQLite 原生 backup 保存独立副本，并备份当前代码及 plist。service install 尚不透传自适应参数；需要在停止后审核修改已有 plist 的 ProgramArguments，或直接使用 worker 参数，不要重新 install 丢失定制参数。部署后以新 PID、多个完整周期、只读数据库与固定目标覆盖检查验收。退化时恢复此次部署前代码和配置，**不要恢复旧数据库**，以免丢失部署期间的新记录与游标进度。
+调整 LaunchAgent 前应停止单实例、检查子进程退出、用 SQLite 原生 backup 保存独立副本，并备份当前代码及 plist。`service install` 将共同配置及 adaptive 开关、min、max、target 写入 plist；`start/restart` 沿用已安装配置。重新 install 时应显式提供要保留的非默认参数。`--once` 与 `--max-cycles` 仅用于前台 worker，service 拒绝这两个参数，持久化白名单也不会包含它们。`--db` 仍仅用于 service 的 status/wait-ok，不改变后台数据库。部署后以新 PID、多个完整周期、只读数据库与固定目标覆盖检查验收。退化时恢复此次部署前代码和配置，**不要恢复旧数据库**，以免丢失部署期间的新记录与游标进度。
 
 ## 原始消息与有界回填
 

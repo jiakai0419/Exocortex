@@ -19,7 +19,7 @@ function localState(overrides = {}) {
   };
 }
 
-test("keychain failures are classified as live unavailable, not sync failure", () => {
+test("keychain failures keep live unavailable but cannot make a nonzero doctor run green", () => {
   const live = normalizeLiveResult({
     ok: false,
     status: "command_failed",
@@ -32,9 +32,9 @@ test("keychain failures are classified as live unavailable, not sync failure", (
   assert.equal(live.status, "unavailable");
   assert.equal(live.reason, "keychain_unavailable");
   assert.match(live.hint, /background service can still be healthy/);
-  assert.equal(overallStatus(localState({ live })), "local_ready");
-  assert.equal(shimOverallStatus(localState({ live })), "local_ready");
-  assert.deepEqual(buildFindings(localState({ live })), ["live lag probe unavailable in this shell"]);
+  assert.equal(overallStatus(localState({ live })), "needs_attention");
+  assert.equal(shimOverallStatus(localState({ live })), "needs_attention");
+  assert.deepEqual(buildFindings(localState({ live })), ["live lag probe command returned a nonzero exit status", "live lag probe unavailable in this shell"]);
 });
 
 test("live unavailable cannot turn unverified syncing history into active work", () => {

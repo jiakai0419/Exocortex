@@ -146,3 +146,35 @@ The table below records the preceding candidate's validation. Version 3 projecti
 | Production service/account/data and deployment acceptance | NOT RUN; deferred until independent final review |
 
 The preceding candidate's validation performed no real launchd operation, account request, synchronization, deployment, or production data repair. All fixtures are invented; none are real or sanitized operational data. Existing disabled scopes are not automatically re-enabled. Permanently unavailable details continue to block *full-content* completion while list scanning proceeds. A saturated minimum list minute still fails safely. An unexpired lease proves neither current work nor owner liveness. Runtime acceptance and publication remain deferred until independent final review. The original and follow-up candidates are retained for independent review.
+
+
+## Cross-entry service and diagnostic contracts
+
+Doctor preserves child exit status before public projection. A healthy JSON body
+cannot override exit 1, spawn errors or signals. Exit 2 remains a supported
+quality/live diagnostic result, but never establishes a healthy overall result;
+a keychain-unavailable live probe retains separate local health evidence while
+the overall doctor command remains nonzero.
+
+Maintenance stops the LaunchAgent before checks that can rebuild `dist`, and
+starts it only after all local checks pass. Failed stop prevents builds; failed
+builds leave the service stopped. With `--no-restart`, local builds require a
+confirmed absent job; loaded or unknown is rejected without stopping it.
+`--no-restart --skip-local-checks` remains the diagnostic-only combination.
+Public text/JSON exclude raw child output and allow only bounded diagnostic
+vocabulary, numeric counts, exit status and a finding count.
+
+Install captures the old plist and loaded state independently, validates staging
+before stopping, and restores both after bootstrap/kickstart failure. Previously
+unloaded configurations stay unloaded. Unknown inspection is never absence, and
+a loaded job with no recoverable old plist is rejected. Rollback first confirms
+the replacement is unloaded; restoring bytes alone cannot establish a restored
+loaded configuration. Restoration and staging-cleanup failures remain explicit.
+
+Synthetic regressions: `doctor-child-exit-contract.test.mjs` covers all three
+children with misleading healthy JSON plus exit 1/2, error and signal outcomes;
+`maintenance-boundaries.test.mjs` covers stop/build/start order, unloaded/loaded/
+unknown inspection and public-output sentinels; `lark-im-install-rollback.test.mjs`
+covers loaded/absent with existing/missing files, permissions, lint-before-stop,
+rollback inspection/bootout/bootstrap/kickstart and cleanup failures. Existing
+service start/stop/uninstall and independent foreground activity tests remain.

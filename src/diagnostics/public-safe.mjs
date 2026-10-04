@@ -100,7 +100,7 @@ function publicMessageTypes(rows) {
 
 /** @param {unknown} text */
 function publicCommandFailureReason(text) {
-  const message = String(text || "");
+  const message = String(text || "").trim();
   if (["keychain_unavailable", "database_not_found", "dependency_unavailable", "command_failed"].includes(message)) {
     return message;
   }

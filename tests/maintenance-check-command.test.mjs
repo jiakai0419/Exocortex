@@ -77,7 +77,7 @@ test("maintenance check parseArgs keeps default validation flow explicit", () =>
   assert.throws(() => parseArgs(["--format", "yaml"]), /--format must be text or json/);
 });
 
-test("maintenance check runs local checks, service restart, wait-ok, doctor, live, and status", () => {
+test("maintenance check stops service before local checks, then starts, waits,, doctor, live, and status", () => {
   const fake = fakeRun();
   const report = executeMaintenanceCheck(parseArgs(["--live", "--timeout-seconds", "12", "--poll-seconds", "3"]), {
     run: fake.run,
@@ -89,11 +89,12 @@ test("maintenance check runs local checks, service restart, wait-ok, doctor, liv
   assert.equal(report.git.clean, true);
   assert.deepEqual(fake.calls, [
     ["git", ["status", "--short"]],
+    ["/usr/local/bin/node", ["scripts/lark-im-service.mjs", "stop"]],
     ["npm", ["run", "check"]],
     ["npm", ["run", "build:check"]],
     ["npm", ["run", "typecheck"]],
     ["npm", ["test"]],
-    ["/usr/local/bin/node", ["scripts/lark-im-service.mjs", "restart"]],
+    ["/usr/local/bin/node", ["scripts/lark-im-service.mjs", "start"]],
     [
       "/usr/local/bin/node",
       ["scripts/lark-im-service.mjs", "wait-ok", "--timeout-seconds", "12", "--poll-seconds", "3"],
@@ -135,9 +136,10 @@ test("maintenance check stops later required steps after a local check failure",
   assert.equal(report.ok, false);
   assert.equal(report.status, "failed");
   assert.equal(report.steps.find((step) => step.name === "syntax check").status, "failed");
-  assert.equal(report.steps.find((step) => step.name === "service restart").status, "skipped");
+  assert.equal(report.steps.find((step) => step.name === "service start").status, "skipped");
   assert.equal(report.steps.find((step) => step.name === "doctor live").status, "skipped");
-  assert.match(plain(renderMaintenanceText(report)), /redacted syntax failure/);
+  assert.match(plain(renderMaintenanceText(report)), /command_failed/);
+  assert.doesNotMatch(plain(renderMaintenanceText(report)), /redacted syntax failure/);
 });
 
 test("maintenance check keeps structured live failure details and still runs service status", () => {

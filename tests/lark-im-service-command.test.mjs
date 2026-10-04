@@ -58,6 +58,10 @@ function fakeServiceDeps(overrides = {}) {
     },
     mkdirSync: (path, options) => calls.push(["mkdir", path, options]),
     writeFileSync: (path, data) => calls.push(["write", path, data]),
+    readFileSync: () => "SYNTHETIC_OLD_PLIST",
+    statSync: () => ({ mode: 0o600 }),
+    chmodSync: (path, mode) => calls.push(["chmod", path, mode]),
+    renameSync: (from, to) => calls.push(["rename", from, to]),
     rmSync: (path) => calls.push(["rm", path]),
     run: (cmd, args, options = {}) => {
       calls.push(["run", cmd, args, options]);
@@ -262,26 +266,15 @@ test("service install writes plist and bootstraps LaunchAgent through injected d
     ],
   );
   const write = calls.find((call) => call[0] === "write");
-  assert.equal(write[1], "/home/tester/Library/LaunchAgents/com.exocortex.lark-im-worker.plist");
+  assert.match(write[1], /com\.exocortex\.lark-im-worker\.plist\.tmp-\d+$/);
   assert.match(write[2], /<string>--interval-seconds<\/string>\s*<string>15<\/string>/);
   assert.deepEqual(
-    calls.filter((call) => call[0] === "run").map((call) => call.slice(1, 4)),
-    [
-      ["which", ["lark-cli"], { allowFailure: true }],
-      ["launchctl", ["bootout", "gui/501/com.exocortex.lark-im-worker"], { allowFailure: true }],
-      [
-        "launchctl",
-        ["bootout", "gui/501", "/home/tester/Library/LaunchAgents/com.exocortex.lark-im-worker.plist"],
-        { allowFailure: true },
-      ],
-      [
-        "launchctl",
-        ["bootstrap", "gui/501", "/home/tester/Library/LaunchAgents/com.exocortex.lark-im-worker.plist"],
-        {},
-      ],
-      ["launchctl", ["kickstart", "-k", "gui/501/com.exocortex.lark-im-worker"], {}],
-    ],
+    calls.filter((call) => call[0] === "run").map((call) => [call[1], call[2][0]]),
+    [["launchctl", "print"], ["which", "lark-cli"], ["plutil", "-lint"], ["launchctl", "bootstrap"], ["launchctl", "kickstart"]],
   );
+  const rename = calls.find((call) => call[0] === "rename");
+  assert.equal(rename[1], write[1]);
+  assert.equal(rename[2], "/home/tester/Library/LaunchAgents/com.exocortex.lark-im-worker.plist");
 });
 
 test("service start kickstarts when LaunchAgent is already loaded", () => {
@@ -503,8 +496,11 @@ test("service status passes an explicit database and install rejects ignored DB 
 test("start and install propagate kickstart failures without claiming success", () => {
   for (const command of ["start", "install"]) {
     for (const loaded of [true, false]) {
+      let currentLoaded = loaded;
       const { deps, stdout } = fakeServiceDeps({ run: (cmd, args) => {
-        if (args[0] === "print") return loaded ? spawnResult() : spawnResult({ status: 113, stderr: 'Could not find service "com.exocortex.lark-im-worker" in domain for user gui: 501' });
+        if (args[0] === "print") return currentLoaded ? spawnResult() : spawnResult({ status: 113, stderr: 'Could not find service "com.exocortex.lark-im-worker" in domain for user gui: 501' });
+        if (args[0] === "bootout") currentLoaded = false;
+        if (args[0] === "bootstrap") currentLoaded = true;
         if (args[0] === "kickstart") return spawnResult({ status: 5, stderr: "synthetic kickstart denied" });
         return spawnResult();
       } });
@@ -593,4 +589,20 @@ test("wait-ok requires pending detail debt to reach zero despite raw healthy sta
     assert.equal(evaluation.healthReady, pendingCount === 0);
     assert.equal(evaluation.ready, pendingCount === 0);
   }
+});
+test("service wait-ok passes its observation clock to worker history summarization", () => {
+  const now = Date.parse("2030-02-03T04:05:06Z");
+  const seen = [];
+  const { deps } = fakeServiceDeps({ deps: {
+    nowMs: () => now,
+    run: () => spawnResult({ stdout: '{"health":"ok"}' }),
+    readRecentWorkerEvents: () => ({ path: "synthetic-worker.jsonl", exists: true, events: [] }),
+    summarizeWorkerEvents: (events, observedAt) => {
+      seen.push(observedAt);
+      return { last_cycle: { cycle: 1, ok: true, at: new Date(now).toISOString() }, in_progress: false };
+    },
+    sleepMs: () => { throw new Error("ready fixture must not wait"); },
+  } });
+  runServiceCommand(parseArgs(["wait-ok"]), deps);
+  assert.deepEqual(seen, [now]);
 });

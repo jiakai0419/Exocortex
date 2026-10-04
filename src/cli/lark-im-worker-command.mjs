@@ -23,18 +23,13 @@ import {
   runCycleWithRunner,
 } from "../../dist/runtime/worker/lark-im-worker-core.js";
 
-const DEFAULT_INTERVAL_SECONDS = 60;
-const DEFAULT_RECEIVED_SCOPES_PER_CYCLE = 50;
-const DEFAULT_HOT_RECEIVED_SCOPES_PER_CYCLE = 20;
-const DEFAULT_DISCOVERY_PAGES_PER_CYCLE = 1;
-const DEFAULT_HOT_DISCOVERY_PAGES_PER_CYCLE = 5;
-const DEFAULT_MAX_CHAT_PAGES = 300;
-const DEFAULT_RECONCILE_INTERVAL_HOURS = 24;
-const DEFAULT_CHAT_TYPES = "group,p2p";
-const DEFAULT_STEP_TIMEOUT_SECONDS = 600;
-const DEFAULT_LOG_MAX_BYTES = 10 * 1024 * 1024;
-const DEFAULT_LOG_KEEP_FILES = 5;
-const DEFAULT_RETENTION_EVERY_CYCLES = 1440;
+import {
+  WORKER_DEFAULTS,
+  applyWorkerOption,
+  parsePositiveInt,
+  validateWorkerOptions,
+} from "../../dist/runtime/worker/lark-im-worker-options.js";
+
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const SYNC_SCRIPT = resolve(PROJECT_ROOT, "scripts/lark-im-sync.mjs");
 const MAINTENANCE_SCRIPT = resolve(PROJECT_ROOT, "scripts/sqlite-maintenance.mjs");
@@ -48,26 +43,9 @@ const STEP_OPERATIONS = {
 };
 
 /**
- * @typedef {object} WorkerOptions
- * @property {string} db
- * @property {number} intervalSeconds
- * @property {number} receivedScopesPerCycle
- * @property {number} hotReceivedScopesPerCycle
- * @property {number} discoveryPagesPerCycle
- * @property {number} hotDiscoveryPagesPerCycle
- * @property {number} maxChatPages
- * @property {number} reconcileIntervalHours
- * @property {string} chatTypes
- * @property {string} logDir
- * @property {number} stepTimeoutSeconds
- * @property {number} logMaxBytes
- * @property {number} logKeepFiles
- * @property {number} retentionEveryCycles
- * @property {number | null} maxCycles
- * @property {boolean} adaptiveFair
- * @property {number} adaptiveFairMin
- * @property {number} adaptiveFairMax
- * @property {number} adaptiveTargetCycleSeconds
+ * @typedef {import("../../dist/runtime/worker/lark-im-worker-options.js").WorkerSettings & {
+ *   db: string, maxCycles: number | null,
+ * }} WorkerOptions
  *
  * @typedef {Record<string, any>} JsonObject
  *
@@ -131,65 +109,33 @@ function usage() {
 
 Options:
   --db <path>                         SQLite database path. Default: data/exocortex.sqlite
-  --interval-seconds <n>              Sleep between cycles. Default: ${DEFAULT_INTERVAL_SECONDS}
-  --hot-received-scopes-per-cycle <n> Recently active received scopes per cycle. Default: ${DEFAULT_HOT_RECEIVED_SCOPES_PER_CYCLE}
-  --received-scopes-per-cycle <n>     Catch-up received scopes per cycle. Default: ${DEFAULT_RECEIVED_SCOPES_PER_CYCLE}
-  --hot-discovery-pages-per-cycle <n> Recently active discovery pages per cycle. Default: ${DEFAULT_HOT_DISCOVERY_PAGES_PER_CYCLE}
-  --discovery-pages-per-cycle <n>     Full discovery pages per cycle. Default: ${DEFAULT_DISCOVERY_PAGES_PER_CYCLE}
-  --max-chat-pages <n>                Max full-discovery pages per snapshot. Default: ${DEFAULT_MAX_CHAT_PAGES}
-  --reconcile-interval-hours <n>      Minimum hours between full reconcile snapshots. Default: ${DEFAULT_RECONCILE_INTERVAL_HOURS}
-  --chat-types <types>                Chat types for received discovery. Default: ${DEFAULT_CHAT_TYPES}
-  --log-dir <path>                    JSONL log directory. Default: logs/lark-im
-  --step-timeout-seconds <n>          Hard timeout for each sync step. Default: ${DEFAULT_STEP_TIMEOUT_SECONDS}
-  --log-max-bytes <n>                 Rotate worker.jsonl at this size. Default: ${DEFAULT_LOG_MAX_BYTES}
-  --log-keep-files <n>                Rotated worker logs to keep. Default: ${DEFAULT_LOG_KEEP_FILES}
-  --retention-every-cycles <n>        Apply run retention every N cycles. Default: ${DEFAULT_RETENTION_EVERY_CYCLES}
+  --interval-seconds <n>              Sleep between cycles. Default: ${WORKER_DEFAULTS.intervalSeconds}
+  --hot-received-scopes-per-cycle <n> Recently active received scopes per cycle. Default: ${WORKER_DEFAULTS.hotReceivedScopesPerCycle}
+  --received-scopes-per-cycle <n>     Catch-up received scopes per cycle. Default: ${WORKER_DEFAULTS.receivedScopesPerCycle}
+  --hot-discovery-pages-per-cycle <n> Recently active discovery pages per cycle. Default: ${WORKER_DEFAULTS.hotDiscoveryPagesPerCycle}
+  --discovery-pages-per-cycle <n>     Full discovery pages per cycle. Default: ${WORKER_DEFAULTS.discoveryPagesPerCycle}
+  --max-chat-pages <n>                Max full-discovery pages per snapshot. Default: ${WORKER_DEFAULTS.maxChatPages}
+  --reconcile-interval-hours <n>      Minimum hours between full reconcile snapshots. Default: ${WORKER_DEFAULTS.reconcileIntervalHours}
+  --chat-types <types>                Chat types for received discovery. Default: ${WORKER_DEFAULTS.chatTypes}
+  --log-dir <path>                    JSONL log directory. Default: ${WORKER_DEFAULTS.logDir}
+  --step-timeout-seconds <n>          Hard timeout for each sync step. Default: ${WORKER_DEFAULTS.stepTimeoutSeconds}
+  --log-max-bytes <n>                 Rotate worker.jsonl at this size. Default: ${WORKER_DEFAULTS.logMaxBytes}
+  --log-keep-files <n>                Rotated worker logs to keep. Default: ${WORKER_DEFAULTS.logKeepFiles}
+  --retention-every-cycles <n>        Apply run retention every N cycles. Default: ${WORKER_DEFAULTS.retentionEveryCycles}
   --adaptive-fair                    Adapt fair scope batch size. Off by default; this is not an HTTP rate limiter.
-  --adaptive-fair-min <n>            Minimum adaptive fair batch. Default: 10
-  --adaptive-fair-max <n>            Maximum adaptive fair batch. Default: 50
-  --adaptive-target-cycle-seconds <n> Target work plus interval duration. Default: 90
+  --adaptive-fair-min <n>            Minimum adaptive fair batch. Default: ${WORKER_DEFAULTS.adaptiveFairMin}
+  --adaptive-fair-max <n>            Maximum adaptive fair batch. Default: ${WORKER_DEFAULTS.adaptiveFairMax}
+  --adaptive-target-cycle-seconds <n> Target work plus interval duration. Default: ${WORKER_DEFAULTS.adaptiveTargetCycleSeconds}
   --max-cycles <n>                    Stop after N cycles. Omit to run forever.
   --once                              Run one cycle and exit.
   --help                              Show this help.
 `;
 }
 
-/**
- * @param {unknown} value
- * @param {string} name
- */
-function parsePositiveInt(value, name) {
-  const text = String(value);
-  if (!/^[1-9]\d*$/.test(text)) throw new Error(`${name} must be positive integer`);
-  const parsed = Number(text);
-  if (!Number.isSafeInteger(parsed)) throw new Error(`${name} must be a safe positive integer`);
-  return parsed;
-}
-
 /** @param {string[]} argv */
 function parseArgs(argv) {
   /** @type {WorkerOptions} */
-  const opts = {
-    db: "data/exocortex.sqlite",
-    intervalSeconds: DEFAULT_INTERVAL_SECONDS,
-    receivedScopesPerCycle: DEFAULT_RECEIVED_SCOPES_PER_CYCLE,
-    hotReceivedScopesPerCycle: DEFAULT_HOT_RECEIVED_SCOPES_PER_CYCLE,
-    discoveryPagesPerCycle: DEFAULT_DISCOVERY_PAGES_PER_CYCLE,
-    hotDiscoveryPagesPerCycle: DEFAULT_HOT_DISCOVERY_PAGES_PER_CYCLE,
-    maxChatPages: DEFAULT_MAX_CHAT_PAGES,
-    reconcileIntervalHours: DEFAULT_RECONCILE_INTERVAL_HOURS,
-    chatTypes: DEFAULT_CHAT_TYPES,
-    logDir: "logs/lark-im",
-    stepTimeoutSeconds: DEFAULT_STEP_TIMEOUT_SECONDS,
-    logMaxBytes: DEFAULT_LOG_MAX_BYTES,
-    logKeepFiles: DEFAULT_LOG_KEEP_FILES,
-    retentionEveryCycles: DEFAULT_RETENTION_EVERY_CYCLES,
-    maxCycles: null,
-    adaptiveFair: false,
-    adaptiveFairMin: 10,
-    adaptiveFairMax: 50,
-    adaptiveTargetCycleSeconds: 90,
-  };
+  const opts = { ...WORKER_DEFAULTS, db: "data/exocortex.sqlite", maxCycles: null };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--help" || arg === "-h") {
@@ -200,50 +146,19 @@ function parseArgs(argv) {
       opts.maxCycles = 1;
       continue;
     }
-    if (arg === "--adaptive-fair") {
-      opts.adaptiveFair = true;
+    const consumed = applyWorkerOption(opts, arg, argv[i + 1]);
+    if (consumed) {
+      i += consumed - 1;
       continue;
     }
     const next = argv[i + 1];
     if (!next || next.startsWith("--")) throw new Error(`${arg} requires a value`);
     if (arg === "--db") opts.db = next;
-    else if (arg === "--interval-seconds")
-      opts.intervalSeconds = parsePositiveInt(next, "interval-seconds");
-    else if (arg === "--received-scopes-per-cycle")
-      opts.receivedScopesPerCycle = parsePositiveInt(next, "received-scopes-per-cycle");
-    else if (arg === "--hot-received-scopes-per-cycle")
-      opts.hotReceivedScopesPerCycle = parsePositiveInt(next, "hot-received-scopes-per-cycle");
-    else if (arg === "--discovery-pages-per-cycle")
-      opts.discoveryPagesPerCycle = parsePositiveInt(next, "discovery-pages-per-cycle");
-    else if (arg === "--hot-discovery-pages-per-cycle")
-      opts.hotDiscoveryPagesPerCycle = parsePositiveInt(next, "hot-discovery-pages-per-cycle");
-    else if (arg === "--max-chat-pages")
-      opts.maxChatPages = parsePositiveInt(next, "max-chat-pages");
-    else if (arg === "--reconcile-interval-hours")
-      opts.reconcileIntervalHours = parsePositiveInt(next, "reconcile-interval-hours");
-    else if (arg === "--chat-types") opts.chatTypes = next;
-    else if (arg === "--log-dir") opts.logDir = next;
-    else if (arg === "--step-timeout-seconds")
-      opts.stepTimeoutSeconds = parsePositiveInt(next, "step-timeout-seconds");
-    else if (arg === "--log-max-bytes") opts.logMaxBytes = parsePositiveInt(next, "log-max-bytes");
-    else if (arg === "--log-keep-files") opts.logKeepFiles = parsePositiveInt(next, "log-keep-files");
-    else if (arg === "--retention-every-cycles")
-      opts.retentionEveryCycles = parsePositiveInt(next, "retention-every-cycles");
     else if (arg === "--max-cycles") opts.maxCycles = parsePositiveInt(next, "max-cycles");
-    else if (arg === "--adaptive-fair-min") opts.adaptiveFairMin = parsePositiveInt(next, "adaptive-fair-min");
-    else if (arg === "--adaptive-fair-max") opts.adaptiveFairMax = parsePositiveInt(next, "adaptive-fair-max");
-    else if (arg === "--adaptive-target-cycle-seconds")
-      opts.adaptiveTargetCycleSeconds = parsePositiveInt(next, "adaptive-target-cycle-seconds");
     else throw new Error(`Unknown option: ${arg}`);
     i += 1;
   }
-  if (opts.adaptiveFairMin > opts.adaptiveFairMax) throw new Error("adaptive-fair-min must not exceed adaptive-fair-max");
-  if (opts.adaptiveFair && (opts.receivedScopesPerCycle < opts.adaptiveFairMin || opts.receivedScopesPerCycle > opts.adaptiveFairMax)) {
-    throw new Error("received-scopes-per-cycle must be within adaptive fair bounds");
-  }
-  if (opts.adaptiveFair && opts.adaptiveTargetCycleSeconds <= opts.intervalSeconds) {
-    throw new Error("adaptive-target-cycle-seconds must exceed interval-seconds");
-  }
+  validateWorkerOptions(opts);
   return opts;
 }
 
@@ -259,14 +174,14 @@ function sleepSeconds(seconds) {
  * @returns {WorkerStepResult}
  */
 function runStep(name, args, deps = {}) {
-  const now = deps.now || (() => new Date());
+  const now = deps.now || (() => new Date((deps.nowMs || Date.now)()));
   const run = deps.spawnSync || spawnSync;
   const execPath = deps.execPath || process.execPath;
   const startedAt = now().toISOString();
   const result = run(execPath, [deps.scriptPath || SYNC_SCRIPT, ...args], {
     encoding: "utf8",
     maxBuffer: 100 * 1024 * 1024,
-    timeout: Number(deps.timeoutSeconds || DEFAULT_STEP_TIMEOUT_SECONDS) * 1000,
+    timeout: Number(deps.timeoutSeconds || WORKER_DEFAULTS.stepTimeoutSeconds) * 1000,
     killSignal: "SIGKILL",
     ...(deps.cooldownsByOperation !== undefined || deps.activityEnv ? { env: {
       ...process.env,
@@ -367,8 +282,8 @@ function writeLog(opts, payload, deps = {}) {
     rotateLogIfNeeded(
       logPath,
       Buffer.byteLength(line),
-      Number(opts.logMaxBytes || DEFAULT_LOG_MAX_BYTES),
-      Number(opts.logKeepFiles || DEFAULT_LOG_KEEP_FILES),
+      Number(opts.logMaxBytes || WORKER_DEFAULTS.logMaxBytes),
+      Number(opts.logKeepFiles || WORKER_DEFAULTS.logKeepFiles),
       deps,
     );
     append(logPath, line, { encoding: "utf8", mode: 0o600 });
@@ -424,7 +339,7 @@ function runCycle(opts, cycle, deps = {}) {
       return step;
     },
     (logOpts, payload) => writeLog(logOpts, payload, deps.writeLog),
-    deps.now,
+    deps.now || (() => new Date(nowMs()).toISOString()),
     deps.onComplete,
   );
 }

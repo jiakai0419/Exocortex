@@ -3,7 +3,6 @@
 import { spawnSync } from "node:child_process";
 import {
   block,
-  compact,
   kv,
   renderError,
   section,
@@ -12,6 +11,9 @@ import {
   table,
   title,
 } from "../../dist/terminal/index.js";
+
+import { publicCommandFailureReason, publicDiagnosticError } from "../diagnostics/public-safe.mjs";
+import { isLaunchdLoaded } from "./lark-im-service-command.mjs";
 
 const DEFAULT_TIMEOUT_SECONDS = 180;
 const DEFAULT_POLL_SECONDS = 5;
@@ -33,6 +35,8 @@ const DEFAULT_POLL_SECONDS = 5;
  * @property {number | null} status
  * @property {string} stdout
  * @property {string} stderr
+ * @property {Error=} error
+ * @property {NodeJS.Signals | null=} signal
  *
  * @typedef {object} MaintenanceStep
  * @property {string} name
@@ -41,8 +45,7 @@ const DEFAULT_POLL_SECONDS = 5;
  * @property {boolean} required
  * @property {number} duration_ms
  * @property {string=} reason
- * @property {string=} stdout_tail
- * @property {string=} stderr_tail
+ * @property {number | null=} exit_status
  * @property {Record<string, any>=} details
  *
  * @typedef {object} MaintenanceReport
@@ -58,6 +61,7 @@ const DEFAULT_POLL_SECONDS = 5;
  * @property {(cmd: string, args: string[]) => SpawnResult=} run
  * @property {() => number=} nowMs
  * @property {string=} execPath
+ * @property {() => boolean=} isServiceLoaded
  *
  * @typedef {object} CliIo
  * @property {{write: (text: string) => unknown}=} stdout
@@ -69,11 +73,11 @@ function usage() {
   return `Usage: node scripts/maintenance-check.mjs [options]
 
 Runs the release/maintenance validation flow:
-  git status -> local checks -> service restart -> wait-ok -> doctor -> status
+  git status -> service stop -> local checks -> service start -> wait-ok -> doctor -> status
 
 Options:
   --live                  Also run doctor --live. Requires lark-cli auth/keychain access.
-  --no-restart            Do not restart the LaunchAgent service.
+  --no-restart            Do not restart. Local checks require a confirmed unloaded service.
   --skip-local-checks     Skip npm checks. Useful only when checks already passed in this shell.
   --timeout-seconds <n>   Timeout passed to service wait-ok. Default: ${DEFAULT_TIMEOUT_SECONDS}
   --poll-seconds <n>      Poll interval passed to service wait-ok. Default: ${DEFAULT_POLL_SECONDS}
@@ -169,9 +173,12 @@ function runProgram(cmd, args, deps = {}) {
       status: result.status,
       stdout: String(result.stdout || ""),
       stderr: String(result.stderr || ""),
+      error: result.error,
+      signal: result.signal,
     };
   });
-  return run(cmd, args);
+  try { return run(cmd, args); }
+  catch (error) { return { status: null, stdout: "", stderr: "", error: error instanceof Error ? error : new Error("command failed") }; }
 }
 
 /**
@@ -198,15 +205,15 @@ function runStep(name, command, cmd, args, required, deps = {}) {
   const nowMs = deps.nowMs || Date.now;
   const started = nowMs();
   const result = runProgram(cmd, args, deps);
-  const status = result.status === 0 ? "ok" : "failed";
+  const status = result.status === 0 && !result.error && !result.signal ? "ok" : "failed";
   return {
     name,
     command,
     status,
     required,
     duration_ms: Math.max(0, nowMs() - started),
-    stdout_tail: tailText(result.stdout),
-    stderr_tail: tailText(result.stderr),
+    exit_status: result.status,
+    ...(status === "failed" ? { reason: publicCommandFailureReason(`${result.error?.message || ""}\n${result.stderr}\n${result.stdout}`) } : {}),
   };
 }
 
@@ -229,15 +236,17 @@ function parseJsonObject(value) {
  */
 function doctorLiveDetails(report, commandExitStatus) {
   const live = report.live && typeof report.live === "object" ? report.live : {};
+  const member = (value, allowed) => allowed.includes(value) ? value : null;
+  const count = (value) => Number.isSafeInteger(value) && value >= 0 ? value : null;
   return {
-    overall: report.overall || null,
-    live_status: live.status || null,
-    live_reason: live.reason || null,
-    live_missing_count: live.missing_count ?? null,
-    live_lag_ms: live.lag_ms ?? null,
-    live_exit_status: live.exit_status ?? live._command_status ?? null,
+    overall: member(report.overall, ["needs_attention", "delayed", "syncing", "catching_up", "not_ready", "unknown", "local_ready", "sampled"]),
+    live_status: member(live.status, ["healthy", "delayed", "needs_attention", "inconclusive", "unavailable", "command_failed"]),
+    live_reason: member(live.reason, ["remote_probe_failed", "keychain_unavailable", "database_not_found", "dependency_unavailable", "command_failed", "no_hot_chats", "no_usable_remote_messages"]),
+    live_missing_count: count(live.missing_count),
+    live_lag_ms: count(live.lag_ms),
+    live_exit_status: count(live.exit_status),
     command_exit_status: commandExitStatus,
-    findings: Array.isArray(report.findings) ? report.findings : [],
+    findings_count: Array.isArray(report.findings) ? report.findings.length : 0,
   };
 }
 
@@ -254,7 +263,7 @@ function runDoctorLiveStep(name, command, cmd, args, deps = {}) {
   const started = nowMs();
   const result = runProgram(cmd, args, deps);
   /** @type {StepStatus} */
-  const status = result.status === 0 ? "ok" : "failed";
+  const status = result.status === 0 && !result.error && !result.signal ? "ok" : "failed";
   const parsed = parseJsonObject(result.stdout.trim());
   /** @type {MaintenanceStep} */
   const step = {
@@ -263,8 +272,8 @@ function runDoctorLiveStep(name, command, cmd, args, deps = {}) {
     status,
     required: true,
     duration_ms: Math.max(0, nowMs() - started),
-    stdout_tail: parsed ? "" : tailText(result.stdout),
-    stderr_tail: tailText(result.stderr),
+    exit_status: result.status,
+    ...(status === "failed" ? { reason: publicCommandFailureReason(`${result.error?.message || ""}\n${result.stderr}\n${result.stdout}`) } : {}),
   };
   if (parsed) step.details = doctorLiveDetails(parsed, result.status);
   return step;
@@ -282,8 +291,9 @@ function executeMaintenanceCheck(opts, deps = {}) {
   /** @type {MaintenanceStep[]} */
   const steps = [];
 
-  const gitStep = runStep("git status", "git status --short", "git", ["status", "--short"], false, deps);
-  const gitLines = gitStep.stdout_tail ? gitStep.stdout_tail.split("\n") : [];
+  const gitResult = runProgram("git", ["status", "--short"], deps);
+  const gitStep = runStep("git status", "git status --short", "git", [], false, { ...deps, run: () => gitResult });
+  const gitLines = gitResult.stdout ? gitResult.stdout.split("\n") : [];
   const changed = changedFileCount(gitLines);
   if (gitStep.status === "ok" && changed > 0) {
     gitStep.status = "warning";
@@ -305,6 +315,25 @@ function executeMaintenanceCheck(opts, deps = {}) {
     steps.push(skippedStep(name, command, true, reason));
   };
 
+  if (opts.restart) {
+    runRequired("service stop", "node scripts/lark-im-service.mjs stop", execPath, ["scripts/lark-im-service.mjs", "stop"]);
+  } else if (opts.localChecks) {
+    // --no-restart never grants permission to stop a running service. Build
+    // writes dist, so proceed only after positive evidence that it is unloaded.
+    let unloaded = false;
+    let reason = "service_state_unknown";
+    try {
+      const loaded = deps.isServiceLoaded ? deps.isServiceLoaded() : isLaunchdLoaded({
+        run: (cmd, args) => runProgram(cmd, args, deps),
+      });
+      unloaded = !loaded;
+      reason = loaded ? "service_loaded" : "service_unloaded";
+    } catch { /* Unknown state cannot authorize a build. */ }
+    steps.push({ name: "service build safety", command: "launchctl print", required: true,
+      status: unloaded ? "ok" : "failed", duration_ms: 0, reason });
+    if (!unloaded) stopped = true;
+  }
+
   if (opts.localChecks) {
     runRequired("syntax check", "npm run check", "npm", ["run", "check"]);
     runRequired("generated files", "npm run build:check", "npm", ["run", "build:check"]);
@@ -318,9 +347,9 @@ function executeMaintenanceCheck(opts, deps = {}) {
   }
 
   if (opts.restart) {
-    runRequired("service restart", "node scripts/lark-im-service.mjs restart", execPath, [
+    runRequired("service start", "node scripts/lark-im-service.mjs start", execPath, [
       "scripts/lark-im-service.mjs",
-      "restart",
+      "start",
     ]);
     runRequired(
       "service wait-ok",
@@ -336,7 +365,7 @@ function executeMaintenanceCheck(opts, deps = {}) {
       ],
     );
   } else {
-    maybeSkip("service restart", "node scripts/lark-im-service.mjs restart", "--no-restart");
+    maybeSkip("service start", "node scripts/lark-im-service.mjs start", "--no-restart");
     maybeSkip("service wait-ok", "node scripts/lark-im-service.mjs wait-ok", "--no-restart");
   }
 
@@ -415,9 +444,7 @@ function renderStepDetails(details) {
   ]
     .filter(([, value]) => value !== null && value !== undefined && value !== "")
     .map(([key, value]) => `${key}=${value}`);
-  if (Array.isArray(details.findings) && details.findings.length > 0) {
-    fields.push(`findings=${details.findings.join("; ")}`);
-  }
+  if (details.findings_count > 0) fields.push(`findings=${details.findings_count}`);
   return fields.join(", ");
 }
 
@@ -459,13 +486,11 @@ function renderMaintenanceText(report) {
 
   if (failed.length > 0) {
     lines.push("");
-    lines.push(section("Failed output"));
+    lines.push(section("Failed steps"));
     for (const step of failed) {
       const details = renderStepDetails(step.details);
-      const output = compact(step.stderr_tail || step.stdout_tail || "", 500);
       if (details) lines.push(`  - ${step.name} details: ${details}`);
-      if (output) lines.push(`  - ${step.name}: ${output}`);
-      if (!details && !output) lines.push(`  - ${step.name}: (no output)`);
+      lines.push(`  - ${step.name}: ${step.reason || "command_failed"}, exit=${step.exit_status ?? "unknown"}`);
     }
   }
 
@@ -479,8 +504,10 @@ function renderMaintenanceText(report) {
 function runMaintenanceCheckCli(argv, io = {}) {
   const stdout = io.stdout || process.stdout;
   const stderr = io.stderr || process.stderr;
+  let opts;
+  try { opts = parseArgs(argv); }
+  catch (error) { stderr.write(renderError(error)); return 1; }
   try {
-    const opts = parseArgs(argv);
     if (opts.help) {
       stdout.write(usage());
       return 0;
@@ -490,7 +517,7 @@ function runMaintenanceCheckCli(argv, io = {}) {
     else stdout.write(renderMaintenanceText(report));
     return report.ok ? 0 : 2;
   } catch (error) {
-    stderr.write(renderError(error));
+    stderr.write(renderError(publicDiagnosticError(error, "maintenance check failed")));
     return 1;
   }
 }

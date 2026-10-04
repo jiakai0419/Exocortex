@@ -8,12 +8,20 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { summarizeWorkerEvents } from "../../dist/runtime/worker/lark-im-worker-core.js";
+import {
+  WORKER_DEFAULTS,
+  applyWorkerOption,
+  parsePositiveInt,
+  validateWorkerOptions,
+  workerProgramArguments,
+} from "../../dist/runtime/worker/lark-im-worker-options.js";
 import {
   buildServiceStatusReport,
   classifyLaunchdPrint,
@@ -32,39 +40,15 @@ import {
 } from "../../dist/terminal/index.js";
 
 const LABEL = "com.exocortex.lark-im-worker";
-const DEFAULT_LOG_DIR = "logs/lark-im";
-const DEFAULT_MAX_CHAT_PAGES = 300;
-const DEFAULT_RECONCILE_INTERVAL_HOURS = 24;
-const DEFAULT_CHAT_TYPES = "group,p2p";
-const DEFAULT_STEP_TIMEOUT_SECONDS = 600;
-const DEFAULT_LOG_MAX_BYTES = 10 * 1024 * 1024;
-const DEFAULT_LOG_KEEP_FILES = 5;
-const DEFAULT_RETENTION_EVERY_CYCLES = 1440;
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const SYNC_STATUS_SCRIPT = resolve(PROJECT_ROOT, "scripts/sync-status.mjs");
 
 /**
  * @typedef {"install" | "start" | "stop" | "restart" | "status" | "wait-ok" | "tail" | "uninstall" | string} ServiceCommand
  *
- * @typedef {object} ServiceOptions
- * @property {ServiceCommand} command
- * @property {number} intervalSeconds
- * @property {number} hotReceivedScopesPerCycle
- * @property {number} receivedScopesPerCycle
- * @property {number} hotDiscoveryPagesPerCycle
- * @property {number} discoveryPagesPerCycle
- * @property {number} maxChatPages
- * @property {number} reconcileIntervalHours
- * @property {string} chatTypes
- * @property {string} logDir
- * @property {string=} db
- * @property {number} lines
- * @property {number} timeoutSeconds
- * @property {number} pollSeconds
- * @property {number} stepTimeoutSeconds
- * @property {number} logMaxBytes
- * @property {number} logKeepFiles
- * @property {number} retentionEveryCycles
+ * @typedef {import("../../dist/runtime/worker/lark-im-worker-options.js").WorkerSettings & {
+ *   command: ServiceCommand, db?: string, lines: number, timeoutSeconds: number, pollSeconds: number,
+ * }} ServiceOptions
  *
  * @typedef {object} RunOptions
  * @property {boolean=} allowFailure
@@ -100,7 +84,9 @@ const SYNC_STATUS_SCRIPT = resolve(PROJECT_ROOT, "scripts/sync-status.mjs");
  * @property {(path: string) => boolean=} existsSync
  * @property {(path: string, options?: {recursive?: boolean}) => void=} mkdirSync
  * @property {(path: string, encoding: BufferEncoding) => string=} readFileSync
- * @property {(path: string) => void=} rmSync
+ * @property {(path: string, options?: {force?: boolean}) => void=} rmSync
+ * @property {(oldPath: string, newPath: string) => void=} renameSync
+ * @property {(path: string) => {mode: number}=} statSync
  * @property {(path: string, data: string, options?: JsonObject) => void=} writeFileSync
  * @property {(path: string, mode: number) => void=} chmodSync
  * @property {() => string=} homedir
@@ -140,36 +126,31 @@ Commands:
 
 Options:
   --db <path>                        Database for status/wait-ok only. Default: data/exocortex.sqlite
-  --interval-seconds <n>              Worker interval. Default: 60
-  --hot-received-scopes-per-cycle <n> Recently active received scopes per cycle. Default: 20
-  --received-scopes-per-cycle <n>     Catch-up received scopes per cycle. Default: 50
-  --hot-discovery-pages-per-cycle <n> Recently active discovery pages per cycle. Default: 5
-  --discovery-pages-per-cycle <n>     Full discovery pages per cycle. Default: 1
-  --max-chat-pages <n>                Max full-discovery pages per snapshot. Default: ${DEFAULT_MAX_CHAT_PAGES}
-  --reconcile-interval-hours <n>      Minimum hours between full reconcile snapshots. Default: ${DEFAULT_RECONCILE_INTERVAL_HOURS}
-  --chat-types <types>                Chat types for received discovery. Default: ${DEFAULT_CHAT_TYPES}
-  --log-dir <path>                    Log directory. Default: ${DEFAULT_LOG_DIR}
+  --interval-seconds <n>              Worker interval. Default: ${WORKER_DEFAULTS.intervalSeconds}
+  --hot-received-scopes-per-cycle <n> Recently active received scopes per cycle. Default: ${WORKER_DEFAULTS.hotReceivedScopesPerCycle}
+  --received-scopes-per-cycle <n>     Catch-up received scopes per cycle. Default: ${WORKER_DEFAULTS.receivedScopesPerCycle}
+  --hot-discovery-pages-per-cycle <n> Recently active discovery pages per cycle. Default: ${WORKER_DEFAULTS.hotDiscoveryPagesPerCycle}
+  --discovery-pages-per-cycle <n>     Full discovery pages per cycle. Default: ${WORKER_DEFAULTS.discoveryPagesPerCycle}
+  --max-chat-pages <n>                Max full-discovery pages per snapshot. Default: ${WORKER_DEFAULTS.maxChatPages}
+  --reconcile-interval-hours <n>      Minimum hours between full reconcile snapshots. Default: ${WORKER_DEFAULTS.reconcileIntervalHours}
+  --chat-types <types>                Chat types for received discovery. Default: ${WORKER_DEFAULTS.chatTypes}
+  --log-dir <path>                    Log directory. Default: ${WORKER_DEFAULTS.logDir}
   --lines <n>                         Lines for tail. Default: 20
   --timeout-seconds <n>               Timeout for wait-ok. Default: 180
   --poll-seconds <n>                  Poll interval for wait-ok. Default: 5
-  --step-timeout-seconds <n>          Hard timeout for each sync step. Default: ${DEFAULT_STEP_TIMEOUT_SECONDS}
-  --log-max-bytes <n>                 Rotate worker.jsonl at this size. Default: ${DEFAULT_LOG_MAX_BYTES}
-  --log-keep-files <n>                Rotated worker logs to keep. Default: ${DEFAULT_LOG_KEEP_FILES}
-  --retention-every-cycles <n>        Apply run retention every N cycles. Default: ${DEFAULT_RETENTION_EVERY_CYCLES}
+  --step-timeout-seconds <n>          Hard timeout for each sync step. Default: ${WORKER_DEFAULTS.stepTimeoutSeconds}
+  --log-max-bytes <n>                 Rotate worker.jsonl at this size. Default: ${WORKER_DEFAULTS.logMaxBytes}
+  --log-keep-files <n>                Rotated worker logs to keep. Default: ${WORKER_DEFAULTS.logKeepFiles}
+  --retention-every-cycles <n>        Apply run retention every N cycles. Default: ${WORKER_DEFAULTS.retentionEveryCycles}
+  --adaptive-fair                    Adapt fair scope batch size. Off by default; persisted by install.
+  --adaptive-fair-min <n>            Minimum adaptive fair batch. Default: ${WORKER_DEFAULTS.adaptiveFairMin}
+  --adaptive-fair-max <n>            Maximum adaptive fair batch. Default: ${WORKER_DEFAULTS.adaptiveFairMax}
+  --adaptive-target-cycle-seconds <n> Target work plus interval duration. Default: ${WORKER_DEFAULTS.adaptiveTargetCycleSeconds}
   --help                              Show this help.
-`;
-}
 
-/**
- * @param {unknown} value
- * @param {string} name
- */
-function parsePositiveInt(value, name) {
-  const text = String(value);
-  if (!/^[1-9]\d*$/.test(text)) throw new Error(`${name} must be positive integer`);
-  const parsed = Number(text);
-  if (!Number.isSafeInteger(parsed)) throw new Error(`${name} must be a safe positive integer`);
-  return parsed;
+Worker tuning is persisted by install; start/restart use the installed plist.
+--once and --max-cycles are available only for the foreground worker.
+`;
 }
 
 /** @param {string[]} argv */
@@ -180,61 +161,31 @@ function parseArgs(argv) {
     process.exit(0);
   }
   /** @type {ServiceOptions} */
-  const opts = {
-    command,
-    intervalSeconds: 60,
-    hotReceivedScopesPerCycle: 20,
-    receivedScopesPerCycle: 50,
-    hotDiscoveryPagesPerCycle: 5,
-    discoveryPagesPerCycle: 1,
-    maxChatPages: DEFAULT_MAX_CHAT_PAGES,
-    reconcileIntervalHours: DEFAULT_RECONCILE_INTERVAL_HOURS,
-    chatTypes: DEFAULT_CHAT_TYPES,
-    logDir: DEFAULT_LOG_DIR,
-    lines: 20,
-    timeoutSeconds: 180,
-    pollSeconds: 5,
-    stepTimeoutSeconds: DEFAULT_STEP_TIMEOUT_SECONDS,
-    logMaxBytes: DEFAULT_LOG_MAX_BYTES,
-    logKeepFiles: DEFAULT_LOG_KEEP_FILES,
-    retentionEveryCycles: DEFAULT_RETENTION_EVERY_CYCLES,
-  };
+  const opts = { ...WORKER_DEFAULTS, command, lines: 20, timeoutSeconds: 180, pollSeconds: 5 };
   for (let i = 0; i < rest.length; i += 1) {
     const arg = rest[i];
     if (arg === "--help" || arg === "-h") {
       process.stdout.write(usage());
       process.exit(0);
     }
+    if (arg === "--once" || arg === "--max-cycles") {
+      throw new Error(`${arg} is supported by the foreground worker only`);
+    }
+    const consumed = applyWorkerOption(opts, arg, rest[i + 1]);
+    if (consumed) {
+      i += consumed - 1;
+      continue;
+    }
     const next = rest[i + 1];
     if (!next || next.startsWith("--")) throw new Error(`${arg} requires a value`);
-    if (arg === "--interval-seconds") opts.intervalSeconds = parsePositiveInt(next, "interval-seconds");
-    else if (arg === "--hot-received-scopes-per-cycle")
-      opts.hotReceivedScopesPerCycle = parsePositiveInt(next, "hot-received-scopes-per-cycle");
-    else if (arg === "--received-scopes-per-cycle")
-      opts.receivedScopesPerCycle = parsePositiveInt(next, "received-scopes-per-cycle");
-    else if (arg === "--hot-discovery-pages-per-cycle")
-      opts.hotDiscoveryPagesPerCycle = parsePositiveInt(next, "hot-discovery-pages-per-cycle");
-    else if (arg === "--discovery-pages-per-cycle")
-      opts.discoveryPagesPerCycle = parsePositiveInt(next, "discovery-pages-per-cycle");
-    else if (arg === "--max-chat-pages")
-      opts.maxChatPages = parsePositiveInt(next, "max-chat-pages");
-    else if (arg === "--reconcile-interval-hours")
-      opts.reconcileIntervalHours = parsePositiveInt(next, "reconcile-interval-hours");
-    else if (arg === "--chat-types") opts.chatTypes = next;
-    else if (arg === "--log-dir") opts.logDir = next;
-    else if (arg === "--db") opts.db = next;
+    if (arg === "--db") opts.db = next;
     else if (arg === "--lines") opts.lines = parsePositiveInt(next, "lines");
     else if (arg === "--timeout-seconds") opts.timeoutSeconds = parsePositiveInt(next, "timeout-seconds");
     else if (arg === "--poll-seconds") opts.pollSeconds = parsePositiveInt(next, "poll-seconds");
-    else if (arg === "--step-timeout-seconds")
-      opts.stepTimeoutSeconds = parsePositiveInt(next, "step-timeout-seconds");
-    else if (arg === "--log-max-bytes") opts.logMaxBytes = parsePositiveInt(next, "log-max-bytes");
-    else if (arg === "--log-keep-files") opts.logKeepFiles = parsePositiveInt(next, "log-keep-files");
-    else if (arg === "--retention-every-cycles")
-      opts.retentionEveryCycles = parsePositiveInt(next, "retention-every-cycles");
     else throw new Error(`Unknown option: ${arg}`);
     i += 1;
   }
+  validateWorkerOptions(opts);
   if (opts.db && !["status", "wait-ok"].includes(opts.command)) throw new Error("--db is supported only for status and wait-ok");
   return opts;
 }
@@ -334,14 +285,12 @@ function plistXml(opts, deps = {}) {
     Object.entries({
       label: LABEL,
       cwd,
-      nodePath,
-      workerPath,
-      chatTypes: opts.chatTypes,
-      logDir,
       larkCli,
       stderrPath: resolvePath(logDir, "launchd.err.log"),
     }).map(([key, value]) => [key, xmlEscape(value)]),
   );
+  const argumentsXml = [nodePath, workerPath, ...workerProgramArguments({ ...opts, logDir })]
+    .map((arg) => `    <string>${xmlEscape(arg)}</string>`).join("\n");
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -352,34 +301,7 @@ function plistXml(opts, deps = {}) {
   <string>${escaped.cwd}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${escaped.nodePath}</string>
-    <string>${escaped.workerPath}</string>
-    <string>--interval-seconds</string>
-    <string>${opts.intervalSeconds}</string>
-    <string>--received-scopes-per-cycle</string>
-    <string>${opts.receivedScopesPerCycle}</string>
-    <string>--hot-received-scopes-per-cycle</string>
-    <string>${opts.hotReceivedScopesPerCycle}</string>
-    <string>--discovery-pages-per-cycle</string>
-    <string>${opts.discoveryPagesPerCycle}</string>
-    <string>--hot-discovery-pages-per-cycle</string>
-    <string>${opts.hotDiscoveryPagesPerCycle}</string>
-    <string>--max-chat-pages</string>
-    <string>${opts.maxChatPages}</string>
-    <string>--reconcile-interval-hours</string>
-    <string>${opts.reconcileIntervalHours}</string>
-    <string>--chat-types</string>
-    <string>${escaped.chatTypes}</string>
-    <string>--log-dir</string>
-    <string>${escaped.logDir}</string>
-    <string>--step-timeout-seconds</string>
-    <string>${opts.stepTimeoutSeconds}</string>
-    <string>--log-max-bytes</string>
-    <string>${opts.logMaxBytes}</string>
-    <string>--log-keep-files</string>
-    <string>${opts.logKeepFiles}</string>
-    <string>--retention-every-cycles</string>
-    <string>${opts.retentionEveryCycles}</string>
+${argumentsXml}
   </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -411,52 +333,86 @@ function install(opts, deps = {}) {
   const resolvePath = deps.resolvePath || resolve;
   const makeDir = deps.mkdirSync || mkdirSync;
   const writeFile = deps.writeFileSync || writeFileSync;
-  const chmod = deps.chmodSync || (deps.writeFileSync || deps.mkdirSync ? () => {} : chmodSync);
+  const readFile = deps.readFileSync || readFileSync;
+  const exists = deps.existsSync || existsSync;
+  const rename = deps.renameSync || renameSync;
+  const remove = deps.rmSync || rmSync;
+  const stat = deps.statSync || statSync;
+  const chmod = deps.chmodSync || chmodSync;
   const output = deps.stdout || process.stdout;
-  const launchAgentsDir = resolvePath((deps.homedir || homedir)(), "Library/LaunchAgents");
-  makeDir(launchAgentsDir, { recursive: true });
   const path = plistPath(deps);
+  // Capture both independent pieces of state before changing either. An
+  // installed but stopped plist must remain stopped after a failed install.
+  const previouslyLoaded = isLaunchdLoaded(deps);
+  const previousPlist = exists(path) ? readFile(path, "utf8") : null;
+  if (previouslyLoaded && previousPlist === null) {
+    throw new Error("cannot replace loaded service without its previous plist");
+  }
+  const previousMode = previousPlist === null ? 0o600 : stat(path).mode & 0o777;
+  const quietDeps = { ...deps, stdout: { write() {} } };
+  const tempPath = `${path}.tmp-${process.pid}`;
+  makeDir(resolvePath((deps.homedir || homedir)(), "Library/LaunchAgents"), { recursive: true });
   const xml = plistXml(opts, deps);
-  /** @type {string | null} */
-  let previousPlist = null;
-  if (deps.writeFileSync) {
-    writeFile(path, xml, { encoding: "utf8", mode: 0o600 });
-  } else {
-    previousPlist = existsSync(path) ? readFileSync(path, "utf8") : null;
-    const tempPath = `${path}.tmp-${process.pid}`;
-    writeFileSync(tempPath, xml, { encoding: "utf8", mode: 0o600 });
-    try {
-      run("plutil", ["-lint", tempPath], {}, deps);
-      renameSync(tempPath, path);
-    } catch (error) {
-      rmSync(tempPath, { force: true });
-      throw error;
-    }
-  }
-  chmod(path, 0o600);
-  if (!deps.writeFileSync && !deps.mkdirSync) {
-    const logDir = resolvePath(PROJECT_ROOT, opts.logDir);
-    for (const name of ["worker.jsonl", "launchd.out.log", "launchd.err.log"]) {
-      const logPath = resolvePath(logDir, name);
-      if (existsSync(logPath)) chmodSync(logPath, 0o600);
-    }
-  }
   try {
-    run("launchctl", ["bootout", target(deps)], { allowFailure: true }, deps);
-    run("launchctl", ["bootout", domain(deps), plistPath(deps)], { allowFailure: true }, deps);
-    run("launchctl", ["bootstrap", domain(deps), plistPath(deps)], {}, deps);
-    run("launchctl", ["kickstart", "-k", target(deps)], {}, deps);
+    writeFile(tempPath, xml, { encoding: "utf8", mode: 0o600 });
+    chmod(tempPath, 0o600);
+    run("plutil", ["-lint", tempPath], {}, deps);
   } catch (error) {
-    if (!deps.writeFileSync) {
-      if (previousPlist === null) rmSync(path, { force: true });
-      else writeFileSync(path, previousPlist, { encoding: "utf8", mode: 0o600 });
-      if (previousPlist !== null) {
-        run("launchctl", ["bootstrap", domain(deps), path], { allowFailure: true }, deps);
-        run("launchctl", ["kickstart", "-k", target(deps)], { allowFailure: true }, deps);
-      }
+    try { remove(tempPath, { force: true }); }
+    catch {
+      const original = error instanceof Error ? error.message : "plist validation failed";
+      throw new Error(`${original}; staging cleanup failed`);
     }
     throw error;
   }
+  let installError = null;
+  try {
+    if (previouslyLoaded) stop(quietDeps);
+    rename(tempPath, path);
+    chmod(path, 0o600);
+    const logDir = deps.logDir || resolvePath(deps.cwd || PROJECT_ROOT, opts.logDir);
+    for (const name of ["worker.jsonl", "launchd.out.log", "launchd.err.log"]) {
+      const logPath = resolvePath(logDir, name);
+      if (exists(logPath)) chmod(logPath, 0o600);
+    }
+    run("launchctl", ["bootstrap", domain(deps), path], {}, deps);
+    run("launchctl", ["kickstart", "-k", target(deps)], {}, deps);
+  } catch (error) {
+    const failures = [];
+    let unloaded = false;
+    try {
+      stop(quietDeps);
+      unloaded = true;
+    } catch { failures.push("could not confirm replacement service unloaded"); }
+    let fileRestored = false;
+    try {
+      if (previousPlist === null) remove(path, { force: true });
+      else {
+        writeFile(tempPath, previousPlist, { encoding: "utf8", mode: previousMode });
+        chmod(tempPath, previousMode);
+        rename(tempPath, path);
+      }
+      fileRestored = true;
+    } catch { failures.push("could not restore previous plist"); }
+    // Never bootstrap over a possibly loaded replacement. A successful print
+    // is required after restoring the old job; file restoration alone is not
+    // evidence that launchd is using that file.
+    if (previouslyLoaded && unloaded && fileRestored) {
+      try {
+        run("launchctl", ["bootstrap", domain(deps), path], {}, deps);
+        run("launchctl", ["kickstart", "-k", target(deps)], {}, deps);
+        if (!isLaunchdLoaded(deps)) throw new Error("previous service remains unloaded");
+      } catch { failures.push("could not restore previous loaded service"); }
+    }
+    const original = error instanceof Error ? error.message : "install failed";
+    installError = failures.length ? new Error(`${original}; rollback incomplete: ${failures.join("; ")}`) : error;
+  }
+  try { remove(tempPath, { force: true }); }
+  catch {
+    const original = installError instanceof Error ? installError.message : installError ? "install failed" : "service installed";
+    throw new Error(`${original}; staging cleanup failed`);
+  }
+  if (installError) throw installError;
   output.write(`installed ${LABEL}\n`);
 }
 
@@ -611,7 +567,7 @@ function waitOk(opts, deps = {}) {
     const sync = run(execPath, [SYNC_STATUS_SCRIPT, "--db", opts.db || "data/exocortex.sqlite", "--format", "json"], { allowFailure: true }, deps);
     const syncStatus = sync.status === 0 && !sync.error && !sync.signal ? parseJson(sync) : null;
     const workerLog = readWorkerEvents(opts.logDir);
-    const workerSummary = summarize(workerLog.events);
+    const workerSummary = summarize(workerLog.events, nowMs());
     const lastCycle = workerSummary.last_cycle;
     const evaluation = evaluateWaitOkState(startedAt, syncStatus, workerSummary);
 

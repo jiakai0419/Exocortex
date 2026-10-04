@@ -221,7 +221,7 @@ test("doctor command runs live probe with tolerated delayed exit status", () => 
   assert.equal(cacheWrites[0].report.live.status, "healthy");
 });
 
-test("doctor command normalizes live keychain failures without failing local health", () => {
+test("doctor command retains local health while reporting a nonzero live keychain command", () => {
   const stdout = memoryWriter();
   const stderr = memoryWriter();
   const calls = [];
@@ -245,13 +245,14 @@ test("doctor command normalizes live keychain failures without failing local hea
     },
   });
 
-  assert.equal(exitCode, 0);
+  assert.equal(exitCode, 2);
   assert.equal(stderr.text(), "");
   const report = JSON.parse(stdout.text());
-  assert.equal(report.overall, "local_ready");
+  assert.equal(report.overall, "needs_attention");
+  assert.equal(report.status.health, "ok");
   assert.equal(report.live.status, "unavailable");
   assert.equal(report.live.reason, "keychain_unavailable");
-  assert.deepEqual(report.findings, ["live lag probe unavailable in this shell"]);
+  assert.deepEqual(report.findings, ["live lag probe command returned a nonzero exit status", "live lag probe unavailable in this shell"]);
   assert.equal(cacheWrites.length, 0);
 });
 

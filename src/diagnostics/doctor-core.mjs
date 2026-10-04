@@ -9,9 +9,11 @@ import { databaseOnlyHealth } from "./lark-im-activity-evidence.mjs";
  * @typedef {object} LocalStatus
  * @property {string=} status
  * @property {string=} health
+ * @property {number=} exit_status
  * @property {string=} health_detail
  *
  * @typedef {object} LocalQuality
+ * @property {number=} exit_status
  * @property {string=} status
  * @property {{missing_sender_name?: number, missing_user_sender_name?: number, missing_app_sender_name?: number, actionable_missing_sender_name?: number, missing_chat_name?: number, invalid_rendered_body?: number}=} quality
  *
@@ -55,6 +57,9 @@ function isKeychainUnavailable(text) {
  */
 function normalizeLiveResult(live) {
   if (!live) return null;
+  if (live.status === "healthy" && Number(live.exit_status || 0) !== 0) {
+    return { ...live, status: "command_failed", reason: "command_failed", ok: false };
+  }
   if (
     live.status === "command_failed" &&
     (live.reason === "keychain_unavailable" || isKeychainUnavailable(textFromCommandFailure(live)))
@@ -97,6 +102,11 @@ function buildFindings({ status, quality, live }) {
   const missingSenderName = actionableMissingSenderNames({ status, quality, live });
   const missingChatName = Number(quality.quality?.missing_chat_name || 0);
   const invalidRenderedBody = Number(quality.quality?.invalid_rendered_body || 0);
+  for (const [label, result] of [["local status", status], ["local quality", quality], ["live lag probe", live]]) {
+    if (result && typeof result === "object" && result.status !== "command_failed" && Number(result.exit_status || 0) !== 0) {
+      findings.push(`${label} command returned a nonzero exit status`);
+    }
+  }
   if (status.status === "command_failed") findings.push("local status command failed");
   if (quality.status === "command_failed") findings.push("local quality command failed");
   if (status.health === "syncing") findings.push("current activity is unverified; historical sync state is not a live phase");
@@ -135,6 +145,7 @@ function overallStatus({ status, quality, live }) {
   ) return "needs_attention";
   if (hasActionableQualityIssues(state)) return "needs_attention";
   if (live?.status === "delayed") return "delayed";
+  if ([status, quality, live].some((result) => Number(result?.exit_status || 0) !== 0)) return "needs_attention";
   if (databaseOnlyHealth(status.health) === "unknown") return "unknown";
   if (status.health === "catching_up") return "catching_up";
   if (status.health === "not_ready") return "not_ready";
