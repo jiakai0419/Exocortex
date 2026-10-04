@@ -5,7 +5,7 @@ import test from "node:test";
 import {
   DEFAULT_LARK_RETRY_BUDGET_MS, MAX_LARK_RETRIES, TRANSPORT_OPERATIONS,
   classifyLarkFailure, createLarkCliRunner, createTransportState, getTransportStats,
-  resetTransportStats, isTransientLarkFailure, retryDelayForAttempt, parseJson,
+  resetTransportStats, isTransientLarkFailure, isExhaustedLarkTransportFailure, retryDelayForAttempt, parseJson,
   redactCommand, transportOperation,
 } from "../src/adapters/lark-im/transport.mjs";
 
@@ -156,6 +156,37 @@ test("non-rate transient retries preserve exponential backoff and successful tel
   assert.equal(h.stats().retries, 1);
   assert.equal(h.stats().rate_limits, 0);
   assert.equal(h.stats().wait_ms, 7);
+});
+
+test("transport exhaustion shares transient classification without trusting task-local or malformed descriptors", () => {
+  for (const code of [2200, 1663]) {
+    const h = harness([fail({ error: { type: "api", code, message: "Internal Error invented private payload" } })]);
+    assert.throws(() => h.run(HISTORY, { retries: 1, retryDelayMs: 7 }), (error) => {
+      assert.equal(classifyLarkFailure(error).kind, "internal_error");
+      assert.equal(isExhaustedLarkTransportFailure(error), true);
+      assert.match(error.message, new RegExp(`code=${code}\\b`));
+      assert.doesNotMatch(error.message, /invented|private/);
+      return true;
+    });
+    assert.equal(h.calls.length, 2);
+    assert.deepEqual(h.sleeps, [7]);
+  }
+  for (const text of [
+    "validation noted kind=rate_limited", "message-details unavailable: kind=internal_error",
+    "lark-cli failed: kind=rate_limited-other", "lark-cli failed: kind=internal_error_extra",
+    "lark-cli failed: kind=invalid-kind operation=other; additionally kind=internal_error",
+    "lark-cli failed: kind=permission_denied", "lark-cli failed: kind=unknown code=2200",
+  ]) assert.equal(isExhaustedLarkTransportFailure(text), false, text);
+  for (const [descriptor, kind] of [
+    ["kind=permission_denied", "permission_denied"],
+    ["kind=unknown code=231203", "restricted_mode"],
+    ["kind=unknown code=230002", "bot_user_out_of_chat"],
+    ["kind=unknown code: 231203", "restricted_mode"],
+    ["kind=unknown code: 230002", "bot_user_out_of_chat"],
+  ]) {
+    assert.equal(classifyLarkFailure(descriptor).kind, kind);
+    assert.equal(classifyLarkFailure(descriptor).transient, false);
+  }
 });
 
 test("recovered rate limits retain numeric aggregate and operation telemetry after success", () => {

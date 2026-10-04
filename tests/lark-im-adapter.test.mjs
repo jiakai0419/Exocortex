@@ -389,6 +389,8 @@ test("buildPeopleContext uses bot app_id matches even when a chat has multiple b
 test("restricted mode classifier recognizes Lark restricted chat errors", () => {
   assert.equal(isRestrictedModeError(new Error('{"code":231203,"msg":"Restricted Mode"}')), true);
   assert.equal(isRestrictedModeError(new Error("kind=unknown code=231203")), true);
+  assert.equal(isRestrictedModeError(new Error("code=231203")), true);
+  assert.equal(isRestrictedModeError(new Error("code: 231203")), true);
   assert.equal(isRestrictedModeError(new Error("kind=restricted_mode")), true);
   assert.equal(isRestrictedModeError(new Error("don't allow copying or forwarding messages")), true);
   assert.equal(isRestrictedModeError(new Error("network timeout")), false);
@@ -397,6 +399,8 @@ test("restricted mode classifier recognizes Lark restricted chat errors", () => 
 test("out of chat classifier recognizes lark-cli 230002 errors", () => {
   assert.equal(isBotUserOutOfChatError(new Error('{"code":230002,"message":"Bot/User can NOT be out of the chat"}')), true);
   assert.equal(isBotUserOutOfChatError(new Error("kind=unknown code=230002")), true);
+  assert.equal(isBotUserOutOfChatError(new Error("code=230002")), true);
+  assert.equal(isBotUserOutOfChatError(new Error("code: 230002")), true);
   assert.equal(isBotUserOutOfChatError(new Error("kind=bot_user_out_of_chat")), true);
   assert.equal(isBotUserOutOfChatError(new Error("Bot/User can NOT be out of the chat")), true);
   assert.equal(isBotUserOutOfChatError(new Error("network timeout")), false);

@@ -9,6 +9,7 @@ import {
   isBotUserOutOfChatError,
   isRestrictedModeError,
 } from "./adapter.mjs";
+import { isExhaustedLarkTransportFailure } from "./transport.mjs";
 import {
   acquireLock,
   createRun,
@@ -21,6 +22,7 @@ import {
   quoteSql,
   readScope,
   releaseLock,
+  runFenceGuardSql as storeRunFenceGuardSql,
   sqlJson,
   sqliteExec,
   sqliteQuery,
@@ -42,8 +44,6 @@ import {
   senderId,
   shortHash,
 } from "./core.mjs";
-
-const RUN_FENCE_HARD_LEASE_SECONDS = 20 * 60;
 
 /**
  * @typedef {"cursor" | "hot" | "reconcile"} DiscoveryMode
@@ -79,6 +79,7 @@ const RUN_FENCE_HARD_LEASE_SECONDS = 20 * 60;
  *   id: string,
  *   source_id: string,
  *   enabled?: number,
+ *   source_enabled?: number,
  *   config?: JsonObject,
  *   cursor?: JsonObject | null,
  *   cursor_json?: string | null
@@ -145,6 +146,7 @@ const defaultDeps = {
   quoteSql,
   readScope,
   releaseLock,
+  runFenceGuardSql: storeRunFenceGuardSql,
   sqlJson,
   sqliteExec,
   sqliteQuery,
@@ -229,6 +231,7 @@ function listReceivedScopes(dbPath, mode = "all", deps = defaultDeps) {
        s.cursor_updated_at, s.created_at,
        (SELECT MAX(r.started_at) FROM sync_runs r WHERE r.scope_id = s.id) AS last_attempt_at
      FROM sync_scopes s
+     JOIN sources src ON src.id = s.source_id AND src.enabled = 1
      WHERE s.source_id = ${deps.quoteSql(SOURCE_ID)}
        AND s.id LIKE 'lark.im.received.chat.%'
        AND s.enabled = 1
@@ -270,6 +273,7 @@ function listReceivedScopes(dbPath, mode = "all", deps = defaultDeps) {
 function syncScope(dbPath, scopeId, opts, worker, deps = defaultDeps) {
   const initialScope = /** @type {ScopeRow} */ (deps.readScope(dbPath, scopeId));
   if (!initialScope.enabled) return { scope_id: scopeId, skipped: true, reason: "scope_disabled" };
+  if (initialScope.source_enabled === 0) return { scope_id: scopeId, skipped: true, reason: "source_disabled" };
   if (deps.isMaintenanceLocked(dbPath)) {
     return { scope_id: scopeId, skipped: true, reason: "maintenance_lock" };
   }
@@ -290,6 +294,8 @@ function syncScope(dbPath, scopeId, opts, worker, deps = defaultDeps) {
     const scope = /** @type {ScopeRow} */ (deps.readScope(dbPath, scopeId));
     if (!scope.enabled) {
       outcome = { scope_id: scopeId, skipped: true, reason: "scope_disabled" };
+    } else if (scope.source_enabled === 0) {
+      outcome = { scope_id: scopeId, skipped: true, reason: "source_disabled" };
     } else {
       const runId = deps.createRun(dbPath, scope);
       try {
@@ -356,35 +362,9 @@ function syncScope(dbPath, scopeId, opts, worker, deps = defaultDeps) {
  * @param {SyncRunnerDeps} deps
  */
 function runFenceGuardSql(scope, runId, finishedAtIso, deps) {
-  const id = Number(runId);
-  if (!Number.isSafeInteger(id) || id <= 0) throw new Error(`invalid run id: ${String(runId)}`);
-  const finishedAtMs = Date.parse(finishedAtIso);
-  if (!Number.isFinite(finishedAtMs)) throw new Error(`invalid run finish time: ${finishedAtIso}`);
-  const hardLeaseCutoff = new Date(
-    finishedAtMs - RUN_FENCE_HARD_LEASE_SECONDS * 1000,
-  ).toISOString();
-  return `
-CREATE TEMP TABLE __lark_run_fence_guard (allowed INTEGER PRIMARY KEY);
-INSERT INTO __lark_run_fence_guard (allowed)
-SELECT 1
-FROM sync_runs r
-JOIN sync_scopes s ON s.id = r.scope_id AND s.source_id = r.source_id
-JOIN sync_locks l ON l.scope_id = r.scope_id
-WHERE r.id = ${id}
-  AND r.status = 'running'
-  AND r.scope_id = ${deps.quoteSql(scope.id)}
-  AND r.source_id = ${deps.quoteSql(scope.source_id)}
-  AND l.locked_by = json_extract(r.metadata_json, '$.__run_fence.owner')
-  AND l.locked_at = json_extract(r.metadata_json, '$.__run_fence.locked_at')
-  AND julianday(l.locked_at) IS NOT NULL
-  AND l.locked_at > ${deps.quoteSql(hardLeaseCutoff)}
-  AND s.cursor_json IS r.cursor_before_json;
-CREATE TEMP TABLE __lark_run_fence_assert (
-  allowed INTEGER NOT NULL CHECK (allowed = 1)
-);
-INSERT INTO __lark_run_fence_assert (allowed)
-VALUES (CASE WHEN EXISTS (SELECT 1 FROM __lark_run_fence_guard) THEN 1 ELSE 0 END);
-`;
+  return deps.runFenceGuardSql(scope, runId, finishedAtIso, {
+    guardTable: "__lark_run_fence_guard", assert: true,
+  });
 }
 
 /** Retry one scope's durable debt without any list fetch or list-cursor rewind.
@@ -517,7 +497,8 @@ function retryDetails(dbPath, opts, selfProfile, deps = defaultDeps) {
   const scanLimit = Math.max(limit * 3, limit + 20);
   const scopeFilter = opts.detailScope ? `AND s.id = ${deps.quoteSql(opts.detailScope)}` : "";
   const scopes = deps.sqliteQuery(dbPath, `SELECT s.id, MIN(d.retry_at) AS due_at
-    FROM sync_scopes s JOIN lark_im_detail_tasks d ON d.scope_id=s.id
+    FROM sync_scopes s JOIN sources src ON src.id=s.source_id AND src.enabled=1
+      JOIN lark_im_detail_tasks d ON d.scope_id=s.id
     WHERE s.source_id='lark.im' AND s.enabled=1 AND d.status='pending'
       AND d.retry_at <= ${deps.quoteSql(now)} ${scopeFilter}
     GROUP BY s.id ORDER BY due_at, s.id LIMIT ${scanLimit};`, "list due detail scopes");
@@ -532,7 +513,8 @@ function retryDetails(dbPath, opts, selfProfile, deps = defaultDeps) {
     if (result.skipped && result.reason === "maintenance_lock") break;
   }
   const outstanding = deps.sqliteQuery(dbPath, `SELECT COUNT(*) AS count
-    FROM sync_scopes s JOIN lark_im_detail_tasks d ON d.scope_id=s.id
+    FROM sync_scopes s JOIN sources src ON src.id=s.source_id AND src.enabled=1
+      JOIN lark_im_detail_tasks d ON d.scope_id=s.id
     WHERE s.source_id='lark.im' AND s.enabled=1 AND d.status='pending' ${scopeFilter};`, "count remaining detail debt")[0];
   if (Number(outstanding?.count || 0) > 0) {
     results.push({ ok: false, incomplete: true, reason: "details_pending",
@@ -1057,7 +1039,7 @@ function syncReceived(dbPath, opts, selfProfile, deps = defaultDeps) {
     if (
       result.ok === false &&
       typeof result.error === "string" &&
-      /^lark-cli failed: kind=(rate_limited|network_timeout|network_error|service_unavailable)(?=\s|;|$)/.test(result.error)
+      isExhaustedLarkTransportFailure(result.error)
     ) break;
   }
   return results;

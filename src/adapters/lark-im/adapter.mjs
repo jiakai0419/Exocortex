@@ -22,6 +22,7 @@ import {
 import {
   DEFAULT_LARK_CLI_TIMEOUT_MS,
   DEFAULT_LARK_RETRY_BUDGET_MS,
+  classifyLarkFailure,
   isTransientLarkFailure,
   parseJson,
   redactCommand,
@@ -271,14 +272,12 @@ function normalizeChat(value, index) {
 
 /** @param {unknown} error */
 function isRestrictedModeError(error) {
-  const message = String(error instanceof Error ? error.message : error || "");
-  return /\bkind=restricted_mode\b|(?:"code"\s*:\s*|\bcode[=:]\s*)231203\b|Restricted Mode|don't allow copying or forwarding messages/i.test(message);
+  return classifyLarkFailure(error).kind === "restricted_mode";
 }
 
 /** @param {unknown} error */
 function isBotUserOutOfChatError(error) {
-  const message = String(error instanceof Error ? error.message : error || "");
-  return /\bkind=bot_user_out_of_chat\b|(?:"code"\s*:\s*|\bcode[=:]\s*)230002\b|Bot\/User can NOT be out of the chat/i.test(message);
+  return classifyLarkFailure(error).kind === "bot_user_out_of_chat";
 }
 
 /** One queued root failed; its deadline or page bounds cannot bisect a list window. */
@@ -294,11 +293,8 @@ class MessageDetailError extends Error {
 /** @param {unknown} error */
 function detailFailureReason(error) {
   if (error instanceof MessageDetailError) return error.detailReason;
-  if (isRestrictedModeError(error)) return "restricted_mode";
-  if (isBotUserOutOfChatError(error)) return "bot_user_out_of_chat";
-  const text = error instanceof Error ? error.message : "";
-  return text.match(/\bkind=(permission_denied|network_timeout|network_error|rate_limited|service_unavailable)\b/)?.[1]
-    || "invalid_or_unavailable_details";
+  const failure = classifyLarkFailure(error);
+  return failure.kind === "unknown" ? "invalid_or_unavailable_details" : failure.kind;
 }
 
 /** A queued root is evidence of identity/version, not the authoritative detail snapshot.
@@ -371,7 +367,7 @@ function createLarkImAdapter({ run = runLark, clock = Date.now } = {}) {
       } catch (error) {
         // Only an exhausted shared deadline justifies a smaller time window.
         // Permission, rate limits and ordinary request failures keep their meaning.
-        if (error instanceof Error && /\bkind=network_timeout\b/.test(error.message) && now() >= deadline) {
+        if (classifyLarkFailure(error).kind === "network_timeout" && now() >= deadline) {
           throw new MessageWindowBudgetError(operation, error);
         }
         throw error;
@@ -430,11 +426,8 @@ function createLarkImAdapter({ run = runLark, clock = Date.now } = {}) {
         // that could erase an already stored complete expansion.
         if (error instanceof MessageWindowBudgetError || isPaginationLimitError(error)) throw error;
         const text = error instanceof Error ? error.message : "";
-        const kind = text.match(/\bkind=(restricted_mode|bot_user_out_of_chat|permission_denied|network_timeout|network_error|rate_limited|service_unavailable)\b/)?.[1];
-        const reason = isRestrictedModeError(error) ? "restricted_mode"
-          : isBotUserOutOfChatError(error) ? "bot_user_out_of_chat"
-          : text === "merge-forward source changed during detail retrieval" ? "source_changed"
-          : kind || "invalid_or_unavailable_details";
+        const reason = text === "merge-forward source changed during detail retrieval" ? "source_changed"
+          : detailFailureReason(error);
         missingDetails.set(message.message_id, { message_id: message.message_id, reason });
         return null;
       }

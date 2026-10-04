@@ -173,7 +173,7 @@ test("detail retry accepts a newer authoritative ordinary replacement without re
   assert.equal(result.raw_api_expansions, undefined);
 });
 
-for (const kind of ["permission_denied", "restricted_mode", "bot_user_out_of_chat", "network_timeout", "rate_limited"]) {
+for (const kind of ["permission_denied", "restricted_mode", "bot_user_out_of_chat", "network_timeout", "network_error", "rate_limited", "service_unavailable", "internal_error"]) {
   test(`detail ${kind} stays sanitized and task local`, () => {
     const adapter = createLarkImAdapter({ run() { throw new Error(`kind=${kind} secret invented detail om_synthetic_private`); } });
     assert.throws(() => adapter.fetchMessageDetails(merged()), (error) => {
@@ -182,6 +182,45 @@ for (const kind of ["permission_denied", "restricted_mode", "bot_user_out_of_cha
       assert.equal(error instanceof MessageWindowBudgetError, false);
       return true;
     });
+  });
+}
+
+for (const code of [2200, 1663]) {
+  test(`internal API error ${code} has the same detail reason in strict and queued paths`, () => {
+    const error = new Error(JSON.stringify({ error: { type: "api", code, message: "Internal Error invented private payload" } }));
+    const root = merged();
+    const adapter = createLarkImAdapter({ run(args) {
+      if (args[2] === "/open-apis/im/v1/messages") return page([root, raw("ordinary")]);
+      throw error;
+    } });
+    assert.throws(() => strictList(adapter, "received"), (failure) => {
+      assert.ok(failure instanceof MessageDetailsIncompleteError);
+      assert.equal(failure.messages.length, 1);
+      assert.equal(failure.missingDetails[0].reason, "internal_error");
+      assert.doesNotMatch(failure.message, /invented|private/);
+      return true;
+    });
+    assert.throws(() => adapter.fetchMessageDetails(root), (failure) => {
+      assert.equal(failure.detailReason, "internal_error");
+      assert.equal(failure instanceof MessageWindowBudgetError, false);
+      return true;
+    });
+  });
+}
+
+for (const kind of ["internal_error", "rate_limited", "permission_denied", "network_error"]) {
+  test(`exhausted window time does not reinterpret ${kind} as a bisectable timeout`, () => {
+    let now = 0;
+    let calls = 0;
+    const adapter = createLarkImAdapter({ clock: () => now, run() {
+      calls += 1;
+      now += 180_000;
+      throw new Error(`lark-cli failed: kind=${kind} operation=message_history_bundle retry_exhausted=1`);
+    } });
+    assert.throws(() => fetchMessageWindowWithBisection((start, end) =>
+      adapter.fetchChatMessageList("oc_synthetic_details", start, end, opts()), START, START + 3_600_000),
+    (error) => error.message.includes(`kind=${kind}`) && !(error instanceof MessageWindowBudgetError));
+    assert.equal(calls, 1);
   });
 }
 

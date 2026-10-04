@@ -550,6 +550,66 @@ test("syncSent skips disabled scopes before locking or calling the adapter", () 
   assert.deepEqual(calls, []);
 });
 
+for (const disableAfterLock of [false, true]) {
+  test(`sync with an existing baseline honors source disable ${disableAfterLock ? "after" : "before"} locking`, () => {
+    const calls = [];
+    let locked = false;
+    const runner = createTestRunner({
+      readScope: () => ({ id: "lark.im.sent_by_me", source_id: "lark.im", enabled: 1,
+        source_enabled: !disableAfterLock || locked ? 0 : 1,
+        config: {}, cursor: { created_at_ms: BASE_MS, message_id: "" } }),
+      acquireLock: () => { calls.push("lock"); locked = true; return true; },
+      createRun: () => assert.fail("disabled source must not create a run"),
+      fetchSentMessageList: () => assert.fail("disabled source must not fetch messages"),
+      releaseLock: () => calls.push("release"),
+    });
+    assert.deepEqual(runner.syncSent("fake.sqlite", syncOptions(), { open_id: "ou_synthetic_self", name: "Self" }),
+      { scope_id: "lark.im.sent_by_me", skipped: true, reason: "source_disabled" });
+    assert.deepEqual(calls, disableAfterLock ? ["lock", "release"] : []);
+  });
+}
+
+test("disabled persisted source with a baseline does not acquire a run or call the adapter", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "exocortex-runner-disabled-source-synthetic-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const dbPath = join(dir, "synthetic.sqlite");
+  ensureInitialized(dbPath);
+  ensureSourceInitialSyncStart(dbPath, "lark.im", BASE_MS, { explicit: true });
+  sqliteExec(dbPath, "UPDATE sources SET enabled=0 WHERE id='lark.im';");
+  const runner = createSyncRunner({ fetchSentMessageList: () => assert.fail("disabled source fetched") });
+  assert.deepEqual(runner.syncSent(dbPath, syncOptions(), { open_id: "ou_synthetic_self", name: "Self" }),
+    { scope_id: "lark.im.sent_by_me", skipped: true, reason: "source_disabled" });
+  assert.deepEqual(sqliteQuery(dbPath, "SELECT COUNT(*) AS count FROM sync_runs;"), [{ count: 0 }]);
+  assert.deepEqual(sqliteQuery(dbPath, "SELECT COUNT(*) AS count FROM sync_locks;"), [{ count: 0 }]);
+});
+
+for (const target of ["source", "scope"]) {
+  test(`${target} disabled during a list request rejects the whole commit and only closes the failed run`, (t) => {
+    const dir = mkdtempSync(join(tmpdir(), "exocortex-runner-disable-race-synthetic-"));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const dbPath = join(dir, "synthetic.sqlite");
+    ensureInitialized(dbPath);
+    ensureSourceInitialSyncStart(dbPath, "lark.im", BASE_MS, { explicit: true });
+    const runner = createSyncRunner({
+      fetchSentMessageList: () => {
+        sqliteExec(dbPath, target === "source"
+          ? "UPDATE sources SET enabled=0 WHERE id='lark.im';"
+          : "UPDATE sync_scopes SET enabled=0 WHERE id='lark.im.sent_by_me';");
+        return { messages: [message("om_synthetic_disable_race", BASE_MS)], detailRoots: [], pages: 1 };
+      },
+      buildPeopleContext: (_messages, _opts, profile) => peopleContext(profile),
+    });
+    const result = runner.syncSent(dbPath, syncOptions(), { open_id: "ou_self", name: "Self" });
+    assert.equal(result.ok, false);
+    assert.equal(result.fail_run_error, undefined);
+    assert.equal(readScope(dbPath, "lark.im.sent_by_me").cursor, null);
+    assert.deepEqual(sqliteQuery(dbPath, "SELECT COUNT(*) AS count FROM records;"), [{ count: 0 }]);
+    assert.deepEqual(sqliteQuery(dbPath, "SELECT COUNT(*) AS count FROM lark_im_list_progress;"), [{ count: 0 }]);
+    assert.deepEqual(sqliteQuery(dbPath, "SELECT status FROM sync_runs;"), [{ status: "failed" }]);
+    assert.deepEqual(sqliteQuery(dbPath, "SELECT COUNT(*) AS count FROM sync_locks;"), [{ count: 0 }]);
+  });
+}
+
 test("completed discovery skip is fenced by the running run and current lock", () => {
   const scope = {
     id: "lark.im.unmuted_chat_discovery",
@@ -581,8 +641,8 @@ test("completed discovery skip is fenced by the running run and current lock", (
   assert.match(sql, /BEGIN;[\s\S]*__lark_run_fence_guard/);
   assert.match(sql, /r\.status = 'running'/);
   assert.match(sql, /JOIN sync_locks/);
-  assert.match(sql, /julianday\(l\.locked_at\) IS NOT NULL/);
-  assert.match(sql, /l\.locked_at > '2026-06-18T07:40:00.000Z'/);
+  assert.match(sql, /julianday\(l\.locked_at\) > julianday\('now'\) - 1200 \/ 86400\.0/);
+  assert.match(sql, /s\.enabled = 1 AND src\.enabled = 1/);
   assert.match(sql, /EXISTS \(SELECT 1 FROM __lark_run_fence_guard\)/);
   assert.match(sql, /COMMIT;/);
 });
@@ -724,7 +784,7 @@ test("syncReceived honors receivedScopesPerRun batch limits", () => {
 });
 
 test("syncReceived stops after exhausted transient transport failures and keeps committed progress", async (t) => {
-  const cases = ["rate_limited", "network_timeout", "network_error", "service_unavailable"].map((kind) => ({
+  const cases = ["rate_limited", "network_timeout", "network_error", "service_unavailable", "internal_error code=2200", "internal_error code=1663"].map((kind) => ({
     errorMessage: `lark-cli failed: kind=${kind} operation=message_history_bundle`,
     shouldStop: true,
   }));
@@ -732,6 +792,8 @@ test("syncReceived stops after exhausted transient transport failures and keeps 
     "lark-cli failed: kind=unknown operation=message_history_bundle",
     "validation noted kind=rate_limited",
     "lark-cli failed: kind=rate_limited-other operation=message_history_bundle",
+    "lark-cli failed: kind=internal_error_extra operation=message_history_bundle",
+    "message-details unavailable: kind=internal_error",
   ].map((errorMessage) => ({ errorMessage, shouldStop: false })));
   for (const { errorMessage, shouldStop } of cases) {
     await t.test(errorMessage, () => {

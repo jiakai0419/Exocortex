@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 
 /**
  * @typedef {Record<string, any>} JsonObject
- * @typedef {"network_timeout" | "network_error" | "rate_limited" | "service_unavailable" | "internal_error" | "restricted_mode" | "bot_user_out_of_chat" | "command_unavailable" | "spawn_error" | "unknown"} LarkFailureKind
+ * @typedef {"network_timeout" | "network_error" | "rate_limited" | "service_unavailable" | "internal_error" | "restricted_mode" | "bot_user_out_of_chat" | "permission_denied" | "command_unavailable" | "spawn_error" | "unknown"} LarkFailureKind
  * @typedef {"message_history_bundle" | "message_search_bundle" | "chat_discovery_bundle" | "self_profile" | "contact_search" | "chat_members" | "chat_bots" | "application_info" | "other"} TransportOperation
  * @typedef {{kind: LarkFailureKind, transient: boolean, code: number | null, message: string, retry_after_ms: number | null}} LarkFailureClassification
  * @typedef {{calls: number, attempts: number, retries: number, rate_limits: number, timeouts: number, wait_ms: number, max_retry_after_ms: number, cooldown_until_ms: number, exhausted: number, retry_after_unknown: number}} TransportCounters
@@ -239,19 +239,22 @@ function classifyLarkFailure(stderr) {
   const text = String(stderr || "");
   const envelope = parseLarkEnvelope(text);
   const error = parseLarkError(text);
-  const code = numericCode(error?.code ?? envelope?.code);
+  const code = numericCode(error?.code ?? envelope?.code ??
+    (!envelope ? text.match(/\bcode[=:]\s*(\d+)(?=\s|;|$)/)?.[1] : undefined));
   const message = String(error?.message || "");
   const retryAfterMs = extractRetryAfterMs(envelope, text);
   /** @param {LarkFailureKind} kind @param {boolean} transient @param {string} [safeMessage] */
   const result = (kind, transient, safeMessage = kind.replaceAll("_", " ")) => ({
     kind, transient, code, message: safeMessage, retry_after_ms: retryAfterMs,
   });
-  const publicKind = text.match(/\bkind=(network_timeout|network_error|rate_limited|service_unavailable|internal_error|restricted_mode|bot_user_out_of_chat|command_unavailable|spawn_error|unknown)\b/)?.[1];
+  const publicKind = text.match(/\bkind=(network_timeout|network_error|rate_limited|service_unavailable|internal_error|restricted_mode|bot_user_out_of_chat|permission_denied|command_unavailable|spawn_error|unknown)(?=\s|;|$)/)?.[1];
   if (publicKind && !envelope) {
     const classification = result(/** @type {LarkFailureKind} */ (publicKind),
       ["network_timeout", "network_error", "rate_limited", "service_unavailable", "internal_error"].includes(publicKind));
-    classification.code = numericCode(text.match(/\bcode=(\d+)\b/)?.[1]);
     classification.retry_after_ms = numericCode(text.match(/\bretry_after_ms=(\d+)\b/)?.[1]);
+    // Older public descriptors may only have recognized the numeric denial.
+    if (publicKind === "unknown" && classification.code === 231203) classification.kind = "restricted_mode";
+    if (publicKind === "unknown" && classification.code === 230002) classification.kind = "bot_user_out_of_chat";
     return classification;
   }
   const status = [error?.http_status, error?.http_status_code, error?.status, error?.status_code,
@@ -294,6 +297,17 @@ function publicFailureDescriptor(result, timeoutMs) {
 
 /** @param {unknown} stderr */
 function isTransientLarkFailure(stderr) { return classifyLarkFailure(stderr).transient; }
+
+/** A remote outage ends this batch only after the request transport returned
+ * its public failure. Validation prose and task-local detail failures do not
+ * acquire transport semantics merely by mentioning a failure kind.
+ * @param {unknown} error
+ */
+function isExhaustedLarkTransportFailure(error) {
+  const text = error instanceof Error ? error.message : String(error || "");
+  const descriptor = text.match(/^lark-cli failed: (kind=[^\s;]+)/)?.[1];
+  return Boolean(descriptor) && classifyLarkFailure(descriptor).transient;
+}
 
 /** @param {number} attempt @param {number} baseDelayMs */
 function retryDelayForAttempt(attempt, baseDelayMs) {
@@ -388,6 +402,6 @@ const runLark = createLarkCliRunner();
 export {
   DEFAULT_LARK_CLI_TIMEOUT_MS, DEFAULT_LARK_RETRY_BUDGET_MS, MAX_LARK_RETRIES, TRANSPORT_OPERATIONS,
   classifyLarkFailure, createLarkCliRunner, createTransportState, getTransportStats, resetTransportStats,
-  isTransientLarkFailure, parseLarkError, parseJson, publicFailureDescriptor, redactCommand,
+  isTransientLarkFailure, isExhaustedLarkTransportFailure, parseLarkError, parseJson, publicFailureDescriptor, redactCommand,
   retryDelayForAttempt, runLark, sleepMs, transportOperation,
 };
