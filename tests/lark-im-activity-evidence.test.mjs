@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync, rmSync, renameSync, symlinkSync, appendFile
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { activityDatabaseKey, createActivityWriter, evaluateActivityEvent, inspectActivityProcesses,
-  latestActivityEvents, observeLockOwners, validateActivityEventShape } from "../src/diagnostics/lark-im-activity-evidence.mjs";
+  latestActivityEvents, observeLockOwners, validateActivityEventShape, compareActivityProcessStarts, collectWorkerParentIdentities } from "../src/diagnostics/lark-im-activity-evidence.mjs";
 import { buildServiceOverview, buildServiceStatusReport, readRecentWorkerEvents } from "../src/diagnostics/lark-im-service-report.mjs";
 import { runWorker, parseArgs } from "../src/cli/lark-im-worker-command.mjs";
 
@@ -300,7 +300,7 @@ function logBackedActivity(t, inputEvents, processes, launchdPid = 8200) {
   const dir = mkdtempSync(join(tmpdir(), "synthetic-activity-review-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const db = join(dir, "invented.sqlite"); writeFileSync(db, "synthetic database identity only");
-  const events = inputEvents.map((event) => typeof event.database_key === "string"
+  const events = inputEvents.map((event) => event.database_key === key
     ? { ...event, database_key: activityDatabaseKey(db) } : event);
   writeFileSync(join(dir, "worker.jsonl"), events.map((event) => JSON.stringify(event)).join("\n") + "\n");
   const deps = { nowMs: clock,
@@ -425,4 +425,135 @@ test("stopped service with an old dead worker and living orphan still admits ind
   assert.equal(report.overview.activity.state, "syncing");
   assert.equal(report.overview.activity.evidence, "recent_foreground_phase");
   assert.equal(logBackedActivity(t, events.filter((event) => event !== foreground), processes, null).report().overview.activity.state, "unknown");
+});
+
+test("4531143 regression: a suspended parent with matching start cannot turn its unbound child into independent foreground", async (t) => {
+  const processes = inspectActivityProcesses([8500, 8501], () => ({ status: 0, stderr: "",
+    stdout: `8500 8100 T ${new Date(start).toString()}\n8501 8500 S ${new Date(start).toString()}\n` }));
+  assert.equal(processes.get(8500).state, "unknown"); assert.equal(processes.get(8500).started_at_ms, start);
+  const events = [phase({ pid: 8500, instance_id: "suspended-worker" }),
+    phase({ role: "sync", phase: "sync", pid: 8501, instance_id: "unbound-child", parent_instance: null })];
+  const fixture = logBackedActivity(t, events, processes, null);
+  assert.equal(fixture.report().overview.activity.state, "unknown");
+  const { runLarkImServiceCli } = await import("../src/cli/lark-im-service-command.mjs");
+  const { plain } = await import("../dist/terminal/index.js");
+  let output = "";
+  runLarkImServiceCli(["status", "--db", fixture.db, "--log-dir", fixture.dir], {
+    uid: () => 999, stdout: { write: (text) => { output += text; } },
+    buildServiceStatusReport: (opts) => buildServiceStatusReport(opts, fixture.deps),
+  });
+  assert.match(plain(output), /Activity\s+UNKNOWN/); assert.doesNotMatch(plain(output), /foreground sync observed/);
+});
+
+test("parent identity and liveness stay separate across 81 log/report/CLI combinations", async (t) => {
+  const { runLarkImServiceCli } = await import("../src/cli/lark-im-service-command.mjs");
+  const { plain } = await import("../dist/terminal/index.js");
+  let checked = 0;
+  for (const liveness of ["alive", "unknown", "dead"]) {
+    for (const [identity, observedStart] of [["same", start], ["different", start + 1000], ["missing", null]]) {
+      for (const parent of [null, "matrix-worker", "different-worker"]) {
+        for (const service of ["running", "stopped", "unknown"]) {
+          const label = [liveness, identity, String(parent), service].join(" / ");
+          const events = [phase({ pid: 8500, instance_id: "matrix-worker", phase: "waiting" }),
+            phase({ role: "sync", phase: "sync", pid: 8501, instance_id: "matrix-child", parent_instance: parent })];
+          const processes = new Map([[8500, { state: liveness, started_at_ms: observedStart, ppid: 8100 }], [8501, { ...processState, ppid: 8500 }]]);
+          const fixture = logBackedActivity(t, events, processes, service === "stopped" ? null : 8200);
+          if (service === "unknown") {
+            const original = fixture.deps.runCommand;
+            fixture.deps.runCommand = (cmd) => cmd === "launchctl" ? { status: 1, stdout: "", stderr: "synthetic inspection unavailable" } : original(cmd);
+          }
+          const expected = parent === null && identity === "different" ? "syncing" : "unknown";
+          assert.equal(readRecentWorkerEvents(fixture.dir).activity_integrity, true, label);
+          const report = fixture.report();
+          assert.equal(report.overview.service.status, service, label);
+          assert.equal(report.overview.activity.state, expected, label);
+          assert.equal(report.overview.activity.evidence === "recent_foreground_phase", expected === "syncing", label);
+          let output = "";
+          runLarkImServiceCli(["status", "--db", fixture.db, "--log-dir", fixture.dir], {
+            uid: () => 999, stdout: { write: (text) => { output += text; } },
+            buildServiceStatusReport: (opts) => buildServiceStatusReport(opts, fixture.deps),
+          });
+          assert.match(plain(output), new RegExp(`Activity\\s+${expected.toUpperCase()}`), label);
+          checked++;
+        }
+      }
+    }
+  }
+  assert.equal(checked, 81);
+});
+
+test("phase evaluation never turns unavailable start identity into proof of a dead or reused process", () => {
+  for (const liveness of ["alive", "unknown", "dead"]) {
+    for (const observedStart of [start, start + 1000, null]) {
+      const identity = compareActivityProcessStarts(start, observedStart);
+      assert.equal(identity, observedStart === null ? "unknown" : observedStart === start ? "same" : "different");
+      const evaluated = evaluateActivityEvent(phase(), { state: liveness, started_at_ms: observedStart }, key, clock);
+      const expected = liveness === "dead" || identity === "different" ? "dead"
+        : liveness === "alive" && identity === "same" ? "syncing" : "unknown";
+      assert.equal(evaluated.state, expected, `${liveness}/${identity}`);
+    }
+    assert.equal(compareActivityProcessStarts(null, start), "unknown");
+    assert.equal(evaluateActivityEvent(phase({ process_started_at_ms: null }), { state: liveness, started_at_ms: start }, key, clock).state,
+      liveness === "dead" ? "dead" : "unknown");
+  }
+  for (const invalid of [undefined, "123", 0, NaN]) assert.equal(compareActivityProcessStarts(start, invalid), "unknown");
+});
+
+test("stopped parent identity survives selection without consuming active-process budget", (t) => {
+  for (const observedStart of [start, start + 1000, null]) {
+    for (const liveness of ["alive", "unknown", "dead"]) {
+      const events = [phase({ pid: 8500, instance_id: "terminal-worker", phase: "stopped" }),
+        phase({ role: "sync", phase: "sync", pid: 8501, instance_id: "terminal-child", parent_instance: null })];
+      const processes = new Map([[8500, { state: liveness, started_at_ms: observedStart }], [8501, { ...processState, ppid: 8500 }]]);
+      assert.equal(latestActivityEvents(events, key, clock).events.length, 1);
+      assert.equal(logBackedActivity(t, events, processes, null).report().overview.activity.state, observedStart === start + 1000 ? "syncing" : "unknown");
+    }
+  }
+  const history = Array.from({ length: 150 }, (_, n) => phase({ pid: 9000 + n, instance_id: `complete-worker-${n}`, phase: "stopped" }));
+  const events = [...history, phase({ pid: 8500, instance_id: "relevant-terminal", phase: "stopped" }),
+    phase({ role: "sync", phase: "sync", pid: 8501, instance_id: "terminal-child", parent_instance: null })];
+  const fixture = logBackedActivity(t, events, new Map(), null);
+  let calls = 0;
+  fixture.deps.inspectActivityProcesses = (pids) => {
+    calls++; assert.deepEqual(pids, [8501]);
+    return new Map([[8501, { ...processState, ppid: 8500 }]]);
+  };
+  assert.equal(fixture.report().overview.activity.state, "unknown"); assert.equal(calls, 1);
+  const parentRoles = collectWorkerParentIdentities(events, [8500]);
+  assert.deepEqual([...parentRoles], [[8500, new Set([start])]]);
+});
+
+test("unobserved or unavailable parents cannot lose association because their phase is old, future, or bound elsewhere", (t) => {
+  for (const changes of [
+    { phase: "stopped", database_key: "c".repeat(64) }, { database_key: "c".repeat(64) },
+    { valid_until: iso(clock) }, { updated_at: iso(clock + 1) },
+    { updated_at: iso(start + 100) }, { process_started_at_ms: null },
+  ]) {
+    const events = [phase({ pid: 8500, instance_id: "uncertain-parent", ...changes }),
+      phase({ role: "sync", phase: "sync", pid: 8501, instance_id: "uncertain-child", parent_instance: null })];
+    const fixture = logBackedActivity(t, events, new Map([[8501, { ...processState, ppid: 8500 }]]), null);
+    assert.equal(fixture.report().overview.activity.state, "unknown");
+    const realForeground = phase({ role: "sync", phase: "sync", pid: 8600, instance_id: "independent", parent_instance: null });
+    const independent = logBackedActivity(t, [...events, realForeground], new Map([[8501, { ...processState, ppid: 8500 }], [8600, processState]]), null);
+    assert.equal(independent.report().overview.activity.state, "syncing");
+    assert.equal(independent.report().overview.activity.evidence, "recent_foreground_phase");
+  }
+});
+
+test("matching PPID aggregation keeps every unrefuted instance and only replaces older evidence within that instance", (t) => {
+  const same = phase({ pid: 8500, instance_id: "same-parent", phase: "stopped" });
+  const different = phase({ pid: 8500, instance_id: "different-parent", phase: "stopped", process_started_at_ms: start - 1000 });
+  const unavailable = phase({ pid: 8500, instance_id: "unknown-parent", phase: "stopped", process_started_at_ms: null });
+  const child = phase({ role: "sync", phase: "sync", pid: 8501, instance_id: "child", parent_instance: null });
+  const processes = new Map([[8500, processState], [8501, { ...processState, ppid: 8500 }]]);
+  const anotherDifferent = { ...different, instance_id: "another-different", process_started_at_ms: start - 2000 };
+  const updatedSameInstance = { ...different, instance_id: same.instance_id };
+  for (const [parents, expected] of [
+    [[same, different], "unknown"], [[different, same], "unknown"], [[unavailable, different], "unknown"],
+    [[different, unavailable], "unknown"], [[different, anotherDifferent], "syncing"],
+    [[same, updatedSameInstance], "syncing"],
+  ]) {
+    assert.equal(logBackedActivity(t, [...parents, child], processes, null).report().overview.activity.state, expected);
+    assert.equal(logBackedActivity(t, [...parents, { ...child, parent_instance: "explicit-parent" }], processes, null).report().overview.activity.state, "unknown");
+  }
 });

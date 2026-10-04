@@ -127,7 +127,10 @@ function mergeLarkNameProjectionSql(existingJson, incomingJson, existingActor, i
             ? larkSenderNameIsUnknownSql('next', incomingRaw, incomingActor)
             : `COALESCE(json_extract(next, '${group.name}'), '') = ''`;
         const oldUnknown = group.name === '$.sender_name'
-            ? larkSenderNameIsUnknownSql('old', existingRaw, existingActor)
+            // An incoming source may reveal that the historical display was an ID.
+            // Retain it only when neither source identifies it as an alias.
+            ? `(${larkSenderNameIsUnknownSql('old', existingRaw, existingActor)}
+        OR ${larkSenderNameIsUnknownSql('old', incomingRaw, incomingActor)})`
             : `COALESCE(json_extract(old, '${group.name}'), '') = ''`;
         stages.push(`n${index} AS MATERIALIZED (SELECT old, next,
       (${group.identity})

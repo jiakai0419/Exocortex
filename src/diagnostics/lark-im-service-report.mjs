@@ -14,7 +14,7 @@ import {
 } from "node:fs";
 import { resolve } from "node:path";
 import { summarizeWorkerEvents } from "../../dist/runtime/worker/lark-im-worker-core.js";
-import { activityDatabaseKey, inspectActivityProcesses, latestActivityEvents, evaluateActivityEvent, validateActivityEventShape } from "./lark-im-activity-evidence.mjs";
+import { activityDatabaseKey, inspectActivityProcesses, latestActivityEvents, evaluateActivityEvent, validateActivityEventShape, compareActivityProcessStarts, collectWorkerParentIdentities } from "./lark-im-activity-evidence.mjs";
 import { classifyLarkFailure } from "../adapters/lark-im/transport.mjs";
 import { readLiveProbeCache, liveProbeContext, DEFAULT_LIVE_PROBE_TTL_MS } from "./live-probe-cache.mjs";
 import { diagnosticSubprocessError } from "./public-safe.mjs";
@@ -415,13 +415,14 @@ function summarizeServiceActivity({ service, syncStatus, nowMs = Date.now(), act
   const evaluated = events.map((event) => ({ event,
     value: evaluateActivityEvent(event, processes.get(event.pid), activityEvidence?.database_key || "", nowMs),
   })).filter((item) => item.value.state !== "other_database" && item.value.state !== "dead");
-  // A historical PID does not retain its old worker identity after reuse.
-  // Parent classification needs the currently observed same process instance;
-  // this identifies its role, but does not refresh an expired phase.
-  const workerPids = new Set(evaluated.filter(({ event }) => event.role === "worker"
-    && event.process_started_at_ms !== null && processes.get(event.pid)?.state === "alive"
-    && processes.get(event.pid)?.started_at_ms === event.process_started_at_ms
-    && Date.parse(event.updated_at) >= event.process_started_at_ms + 1000).map(({ event }) => event.pid));
+  // Unknown liveness/start evidence is not proof that a historical worker
+  // association disappeared. Only two known, different starts exclude it.
+  // A dead parent still named by a live child's PPID is a non-atomic conflict,
+  // not evidence that the child has become an independent invocation.
+  const parentIdentities = activityEvidence?.parent_identities || collectWorkerParentIdentities(events,
+    events.filter((event) => event.role === "sync").map((event) => processes.get(event.pid)?.ppid));
+  const workerPids = new Set([...parentIdentities].filter(([pid, expectedStarts]) =>
+    [...expectedStarts].some((expectedStart) => compareActivityProcessStarts(expectedStart, processes.get(pid)?.started_at_ms) !== "different")).map(([pid]) => pid));
   if (service.status === "running" && launchd.pid) workerPids.add(Number(launchd.pid));
   const worker = evaluated.find((item) => item.event.role === "worker"
     && (service.status !== "running" || item.event.pid === Number(launchd.pid)));
@@ -599,9 +600,11 @@ function buildServiceStatusReport(opts, deps = {}) {
   // after collection began. Evaluate all temporal evidence after those reads.
   const candidates = latestActivityEvents(workerLog.events, initialDatabaseKey, now());
   const processes = (deps.inspectActivityProcesses || inspectActivityProcesses)(candidates.events.map((event) => Number(event.pid)));
+  const parentIdentities = collectWorkerParentIdentities(workerLog.events, candidates.events
+    .filter((event) => event.role === "sync").map((event) => processes.get(Number(event.pid))?.ppid));
   const finalDatabaseKey = activityDatabaseKey(opts.db || DEFAULT_DB);
   const nowMs = now();
-  const activityEvidence = { ...candidates, processes, database_key: finalDatabaseKey,
+  const activityEvidence = { ...candidates, processes, parent_identities: parentIdentities, database_key: finalDatabaseKey,
     database_identity_stable: initialDatabaseKey !== null && initialDatabaseKey === finalDatabaseKey,
     integrity: workerLog.activity_integrity !== false && candidates.integrity !== false, observed_at: new Date(nowMs).toISOString() };
   const workerSummary = summarize(workerLog.events.filter((event) => event.type !== "lark_im_worker_activity"), nowMs);

@@ -34,6 +34,8 @@ sender 的兼容输入范围是有限的：接受 `sender.id` 配合显式 `id_t
 
 所有明确 ID 槽构成同一条源消息的 alias 集合。直接姓名、远端候选与已存姓名若等于其中任何 ID，均为 unknown；原消息明确给出的 alias 即使未出现在远端响应中也有效。先做这项校验，再决定是否查询成员 fallback，不能用回显值计为 resolved 或抑制补全。共享正向缓存也不能把本次已知的 ID 回显当作成功；真实姓名、显式 clear 和同版本改进的既有规则保持。历史 sender-only 仍只修可信匹配的 open-ID 姓名，不隐式迁移错误 actor 或增加 user/union-ID 远端查询通道。
 
+继承旧姓名需要同时通过旧、新来源的可信 alias 校验。相同 actor、namespace、chat 只说明身份可比较，不足以证明旧值仍是姓名：较新来源可能新增一个 typed ID，揭示旧值其实是 ID 回显。此时不得在新投影已经判定 unknown 后恢复旧值；这不是权威清空，也不产生 clear 标记。无关的新 alias 不影响真实姓名继承，显式 clear、新可信姓名及源版本保护保持原规则。跨版本写入保存被接受的新 raw/hash/version；旧版本重放不能逆转它。
+
 sender 持久投影新增 `canonical.sender_id_type`。姓名 SQL 合并只有 effective namespace、actor 与适用的 chat 均相同才可继承。旧 canonical 缺 type 时先核对 raw 的显式类型；raw/canonical 相互矛盾不得继承。仅当两者都无类型证据时，`ou_` 兼容解释为 `open_id`、`cli_` 为 `app_id`，其他为 opaque legacy；显式 `user_id`/`union_id` 不能与这些旧兼容类型相等。该旧记录规则只服务合并兼容，不能授权联网；网络查询仍要求原始显式 typed 证据。新增类型须与 `message-record`、resolver 和补全共用同一小型身份函数，不让每条路径自行猜测。
 
 姓名状态沿用已实现的 SQL 合并合同：`resolved` 保留姓名与来源；缺字段、空 lookup、超时、拒绝、冲突为 `unknown`，不能抹掉同身份已有值；只有显式 `*_name_state=cleared`（对方为 `chat_partner.name_state`）才是权威清空。未知不能复活已清空值，新可信解析可以更新它。缓存会话名等历史证据只能补未知，不覆盖已知或权威清空。原始消息中的新姓名及同版本投影改善仍按既有版本保护规则处理。卡片临时映射只决定本次展示，不产生权威清空或修改 sender 的存储姓名。

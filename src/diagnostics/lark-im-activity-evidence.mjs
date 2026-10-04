@@ -156,6 +156,39 @@ function latestActivityEvents(events, databaseKey, nowMs = Date.now()) {
   return { events: candidates, truncated: false, integrity: true };
 }
 
+/** Identity and liveness are separate observations. Missing start evidence
+ * never establishes PID reuse, including for a suspended or absent process.
+ * @param {unknown} expectedStart @param {unknown} observedStart
+ * @returns {"same" | "different" | "unknown"} */
+function compareActivityProcessStarts(expectedStart, observedStart) {
+  const valid = (/** @type {unknown} */ value) => typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+  if (!valid(expectedStart) || !valid(observedStart)) return "unknown";
+  return expectedStart === observedStart ? "same" : "different";
+}
+
+/** Only parent-role evidence is retained here: it cannot establish activity.
+ * Keep each instance's latest identity for matching OS PPIDs, including
+ * stopped phases and other database bindings. Any unrefuted instance retains
+ * the possible worker role; one different instance cannot erase another.
+ * @param {unknown[]} events @param {unknown[]} parentPids
+ * @returns {Map<number, Set<number | null>>} */
+function collectWorkerParentIdentities(events, parentPids) {
+  const requested = new Set(parentPids.flatMap((pid) => typeof pid === "number" && Number.isSafeInteger(pid) && pid > 0 ? [pid] : []));
+  /** @type {Map<number, Set<number | null>>} */
+  const result = new Map();
+  if (requested.size === 0) return result;
+  const seenInstances = new Set();
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = /** @type {Record<string, any>} */ (events[index]);
+    if (event?.role !== "worker" || !validateActivityEventShape(event) || seenInstances.has(event.instance_id)) continue;
+    seenInstances.add(event.instance_id);
+    if (!requested.has(event.pid)) continue;
+    if (!result.has(event.pid)) result.set(event.pid, new Set());
+    result.get(event.pid)?.add(event.process_started_at_ms);
+  }
+  return result;
+}
+
 /** @param {Record<string, any>} event @param {Record<string, any> | undefined} processState @param {string | null} databaseKey @param {number} nowMs */
 function evaluateActivityEvent(event, processState, databaseKey, nowMs) {
   if (!validateActivityEventShape(event)) return { state: "unknown" };
@@ -163,12 +196,12 @@ function evaluateActivityEvent(event, processState, databaseKey, nowMs) {
     || typeof event.database_key !== "string" || !/^[a-f0-9]{64}$/.test(event.database_key)) return { state: "unknown" };
   if (event.database_key !== databaseKey) return { state: "other_database" };
   if (processState?.state === "dead") return { state: "dead" };
-  const start = Number(event.process_started_at_ms);
-  if (processState?.state === "alive" && Number.isFinite(start) && start > 0 && processState.started_at_ms !== start) return { state: "dead" };
+  const start = event.process_started_at_ms;
+  const identity = compareActivityProcessStarts(start, processState?.started_at_ms);
+  if (identity === "different") return { state: "dead" };
   const updated = Date.parse(String(event.updated_at || ""));
   const until = Date.parse(String(event.valid_until || ""));
-  const valid = event.process_started_at_ms !== null
-    && processState?.state === "alive" && processState.started_at_ms === start
+  const valid = identity === "same" && processState?.state === "alive"
     && updated >= start + 1000 && updated <= nowMs && nowMs < until;
   if (!valid) return { state: "unknown" };
   if (event.phase === "stopped") return { state: "stopped" };
@@ -191,4 +224,5 @@ function databaseOnlyHealth(health) {
 }
 
 export { databaseActivityEvidence, databaseOnlyHealth, ACTIVITY_GAP_MS, ACTIVITY_GRACE_MS, MAX_ACTIVITY_AGE_MS, activityDatabaseKey, createActivityWriter,
-  inspectActivityProcesses, observeLockOwners, latestActivityEvents, evaluateActivityEvent, validateActivityEventShape };
+  inspectActivityProcesses, observeLockOwners, latestActivityEvents, evaluateActivityEvent, validateActivityEventShape,
+  compareActivityProcessStarts, collectWorkerParentIdentities };
