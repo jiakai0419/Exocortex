@@ -1,6 +1,6 @@
 # Ingestion Core Design
 
-> 本文保留早期架构设计，不是当前 CLI 与读取路径的完整说明。其中快捷命令示例不代表当前实现：当前 received 使用原生 list，sent 使用 search 加 mget；以源码和 Operations 为准。
+> 历史设计：本文保留早期架构设想，不是当前 CLI 与读取路径的完整说明。其中快捷命令示例不代表当前实现：当前 received 使用原生 list，sent 使用 search 加 mget。现行操作见 [Operations](operations.md)，版本、事务与多来源查询边界见 [Storage contracts](storage-contracts.md)。下文扩展目标不是已实现功能清单。
 
 ## 目标
 

@@ -57,3 +57,4 @@ python3 -B scripts/lark-im-coverage-check.py --target "$COVERAGE_TARGET_ISO"
 - [Language and module boundaries](docs/language-and-refactor-plan.md)
 - [Terminal experience](docs/terminal-experience.md)
 - [Node reliability fixes and regression evidence](docs/node-reliability-fixes.md)
+- [Current storage and entrypoint contracts](docs/storage-contracts.md)

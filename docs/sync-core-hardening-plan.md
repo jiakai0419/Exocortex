@@ -1,5 +1,7 @@
 # Sync Core Hardening Plan
 
+> 历史规划：本文保留早期阶段目标和验收设想，不是当前实现清单或运行状态。现行操作见 [Operations](operations.md)，事务与来源边界见 [Storage contracts](storage-contracts.md)，已实现反例见 [Node reliability fixes](node-reliability-fixes.md)。下文的“当前”“下一阶段”均指写作时点。
+
 ## 当前判断
 
 衍我当前阶段的核心不是 UI、摘要、embedding 或新信息源，而是把飞书消息同步做成可以长期依赖的事实流。

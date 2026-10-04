@@ -1,6 +1,6 @@
 # Language and Refactor Plan
 
-> 本文保留早期 Node/TypeScript 模块规划，不是当前文件清单。部分 .mjs 路径已迁为 .ts，实际入口和构建边界以仓库文件及 Operations 为准。
+> 历史规划：本文保留早期 Node/TypeScript 模块规划，不是当前文件清单。部分 .mjs 路径已迁为 .ts；现行入口、配置与维护流程见 [Operations](operations.md)，现行事务与来源边界见 [Storage contracts](storage-contracts.md)。下文阶段状态和“当前”描述仅代表写作时点，不构成新迁移授权。
 
 ## 结论
 
