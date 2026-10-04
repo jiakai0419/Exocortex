@@ -6,7 +6,7 @@ import { COMMANDS, GROUPS, filteredCommands } from "../scripts/help.mjs";
 
 test("terminal catalog lists every script command", () => {
   const scripts = readdirSync("scripts")
-    .filter((name) => name.endsWith(".mjs"))
+    .filter((name) => name.endsWith(".mjs") || name.endsWith(".py"))
     .map((name) => `scripts/${name}`)
     .sort();
   const catalogedScripts = COMMANDS.filter((item) => item.file.startsWith("scripts/"))
@@ -14,6 +14,14 @@ test("terminal catalog lists every script command", () => {
     .sort();
 
   assert.deepEqual(catalogedScripts, scripts);
+});
+
+test("coverage help names Python and an explicit endpoint without adding a daily command", () => {
+  const entries = filteredCommands({ all: false, group: null, command: "coverage-check" });
+  assert.equal(entries.length, 1);
+  assert.match(entries[0].command, /^python3 -B .* --target /);
+  assert.match(entries[0].summary, /without writing/);
+  assert.notEqual(entries[0].core, true);
 });
 
 test("terminal catalog entries have valid groups and examples", () => {

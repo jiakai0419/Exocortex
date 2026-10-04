@@ -124,6 +124,13 @@ const COMMANDS = [
   },
   {
     group: "diagnostics",
+    command: "python3 -B scripts/lark-im-coverage-check.py --target <ISO-with-timezone>",
+    file: "scripts/lark-im-coverage-check.py",
+    summary: "Check retained successful-window coverage to an explicit fixed endpoint without writing the database.",
+    examples: ["python3 -B scripts/lark-im-coverage-check.py --target 2031-04-05T12:00:00Z"],
+  },
+  {
+    group: "diagnostics",
     command: "node scripts/lark-im-quality.mjs",
     file: "scripts/lark-im-quality.mjs",
     summary: "Check local Lark IM data quality.",
@@ -205,6 +212,13 @@ const COMMANDS = [
     file: "scripts/check-syntax.mjs",
     summary: "Syntax-check every JavaScript source file individually.",
     examples: ["node scripts/check-syntax.mjs"],
+  },
+  {
+    group: "development",
+    command: "npm run build:check",
+    file: "scripts/check-generated.mjs",
+    summary: "Compare dist with a clean temporary build, including missing and obsolete output files.",
+    examples: ["npm run build:check"],
   },
   {
     group: "development",
