@@ -10,7 +10,7 @@ import {
   parseArgs,
   runSyncStatusCli,
 } from "../src/cli/sync-status-command.mjs";
-import { buildStatus, sanitizeStatusReportForPublicOutput } from "../src/diagnostics/sync-status-report.mjs";
+import { buildStatus, sanitizeStatusReportForPublicOutput, sqliteJson as readStatusRows } from "../src/diagnostics/sync-status-report.mjs";
 import { renderSyncStatusText as renderText } from "../src/terminal/sync-status-view.mjs";
 import { ensureInitialized, quoteSql } from "../dist/storage/sqlite/ingestion-store.js";
 
@@ -183,74 +183,36 @@ test("renderText shows summary, unsupported reasons, recovery, and recent failur
   assert.doesNotMatch(output, /lark\.im\.received\.chat\.1/);
 });
 
-test("buildStatus assembles rows without performing recovery", () => {
+test("buildStatus assembles one tagged snapshot without performing recovery", () => {
   const calls = [];
+  const sections = {
+    "read detail progress schema": [],
+    "read detail progress migration": [],
+    "read record totals": [{ count: 3, latest_ms: Date.parse("2026-06-20T00:00:00.000Z") }],
+    "read direction totals": [
+      { direction: "received", count: 2, latest_ms: Date.parse("2026-06-20T00:00:00.000Z") },
+      { direction: "sent", count: 1, latest_ms: Date.parse("2026-06-19T23:59:00.000Z") },
+    ],
+    "read scope totals": [{ total: 4, enabled: 3, received_enabled: 2, message_enabled: 3,
+      message_without_success: 0, received_without_cursor: 1, received_unsupported: 1 }],
+    "read unsupported scope reasons": [{ reason: "restricted_mode", lark_cli_error_code: "", count: 1 }],
+    "read discovery scope": [{ cursor_json: JSON.stringify({ has_more: false, pages_scanned: 7 }),
+      cursor_updated_at: "2026-06-20T00:00:01.000Z", has_success: 1 }],
+    "read hot discovery scope": [{ cursor_json: null, has_success: 1 }],
+    "read reconcile scope": [{ cursor_json: JSON.stringify({ has_more: true, pages_scanned: 2 }),
+      cursor_updated_at: "2026-06-20T00:02:00.000Z" }],
+    "read run counts": [{ status: "failed", count: 1 }, { status: "succeeded", count: 1 }],
+    "read recent runs": [{ status: "failed",
+      error_message: '{"error":{"type":"api","code":9499,"message":"too many request"}}' }],
+    "read locks": [],
+  };
   const status = buildStatus("/abs/db.sqlite", {
-    recoverStaleSyncState: (dbPath) => {
-      throw new Error("read-only status must not recover");
-    },
+    recoverStaleSyncState: () => { throw new Error("read-only status must not recover"); },
     sqliteJson: (dbPath, _sql, label) => {
       calls.push([label, dbPath]);
-      if (label === "read detail progress schema") return [];
-      if (label === "read record totals") {
-        return [{ count: 3, latest_ms: Date.parse("2026-06-20T00:00:00.000Z") }];
-      }
-      if (label === "read direction totals") {
-        return [
-          { direction: "received", count: 2, latest_ms: Date.parse("2026-06-20T00:00:00.000Z") },
-          { direction: "sent", count: 1, latest_ms: Date.parse("2026-06-19T23:59:00.000Z") },
-        ];
-      }
-      if (label === "read scope totals") {
-        return [
-          {
-            total: 4,
-            enabled: 3,
-            received_enabled: 2,
-            message_enabled: 3,
-            message_without_success: 0,
-            received_without_cursor: 1,
-            received_unsupported: 1,
-          },
-        ];
-      }
-      if (label === "read unsupported scope reasons") {
-        return [{ reason: "restricted_mode", lark_cli_error_code: "", lark_cli_error_message: "", count: 1 }];
-      }
-      if (label === "read discovery scope") {
-        return [
-          {
-            cursor_json: JSON.stringify({ has_more: false, pages_scanned: 7 }),
-            cursor_updated_at: "2026-06-20T00:00:01.000Z",
-            last_success_run_id: 10,
-          },
-        ];
-      }
-      if (label === "read hot discovery scope") {
-        return [{ cursor_json: null, has_success: 1 }];
-      }
-      if (label === "read reconcile scope") {
-        return [
-          {
-            cursor_json: JSON.stringify({ has_more: true, pages_scanned: 2 }),
-            cursor_updated_at: "2026-06-20T00:02:00.000Z",
-          },
-        ];
-      }
-      if (label === "read run counts") {
-        return [{ status: "failed", count: 1 }, { status: "succeeded", count: 1 }];
-      }
-      if (label === "read recent runs") {
-        return [
-          {
-            id: 12,
-            scope_id: "scope",
-            status: "failed",
-            error_message: '{"error":{"type":"api","code":9499,"message":"too many request"}}',
-          },
-        ];
-      }
-      if (label === "read locks") return [];
+      if (label === "read detail progress schema") return sections[label];
+      if (label === "read sync status snapshot") return Object.entries(sections)
+        .map(([section, rows]) => ({ section, rows_json: JSON.stringify(rows) }));
       throw new Error(`unexpected query: ${label}`);
     },
   });
@@ -264,7 +226,8 @@ test("buildStatus assembles rows without performing recovery", () => {
   assert.equal(status.runs.recent[0].failure_kind, "rate_limited");
   assert.equal(status.runs.recent[0].transient, true);
   assert.equal(status.runs.recent[0].error_code, 9499);
-  assert.equal(calls.some(([label]) => label === "recover"), false);
+  assert.deepEqual(calls, [["read detail progress schema", "/abs/db.sqlite"],
+    ["read sync status snapshot", "/abs/db.sqlite"]]);
   assert.equal(status.recovery.performed, false);
   assert.equal(status.details.evidence, "legacy_unavailable");
   assert.equal(status.details.pending_count, null);
@@ -319,7 +282,7 @@ test("legacy status stays explicit and partial or unreadable new detail schemas 
   sql("DROP TABLE lark_im_detail_tasks;");
   assert.throws(() => buildStatus(db), /schema is incomplete/);
   sql("CREATE TABLE lark_im_detail_tasks(unrelated TEXT);");
-  assert.throws(() => buildStatus(db), /read pending detail totals failed/);
+  assert.throws(() => buildStatus(db), /read sync status snapshot failed/);
   sql("DROP TABLE lark_im_detail_tasks; DROP TABLE lark_im_list_progress;");
   assert.throws(() => buildStatus(db), /schema is incomplete/);
   sql("DELETE FROM schema_migrations WHERE version='009';");
@@ -347,6 +310,94 @@ test("public status sanitization cannot retain stale okay health when detail deb
   }));
   assert.equal(invalidList.health, "needs_attention");
   assert.match(invalidList.health_detail, /list progress evidence is unavailable/);
+});
+
+test("status validates migration evidence in the report snapshot after legacy preflight", (t) => {
+  const { db, sql } = detailFixture(t);
+  sql("DROP TABLE lark_im_detail_tasks; DROP TABLE lark_im_list_progress; DELETE FROM schema_migrations WHERE version='009';");
+  assert.equal(buildStatus(db).details.evidence, "legacy_unavailable");
+  let changed = false;
+  assert.throws(() => buildStatus(db, {
+    sqliteJson: (path, query, label) => {
+      const rows = readStatusRows(path, query, label);
+      if (label === "read detail progress schema") {
+        // The relevant sqlite_schema names and SQL are unchanged. A separate
+        // reader for migration metadata could incorrectly keep the old verdict.
+        sql("INSERT INTO schema_migrations(version,name) VALUES('009','generated-marker-race');");
+        changed = true;
+      }
+      return rows;
+    },
+  }), /schema is incomplete/);
+  assert.equal(changed, true);
+});
+
+test("status rejects changed schema definitions even when preflight table names still match", (t) => {
+  const { db, sql } = detailFixture(t);
+  let changed = false;
+  assert.throws(() => buildStatus(db, {
+    sqliteJson: (path, query, label) => {
+      const rows = readStatusRows(path, query, label);
+      if (label === "read detail progress schema") {
+        sql("ALTER TABLE schema_migrations ADD COLUMN generated_snapshot_marker TEXT;");
+        changed = true;
+      }
+      return rows;
+    },
+  }), /schema changed during status collection/);
+  assert.equal(changed, true);
+});
+
+test("missing, repeated or malformed snapshot sections cannot become an okay report", (t) => {
+  const { db } = detailFixture(t);
+  const changeDetailRows = (rows, rowsJson) => rows.map((row) => row.section === "read pending detail totals"
+    ? { ...row, rows_json: rowsJson } : row);
+  const cases = [
+    ["empty snapshot", () => []],
+    ["missing detail evidence", (rows) => rows.filter((row) => row.section !== "read pending detail totals")],
+    ["missing run evidence", (rows) => rows.filter((row) => row.section !== "read run counts")],
+    ["repeated detail evidence", (rows) => [...rows, rows.find((row) => row.section === "read pending detail totals")]],
+    ["unknown section", (rows) => [...rows, { section: "generated unknown section", rows_json: "[]" }]],
+    ["invalid JSON", (rows) => changeDetailRows(rows, "GENERATED_PRIVATE_INVALID_JSON")],
+    ["non-array JSON", (rows) => changeDetailRows(rows, "{}")],
+    ["null row", (rows) => changeDetailRows(rows, "[null]")],
+    ["array row", (rows) => changeDetailRows(rows, "[[]]")],
+    ["empty required aggregate", (rows) => changeDetailRows(rows, "[]")],
+    ["multiple aggregate rows", (rows) => changeDetailRows(rows, "[{},{}]")],
+  ];
+  const before = readFileSync(db);
+  for (const [name, mutate] of cases) {
+    let mutated = false;
+    assert.throws(() => buildStatus(db, {
+      sqliteJson: (path, query, label) => {
+        const rows = readStatusRows(path, query, label);
+        if (label !== "read sync status snapshot") return rows;
+        mutated = true;
+        return mutate(rows);
+      },
+    }), (error) => {
+      assert.match(error.message, /sync status snapshot returned (?:invalid|incomplete)/, name);
+      assert.doesNotMatch(error.message, /GENERATED_PRIVATE/);
+      return true;
+    }, name);
+    assert.equal(mutated, true, name);
+  }
+  assert.deepEqual(readFileSync(db), before);
+});
+
+test("malformed aggregate values stay unavailable rather than becoming an empty detail backlog", (t) => {
+  const { db } = detailFixture(t);
+  const report = buildStatus(db, {
+    sqliteJson: (path, query, label) => {
+      const rows = readStatusRows(path, query, label);
+      if (label !== "read sync status snapshot") return rows;
+      return rows.map((row) => row.section === "read pending detail totals"
+        ? { ...row, rows_json: JSON.stringify([{ pending_count: null, scopes_pending: 1, due_count: 1 }]) } : row);
+    },
+  });
+  assert.equal(report.health, "needs_attention");
+  assert.equal(report.details.evidence, "unavailable");
+  assert.equal(report.details.pending_count, null);
 });
 
 test("parseArgs validates format and missing values", () => {

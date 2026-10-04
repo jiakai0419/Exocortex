@@ -164,7 +164,7 @@ test("WAL-header diagnostics stay read-only with missing coordination files", (t
     // Some SQLite builds cannot open WAL databases read-only without existing
     // sidecars. Confirm that exact engine limitation independently, and require
     // the application to fail closed without changing any files in that case.
-    assert.equal(error.message, "read record totals failed");
+    assert.equal(error.message, "read detail progress schema failed");
     const probe = spawnSync("sqlite3", ["-readonly", db, "SELECT COUNT(*) FROM sqlite_schema;"], { encoding: "utf8" });
     assert.equal(probe.error, undefined);
     assert.equal(probe.signal, null);

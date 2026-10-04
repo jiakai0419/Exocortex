@@ -36,6 +36,12 @@ launchd inspection returns loaded, absent, or unknown. Absence requires both exi
 
 Completed worker-step events are historical facts, even when their cycle never finished. `unfinished_cycle` tracks append order independently of reset cycle numbers; `in_progress` cannot be inferred from these events. Service SYNCING requires a valid unexpired database lease, capped at the store's one-hour hard limit. This includes foreground synchronization while the background service is stopped. Missing current evidence is UNKNOWN. Lease evaluation samples the clock after all diagnostic evidence has been collected, so leases acquired or expired during subprocess queries are interpreted against the actual observation time. Tests retain numeric time overrides and cover acquisition, expiry, and hard-lease crossings. `wait-ok` rejects unfinished cycle history, failed status subprocesses, and pending detail debt.
 
+### Consistent health evidence
+
+All database facts used by the status report—detail debt, list progress, records, scopes, discovery, runs, and locks—are read by one SQLite SELECT inside one read-only transaction. Schema preflight chooses the query shape only; the final snapshot rechecks that shape and migration 009. Concurrent schema changes, missing sections, or unparseable evidence reject the report; invalid aggregate counts remain unavailable and require attention instead of becoming zero debt or legacy evidence. Service health and `wait-ok` consume that consistent report.
+
+A report describes one database snapshot. A writer may commit after the snapshot begins, so a coherent earlier report remains possible; it cannot combine earlier zero debt with a newer incomplete list frontier or failed run. Synthetic WAL tests keep a real reader transaction open while a separate process commits through the real synchronization adapter and store, then verify both the complete earlier report and the incomplete subsequent report. The earlier `b528dc6` candidate is retained in Git history as the negative comparison; this correction is an appended commit.
+
 ### Shared name merging
 
 The Lark-specific SQL merge is shared by ingestion and enrichment. Null/empty lookup results mean unknown; explicit `*_name_state: "cleared"` is authoritative. Known names and provenance remain together only when record and canonical identities agree, including the container for scoped sender names. Unknown cannot resurrect a cleared name; a fresh resolved value may replace a clear. Cached chat names explicitly carry `scope_config` / `local_history` provenance and can only fill unknown fields; they cannot overwrite a known name or authoritative clear. A fresh message name remains eligible for a same-version improvement. Other record types keep their existing replacement semantics.
@@ -50,6 +56,7 @@ All identities, message bodies, clocks, subprocess outcomes, and databases in ne
 | --- | --- | --- | --- |
 | Detail isolation and progress | A denied root disabled the conversation; the initial fix then pinned list progress at a shrinking prefix | Both directions, repeated shrinking, fresh runner instances, late ordinary records, default page limits, independent repair, continued healthy detail tasks, preserved old expansions | `lark-im-detail-progress.test.mjs`, `lark-im-native-sync.test.mjs` |
 | Durable list/debt transactions | A restart must retain both progress and unresolved root descriptors | List failure commits nothing; baseline/gaps, lock/lease/cursor/generation/identity/fingerprint fences; mutable discovery metadata allowed; receipts, version conflicts, rollback and final closure | `lark-detail-store.test.mjs`, `lark-im-detail-adapter.test.mjs` |
+| Consistent status snapshot | Separate read-only connections combined old zero debt with a new incomplete list and failed run | Real concurrent WAL writer; consistent before/after reports; Service and wait-ok; schema preflight race; malformed/missing evidence fails closed | `sync-status-snapshot.test.mjs`, `sync-status-command.test.mjs`, `diagnostics-readonly.test.mjs` |
 | Coverage and diagnostics | List-only evidence or historical health could hide pending details | Partial flags and malformed composed intervals rejected; target-relative debt; legacy versus damaged schema; public aggregate output | `lark_im_coverage_check_test.py`, `sync-status-command.test.mjs`, `sync-status-core.test.mjs` |
 | Window timeout | Shared deadline repeatedly retried one large window without progress | One minimum-prefix retry; boundary messages reread; non-minute start; ordinary timeout/rate limit unchanged; minimum saturation and incomplete pagination never advance | `lark-im-core-pagination.test.mjs`, `lark-im-native-sync.test.mjs` |
 | Failed record transaction | Complete ordinary records needed durable storage without claiming full coverage | Cancelled run, replaced owner, lost lock and stale lease reject writes; cursor and last-success markers remain unchanged | `ingestion-store.test.mjs` |
@@ -63,14 +70,14 @@ The original baseline was also executed against synthetic comparison probes: det
 
 ## Validation and operational boundary
 
-Final checks use Node.js 22 and SQLite CLI 3.51.0. The initial candidate passed 510 tests but failed subsequent independent review; that historical pass is not acceptance of this follow-up. The review counterexamples for a diagnostic clock crossing and cached chat names were run against the frozen candidate and failed as expected before the fixed focused tests passed. A separate intentionally blocked child verified the external test deadline.
+Final checks use Node.js 22 and SQLite CLI 3.51.0. The initial candidate passed 510 tests but failed subsequent independent review. The durable-progress candidate then passed 601 tests before review found the mixed-snapshot diagnostic race; neither historical pass is acceptance of this snapshot follow-up. The review counterexamples for a diagnostic clock crossing and cached chat names were run against the frozen candidate and failed as expected before the fixed focused tests passed. A separate intentionally blocked child verified the external test deadline.
 
 | Check | Follow-up result |
 | --- | --- |
 | `npm run build` | PASS |
 | `npm run typecheck` | PASS |
 | `npm run check` | PASS; 69 JavaScript files |
-| `npm test` | PASS; 601 tests, 0 failures, 0 skipped; includes synthetic Python coverage tests |
+| `npm test` | PASS; 608 tests, 0 failures, 0 skipped; includes synthetic Python coverage tests |
 | `git diff --check` | PASS |
 | `npm run build:check` | PASS; generated files match committed source |
 | Production service/account/data and deployment acceptance | NOT RUN; outside local implementation authorization |

@@ -227,87 +227,29 @@ function sanitizeStatusReportForPublicOutput(report) {
   };
 }
 
-/**
- * @param {string} dbPath
- * @param {string} scopeId
- * @param {string} label
- * @param {(dbPath: string, sql: string, label: string) => Row[]} query
- */
-function readScopeStatus(dbPath, scopeId, label, query) {
-  return first(
-    query(
-      dbPath,
-      `SELECT cursor_json, cursor_updated_at, (last_success_run_id IS NOT NULL) AS has_success
-       FROM sync_scopes
-       WHERE id = ${quoteSql(scopeId)}
-       LIMIT 1;`,
-      label,
-    ),
-    {},
-  );
-}
+// Schema discovery selects only the SQL shape. Every health/readiness fact,
+// including schema validation, is then collected by one SELECT on one snapshot.
+const DETAIL_SCHEMA_SQL = `SELECT name, sql FROM sqlite_schema WHERE type = 'table'
+  AND name IN ('lark_im_list_progress', 'lark_im_detail_tasks', 'schema_migrations') ORDER BY name`;
+const ENABLED_MESSAGE_SCOPE = "s.source_id = 'lark.im' AND s.enabled = 1 AND (s.id = 'lark.im.sent_by_me' OR s.id LIKE 'lark.im.received.chat.%')";
 
-/** Read only aggregates. A partial schema or read failure must fail the check.
- * @param {string} dbPath
- * @param {(dbPath: string, sql: string, label: string) => Row[]} query
- */
-function readDetailProgress(dbPath, query) {
-  const tables = query(dbPath,
-    "SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('lark_im_list_progress', 'lark_im_detail_tasks', 'schema_migrations');",
-    "read detail progress schema");
-  const names = new Set(tables.map((row) => row.name));
+/** @param {string} dbPath @param {(dbPath: string, sql: string, label: string) => Row[]} query */
+function readStatusSnapshot(dbPath, query) {
+  const expectedSchema = query(dbPath, `${DETAIL_SCHEMA_SQL};`, "read detail progress schema");
+  const names = new Set(expectedSchema.map((row) => row.name));
   const present = Number(names.has("lark_im_list_progress")) + Number(names.has("lark_im_detail_tasks"));
-  const migrated = names.has("schema_migrations") && query(dbPath,
-    "SELECT version FROM schema_migrations WHERE version = '009';", "read detail progress migration").length > 0;
-  if (present === 0 && !migrated) return {
-    details: { evidence: "legacy_unavailable" }, list_progress: { evidence: "legacy_unavailable" },
-  };
-  if (present !== 2) throw new Error("message detail progress schema is incomplete");
-  const enabledScope = "s.source_id = 'lark.im' AND s.enabled = 1 AND (s.id = 'lark.im.sent_by_me' OR s.id LIKE 'lark.im.received.chat.%')";
-  const details = query(dbPath, `SELECT COUNT(*) AS pending_count,
-      COUNT(DISTINCT t.scope_id) AS scopes_pending,
-      COALESCE(SUM(CASE WHEN julianday(t.retry_at) <= julianday('now') THEN 1 ELSE 0 END), 0) AS due_count,
-      MIN(t.occurred_at_ms) AS oldest_pending_ms, MIN(t.retry_at) AS next_retry_at
-    FROM lark_im_detail_tasks t JOIN sync_scopes s ON s.id = t.scope_id
-    WHERE ${enabledScope} AND t.status = 'pending';`, "read pending detail totals");
-  const listProgress = query(dbPath, `WITH progress AS (
-      SELECT CASE WHEN json_valid(p.cursor_json) THEN p.cursor_json ELSE '{}' END AS cursor_json
-      FROM lark_im_list_progress p JOIN sync_scopes s ON s.id = p.scope_id WHERE ${enabledScope}
-    ), cursors AS (
-      SELECT CASE WHEN json_extract(cursor_json, '$.kind') = 'time_message_cursor/v1'
-        AND json_type(cursor_json, '$.created_at_ms') = 'integer'
-        AND json_extract(cursor_json, '$.created_at_ms') BETWEEN 0 AND 9007199254740991
-        THEN json_extract(cursor_json, '$.created_at_ms') END AS cursor_ms FROM progress
-    ) SELECT COUNT(*) AS scopes, MIN(cursor_ms) AS oldest_cursor_ms,
-      COUNT(*) - COUNT(cursor_ms) AS invalid_cursor_scopes FROM cursors;`, "read list progress totals");
-  if (details.length !== 1 || listProgress.length !== 1) throw new Error("message detail progress evidence is unavailable");
-  return { details: { evidence: "available", ...details[0] }, list_progress: { evidence: "available", ...listProgress[0] } };
-}
-
-/**
- * @param {string} dbPath
- * @param {SyncStatusReportDeps} [deps]
- */
-function buildStatus(dbPath, deps = {}) {
-  const query = deps.sqliteJson || sqliteJson;
-  const totals = first(
-    query(
-      dbPath,
-      "SELECT COUNT(*) AS count, MAX(occurred_at_ms) AS latest_ms FROM records;",
-      "read record totals",
-    ),
-    { count: 0, latest_ms: null },
-  );
-  const detailProgress = readDetailProgress(dbPath, query);
-  const byDirection = query(
-    dbPath,
-    "SELECT COALESCE(direction, 'unknown') AS direction, COUNT(*) AS count, MAX(occurred_at_ms) AS latest_ms FROM records GROUP BY direction ORDER BY direction;",
-    "read direction totals",
-  );
-  const scopeCounts = first(
-    query(
-      dbPath,
-      `SELECT
+  if (present === 1) throw new Error("message detail progress schema is incomplete");
+  /** @type {{label: string, columns: string[], sql: string}[]} */
+  const sections = [
+    { label: "read detail progress schema", columns: ["name", "sql"], sql: DETAIL_SCHEMA_SQL },
+    { label: "read detail progress migration", columns: ["version"], sql: names.has("schema_migrations")
+      ? "SELECT version FROM schema_migrations WHERE version = '009'" : "SELECT NULL AS version WHERE 0" },
+    { label: "read record totals", columns: ["count", "latest_ms"],
+      sql: "SELECT COUNT(*) AS count, MAX(occurred_at_ms) AS latest_ms FROM records" },
+    { label: "read direction totals", columns: ["direction", "count", "latest_ms"],
+      sql: "SELECT COALESCE(direction, 'unknown') AS direction, COUNT(*) AS count, MAX(occurred_at_ms) AS latest_ms FROM records GROUP BY direction ORDER BY direction" },
+    { label: "read scope totals", columns: ["total", "enabled", "received_enabled", "received_without_cursor", "message_enabled", "message_without_success", "received_unsupported"],
+      sql: `SELECT
          COUNT(*) AS total,
          SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END) AS enabled,
          SUM(CASE WHEN id LIKE 'lark.im.received.chat.%' AND enabled = 1 THEN 1 ELSE 0 END) AS received_enabled,
@@ -317,60 +259,100 @@ function buildStatus(dbPath, deps = {}) {
            AND NOT EXISTS (SELECT 1 FROM sync_runs r WHERE r.id = sync_scopes.last_success_run_id AND r.scope_id = sync_scopes.id AND r.status = 'succeeded')
            THEN 1 ELSE 0 END) AS message_without_success,
          SUM(CASE WHEN id LIKE 'lark.im.received.chat.%' AND json_extract(config_json, '$.unsupported_reason') IS NOT NULL THEN 1 ELSE 0 END) AS received_unsupported
-       FROM sync_scopes;`,
-      "read scope totals",
-    ),
-    {},
+       FROM sync_scopes` },
+    { label: "read unsupported scope reasons", columns: ["reason", "lark_cli_error_code", "count"],
+      sql: `SELECT COALESCE(json_extract(config_json, '$.unsupported_reason'), 'unknown') AS reason,
+        MAX(COALESCE(json_extract(config_json, '$.lark_cli_error_code'), '')) AS lark_cli_error_code,
+        COUNT(*) AS count FROM sync_scopes
+        WHERE id LIKE 'lark.im.received.chat.%' AND json_extract(config_json, '$.unsupported_reason') IS NOT NULL
+        GROUP BY reason ORDER BY count DESC, reason` },
+    ...[
+      ["read discovery scope", "lark.im.unmuted_chat_discovery"],
+      ["read hot discovery scope", "lark.im.unmuted_chat_hot"],
+      ["read reconcile scope", "lark.im.unmuted_chat_reconcile"],
+    ].map(([label, scopeId]) => ({ label, columns: ["cursor_json", "cursor_updated_at", "has_success"],
+      sql: `SELECT cursor_json, cursor_updated_at, (last_success_run_id IS NOT NULL) AS has_success
+        FROM sync_scopes WHERE id = ${quoteSql(scopeId)} LIMIT 1` })),
+    { label: "read run counts", columns: ["status", "count"],
+      sql: "SELECT status, COUNT(*) AS count FROM sync_runs GROUP BY status ORDER BY status" },
+    { label: "read recent runs", columns: ["status", "started_at", "finished_at", "scanned_count", "inserted_count", "updated_count", "duplicate_count", "error_message"],
+      sql: `SELECT status, started_at, finished_at, scanned_count, inserted_count, updated_count, duplicate_count, error_message
+        FROM sync_runs ORDER BY id DESC LIMIT 10` },
+    { label: "read locks", columns: ["locked_at", "expires_at"],
+      sql: "SELECT locked_at, expires_at FROM sync_locks ORDER BY locked_at DESC" },
+  ];
+  if (present === 2) sections.push(
+    { label: "read pending detail totals", columns: ["pending_count", "scopes_pending", "due_count", "oldest_pending_ms", "next_retry_at"],
+      sql: `SELECT COUNT(*) AS pending_count, COUNT(DISTINCT t.scope_id) AS scopes_pending,
+        COALESCE(SUM(CASE WHEN julianday(t.retry_at) <= julianday('now') THEN 1 ELSE 0 END), 0) AS due_count,
+        MIN(t.occurred_at_ms) AS oldest_pending_ms, MIN(t.retry_at) AS next_retry_at
+        FROM lark_im_detail_tasks t JOIN sync_scopes s ON s.id = t.scope_id
+        WHERE ${ENABLED_MESSAGE_SCOPE} AND t.status = 'pending'` },
+    { label: "read list progress totals", columns: ["scopes", "oldest_cursor_ms", "invalid_cursor_scopes"],
+      sql: `WITH progress AS (
+        SELECT CASE WHEN json_valid(p.cursor_json) THEN p.cursor_json ELSE '{}' END AS cursor_json
+        FROM lark_im_list_progress p JOIN sync_scopes s ON s.id = p.scope_id WHERE ${ENABLED_MESSAGE_SCOPE}
+      ), cursors AS (
+        SELECT CASE WHEN json_extract(cursor_json, '$.kind') = 'time_message_cursor/v1'
+          AND json_type(cursor_json, '$.created_at_ms') = 'integer'
+          AND json_extract(cursor_json, '$.created_at_ms') BETWEEN 0 AND 9007199254740991
+          THEN json_extract(cursor_json, '$.created_at_ms') END AS cursor_ms FROM progress
+      ) SELECT COUNT(*) AS scopes, MIN(cursor_ms) AS oldest_cursor_ms,
+        COUNT(*) - COUNT(cursor_ms) AS invalid_cursor_scopes FROM cursors` },
   );
-  const unsupportedReasons = query(
-    dbPath,
-    `SELECT
-       COALESCE(json_extract(config_json, '$.unsupported_reason'), 'unknown') AS reason,
-       MAX(COALESCE(json_extract(config_json, '$.lark_cli_error_code'), '')) AS lark_cli_error_code,
-       COUNT(*) AS count
-     FROM sync_scopes
-     WHERE id LIKE 'lark.im.received.chat.%'
-       AND json_extract(config_json, '$.unsupported_reason') IS NOT NULL
-     GROUP BY reason
-     ORDER BY count DESC, reason;`,
-    "read unsupported scope reasons",
-  );
-  const discoveryRow = readScopeStatus(
-    dbPath,
-    "lark.im.unmuted_chat_discovery",
-    "read discovery scope",
-    query,
-  );
-  const hotDiscoveryRow = readScopeStatus(
-    dbPath,
-    "lark.im.unmuted_chat_hot",
-    "read hot discovery scope",
-    query,
-  );
-  const reconcileRow = readScopeStatus(
-    dbPath,
-    "lark.im.unmuted_chat_reconcile",
-    "read reconcile scope",
-    query,
-  );
-  const runCounts = query(
-    dbPath,
-    "SELECT status, COUNT(*) AS count FROM sync_runs GROUP BY status ORDER BY status;",
-    "read run counts",
-  );
-  const recentRuns = query(
-    dbPath,
-    `SELECT status, started_at, finished_at, scanned_count, inserted_count, updated_count, duplicate_count, error_message
-     FROM sync_runs
-     ORDER BY id DESC
-     LIMIT 10;`,
-    "read recent runs",
-  );
-  const locks = query(
-    dbPath,
-    "SELECT locked_at, expires_at FROM sync_locks ORDER BY locked_at DESC;",
-    "read locks",
-  );
+  // A single SELECT also gives all julianday('now') evaluations one clock value.
+  // Tagged aggregate arrays preserve empty result sets without multiple CLI JSON
+  // documents. Labels/columns/SQL are application constants, never caller SQL.
+  const sql = sections.map(({ label, columns, sql }) => `SELECT ${quoteSql(label)} AS section,
+    json_group_array(json_object(${columns.map((column) => `${quoteSql(column)}, ${column}`).join(", ")})) AS rows_json
+    FROM (${sql})`).join("\nUNION ALL\n") + ";";
+  const rows = query(dbPath, sql, "read sync status snapshot");
+  /** @type {Map<string, Row[]>} */
+  const snapshot = new Map();
+  const expectedLabels = new Set(sections.map((section) => section.label));
+  for (const row of rows) {
+    const values = parseMaybeJson(row.rows_json);
+    if (!expectedLabels.has(row.section) || snapshot.has(row.section) || !Array.isArray(values) ||
+        values.some((value) => !value || typeof value !== "object" || Array.isArray(value))) {
+      throw new Error("sync status snapshot returned invalid evidence");
+    }
+    snapshot.set(row.section, values);
+  }
+  if (snapshot.size !== sections.length) throw new Error("sync status snapshot returned incomplete evidence");
+  const schema = snapshot.get("read detail progress schema");
+  if (JSON.stringify(schema) !== JSON.stringify(expectedSchema)) {
+    throw new Error("message detail progress schema changed during status collection");
+  }
+  if (present === 0 && snapshot.get("read detail progress migration")?.length) {
+    throw new Error("message detail progress schema is incomplete");
+  }
+  for (const label of ["read record totals", "read scope totals", ...(present === 2
+    ? ["read pending detail totals", "read list progress totals"] : [])]) {
+    if (snapshot.get(label)?.length !== 1) throw new Error("sync status snapshot returned incomplete aggregate evidence");
+  }
+  return snapshot;
+}
+
+/** @param {string} dbPath @param {SyncStatusReportDeps} [deps] */
+function buildStatus(dbPath, deps = {}) {
+  const snapshot = readStatusSnapshot(dbPath, deps.sqliteJson || sqliteJson);
+  /** @param {string} label */
+  const rows = (label) => snapshot.get(label) || [];
+  const totals = first(rows("read record totals"));
+  const hasDetails = snapshot.has("read pending detail totals");
+  const detailProgress = hasDetails ? {
+    details: { evidence: "available", ...first(rows("read pending detail totals")) },
+    list_progress: { evidence: "available", ...first(rows("read list progress totals")) },
+  } : { details: { evidence: "legacy_unavailable" }, list_progress: { evidence: "legacy_unavailable" } };
+  const byDirection = rows("read direction totals");
+  const scopeCounts = first(rows("read scope totals"));
+  const unsupportedReasons = rows("read unsupported scope reasons");
+  const discoveryRow = first(rows("read discovery scope"));
+  const hotDiscoveryRow = first(rows("read hot discovery scope"));
+  const reconcileRow = first(rows("read reconcile scope"));
+  const runCounts = rows("read run counts");
+  const recentRuns = rows("read recent runs");
+  const locks = rows("read locks");
 
   const discoveryCursor = parseMaybeJson(discoveryRow.cursor_json);
   const hotDiscoveryCursor = parseMaybeJson(hotDiscoveryRow.cursor_json);

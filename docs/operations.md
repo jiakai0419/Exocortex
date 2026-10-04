@@ -681,6 +681,8 @@ received 直接分页读取原生消息列表，显式请求 `only_thread_root_m
 
 有欠账时 `sync_scopes.cursor_json`、完整覆盖窗口和最近成功标记不前进；部分 run 仅发出 `list_window_*`，并明确 `list_complete=true/details_complete=false/window_complete=false`。全部待办解决后，事务将完整游标推进到已经连续扫描的列表水位，并发出 `coverage_mode=list_checkpoint_and_details` 的闭合证据。目标时间及之前仍有当前待办时，覆盖检查不得凭历史成功报告完成。状态报告公开 `details` 和 `list_progress` 的汇总；pending details 使 health 保持 `catching_up`，Service 和 `wait-ok` 同样拒绝完整健康结论。
 
+状态报告在同一只读 SQLite 快照内采集欠账、列表水位、records、scope、discovery、run 和 lock，Service health 与 `wait-ok` 使用该一致报告。表结构预查只选择查询分支，最终快照再次核对结构与迁移标记；并发迁移或证据缺失时失败关闭，不把它解释为零欠账。报告是某一时点的快照，之后提交的写入会在下次报告中出现；不得拼接旧的零欠账与新提交的未完整水位。该诊断不初始化数据库、不执行恢复，也不修改业务数据。
+
 每次成功列表提交后至多尝试一个到期详情根。详情有独立 30 秒总请求预算、50 页、1000 项、64 层上限，不进入列表二分；失败按每根 60 秒指数退避，上限 24 小时，无最大失败次数。已完成指纹收据避免包含式边界反复重开相同欠账；新版根重新排队，详情重试先验证权威当前根，拒绝身份变化、版本倒退、同版本冲突及未展开根。旧完整正文会一直保留到完整新版本可替换。
 
 独立详情入口只处理持久化的到期待办，不重新抓取列表，并遵守退避：
