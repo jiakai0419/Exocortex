@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
+import { commitEnrichmentUpdates, publicEnrichmentError } from "../src/maintenance/enrichment-commit.mjs";
 
 // Authored from empty objects for this suite: an imaginary materials bench.
 // The API field names are contracts; all identities, prose, times and relationships
@@ -553,29 +554,70 @@ test("an active sync lock blocks only the commit and remains untouched", (t) => 
   assert.deepEqual(maintenanceLocks(fixture.dbPath), []);
 });
 
-function installCommitInterleavingSqlite(dir, dbPath, sql) {
+function installCommitInterleavingSqlite(dir, dbPath, sql = null) {
   const path = join(dir, "sqlite3");
+  const tracePath = join(dir, "commit-interleaving.jsonl");
+  const mutationSql = sql === null ? null : `.bail on\n${sql}
+    SELECT changes() AS affected, owner, expires_at FROM maintenance_locks WHERE name = 'global';`;
   writeFileSync(path, `#!/usr/bin/env node
-import { readFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 const args = process.argv.slice(2);
 const input = readFileSync(0, "utf8");
-if (input.includes("CREATE TEMP TABLE __enrichment_fence")) {
-  const changed = spawnSync("/usr/bin/sqlite3", [${JSON.stringify(dbPath)}], {
-    input: ${JSON.stringify(`.bail on\n${sql}`)}, encoding: "utf8",
+const isCommit = input.includes("CREATE TEMP TABLE __enrichment_fence");
+const mutationSql = ${JSON.stringify(mutationSql)};
+const trace = value => appendFileSync(${JSON.stringify(tracePath)}, JSON.stringify(value) + "\\n");
+if (isCommit && mutationSql !== null) {
+  const changed = spawnSync("/usr/bin/sqlite3", ["-json", ${JSON.stringify(dbPath)}], {
+    input: mutationSql, encoding: "utf8",
   });
   if (changed.status !== 0) {
     process.stderr.write(changed.stderr || "synthetic interleaving failed");
     process.exit(1);
   }
+  const lock = JSON.parse(changed.stdout)[0];
+  if (lock?.affected !== 1) {
+    process.stderr.write("synthetic mutation did not affect exactly one lock");
+    process.exit(1);
+  }
+  trace({ event: "mutation", ...lock });
 }
 const result = spawnSync("/usr/bin/sqlite3", args, { input, encoding: "utf8" });
+if (isCommit) trace({ event: "commit", status: result.status, stderr: result.stderr || "" });
 process.stdout.write(result.stdout || "");
 process.stderr.write(result.stderr || "");
 process.exit(result.status ?? 1);
 `);
   chmodSync(path, 0o755);
+  return tracePath;
 }
+
+function commitLeaseProposal(fixture, rowId) {
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${fixture.dir}:${SAFE_PATH}`;
+  try {
+    return commitEnrichmentUpdates(fixture.dbPath, [`
+      UPDATE records SET body = 'Synthetic lease commit marker' WHERE id = ${Number(rowId)};
+      INSERT INTO __enrichment_effects (updated) VALUES (changes());`], {
+      dryRun: false, reason: "synthetic-lease-fence", label: "synthetic lease commit",
+    });
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+  }
+}
+
+test("a valid maintenance lease commits the prepared enrichment SQL", (t) => {
+  const fixture = enrichmentFixture(t);
+  const before = readRecords(fixture.dbPath);
+  const tracePath = installCommitInterleavingSqlite(fixture.dir, fixture.dbPath);
+  assert.deepEqual(commitLeaseProposal(fixture, before[0].id), { updated: 1, skippedConflicts: 0 });
+  assert.deepEqual(readRecords(fixture.dbPath), [{ ...before[0], body: "Synthetic lease commit marker" }]);
+  assert.deepEqual(maintenanceLocks(fixture.dbPath), []);
+  assert.deepEqual(readFileSync(tracePath, "utf8").trim().split("\n").map(JSON.parse), [
+    { event: "commit", status: 0, stderr: "" },
+  ]);
+});
 
 for (const replacement of [false, true]) {
   test(`commit rejects a maintenance lease ${replacement ? "replaced" : "expired"} after acquisition`, (t) => {
@@ -584,15 +626,26 @@ for (const replacement of [false, true]) {
     const mutation = replacement
       ? "UPDATE maintenance_locks SET owner = 'synthetic-other-owner';"
       : "UPDATE maintenance_locks SET expires_at = '1997-03-11T12:13:14.000Z';";
-    installCommitInterleavingSqlite(fixture.dir, fixture.dbPath, mutation);
-    const result = runEnrichment(fixture, [], { PATH: `${fixture.dir}:${SAFE_PATH}` });
-    assert.equal(result.status, 1);
-    assert.match(result.stderr, /record enrichment failed/);
-    assert.doesNotMatch(result.stderr, /CHECK constraint|INSERT INTO|maintenance_locks|other-owner/);
+    const tracePath = installCommitInterleavingSqlite(fixture.dir, fixture.dbPath, mutation);
+    assert.throws(() => commitLeaseProposal(fixture, before[0].id), error => {
+      const message = publicEnrichmentError(error, "record enrichment failed").message;
+      assert.equal(message, "record enrichment failed");
+      assert.doesNotMatch(message, /CHECK constraint|INSERT INTO|maintenance_locks|other-owner/);
+      return true;
+    });
+    const trace = readFileSync(tracePath, "utf8").trim().split("\n").map(JSON.parse);
+    assert.equal(trace.length, 2);
+    assert.equal(trace[0].event, "mutation");
+    assert.equal(trace[0].affected, 1, "fault must modify an acquired lease before testing the fence");
+    if (replacement) assert.equal(trace[0].owner, "synthetic-other-owner");
+    else assert.equal(trace[0].expires_at, "1997-03-11T12:13:14.000Z");
+    assert.equal(trace[1].event, "commit");
+    assert.equal(trace[1].status, 1);
+    assert.match(trace[1].stderr, /CHECK constraint failed: allowed = 1/);
     assert.deepEqual(readRecords(fixture.dbPath), before);
     const locks = maintenanceLocks(fixture.dbPath);
     if (replacement) {
-      assert.equal(locks.length, 1, JSON.stringify({ stdout: result.stdout, stderr: result.stderr }));
+      assert.equal(locks.length, 1);
       assert.equal(locks[0].owner, "synthetic-other-owner");
     } else {
       assert.deepEqual(locks, []);
