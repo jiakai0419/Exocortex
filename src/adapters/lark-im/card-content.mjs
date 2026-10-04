@@ -557,7 +557,8 @@ function renderCardContent(content, mentions = []) {
     });
   }
 
-  /** Prefer one complete language projection, never combine translated copies. @param {unknown} value */
+  /** Prefer one complete language projection. Null means a verified empty outer
+   * dictionary; undefined retains invalid-language diagnostics. @param {unknown} value */
   function locale(value) {
     if (!object(value)) { mark("unsupported_card_structure"); return undefined; }
     for (const language of LOCALES) {
@@ -565,6 +566,8 @@ function renderCardContent(content, mentions = []) {
       if (typeof translated === "string" || Array.isArray(translated) || object(translated)) return translated;
       if (translated !== undefined) mark("unsupported_card_structure");
     }
+    const prototype = Object.getPrototypeOf(value);
+    if ((prototype === Object.prototype || prototype === null) && Reflect.ownKeys(value).length === 0) return null;
     mark("unsupported_card_structure");
     return undefined;
   }
@@ -577,10 +580,14 @@ function renderCardContent(content, mentions = []) {
 
   /** @param {JsonObject} payload @param {number} depth @returns {boolean} */
   function textSlots(payload, depth) {
-    const elements = read(payload, "i18nElements");
-    if (elements !== undefined) { inline(locale(elements), depth + 1); return true; }
-    const translated = read(payload, "i18nContent");
-    if (translated !== undefined) { inline(locale(translated), depth + 1); return true; }
+    for (const key of ["i18nElements", "i18nContent"]) {
+      const mapping = read(payload, key);
+      if (mapping === undefined) continue;
+      const selected = locale(mapping);
+      if (selected === null) continue;
+      inline(selected, depth + 1);
+      return true;
+    }
     const contentText = read(payload, "content");
     if (contentText !== undefined) { inline(contentText, depth + 1); return true; }
     const text = read(payload, "text");
