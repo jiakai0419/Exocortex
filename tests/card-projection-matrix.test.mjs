@@ -88,3 +88,42 @@ test("combined identity, folded action and invalid navigation keep the important
   assert.match(result.text, /不支持的链接/);
   assert.doesNotMatch(result.text, /SYNTHETIC_PRIVATE_CODE|Synthetic acknowledgement/);
 });
+
+for (const form of ["div", "untagged", "native property", "nested"]) {
+  for (const targetKind of ["undefined", "null", "empty", "wrapped empty", "invalid"]) {
+    test(`slot/navigation matrix: ${form}, ${targetKind} primary with valid href`, () => {
+      const url = { undefined, null: null, empty: "", "wrapped empty": { url: "" },
+        invalid: "javascript:SYNTHETIC_INVALID_NAVIGATION" }[targetKind];
+      const slots = {
+        text: paragraph(text("Summary: "), text("invented summary")),
+        fields: [{ text: paragraph(text("Field: "), text("invented value"), { tag: "br" }, text("Field detail")) }],
+        elements: [text("Meaningful "), text("tail for "), person, { tag: "br" }, text("Due: "), text("invented day")],
+        actions: [action, { tag: "button", text: text("Usable reference"), url,
+          href: "https://example.invalid/reference?private=SYNTHETIC_MIXED_SECRET" }],
+        extra: { tag: "note", elements: [text("Final "), text("meaningful note")] },
+      };
+      const mixed = form === "div" ? { tag: "div", ...slots } : form === "untagged" ? slots :
+        form === "native property" ? { type: "div", property: slots } :
+          { tag: "div", fields: [{ text: text("Outer field") }], elements: [{ ...slots }] };
+      const fixture = source([mixed, paragraph(text("Independent tail"))], named);
+      const before = JSON.stringify(fixture);
+      const result = renderCardContent(fixture.content, fixture.mentions);
+      assert.equal(JSON.stringify(fixture), before);
+      assert.match(result.text, /Summary: invented summary\nField: invented value\nField detail\nMeaningful tail for @Synthetic Fern\nDue: invented day/);
+      assert.match(result.text, /Final meaningful note\nIndependent tail(?:\n|$)/);
+      assert.doesNotMatch(result.text, /SYNTHETIC_MIXED_SECRET|SYNTHETIC_INVALID_NAVIGATION|PRIVATE_SYNTHETIC_ACTION|Synthetic acknowledgement/);
+      if (form === "nested") assert.match(result.text, /^Entirely synthetic notification\nOuter field\nSummary:/);
+      if (targetKind === "invalid") {
+        assert.equal(result.status, "partial");
+        assert.equal(result.reason, "unsupported_card_link");
+        assert.equal(result.omitted_actions, 2);
+        assert.doesNotMatch(result.text, /Usable reference|example.invalid\/reference/);
+      } else {
+        assert.equal(result.status, "rendered");
+        assert.equal(result.reason, null);
+        assert.equal(result.omitted_actions, 1);
+        assert.match(result.text, /Due: invented day\nUsable reference （链接：https:\/\/example.invalid\/reference \[链接敏感部分已省略\]）\nFinal meaningful note/);
+      }
+    });
+  }
+}

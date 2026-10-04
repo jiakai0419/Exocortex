@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync, rmSync, renameSync, symlinkSync, appendFile
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { activityDatabaseKey, createActivityWriter, evaluateActivityEvent, inspectActivityProcesses,
-  latestActivityEvents, observeLockOwners } from "../src/diagnostics/lark-im-activity-evidence.mjs";
+  latestActivityEvents, observeLockOwners, validateActivityEventShape } from "../src/diagnostics/lark-im-activity-evidence.mjs";
 import { buildServiceOverview, buildServiceStatusReport, readRecentWorkerEvents } from "../src/diagnostics/lark-im-service-report.mjs";
 import { runWorker, parseArgs } from "../src/cli/lark-im-worker-command.mjs";
 
@@ -147,7 +147,7 @@ test("status reevaluates phase deadline after all slow observations", (t) => {
 });
 
 test("hundreds of complete child instances and other databases do not exhaust current phase budget", () => {
-  const history = Array.from({ length: 150 }, (_, n) => [phase({ role: "sync", instance_id: `child-${n}` }), phase({ role: "sync", instance_id: `child-${n}`, phase: "stopped" })]).flat();
+  const history = Array.from({ length: 150 }, (_, n) => [phase({ role: "sync", phase: "sync", instance_id: `child-${n}` }), phase({ role: "sync", instance_id: `child-${n}`, phase: "stopped" })]).flat();
   const other = Array.from({ length: 150 }, (_, n) => phase({ instance_id: `other-${n}`, database_key: "a".repeat(64) }));
   const selected = latestActivityEvents([...history, ...other, phase()], key, clock);
   assert.equal(selected.truncated, false); assert.deepEqual(selected.events, [phase()]);
@@ -294,4 +294,135 @@ for (const during of ["database query", "OS observation"]) test(`database replac
     inspectActivityProcesses: () => { if (during === "OS observation") replace(); return new Map([[8200, processState]]); },
   });
   assert.equal(report.overview.activity.state, "unknown"); assert.match(report.overview.activity.detail, /file identity changed/);
+});
+
+function logBackedActivity(t, inputEvents, processes, launchdPid = 8200) {
+  const dir = mkdtempSync(join(tmpdir(), "synthetic-activity-review-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const db = join(dir, "invented.sqlite"); writeFileSync(db, "synthetic database identity only");
+  const events = inputEvents.map((event) => typeof event.database_key === "string"
+    ? { ...event, database_key: activityDatabaseKey(db) } : event);
+  writeFileSync(join(dir, "worker.jsonl"), events.map((event) => JSON.stringify(event)).join("\n") + "\n");
+  const deps = { nowMs: clock,
+    runCommand: (cmd) => ({ status: 0, stdout: cmd === "launchctl"
+      ? launchdPid === null ? "state = waiting\n" : `state = running\npid = ${launchdPid}\n`
+      : JSON.stringify({ health: "ok", locks: [] }), stderr: "" }),
+    readLiveProbeCache: () => null, liveProbeContext: () => null, sqliteJson: () => [],
+    inspectActivityProcesses: () => processes,
+  };
+  return { dir, db, deps, report: () => buildServiceStatusReport({ label: "synthetic", target: "test/synthetic", logDir: dir, db }, deps) };
+}
+
+test("review regression: a syntactically valid but incomplete activity tail cannot fall back to an older phase", (t) => {
+  const fixture = logBackedActivity(t, [phase(), { type: "lark_im_worker_activity", pid: 8200 }], new Map([[8200, processState]]));
+  assert.equal(readRecentWorkerEvents(fixture.dir).activity_integrity, false);
+  assert.equal(fixture.report().overview.activity.state, "unknown");
+});
+
+test("review regression: an unrelated orphan cannot suppress verified independent foreground activity through service CLI", async (t) => {
+  const { runLarkImServiceCli } = await import("../src/cli/lark-im-service-command.mjs");
+  const { plain } = await import("../dist/terminal/index.js");
+  const fixture = logBackedActivity(t, [
+    phase({ phase: "waiting" }),
+    phase({ pid: 8300, instance_id: "old-worker" }),
+    phase({ role: "sync", phase: "sync", pid: 8301, instance_id: "orphan", parent_instance: "old-worker" }),
+    phase({ role: "sync", phase: "sync", pid: 8400, instance_id: "independent", parent_instance: null }),
+  ], new Map([[8200, processState], [8300, { state: "dead" }], [8301, { ...processState, ppid: 1 }], [8400, { ...processState, ppid: 8100 }]]));
+  assert.equal(fixture.report().overview.activity.state, "syncing");
+  let output = "";
+  assert.equal(runLarkImServiceCli(["status", "--db", fixture.db, "--log-dir", fixture.dir], {
+    uid: () => 999, stdout: { write: (text) => { output += text; } },
+    buildServiceStatusReport: (opts) => buildServiceStatusReport(opts, fixture.deps),
+  }), 0);
+  assert.match(plain(output), /Activity\s+SYNCING foreground sync observed/);
+});
+
+test("all activity consumers reject missing required fields and malformed types without old-phase fallback", async (t) => {
+  const { runLarkImServiceCli } = await import("../src/cli/lark-im-service-command.mjs");
+  const { plain } = await import("../dist/terminal/index.js");
+  const malformed = Object.keys(phase()).map((field) => {
+    const event = phase(); delete event[field]; return [field, event];
+  });
+  malformed.push(...Object.entries({ version: "1", role: "unexpected", instance_id: 12, parent_instance: {}, pid: "8200",
+    process_started_at_ms: "1839142740000", database_key: false, phase: "unexpected", cycle: "4", step: [], updated_at: 1,
+    valid_until: null }).map(([field, value]) => [field, phase({ [field]: value })]));
+  malformed.push(["role/phase", phase({ role: "sync", phase: "waiting" })]);
+  for (const [label, bad] of malformed) {
+    assert.equal(validateActivityEventShape(bad), false, label);
+    assert.equal(evaluateActivityEvent(bad, processState, key, clock).state, "unknown", label);
+    const fixture = logBackedActivity(t, [phase(), bad], new Map([[8200, processState]]));
+    assert.equal(readRecentWorkerEvents(fixture.dir).activity_integrity, false, label);
+    assert.equal(fixture.report().overview.activity.state, "unknown", label);
+    if (bad.type === "lark_im_worker_activity") assert.equal(latestActivityEvents([phase(), bad], key, clock).integrity, false, label);
+  }
+  const fixture = logBackedActivity(t, [phase(), { type: "lark_im_worker_activity", pid: 8200 }], new Map([[8200, processState]]));
+  let output = "";
+  runLarkImServiceCli(["status", "--db", fixture.db, "--log-dir", fixture.dir], {
+    uid: () => 999, stdout: { write: (text) => { output += text; } },
+    buildServiceStatusReport: (opts) => buildServiceStatusReport(opts, fixture.deps),
+  });
+  assert.match(plain(output), /Activity\s+UNKNOWN current phase evidence is incomplete/);
+});
+
+test("explicit unknown identity is valid schema, blocks its old phase, and does not poison later real evidence", (t) => {
+  for (const field of ["process_started_at_ms", "database_key"]) {
+    const unavailable = phase({ [field]: null });
+    assert.equal(validateActivityEventShape(unavailable), true);
+    const before = logBackedActivity(t, [phase(), unavailable], new Map([[8200, processState]]));
+    // Keep explicit null database evidence; the fixture binds only string keys below.
+    assert.equal(readRecentWorkerEvents(before.dir).activity_integrity, true);
+    assert.equal(before.report().overview.activity.state, "unknown");
+    const after = logBackedActivity(t, [unavailable, phase()], new Map([[8200, processState]]));
+    assert.equal(readRecentWorkerEvents(after.dir).activity_integrity, true);
+    assert.equal(after.report().overview.activity.state, "syncing");
+  }
+});
+
+for (const expiredOrphan of [false, true]) {
+  for (const reversed of [false, true]) test(`independent foreground wins over ${expiredOrphan ? "expired" : "fresh"} orphan in ${reversed ? "reverse" : "forward"} append order`, (t) => {
+    const orphan = phase({ role: "sync", phase: "sync", pid: 8301, instance_id: "orphan", parent_instance: "old-worker",
+      ...(expiredOrphan ? { valid_until: iso(clock) } : {}) });
+    const independent = phase({ role: "sync", phase: "sync", pid: 8400, instance_id: "independent", parent_instance: null });
+    const events = [phase({ phase: "waiting" }), phase({ pid: 8300, instance_id: "old-worker" }),
+      ...(reversed ? [independent, orphan] : [orphan, independent])];
+    const processes = new Map([[8200, processState], [8300, { state: "dead" }], [8301, { ...processState, ppid: 1 }], [8400, { ...processState, ppid: 8100 }]]);
+    assert.equal(logBackedActivity(t, events, processes).report().overview.activity.state, "syncing");
+    assert.equal(logBackedActivity(t, events.filter((event) => event !== independent), processes).report().overview.activity.state, "unknown");
+  });
+}
+
+for (const parent of ["invented-instance", "different-instance", null]) test(`independent foreground proves activity despite current worker child binding ${String(parent)}`, (t) => {
+  const child = phase({ role: "sync", phase: "sync", pid: 8301, instance_id: "child", parent_instance: parent });
+  const independent = phase({ role: "sync", phase: "sync", pid: 8400, instance_id: "independent", parent_instance: null });
+  const processes = new Map([[8200, processState], [8301, { ...processState, ppid: 8200 }], [8400, { ...processState, ppid: 8100 }]]);
+  assert.equal(logBackedActivity(t, [phase({ phase: "waiting" }), child, independent], processes).report().overview.activity.state, "syncing");
+  assert.equal(logBackedActivity(t, [phase({ phase: "waiting" }), child], processes).report().overview.activity.state, "unknown");
+});
+
+test("a reused historical worker PID is not a current parent classification", (t) => {
+  const worker = phase({ pid: 8300, instance_id: "old-worker" });
+  const independent = phase({ role: "sync", phase: "sync", pid: 8400, instance_id: "independent", parent_instance: null });
+  const processes = new Map([[8200, processState], [8300, { ...processState, started_at_ms: start + 1000 }], [8400, { ...processState, ppid: 8300 }]]);
+  assert.equal(logBackedActivity(t, [phase({ phase: "waiting" }), worker, independent], processes).report().overview.activity.state, "syncing");
+  const declaredChild = { ...independent, parent_instance: "old-worker" };
+  assert.equal(logBackedActivity(t, [phase({ phase: "waiting" }), worker, declaredChild], processes).report().overview.activity.state, "unknown");
+});
+
+test("missing worker phase cannot turn a process with the current worker PPID into independent foreground", (t) => {
+  const child = phase({ role: "sync", phase: "sync", pid: 8301, instance_id: "child", parent_instance: null });
+  const processes = new Map([[8200, processState], [8301, { ...processState, ppid: 8200 }]]);
+  assert.equal(logBackedActivity(t, [child], processes).report().overview.activity.state, "unknown");
+});
+
+
+test("stopped service with an old dead worker and living orphan still admits independent foreground evidence", (t) => {
+  const orphan = phase({ role: "sync", phase: "sync", pid: 8501, instance_id: "invented-orphan", parent_instance: "invented-dead-worker" });
+  const foreground = phase({ role: "sync", phase: "sync", pid: 8600, instance_id: "invented-foreground", parent_instance: null });
+  const events = [phase({ pid: 8500, instance_id: "invented-dead-worker" }), orphan, foreground];
+  const processes = new Map([[8500, { state: "dead" }], [8501, { ...processState, ppid: 1 }], [8600, { ...processState, ppid: 8100 }]]);
+  const report = logBackedActivity(t, events, processes, null).report();
+  assert.equal(report.overview.service.status, "stopped");
+  assert.equal(report.overview.activity.state, "syncing");
+  assert.equal(report.overview.activity.evidence, "recent_foreground_phase");
+  assert.equal(logBackedActivity(t, events.filter((event) => event !== foreground), processes, null).report().overview.activity.state, "unknown");
 });

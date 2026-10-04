@@ -303,3 +303,97 @@ test("same-source-version attachment projection improves once without changing s
   assert.equal(JSON.parse(stored.canonical_json).content_rendering.version, 3);
   assertReadableProjection(enrichRow(stored).display.card);
 });
+
+// Review regressions are synthetic structure combinations, including native
+// normalization, historical SQLite reads and the real text/JSON CLI boundary.
+test("empty navigation slots and field tails share one projection across native and historical entry points", (t) => {
+  const slots = [undefined, null, "", { url: "" }, { url: null }];
+  const records = [];
+  const natives = [];
+  for (const [index, url] of slots.entries()) {
+    const native = source(`review_slots_${index}`, { elements: [
+      { tag: "div", text: plain("Invented intro"),
+        fields: [{ text: plain("Field: invented value") }],
+        elements: [plain("Meaningful "), plain("tail"), { tag: "br" }, plain("After break")],
+        extra: plain("Separate extra") },
+      { tag: "button", text: plain("Invented destination"), ...(url === undefined ? {} : { url }),
+        href: "https://fictional:REVIEW_SLOT_PASSWORD@example.invalid/review-path?secret=REVIEW_SLOT_QUERY#REVIEW_SLOT_FRAGMENT" },
+    ] }, {}, []);
+    natives.push(native);
+    records.push(legacyRecord(native, index % 2 === 0));
+  }
+  const fixture = database(t, records);
+  const before = snapshot(fixture);
+  const json = messages(fixture, "json");
+  const text = messages(fixture, "text");
+  for (const [index, native] of natives.entries()) {
+    const normalized = normalizeApiMessage(native);
+    const current = recordFromMessage(normalized, SCOPE, "sent");
+    const old = json.find((row) => row.external_id === native.message_id);
+    assertUnchangedDisplay(old, records[index]);
+    const projections = [enrichRow(current).display.card, old.display.card];
+    for (const card of projections) {
+      assert.equal(card.status, "rendered", `slot ${index}`);
+      assert.equal(card.reason, null);
+      assert.equal(card.omitted_actions || 0, 0);
+      assert.match(card.text, /Invented intro\nField: invented value\nMeaningful tail\nAfter break\nSeparate extra/);
+      assert.match(card.text, /Invented destination.*https:\/\/example\.invalid\/review-path/);
+      assert.doesNotMatch(card.text, /REVIEW_SLOT_|fictional:|secret=|valueMeaningful|Meaningful\ntail/);
+      assert.equal(normalized.content, card.text);
+    }
+    assert.deepEqual(projections[0], projections[1]);
+    assert.equal(current.raw_json, JSON.stringify(native));
+    assert.equal(current.content_hash, sha256(JSON.stringify(native)));
+    assert.equal(current.external_version, native.update_time);
+  }
+  assert.match(text, /Field: invented value\n\s+Meaningful tail\n\s+After break/);
+  assert.match(text, /Invented destination.*https:\/\/example\.invalid\/review-path/);
+  assert.doesNotMatch(text, /REVIEW_SLOT_|valueMeaningful/);
+  assert.deepEqual(snapshot(fixture), before);
+});
+
+test("nonempty invalid primary navigation stays incomplete beside a fallback and a field tail", (t) => {
+  const native = source("review_invalid_primary", { elements: [
+    { fields: [{ text: plain("Invented field") }], elements: [plain("Invented "), plain("tail")] },
+    { tag: "button", text: plain("Invalid invented destination"), url: "javascript:REVIEW_INVALID_ACTION", href: "https://example.invalid/unused-fallback" },
+    at("invented_missing_identity"),
+  ] }, {}, []);
+  const record = legacyRecord(native);
+  const fixture = database(t, [record]);
+  const before = snapshot(fixture);
+  const old = messages(fixture, "json")[0];
+  const normalized = normalizeApiMessage(native);
+  assertUnchangedDisplay(old, record);
+  assert.equal(old.display.card.status, "partial");
+  assert.equal(old.display.card.reason, "unsupported_card_link");
+  assert.match(old.display.card.text, /Invented field\nInvented tail/);
+  assert.match(old.display.card.text, /@未知用户/);
+  assert.match(old.display.card.text, /部分内容未展开/);
+  assert.doesNotMatch(old.display.card.text, /REVIEW_INVALID_ACTION|unused-fallback/);
+  assert.equal(normalized.content, old.display.card.text);
+  assert.deepEqual(snapshot(fixture), before);
+});
+
+test("same-version slot projection correction writes once and then becomes a duplicate", (t) => {
+  const fixture = database(t);
+  const native = source("review_slot_version", { elements: [
+    { tag: "div", fields: [{ text: plain("Invented field") }], elements: [plain("Invented tail")] },
+    { tag: "button", text: plain("Invented link"), url: "", href: "https://example.invalid/version" },
+  ] }, {}, []);
+  const normalized = normalizeApiMessage(native);
+  const old = recordFromMessage({ ...normalized, content: "Invented fieldInvented tail", content_rendering: { version: 3, status: "rendered", reason: null, omitted_actions: 1 } }, SCOPE, "sent");
+  const current = recordFromMessage(normalized, SCOPE, "sent");
+  const write = (record) => {
+    const scope = readScope(fixture.db, SCOPE);
+    const runId = createRun(fixture.db, scope, { runner: "invented review slot regression" });
+    return succeedRecordRun(fixture.db, scope, runId, [record], 1, cursorAfter(INSTANT + 60_000), {});
+  };
+  assert.deepEqual(write(old), { inserted: 1, updated: 0, duplicate: 0 });
+  assert.deepEqual(write(current), { inserted: 0, updated: 1, duplicate: 0 });
+  assert.deepEqual(write(current), { inserted: 0, updated: 0, duplicate: 1 });
+  const stored = sqliteQuery(fixture.db, "SELECT * FROM records;", "read synthetic corrected projection")[0];
+  for (const key of ["raw_json", "content_hash", "external_version"]) assert.equal(stored[key], old[key], key);
+  assert.match(stored.body, /Invented field\nInvented tail/);
+  assert.match(stored.body, /Invented link.*https:\/\/example\.invalid\/version/);
+  assert.equal(JSON.parse(stored.canonical_json).content_rendering.version, 3);
+});

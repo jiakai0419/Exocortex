@@ -6,7 +6,7 @@ import {
   senderName,
   senderType,
 } from "./core.mjs";
-import { displayNameFromUser, personName, senderOpenId } from "./sender-identity.mjs";
+import { displayNameFromUser, personName, senderAliasesByOpenId, senderOpenId } from "./sender-identity.mjs";
 
 /**
  * @typedef {Record<string, any>} JsonObject
@@ -44,8 +44,8 @@ import { displayNameFromUser, personName, senderOpenId } from "./sender-identity
  * @property {Map<string, NameDetails>} appFallbackNames
  *
  * @typedef {object} NameResolver
- * @property {(openIds: unknown[], opts: AdapterOptions, seed?: Map<string, string>) => Map<string, string>} resolveContactNames
- * @property {(chatIdValue: string, openIds: unknown[], opts: AdapterOptions) => Map<string, string>} resolveChatMemberNames
+ * @property {(openIds: unknown[], opts: AdapterOptions, seed?: Map<string, string>, aliases?: Map<string, string[]>) => Map<string, string>} resolveContactNames
+ * @property {(chatIdValue: string, openIds: unknown[], opts: AdapterOptions, aliases?: Map<string, string[]>) => Map<string, string>} resolveChatMemberNames
  * @property {(appIds: unknown[], opts: AdapterOptions) => Map<string, string>} resolveApplicationNames
  * @property {(appIdsByChat: Map<string, Set<string>>, officialApps: Map<string, string>, opts: AdapterOptions) => Map<string, NameDetails>} resolveChatBotAppFallbackNames
  * @property {(messages: any[], opts: AdapterOptions, selfProfile: SelfProfile | null, scopeConfig?: JsonObject) => PeopleContext} buildPeopleContext
@@ -143,13 +143,15 @@ function createNameResolver({ run, now = Date.now }) {
    * @param {unknown[]} openIds
    * @param {AdapterOptions} opts
    * @param {Map<string, string>} [seed]
+   * @param {Map<string, string[]>} [aliases]
    */
-  function resolveContactNames(openIds, opts, seed = new Map()) {
-    const names = new Map([...seed].filter(([id, name]) => personName(name, [id])));
+  function resolveContactNames(openIds, opts, seed = new Map(), aliases = new Map()) {
+    const names = new Map([...seed].filter(([id, name]) => personName(name, [id, ...(aliases.get(id) || [])])));
     const unresolved = uniqueOpenIds(openIds).filter((id) => {
       if (names.has(id)) return false;
-      const name = cachedName(`user:${id}`);
+      const name = personName(cachedName(`user:${id}`), [id, ...(aliases.get(id) || [])]);
       if (name) names.set(id, name);
+      else nameCache.delete(`user:${id}`);
       return !name;
     });
     // lark-cli +search-user returns at most 30 users per page. Keep each ID
@@ -182,7 +184,7 @@ function createNameResolver({ run, now = Date.now }) {
         for (const user of users) {
           const openId = user?.open_id;
           if (!ids.includes(openId)) continue;
-          const name = displayNameFromUser(user);
+          const name = displayNameFromUser(user, aliases.get(openId));
           const previous = responseNames.get(openId);
           responseNames.set(openId, !name || responseNames.has(openId) && previous !== name ? null : name);
         }
@@ -202,18 +204,20 @@ function createNameResolver({ run, now = Date.now }) {
    * @param {string} chatIdValue
    * @param {unknown[]} openIds
    * @param {AdapterOptions} opts
+   * @param {Map<string, string[]>} [aliases]
    */
-  function resolveChatMemberNames(chatIdValue, openIds, opts) {
+  function resolveChatMemberNames(chatIdValue, openIds, opts, aliases = new Map()) {
     const targetIds = new Set(uniqueOpenIds(openIds));
     const names = new Map();
     if (!chatIdValue || targetIds.size === 0) return names;
 
     for (const id of targetIds) {
-      const name = cachedName(`member:${JSON.stringify([chatIdValue, id])}`);
+      const key = `member:${JSON.stringify([chatIdValue, id])}`;
+      const name = personName(cachedName(key), [id, ...(aliases.get(id) || [])]);
       if (name) {
         names.set(id, name);
         targetIds.delete(id);
-      }
+      } else nameCache.delete(key);
     }
 
     let pageToken = "";
@@ -251,7 +255,8 @@ function createNameResolver({ run, now = Date.now }) {
         for (const item of items) {
           const memberId = item?.member_id;
           if (!requestedIds.has(memberId)) continue;
-          const name = item?.member_id_type && item.member_id_type !== "open_id" ? "" : displayNameFromUser(item);
+          const name = item?.member_id_type && item.member_id_type !== "open_id" ? ""
+            : displayNameFromUser(item, aliases.get(memberId));
           const previous = responseNames.get(memberId);
           responseNames.set(memberId, !name || responseNames.has(memberId) && previous !== name ? null : name);
         }
@@ -383,6 +388,7 @@ function createNameResolver({ run, now = Date.now }) {
    * @param {JsonObject} [scopeConfig]
    */
   function buildPeopleContext(messages, opts, selfProfile, scopeConfig = {}) {
+    const aliases = senderAliasesByOpenId(messages);
     const seed = new Map();
     if (selfProfile?.open_id && selfProfile?.name) seed.set(selfProfile.open_id, selfProfile.name);
 
@@ -415,10 +421,10 @@ function createNameResolver({ run, now = Date.now }) {
       }
     }
 
-    const contacts = resolveContactNames(contactIds, opts, seed);
+    const contacts = resolveContactNames(contactIds, opts, seed, aliases);
     const chatMembers = new Map();
     for (const [chat, ids] of unresolvedByChat.entries()) {
-      const names = resolveChatMemberNames(chat, [...ids].filter((id) => !contacts.has(id)), opts);
+      const names = resolveChatMemberNames(chat, [...ids].filter((id) => !contacts.has(id)), opts, aliases);
       for (const [id, name] of names.entries()) chatMembers.set(`${chat}:${id}`, name);
     }
     const apps = resolveApplicationNames(appIds, opts);

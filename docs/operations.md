@@ -764,7 +764,7 @@ live freshness 对热会话原始列表的首屏（含回复）仅做消息 ID �
 
 ### 精确补全历史发送者
 
-联系人与群成员请求由同一 `name-resolver.mjs` 实现，在线同步、常规 enrich 和 sender-only 模式共享 30-ID 批次、显式 page-size、localized_name 归一化、self seed 优先和失败重试语义。常规 enrich 保留其扫描范围、dry-run、诊断和事务提交；单次请求最多五秒，它仍可能包含许多批次。
+联系人与群成员请求由同一 `name-resolver.mjs` 实现，在线同步、常规 enrich 和 sender-only 模式共享 30-ID 批次、显式 page-size、localized_name 归一化、self seed 优先和失败重试语义。姓名若等于原消息的任一明确 ID alias，或远端响应自身的 ID，按未知处理，不抑制成员 fallback；这也适用于历史姓名占位的候选筛选。常规 enrich 保留其扫描范围、dry-run、诊断和事务提交；单次请求最多五秒，它仍可能包含许多批次。
 
 单目标修复使用 `--sender-only --sender-id`，需提前从可信记录取得确切 open ID。以下示例中的变量由操作者设置，不从姓名或截图猜 ID：
 

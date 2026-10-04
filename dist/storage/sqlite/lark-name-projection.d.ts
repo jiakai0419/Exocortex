@@ -1,3 +1,6 @@
+/** Empty values and every explicit source ID echo are unknown. This predicate
+ * does not override the separate authoritative-clear rules in the merge. */
+declare function larkSenderNameIsUnknownSql(canonical: string, raw: string, actor: string): string;
 /** Resolve source namespaces before comparing names. Legacy prefixes are only
  * an inheritance compatibility rule, never permission to perform a lookup.
  * Explicit raw evidence wins over a missing canonical type; contradictory
@@ -11,4 +14,4 @@ declare function larkSenderNamespaceSql(canonical: string, raw: string, actor: s
  * Ingestion evaluates this inside its write transaction; enrichment evaluates
  * a snapshot and commits only if that exact snapshot still matches. */
 declare function mergeLarkNameProjectionSql(existingJson: string, incomingJson: string, existingActor: string, incomingActor: string, existingContainer: string, incomingContainer: string, existingRaw?: string, incomingRaw?: string): string;
-export { larkSenderNamespaceSql, mergeLarkNameProjectionSql };
+export { larkSenderNameIsUnknownSql, larkSenderNamespaceSql, mergeLarkNameProjectionSql };

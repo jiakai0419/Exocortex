@@ -110,6 +110,29 @@ function createActivityWriter(opts) {
   };
 }
 
+/** Shared structural contract. Explicit unavailable identities are legal;
+ * absent fields are damaged evidence. Time freshness and OS identity are
+ * evaluated separately so initialization does not poison the retained log.
+ * @param {unknown} input */
+function validateActivityEventShape(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return false;
+  const event = /** @type {Record<string, any>} */ (input);
+  const required = ["type", "version", "role", "instance_id", "parent_instance", "pid", "process_started_at_ms",
+    "database_key", "phase", "cycle", "step", "updated_at", "valid_until"];
+  if (!required.every((field) => Object.hasOwn(event, field))) return false;
+  const token = (/** @type {unknown} */ value) => typeof value === "string" && /^[a-zA-Z0-9-]{1,80}$/.test(value);
+  const positive = (/** @type {unknown} */ value) => typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+  const updated = typeof event.updated_at === "string" ? Date.parse(event.updated_at) : NaN;
+  const until = typeof event.valid_until === "string" ? Date.parse(event.valid_until) : NaN;
+  return event.type === "lark_im_worker_activity" && event.version === 1 && ["worker", "sync"].includes(event.role)
+    && token(event.instance_id) && (event.parent_instance === null || token(event.parent_instance))
+    && positive(event.pid) && (event.process_started_at_ms === null || positive(event.process_started_at_ms))
+    && (event.database_key === null || typeof event.database_key === "string" && /^[a-f0-9]{64}$/.test(event.database_key))
+    && PHASES.has(event.phase) && (event.role === "sync" ? ["sync", "stopped"].includes(event.phase) : event.phase !== "sync")
+    && (event.cycle === null || positive(event.cycle)) && (event.step === null || STEPS.has(event.step))
+    && Number.isFinite(updated) && Number.isFinite(until) && until > updated && until - updated <= MAX_ACTIVITY_AGE_MS;
+}
+
 /** Latest means append order, never the largest timestamp/cycle. Completed
  * instances and other databases do not consume the current-process budget.
  * @param {unknown[]} events @param {string | null} [databaseKey] @param {number} [nowMs] */
@@ -119,26 +142,23 @@ function latestActivityEvents(events, databaseKey, nowMs = Date.now()) {
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = /** @type {Record<string, any>} */ (events[index]);
     if (event?.type !== "lark_im_worker_activity") continue;
+    if (!validateActivityEventShape(event)) return { events: [event], truncated: false, integrity: false };
     const key = String(event.instance_id || "invalid");
     if (seen.has(key)) continue;
     seen.add(key);
     if (databaseKey && typeof event.database_key === "string" && /^[a-f0-9]{64}$/.test(event.database_key) && event.database_key !== databaseKey) continue;
     const updated = Date.parse(event.updated_at);
-    const until = Date.parse(event.valid_until);
-    if (event.phase === "stopped" && event.version === 1 && ["worker", "sync"].includes(event.role)
-      && typeof event.database_key === "string" && /^[a-f0-9]{64}$/.test(event.database_key)
-      && /^[a-zA-Z0-9-]{1,80}$/.test(key) && Number.isSafeInteger(event.pid) && event.pid > 0
-      && Number.isSafeInteger(event.process_started_at_ms) && event.process_started_at_ms > 0
-      && Number.isFinite(updated) && updated >= event.process_started_at_ms && updated <= nowMs
-      && Number.isFinite(until) && until > updated && until - updated <= MAX_ACTIVITY_AGE_MS) continue;
+    if (event.phase === "stopped" && event.database_key !== null && event.process_started_at_ms !== null
+      && updated >= event.process_started_at_ms && updated <= nowMs) continue;
     candidates.push(event);
-    if (candidates.length > MAX_ACTIVITY_INSTANCES) return { events: candidates.slice(0, MAX_ACTIVITY_INSTANCES), truncated: true };
+    if (candidates.length > MAX_ACTIVITY_INSTANCES) return { events: candidates.slice(0, MAX_ACTIVITY_INSTANCES), truncated: true, integrity: true };
   }
-  return { events: candidates, truncated: false };
+  return { events: candidates, truncated: false, integrity: true };
 }
 
 /** @param {Record<string, any>} event @param {Record<string, any> | undefined} processState @param {string | null} databaseKey @param {number} nowMs */
 function evaluateActivityEvent(event, processState, databaseKey, nowMs) {
+  if (!validateActivityEventShape(event)) return { state: "unknown" };
   if (typeof databaseKey !== "string" || !/^[a-f0-9]{64}$/.test(databaseKey)
     || typeof event.database_key !== "string" || !/^[a-f0-9]{64}$/.test(event.database_key)) return { state: "unknown" };
   if (event.database_key !== databaseKey) return { state: "other_database" };
@@ -147,13 +167,9 @@ function evaluateActivityEvent(event, processState, databaseKey, nowMs) {
   if (processState?.state === "alive" && Number.isFinite(start) && start > 0 && processState.started_at_ms !== start) return { state: "dead" };
   const updated = Date.parse(String(event.updated_at || ""));
   const until = Date.parse(String(event.valid_until || ""));
-  const valid = event.version === 1 && ["worker", "sync"].includes(event.role)
-    && typeof event.instance_id === "string" && /^[a-zA-Z0-9-]{1,80}$/.test(event.instance_id)
-    && PHASES.has(event.phase) && (event.step === null || STEPS.has(event.step))
-    && Number.isSafeInteger(event.pid) && event.pid > 0 && Number.isSafeInteger(start) && start > 0
+  const valid = event.process_started_at_ms !== null
     && processState?.state === "alive" && processState.started_at_ms === start
-    && Number.isFinite(updated) && updated >= start + 1000 && updated <= nowMs && nowMs < until
-    && until > updated && until - updated <= MAX_ACTIVITY_AGE_MS;
+    && updated >= start + 1000 && updated <= nowMs && nowMs < until;
   if (!valid) return { state: "unknown" };
   if (event.phase === "stopped") return { state: "stopped" };
   return { state: event.phase === "waiting" ? "waiting" : "syncing", phase: event.phase,
@@ -175,4 +191,4 @@ function databaseOnlyHealth(health) {
 }
 
 export { databaseActivityEvidence, databaseOnlyHealth, ACTIVITY_GAP_MS, ACTIVITY_GRACE_MS, MAX_ACTIVITY_AGE_MS, activityDatabaseKey, createActivityWriter,
-  inspectActivityProcesses, observeLockOwners, latestActivityEvents, evaluateActivityEvent };
+  inspectActivityProcesses, observeLockOwners, latestActivityEvents, evaluateActivityEvent, validateActivityEventShape };

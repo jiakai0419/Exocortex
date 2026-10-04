@@ -166,7 +166,7 @@ function summary(result, status = 0) {
   return output;
 }
 
-function assertSenderWrite(before, after) {
+function assertSenderWrite(before, after, expectedSource = null) {
   for (const field of Object.keys(before)) {
     if (!["canonical_json", "updated_at"].includes(field)) assert.equal(after[field], before[field], field);
   }
@@ -176,7 +176,8 @@ function assertSenderWrite(before, after) {
   assert.deepEqual(strip(next), strip(old), "non-sender canonical fields must remain unchanged");
   assert.equal(next.sender_id_type, "open_id");
   assert.equal(next.sender_name, PERSON);
-  assert.ok(["contact", "chat_member"].includes(next.sender_name_source));
+  if (expectedSource) assert.equal(next.sender_name_source, expectedSource);
+  else assert.ok(["contact", "chat_member"].includes(next.sender_name_source));
   assert.equal(next.sender_name_confidence, "high");
   assert.notEqual(after.updated_at, before.updated_at);
 }
@@ -467,3 +468,153 @@ for (const args of [
     assert.deepEqual(readFileSync(f.db), before);
   });
 }
+
+const SOURCE_ALIASES = Object.freeze({
+  open_id: TARGET, user_id: "synthetic_ceramic_user_alias", union_id: "synthetic_ceramic_union_alias",
+});
+
+for (const aliasType of ["user_id", "union_id"]) {
+  test(`sender alias ${aliasType} already in canonical sender_name is selected and corrected`, (t) => {
+    const f = fixture(t);
+    insertRow(f, { name: SOURCE_ALIASES[aliasType], rawSender: { ...SOURCE_ALIASES },
+      canonical: { sender_name_source: "contact", sender_name_confidence: "high" } });
+    const before = readRows(f)[0];
+    const output = summary(run(f));
+    assert.equal(output.scanned, 1);
+    assert.equal(output.updated, 1);
+    assertSenderWrite(before, readRows(f)[0], "contact");
+    assert.deepEqual(assertTargetCalls(f).map(call => call.kind), ["contact"]);
+  });
+}
+
+test("sender alias already in canonical sender_name is corrected using only nested typed identities", (t) => {
+  const f = fixture(t);
+  insertRow(f, { name: SOURCE_ALIASES.user_id,
+    rawSender: { id: undefined, id_type: undefined, sender_id: { ...SOURCE_ALIASES } } });
+  const before = readRows(f)[0];
+  const output = summary(run(f));
+  assert.equal(output.scanned, 1);
+  assert.equal(output.updated, 1);
+  assertSenderWrite(before, readRows(f)[0], "contact");
+  assert.deepEqual(assertTargetCalls(f).map(call => call.kind), ["contact"]);
+});
+
+test("sender alias evidence does not select an existing genuine canonical sender_name", (t) => {
+  const f = fixture(t);
+  insertRow(f, { name: PERSON, rawSender: { ...SOURCE_ALIASES } });
+  const before = readRows(f);
+  assert.equal(summary(run(f)).scanned, 0);
+  assert.deepEqual(readRows(f), before);
+  assert.deepEqual(callLog(f), []);
+});
+
+for (const [aliasType, alias] of Object.entries(SOURCE_ALIASES)) {
+  for (const field of ["name", "display_name"]) {
+    test(`sender alias ${aliasType} echoed in raw ${field} stays unknown until the reliable open-ID lookup resolves it`, (t) => {
+      const f = fixture(t);
+      insertRow(f, { rawSender: { ...SOURCE_ALIASES, [field]: alias } });
+      const before = readRows(f)[0];
+      const output = summary(run(f));
+      assert.equal(output.updated, 1);
+      assertSenderWrite(before, readRows(f)[0], "contact");
+      assert.deepEqual(assertTargetCalls(f).map(call => call.kind), ["contact"]);
+    });
+  }
+  test(`sender alias ${aliasType} in raw name cannot hide a genuine display_name`, (t) => {
+    const f = fixture(t);
+    insertRow(f, { rawSender: { ...SOURCE_ALIASES, name: alias, display_name: PERSON } });
+    const before = readRows(f)[0];
+    assert.equal(summary(run(f)).updated, 1);
+    assertSenderWrite(before, readRows(f)[0], "message_sender");
+    assert.deepEqual(callLog(f), []);
+  });
+}
+
+test("sender alias remains unknown after denied lookup and recovers later without changing any source facts", (t) => {
+  const f = fixture(t, { contact: "deny", members: "deny" });
+  insertRow(f, { rawSender: { ...SOURCE_ALIASES, name: SOURCE_ALIASES.user_id, display_name: SOURCE_ALIASES.union_id } });
+  const before = readRows(f)[0];
+  const denied = summary(run(f), 1);
+  assert.equal(denied.unresolved, 1);
+  assert.equal(denied.updated, 0);
+  assert.deepEqual(readRows(f)[0], before);
+  setRemote(f, { contact: "success" });
+  assert.equal(summary(run(f)).updated, 1);
+  assertSenderWrite(before, readRows(f)[0], "contact");
+});
+
+test("sender alias correction obeys CAS if source version changes during the reliable lookup", (t) => {
+  const changedVersion = "9876543210456";
+  const f = fixture(t, { contact: "success", mutateSql: `UPDATE records SET external_version='${changedVersion}' WHERE id=1;` });
+  insertRow(f, { rawSender: { ...SOURCE_ALIASES, name: SOURCE_ALIASES.user_id } });
+  const before = readRows(f)[0];
+  const output = summary(run(f), 1);
+  assert.equal(output.skipped_conflicts, 1);
+  assert.equal(output.updated, 0);
+  assert.deepEqual(readRows(f)[0], { ...before, external_version: changedVersion });
+  assert.deepEqual(assertTargetCalls(f).map(call => call.kind), ["contact"]);
+});
+
+test("sender alias in a nested typed sender_id uses its explicit open_id for correction", (t) => {
+  const f = fixture(t);
+  insertRow(f, { rawSender: { id: undefined, id_type: undefined,
+    sender_id: { ...SOURCE_ALIASES }, name: SOURCE_ALIASES.user_id } });
+  const before = readRows(f)[0];
+  assert.equal(summary(run(f)).updated, 1);
+  assertSenderWrite(before, readRows(f)[0], "contact");
+  assert.deepEqual(assertTargetCalls(f).map(call => call.kind), ["contact"]);
+});
+
+for (const type of ["user_id", "union_id"]) {
+  for (const nested of [false, true]) {
+    test(`sender alias with only ${nested ? "nested " : ""}${type} evidence never authorizes open-ID lookup`, (t) => {
+      const f = fixture(t);
+      const evidence = { [type]: TARGET };
+      insertRow(f, { rawSender: { id: undefined, id_type: undefined,
+        ...(nested ? { sender_id: evidence } : evidence) }, canonical: { sender_id_type: type } });
+      const before = readRows(f);
+      const output = summary(run(f));
+      assert.equal(output.scanned, 0);
+      assert.equal(output.updated, 0);
+      assert.deepEqual(callLog(f), []);
+      assert.deepEqual(readRows(f), before);
+    });
+  }
+}
+
+// Added after the original 9b8e750 RED capture: remote responses may omit the
+// alternate-ID fields, but the original message still proves these are aliases.
+test("sender remote alias contact echo without alias fields falls back to a genuine member name", (t) => {
+  const f = fixture(t, { contactUsers: [{ open_id: TARGET, name: SOURCE_ALIASES.user_id }], members: "success" });
+  insertRow(f, { rawSender: { ...SOURCE_ALIASES } });
+  const before = readRows(f)[0];
+  assert.equal(summary(run(f)).updated, 1);
+  assertSenderWrite(before, readRows(f)[0], "chat_member");
+  assert.deepEqual(assertTargetCalls(f).map(call => call.kind), ["contact", "members"]);
+});
+
+test("sender remote alias echoes from contact and member remain unwritten and can recover next run", (t) => {
+  const f = fixture(t, { contactUsers: [{ open_id: TARGET, name: SOURCE_ALIASES.user_id }],
+    members: "success", memberName: SOURCE_ALIASES.union_id });
+  insertRow(f, { rawSender: { ...SOURCE_ALIASES } });
+  const before = readRows(f)[0];
+  const unresolved = summary(run(f), 1);
+  assert.equal(unresolved.unresolved, 1);
+  assert.equal(unresolved.updated, 0);
+  assert.deepEqual(readRows(f)[0], before);
+  assert.deepEqual(assertTargetCalls(f).map(call => call.kind), ["contact", "members"]);
+  setRemote(f, { contact: "success" });
+  assert.equal(summary(run(f)).updated, 1);
+  assertSenderWrite(before, readRows(f)[0], "contact");
+});
+
+test("sender remote alias member echo is unknown even when contact returns no person", (t) => {
+  const f = fixture(t, { contact: "empty", members: "success", memberName: SOURCE_ALIASES.user_id });
+  insertRow(f, { rawSender: { ...SOURCE_ALIASES } });
+  const before = readRows(f)[0];
+  const output = summary(run(f), 1);
+  assert.equal(output.unresolved, 1);
+  assert.equal(output.updated, 0);
+  assert.deepEqual(readRows(f)[0], before);
+  assert.deepEqual(assertTargetCalls(f).map(call => call.kind), ["contact", "members"]);
+});

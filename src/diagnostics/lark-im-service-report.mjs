@@ -14,7 +14,7 @@ import {
 } from "node:fs";
 import { resolve } from "node:path";
 import { summarizeWorkerEvents } from "../../dist/runtime/worker/lark-im-worker-core.js";
-import { activityDatabaseKey, inspectActivityProcesses, latestActivityEvents, evaluateActivityEvent } from "./lark-im-activity-evidence.mjs";
+import { activityDatabaseKey, inspectActivityProcesses, latestActivityEvents, evaluateActivityEvent, validateActivityEventShape } from "./lark-im-activity-evidence.mjs";
 import { classifyLarkFailure } from "../adapters/lark-im/transport.mjs";
 import { readLiveProbeCache, liveProbeContext, DEFAULT_LIVE_PROBE_TTL_MS } from "./live-probe-cache.mjs";
 import { diagnosticSubprocessError } from "./public-safe.mjs";
@@ -192,6 +192,7 @@ function readRecentWorkerEvents(logDir, limits = {}) {
       const event = JSON.parse(line);
       if (!event || typeof event !== "object" || Array.isArray(event)) { activityIntegrity = false; continue; }
       if (!["lark_im_worker_cycle", "lark_im_worker_step", "lark_im_worker_scheduler", "lark_im_worker_activity"].includes(event.type)) activityIntegrity = false;
+      if (event.type === "lark_im_worker_activity" && !validateActivityEventShape(event)) activityIntegrity = false;
       events.push(event);
     } catch {
       // Never fall back to an older phase after a damaged or partial event.
@@ -409,33 +410,46 @@ function summarizeServiceActivity({ service, syncStatus, nowMs = Date.now(), act
     return result("unknown", "current phase evidence is incomplete");
   }
   const events = activityEvidence?.events || [];
+  if (!events.every(validateActivityEventShape)) return result("unknown", "current phase evidence is incomplete");
   const processes = activityEvidence?.processes || new Map();
   const evaluated = events.map((event) => ({ event,
     value: evaluateActivityEvent(event, processes.get(event.pid), activityEvidence?.database_key || "", nowMs),
   })).filter((item) => item.value.state !== "other_database" && item.value.state !== "dead");
-  const workerPids = new Set(events.filter((event) => event.role === "worker").map((event) => event.pid));
-  if (launchd.pid) workerPids.add(Number(launchd.pid));
+  // A historical PID does not retain its old worker identity after reuse.
+  // Parent classification needs the currently observed same process instance;
+  // this identifies its role, but does not refresh an expired phase.
+  const workerPids = new Set(evaluated.filter(({ event }) => event.role === "worker"
+    && event.process_started_at_ms !== null && processes.get(event.pid)?.state === "alive"
+    && processes.get(event.pid)?.started_at_ms === event.process_started_at_ms
+    && Date.parse(event.updated_at) >= event.process_started_at_ms + 1000).map(({ event }) => event.pid));
+  if (service.status === "running" && launchd.pid) workerPids.add(Number(launchd.pid));
   const worker = evaluated.find((item) => item.event.role === "worker"
     && (service.status !== "running" || item.event.pid === Number(launchd.pid)));
   const children = evaluated.filter((item) => item.event.role === "sync" && item.value.state !== "stopped");
   const independent = [];
+  let childEvidenceIssue = null;
   for (const child of children) {
     const ppid = processes.get(child.event.pid)?.ppid;
     const parent = child.event.parent_instance;
     if (parent || workerPids.has(ppid)) {
       if (!worker || parent !== worker.event.instance_id || ppid !== worker.event.pid
         || worker.value.state !== "syncing") {
-        return result("unknown", "worker and child phase evidence disagree");
+        const belongsToCurrentWorker = worker && (parent === worker.event.instance_id || ppid === worker.event.pid);
+        childEvidenceIssue = belongsToCurrentWorker ? "worker and child phase evidence disagree"
+          : childEvidenceIssue || "a worker child has no verified current parent phase";
       }
     } else if (!Number.isSafeInteger(ppid) || ppid < 1) {
-      return result("unknown", "foreground process parent is unavailable");
+      childEvidenceIssue ||= "foreground process parent is unavailable";
     } else independent.push(child);
   }
+  // Verified independent work proves activity for this database even if a
+  // different worker/child remains unexplained. Never promote that child.
   const foreground = independent.find((item) => item.value.state === "syncing");
   if (foreground) return result("syncing", "foreground sync observed", {
     phase: "sync", updated_at: foreground.value.updated_at, valid_until: foreground.value.valid_until,
     evidence: "recent_foreground_phase", observed_at: activityEvidence?.observed_at || null,
   });
+  if (childEvidenceIssue) return result("unknown", childEvidenceIssue);
   if (worker?.value.state === "syncing" && service.status !== "unknown") {
     const value = worker.value;
     return result("syncing", `cycle #${value.cycle || "?"}${value.step ? ` · ${value.step}` : " · between steps"}`, {
@@ -589,7 +603,7 @@ function buildServiceStatusReport(opts, deps = {}) {
   const nowMs = now();
   const activityEvidence = { ...candidates, processes, database_key: finalDatabaseKey,
     database_identity_stable: initialDatabaseKey !== null && initialDatabaseKey === finalDatabaseKey,
-    integrity: workerLog.activity_integrity !== false, observed_at: new Date(nowMs).toISOString() };
+    integrity: workerLog.activity_integrity !== false && candidates.integrity !== false, observed_at: new Date(nowMs).toISOString() };
   const workerSummary = summarize(workerLog.events.filter((event) => event.type !== "lark_im_worker_activity"), nowMs);
   const workerStability = summarizeWorkerStability(
     workerLog.events,

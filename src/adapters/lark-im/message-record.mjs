@@ -2,7 +2,7 @@
 
 import { createHash } from "node:crypto";
 import { renderSystemContent } from "./system-content.mjs";
-import { personName, senderIdentity } from "./sender-identity.mjs";
+import { personName, senderIdentity, senderNameFromSource } from "./sender-identity.mjs";
 
 /**
  * @typedef {"sent" | "received"} MessageDirection
@@ -76,23 +76,12 @@ const SOURCE_ID = "lark.im";
 
 /** @param {LarkMessage | null | undefined} message */
 function senderId(message) {
-  const sender = message?.sender;
-  if (!sender || typeof sender !== "object") return "";
-  return (
-    sender.id ||
-    sender.open_id ||
-    sender.sender_id?.open_id ||
-    sender.sender_id?.user_id ||
-    sender.sender_id ||
-    ""
-  );
+  return senderIdentity(message).id;
 }
 
 /** @param {LarkMessage | null | undefined} message */
 function senderName(message) {
-  const sender = message?.sender;
-  if (!sender || typeof sender !== "object") return "";
-  return personName(sender.name, [senderId(message)]) || personName(sender.display_name, [senderId(message)]);
+  return senderNameFromSource(message);
 }
 
 /** @param {LarkMessage | null | undefined} message */
@@ -272,20 +261,21 @@ function nameCandidate(value, source, confidence) {
  * @param {PeopleContext} context
  * @param {string | null | undefined} id
  * @param {string} chatIdValue
+ * @param {string[]} [identifiers]
  * @returns {NameDetails | null}
  */
-function lookupDisplayNameDetails(context, id, chatIdValue) {
+function lookupDisplayNameDetails(context, id, chatIdValue, identifiers = id ? [id] : []) {
   if (!id) return null;
   const app = nameCandidate(context.apps?.get(id), "application_api", "high");
   if (app) return app;
   const appFallback = nameCandidate(context.app_fallbacks?.get(`${chatIdValue}:${id}`), "chat_bot_unique", "medium");
   if (appFallback) return appFallback;
   const chatMember = nameCandidate(context.chat_members?.get(`${chatIdValue}:${id}`), "chat_member", "high");
-  if (chatMember && (chatMember.state === "cleared" || personName(chatMember.name, [id]))) return chatMember;
+  if (chatMember && (chatMember.state === "cleared" || personName(chatMember.name, identifiers))) return chatMember;
   const contact = nameCandidate(context.contacts?.get(id), "contact", "high");
-  if (contact && (contact.state === "cleared" || personName(contact.name, [id]))) return contact;
+  if (contact && (contact.state === "cleared" || personName(contact.name, identifiers))) return contact;
   if (context.self?.open_id === id) {
-    const name = personName(context.self.name, [id]);
+    const name = personName(context.self.name, identifiers);
     if (name) return { name, source: "self", confidence: "high" };
   }
   return null;
@@ -314,9 +304,9 @@ function recordFromMessage(message, scopeId, direction, context = {}, scopeConfi
   const occurredAtMs = parseLarkTimeMs(message?.create_time ?? message?.created_at ?? message?.create_time_ms);
   const version = externalVersion(message);
   const updatedAtMs = version === null ? null : Number(version);
-  const actorId = senderId(message);
   const identity = senderIdentity(message);
-  const senderIdentityConflict = identity.conflict || Boolean(identity.id && identity.id !== actorId);
+  const actorId = identity.id;
+  const senderIdentityConflict = identity.conflict;
   const containerId = chatId(message) || scopeConfig.chat_id || "";
   const sender = message?.sender && typeof message.sender === "object" ? message.sender : {};
   const chatPartner =
@@ -335,7 +325,7 @@ function recordFromMessage(message, scopeId, direction, context = {}, scopeConfi
   /** @type {NameDetails | null} */
   const senderNameDetails = senderDirectName
     ? { name: senderDirectName, source: "message_sender", confidence: "high" }
-    : lookupDisplayNameDetails(senderContext, actorId, containerId);
+    : lookupDisplayNameDetails(senderContext, actorId, containerId, identity.identifiers);
   const senderDisplayName = senderNameDetails?.name || "";
   const partnerDirectName = chatPartner?.name || chatPartner?.display_name || "";
   /** @type {NameDetails | null} */

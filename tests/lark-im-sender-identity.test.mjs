@@ -30,7 +30,7 @@ test('contradictory same-namespace identities are unknown; a different namespace
   assert.equal(senderIdentity({ sender: contradictory }).conflict, true);
   assert.equal(senderOpenId({ sender: contradictory }), '');
   assert.deepEqual(senderIdentity({ sender: { id: PERSON, id_type: 'open_id', user_id: 'synthetic_user_alias' } }),
-    { id: PERSON, type: 'open_id', verified: true, conflict: false });
+    { id: PERSON, type: 'open_id', verified: true, conflict: false, identifiers: [PERSON, 'synthetic_user_alias'] });
   assert.equal(senderIdentity({ sender: { id: PERSON, open_id: PERSON, user_id: PERSON } }).conflict, true);
   assert.equal(senderIdentity({ sender: { id: PERSON, id_type: { type: 'open_id' } } }).conflict, true);
 });

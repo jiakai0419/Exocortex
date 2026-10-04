@@ -1,11 +1,38 @@
+// Mirrors senderIdentity's finite source slots and string selection order.
+// Keep this SQL-side contract covered through actual record/store/enrich tests.
+const senderIdPaths = ['$.sender.id', '$.sender.open_id', '$.sender.sender_id.open_id',
+    '$.sender.sender_id.user_id', '$.sender.sender_id.union_id', '$.sender.sender_id',
+    '$.sender.user_id', '$.sender.union_id', '$.sender.app_id', '$.sender.sender_id.app_id'];
+const typedSenderIdPaths = senderIdPaths.filter((path) => !['$.sender.id', '$.sender.sender_id'].includes(path));
+/** Empty values and every explicit source ID echo are unknown. This predicate
+ * does not override the separate authoritative-clear rules in the merge. */
+function larkSenderNameIsUnknownSql(canonical, raw, actor) {
+    const pairs = senderIdPaths.map((path) => `SELECT json_extract(raw, '${path}') AS value,
+    json_type(raw, '${path}') AS kind FROM native`).join(' UNION ALL ');
+    return `(WITH source AS MATERIALIZED (
+    SELECT ${canonical} AS canonical, ${actor} AS actor,
+      CASE WHEN json_valid(${raw}) THEN ${raw} ELSE '{}' END AS raw
+  ), native AS MATERIALIZED (
+    SELECT canonical, actor, CASE WHEN json_type(raw, '$.raw_api') = 'object'
+      THEN json_extract(raw, '$.raw_api') ELSE raw END AS raw FROM source
+  ), ids AS MATERIALIZED (${pairs})
+  SELECT COALESCE(trim(json_extract(canonical, '$.sender_name')), '') = ''
+    OR trim(json_extract(canonical, '$.sender_name')) IS actor
+    OR EXISTS (SELECT 1 FROM ids WHERE kind = 'text' AND value <> ''
+      AND value = trim(json_extract(canonical, '$.sender_name')))
+    FROM native)`;
+}
 /** Resolve source namespaces before comparing names. Legacy prefixes are only
  * an inheritance compatibility rule, never permission to perform a lookup.
  * Explicit raw evidence wins over a missing canonical type; contradictory
  * explicit evidence cannot inherit a name, even when the ID bytes match. */
 function larkSenderNamespaceSql(canonical, raw, actor, allowLegacy = true) {
+    const selectedId = `COALESCE(${senderIdPaths.map((path) => `CASE WHEN json_type(raw, '${path}') = 'text'
+    THEN NULLIF(json_extract(raw, '${path}'), '') END`).join(', ')})`;
+    const malformedId = ['$.sender.id', ...typedSenderIdPaths].map((path) => `json_type(raw, '${path}') NOT IN ('text', 'null')`).join(' OR ');
     const pairs = ['open_id', 'user_id', 'union_id', 'app_id'].flatMap((type) => [
-        `SELECT '${type}' AS type, json_extract(raw, '$.sender.${type}') AS value FROM native`,
-        `SELECT '${type}' AS type, json_extract(raw, '$.sender.sender_id.${type}') AS value FROM native`,
+        `SELECT '${type}' AS type, json_extract(raw, '$.sender.${type}') AS value, 'direct' AS origin FROM native`,
+        `SELECT '${type}' AS type, json_extract(raw, '$.sender.sender_id.${type}') AS value, 'nested' AS origin FROM native`,
     ]).join(' UNION ALL ');
     return `(WITH source AS MATERIALIZED (
     SELECT ${canonical} AS canonical, ${actor} AS actor,
@@ -17,6 +44,7 @@ function larkSenderNamespaceSql(canonical, raw, actor, allowLegacy = true) {
     SELECT *, NULLIF(json_extract(canonical, '$.sender_id_type'), '') AS canonical_type,
       NULLIF(json_extract(raw, '$.sender.id_type'), '') AS declared_type,
       CASE WHEN json_type(raw, '$.sender.id') = 'text' THEN NULLIF(json_extract(raw, '$.sender.id'), '') END AS raw_id,
+      ${selectedId} AS selected_id,
       (SELECT COUNT(DISTINCT type) FROM evidence WHERE value = native.actor) AS matching_types,
       (SELECT MIN(type) FROM evidence WHERE value = native.actor) AS matching_type
     FROM native
@@ -27,6 +55,11 @@ function larkSenderNamespaceSql(canonical, raw, actor, allowLegacy = true) {
     WHEN COALESCE(actor, '') = '' OR canonical_type = 'conflicting'
       OR json_type(canonical, '$.sender_id_type') NOT IN ('text', 'null')
       OR json_type(raw, '$.sender.id_type') NOT IN ('text', 'null')
+      OR (${malformedId})
+      OR json_type(raw, '$.sender.sender_id') NOT IN ('text', 'object', 'null')
+      OR json_type(raw, '$.sender.sender_id') = 'object' AND NOT EXISTS (
+        SELECT 1 FROM evidence WHERE origin = 'nested' AND typeof(value) = 'text' AND value <> '')
+      OR selected_id IS NOT NULL AND selected_id <> actor
       OR raw_id IS NOT NULL AND raw_id <> actor
       OR declared_type IS NULL AND matching_types > 1
       OR source_type IS NULL AND EXISTS (
@@ -90,11 +123,17 @@ function mergeLarkNameProjectionSql(existingJson, incomingJson, existingActor, i
     for (const group of groups) {
         const before = `n${index}`;
         index += 1;
+        const nextUnknown = group.name === '$.sender_name'
+            ? larkSenderNameIsUnknownSql('next', incomingRaw, incomingActor)
+            : `COALESCE(json_extract(next, '${group.name}'), '') = ''`;
+        const oldUnknown = group.name === '$.sender_name'
+            ? larkSenderNameIsUnknownSql('old', existingRaw, existingActor)
+            : `COALESCE(json_extract(old, '${group.name}'), '') = ''`;
         stages.push(`n${index} AS MATERIALIZED (SELECT old, next,
       (${group.identity})
-      AND (COALESCE(json_extract(next, '${group.name}'), '') = '' OR ${group.historical || '0'})
+      AND (${nextUnknown} OR ${group.historical || '0'})
       AND COALESCE(json_extract(next, '${group.state}'), '') <> 'cleared'
-      AND (COALESCE(json_extract(old, '${group.name}'), '') <> ''
+      AND (NOT (${oldUnknown})
         OR json_extract(old, '${group.state}') = 'cleared') AS keep
       FROM ${before})`);
         for (const field of group.fields) {
@@ -118,4 +157,4 @@ function mergeLarkNameProjectionSql(existingJson, incomingJson, existingActor, i
       EXCEPT SELECT fullkey, type, atom FROM json_tree(next))
     THEN old ELSE next END FROM n${index})`;
 }
-export { larkSenderNamespaceSql, mergeLarkNameProjectionSql };
+export { larkSenderNameIsUnknownSql, larkSenderNamespaceSql, mergeLarkNameProjectionSql };

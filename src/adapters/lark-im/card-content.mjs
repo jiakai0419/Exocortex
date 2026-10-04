@@ -114,6 +114,7 @@ function renderCardContent(content, mentions = []) {
   let textChars = 0;
   let nodes = 0;
   let output = "";
+  let contentEmissions = 0;
   let stopped = false;
   let omittedActions = 0;
   /** @param {Reason} reason */
@@ -162,14 +163,18 @@ function renderCardContent(content, mentions = []) {
     } else visit();
   }
 
-  /** @param {string} text */
-  function emit(text) {
+  /** @param {string} text @param {boolean} boundary */
+  function emit(text, boundary = false) {
     if (!text || stopped) return;
+    if (!boundary) contentEmissions += 1;
     const remaining = MAX_OUTPUT_CHARS - output.length;
+    // A pending separator alone is not missing content. A subsequent text or
+    // explicit br emission still records overflow against the same limit.
+    if (boundary && remaining === 0) return;
     output += text.slice(0, Math.max(remaining, 0));
     if (text.length > remaining) { mark("card_output_limit"); stopped = true; }
   }
-  function lineBreak() { if (output && !output.endsWith("\n")) emit("\n"); }
+  function lineBreak() { if (output && !output.endsWith("\n")) emit("\n", true); }
 
   /** URL output intentionally contains origin/path only. Path may still be private.
    * @param {string} value
@@ -591,18 +596,28 @@ function renderCardContent(content, mentions = []) {
   /** @param {JsonObject} payload @param {number} depth @param {boolean} columns */
   function container(payload, depth, columns = false) {
     let recognized = false;
-    const text = read(payload, "text");
-    if (text !== undefined) { inline(text, depth + 1); recognized = true; }
-    const fields = read(payload, "fields");
-    if (fields !== undefined) { each(fields, depth + 1, block); recognized = true; }
-    const elements = read(payload, "elements");
-    if (elements !== undefined) { each(elements, depth + 1, columns ? block : inline); recognized = true; }
-    const actions = read(payload, "actions");
-    if (actions !== undefined) { each(actions, depth + 1, block); recognized = true; }
-    const childColumns = read(payload, "columns");
-    if (childColumns !== undefined) { each(childColumns, depth + 1, block); recognized = true; }
-    const extra = read(payload, "extra");
-    if (extra !== undefined) { block(extra, depth + 1); recognized = true; }
+    const start = output.length;
+    // Presentation slots are separate blocks; fragments within an inline slot
+    // remain adjacent. An empty slot must not split surrounding inline text.
+    /** @param {string} key @param {(value: unknown, childDepth: number) => void} visit */
+    function slot(key, visit) {
+      const value = read(payload, key);
+      if (value === undefined) return;
+      const before = output.length;
+      const emissions = contentEmissions;
+      if (output.length > start) lineBreak();
+      recognized = true;
+      visit(value, depth + 1);
+      // Hidden actions/empty lists contribute no separator. Explicit br nodes
+      // are content emissions, so intentional line breaks remain unchanged.
+      if (contentEmissions === emissions) output = output.slice(0, before);
+    }
+    slot("text", inline);
+    slot("fields", (value, childDepth) => each(value, childDepth, block));
+    slot("elements", (value, childDepth) => each(value, childDepth, columns ? block : inline));
+    slot("actions", (value, childDepth) => each(value, childDepth, block));
+    slot("columns", (value, childDepth) => each(value, childDepth, block));
+    slot("extra", block);
     if (!recognized) mark("unsupported_card_structure");
   }
 
@@ -612,29 +627,42 @@ function renderCardContent(content, mentions = []) {
     /** @type {Array<{label: string | null, text: string}>} */
     const links = [];
     let usable = 0;
-    /** @param {unknown} value @param {string | null} label */
-    function add(value, label = null) {
-      if (value === undefined || value === null || value === "") return;
+    /** Project a target once before choosing a fallback. Null means absent;
+     * undefined means invalid. Invalid nonempty targets never borrow href.
+     * @param {unknown} value @returns {string | null | undefined} */
+    function target(value) {
       /** @type {unknown} */
       let destination = value;
       if (object(destination)) {
         const wrapper = destination;
-        destination = undefined;
-        enter(wrapper, depth + 1, () => { destination = read(wrapper, "url"); });
+        let readable = false;
+        enter(wrapper, depth + 1, () => {
+          const descriptor = Object.getOwnPropertyDescriptor(wrapper, "url");
+          if (!descriptor || !("value" in descriptor)) { mark("unsupported_card_structure"); return; }
+          destination = read(wrapper, "url");
+          readable = true;
+        });
+        if (!readable) return undefined;
       }
-      if (typeof destination !== "string") { mark("unsupported_card_structure"); return; }
-      const projected = safeUrl(boundedRawText(destination));
+      if (destination === undefined || destination === null || destination === "") return null;
+      if (typeof destination !== "string") { mark("unsupported_card_structure"); return undefined; }
+      return safeUrl(boundedRawText(destination));
+    }
+    /** @param {string | null | undefined} projected @param {string | null} label */
+    function add(projected, label = null) {
+      if (projected === undefined || projected === null) return;
       if (projected !== "[不支持的链接]") usable += 1;
       links.push({ label, text: projected });
     }
-    add(read(payload, "url") ?? read(payload, "href"));
+    const primary = target(read(payload, "url"));
+    add(primary === null ? target(read(payload, "href")) : primary);
     const multi = read(payload, "multi_url");
     if (multi !== undefined) enter(multi, depth + 1, () => {
       if (!object(multi)) { mark("unsupported_card_structure"); return; }
       let recognized = false;
       for (const [slot, platform] of [["url", "默认"], ["pc_url", "桌面"], ["ios_url", "iOS"], ["android_url", "Android"]]) {
-        const destination = read(multi, slot);
-        if (destination === undefined || destination === null || destination === "") continue;
+        const destination = target(read(multi, slot));
+        if (destination === null) continue;
         recognized = true;
         add(destination, platform);
       }
@@ -650,8 +678,8 @@ function renderCardContent(content, mentions = []) {
         const action = read(entry, "action");
         enter(action, entryDepth + 1, () => {
           if (!object(action)) { mark("unsupported_card_structure"); return; }
-          const url = read(action, "url");
-          if (url === undefined || url === null || url === "") mark("unsupported_card_structure");
+          const url = target(read(action, "url"));
+          if (url === null) mark("unsupported_card_structure");
           else add(url);
         });
       }));

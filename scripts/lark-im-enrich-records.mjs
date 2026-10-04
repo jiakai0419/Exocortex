@@ -9,9 +9,9 @@ import {
   releaseMaintenanceLock,
 } from "../dist/storage/sqlite/ingestion-store.js";
 
-import { larkSenderNamespaceSql, mergeLarkNameProjectionSql } from "../dist/storage/sqlite/lark-name-projection.js";
+import { larkSenderNameIsUnknownSql, larkSenderNamespaceSql, mergeLarkNameProjectionSql } from "../dist/storage/sqlite/lark-name-projection.js";
 import { createNameResolver } from "../src/adapters/lark-im/name-resolver.mjs";
-import { displayNameFromUser, personName, senderIdentity, senderOpenId } from "../src/adapters/lark-im/sender-identity.mjs";
+import { displayNameFromUser, personName, senderAliasesByOpenId, senderIdentity, senderNameFromSource, senderOpenId } from "../src/adapters/lark-im/sender-identity.mjs";
 import { createLarkCliRunner, createTransportState } from "../src/adapters/lark-im/transport.mjs";
 
 const DEFAULT_DB = "data/exocortex.sqlite";
@@ -160,20 +160,18 @@ function getSelfProfile() {
 }
 
 function senderId(raw, row, canonical) {
-  const sender = raw?.sender && typeof raw.sender === "object" ? raw.sender : {};
-  return canonical.sender_id || row.actor_id || sender.id || sender.open_id || "";
+  return canonical.sender_id || row.actor_id || senderIdentity(raw).id;
 }
 
 function senderName(raw, canonical) {
-  const sender = raw?.sender && typeof raw.sender === "object" ? raw.sender : {};
-  const id = canonical.sender_id || sender.id || sender.open_id;
-  if (canonical.sender_name_state === "cleared") return "";
-  const known = personName(canonical.sender_name, [id]);
-  if (known) return known;
   const identity = senderIdentity(raw);
+  const id = canonical.sender_id || identity.id;
+  if (canonical.sender_name_state === "cleared") return "";
+  const known = personName(canonical.sender_name, [id, ...identity.identifiers]);
+  if (known) return known;
   if (identity.conflict || identity.id && id && identity.id !== id
     || canonical.sender_id_type && identity.type && canonical.sender_id_type !== identity.type) return "";
-  return personName(sender.name, [id]) || personName(sender.display_name, [id]);
+  return senderNameFromSource(raw);
 }
 
 function senderType(raw, canonical) {
@@ -536,8 +534,7 @@ function runSenderOnly(dbPath, opts) {
       AND COALESCE(json_extract(raw_json, '$.raw_api.msg_type'), '') <> 'system'
       AND COALESCE(json_extract(canonical_json, '$.sender_type'), '') <> 'app'
       AND COALESCE(json_extract(canonical_json, '$.sender_name_state'), '') <> 'cleared'
-      AND (COALESCE(trim(json_extract(canonical_json, '$.sender_name')), '') = ''
-        OR trim(json_extract(canonical_json, '$.sender_name')) = actor_id)
+      AND ${larkSenderNameIsUnknownSql('r.canonical_json', 'r.raw_json', 'r.actor_id')}
       AND ${larkSenderNamespaceSql('r.canonical_json', 'r.raw_json', 'r.actor_id', false)} = 'typed:open_id'
       AND COALESCE(json_extract(raw_json, '$.sender.sender_type'), '') <> 'app'
       AND COALESCE(json_extract(raw_json, '$.raw_api.sender.sender_type'), '') <> 'app'
@@ -576,11 +573,11 @@ function runSenderOnly(dbPath, opts) {
     }
   };
   const resolver = createNameResolver({ run });
+  const aliases = senderAliasesByOpenId(rows.map((row) => row.raw));
   const lookupOpts = { retries: 0, retryDelayMs: 0 };
-  const directName = (row) => personName(row.raw?.sender?.name, [opts.senderId])
-    || personName(row.raw?.sender?.display_name, [opts.senderId]);
+  const directName = (row) => senderNameFromSource(row.raw);
   const needsLookup = rows.some((row) => !directName(row));
-  const contacts = needsLookup ? resolver.resolveContactNames([opts.senderId], lookupOpts) : new Map();
+  const contacts = needsLookup ? resolver.resolveContactNames([opts.senderId], lookupOpts, new Map(), aliases) : new Map();
   const members = new Map();
   if (needsLookup && !contacts.has(opts.senderId)) {
     const chats = [...new Set(rows.filter((row) => !directName(row)
@@ -589,7 +586,7 @@ function runSenderOnly(dbPath, opts) {
     remote.chat_limit_reached = chats.length > 3;
     for (const cid of chats.slice(0, 3)) {
       if (remote.budget_exhausted || remote.page_limit_reached) break;
-      const names = resolver.resolveChatMemberNames(cid, [opts.senderId], lookupOpts);
+      const names = resolver.resolveChatMemberNames(cid, [opts.senderId], lookupOpts, aliases);
       if (names.has(opts.senderId)) members.set(cid, names.get(opts.senderId));
     }
   }
@@ -703,10 +700,11 @@ function main() {
     }
   } });
   const lookupOpts = { retries: 0, retryDelayMs: 0 };
-  const contactNames = resolver.resolveContactNames(contactIds, lookupOpts, seed);
+  const aliases = senderAliasesByOpenId(rows.map((row) => row.raw));
+  const contactNames = resolver.resolveContactNames(contactIds, lookupOpts, seed, aliases);
   const memberNames = new Map();
   for (const [cid, ids] of groupUnresolved.entries()) {
-    const names = resolver.resolveChatMemberNames(cid, [...ids].filter((id) => !contactNames.has(id)), lookupOpts);
+    const names = resolver.resolveChatMemberNames(cid, [...ids].filter((id) => !contactNames.has(id)), lookupOpts, aliases);
     for (const [id, name] of names.entries()) memberNames.set(`${cid}:${id}`, name);
   }
   const appNames = resolveApplicationNames(appIds, diagnostics);

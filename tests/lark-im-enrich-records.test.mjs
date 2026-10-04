@@ -794,3 +794,202 @@ test("ordinary enrichment retries a permission failure on a later run and fills 
   assert.equal(JSON.parse(repeated.stdout).updated, 0);
   assert.deepEqual(readRecords(fixture.dbPath)[0], after);
 });
+
+const ENRICHMENT_ALIASES = Object.freeze({ open_id: "ou_fixture_alias_pottery_maker",
+  user_id: "synthetic_pottery_user_alias", union_id: "synthetic_pottery_union_alias" });
+const ALIAS_PERSON = "Synthetic Pottery Maker";
+
+function aliasEnrichmentFixture(t, senderOverrides = {}, remoteOverrides = {}, canonicalOverrides = {}) {
+  const sender = { id: ENRICHMENT_ALIASES.open_id, id_type: "open_id", sender_type: "user",
+    ...ENRICHMENT_ALIASES, ...senderOverrides };
+  const fixture = enrichmentFixture(t, { ...remoteOverrides,
+    contactUsers: [{ open_id: ENRICHMENT_ALIASES.open_id, name: ALIAS_PERSON }],
+    record: { sender, canonical: { sender_id: ENRICHMENT_ALIASES.open_id,
+      sender_name: null, chat_name: LAB.room.name, ...canonicalOverrides } },
+  });
+  const callsPath = join(fixture.dir, "alias-calls.jsonl");
+  installFakeLarkCli(fixture.dir, { dbPath: fixture.dbPath, assertNoMaintenanceLock: true,
+    contactUsers: [{ open_id: ENRICHMENT_ALIASES.open_id, name: ALIAS_PERSON }],
+    callLogPath: callsPath, ...remoteOverrides });
+  return { ...fixture, callsPath };
+}
+
+function assertAliasSourcePreserved(before, after) {
+  for (const field of ["raw_json", "content_hash", "external_version", "body", "actor_id", "container_id"])
+    assert.equal(after[field], before[field], field);
+  const omitName = value => Object.fromEntries(Object.entries(value)
+    .filter(([key]) => !["sender_id_type", "sender_name", "sender_name_source", "sender_name_confidence"].includes(key)));
+  assert.deepEqual(omitName(JSON.parse(after.canonical_json)), omitName(JSON.parse(before.canonical_json)));
+}
+
+for (const aliasType of ["user_id", "union_id"]) {
+  test(`ordinary sender alias ${aliasType} already in canonical sender_name is corrected`, (t) => {
+    const fixture = aliasEnrichmentFixture(t, {}, {}, {
+      sender_name: ENRICHMENT_ALIASES[aliasType], sender_name_source: "contact", sender_name_confidence: "high" });
+    const before = readRecords(fixture.dbPath)[0];
+    const result = runEnrichment(fixture);
+    assert.equal(result.status, 0, result.stderr);
+    const after = readRecords(fixture.dbPath)[0];
+    assert.equal(JSON.parse(after.canonical_json).sender_name, ALIAS_PERSON);
+    assertAliasSourcePreserved(before, after);
+    const searches = enrichmentCalls(fixture.callsPath).filter(args => args[0] === "contact" && args[1] === "+search-user");
+    assert.equal(searches.length, 1);
+    assert.equal(searches[0][searches[0].indexOf("--user-ids") + 1], ENRICHMENT_ALIASES.open_id);
+  });
+}
+
+test("ordinary sender alias already in canonical sender_name is corrected using only nested typed identities", (t) => {
+  const fixture = aliasEnrichmentFixture(t, { id: undefined, id_type: undefined,
+    open_id: undefined, user_id: undefined, union_id: undefined, sender_id: { ...ENRICHMENT_ALIASES } }, {},
+    { sender_name: ENRICHMENT_ALIASES.union_id });
+  const before = readRecords(fixture.dbPath)[0];
+  const result = runEnrichment(fixture);
+  assert.equal(result.status, 0, result.stderr);
+  const after = readRecords(fixture.dbPath)[0];
+  assert.equal(JSON.parse(after.canonical_json).sender_name, ALIAS_PERSON);
+  assertAliasSourcePreserved(before, after);
+  const searches = enrichmentCalls(fixture.callsPath).filter(args => args[0] === "contact" && args[1] === "+search-user");
+  assert.equal(searches.length, 1);
+  assert.equal(searches[0][searches[0].indexOf("--user-ids") + 1], ENRICHMENT_ALIASES.open_id);
+});
+
+test("ordinary sender alias evidence preserves a genuine canonical sender_name without lookup", (t) => {
+  const fixture = aliasEnrichmentFixture(t, {}, {}, { sender_name: ALIAS_PERSON });
+  const before = readRecords(fixture.dbPath)[0];
+  const result = runEnrichment(fixture);
+  assert.equal(result.status, 0, result.stderr);
+  const after = readRecords(fixture.dbPath)[0];
+  assert.equal(JSON.parse(after.canonical_json).sender_name, ALIAS_PERSON);
+  assertAliasSourcePreserved(before, after);
+  assert.deepEqual(enrichmentCalls(fixture.callsPath).map(args => args.slice(0, 2)), [["contact", "+get-user"]]);
+});
+
+for (const [aliasType, alias] of Object.entries(ENRICHMENT_ALIASES)) {
+  for (const field of ["name", "display_name"]) {
+    test(`ordinary sender alias ${aliasType} echoed in ${field} requires reliable open-ID enrichment`, (t) => {
+      const fixture = aliasEnrichmentFixture(t, { [field]: alias });
+      const before = readRecords(fixture.dbPath)[0];
+      const result = runEnrichment(fixture);
+      assert.equal(result.status, 0, result.stderr);
+      const after = readRecords(fixture.dbPath)[0];
+      const canonical = JSON.parse(after.canonical_json);
+      assert.equal(canonical.sender_name, ALIAS_PERSON);
+      assert.equal(canonical.sender_name_source, "contact");
+      assertAliasSourcePreserved(before, after);
+      const searches = enrichmentCalls(fixture.callsPath).filter(args => args[0] === "contact" && args[1] === "+search-user");
+      assert.equal(searches.length, 1);
+      assert.equal(searches[0][searches[0].indexOf("--user-ids") + 1], ENRICHMENT_ALIASES.open_id);
+    });
+  }
+  test(`ordinary sender alias ${aliasType} in name falls through to a genuine display_name`, (t) => {
+    const fixture = aliasEnrichmentFixture(t, { name: alias, display_name: ALIAS_PERSON });
+    const before = readRecords(fixture.dbPath)[0];
+    const result = runEnrichment(fixture);
+    assert.equal(result.status, 0, result.stderr);
+    const after = readRecords(fixture.dbPath)[0];
+    assert.equal(JSON.parse(after.canonical_json).sender_name, ALIAS_PERSON);
+    assertAliasSourcePreserved(before, after);
+    assert.deepEqual(enrichmentCalls(fixture.callsPath).map(args => args.slice(0, 2)), [["contact", "+get-user"]]);
+  });
+}
+
+test("ordinary sender alias in nested typed sender_id resolves the matching stored actor through open_id", (t) => {
+  const fixture = aliasEnrichmentFixture(t, { id: undefined, id_type: undefined, open_id: undefined,
+    user_id: undefined, union_id: undefined, sender_id: { ...ENRICHMENT_ALIASES },
+    name: ENRICHMENT_ALIASES.user_id });
+  const before = readRecords(fixture.dbPath)[0];
+  const result = runEnrichment(fixture);
+  assert.equal(result.status, 0, result.stderr);
+  const after = readRecords(fixture.dbPath)[0];
+  assert.equal(JSON.parse(after.canonical_json).sender_name, ALIAS_PERSON);
+  assertAliasSourcePreserved(before, after);
+  const searches = enrichmentCalls(fixture.callsPath).filter(args => args[0] === "contact" && args[1] === "+search-user");
+  assert.equal(searches.length, 1);
+  assert.equal(searches[0][searches[0].indexOf("--user-ids") + 1], ENRICHMENT_ALIASES.open_id);
+});
+
+for (const type of ["user_id", "union_id"]) {
+  for (const nested of [false, true]) {
+    test(`ordinary sender alias with only ${nested ? "nested " : ""}${type} never triggers an open-ID lookup`, (t) => {
+      const evidence = { [type]: ENRICHMENT_ALIASES.open_id };
+      const fixture = aliasEnrichmentFixture(t, { id: undefined, id_type: undefined,
+        open_id: undefined, user_id: undefined, union_id: undefined,
+        ...(nested ? { sender_id: evidence } : evidence) });
+      const before = readRecords(fixture.dbPath)[0];
+      const result = runEnrichment(fixture);
+      assert.equal(result.status, 0, result.stderr);
+      const after = readRecords(fixture.dbPath)[0];
+      assert.equal(JSON.parse(after.canonical_json).sender_name, null);
+      assertAliasSourcePreserved(before, after);
+      assert.deepEqual(enrichmentCalls(fixture.callsPath).map(args => args.slice(0, 2)), [["contact", "+get-user"]]);
+    });
+  }
+}
+
+test("ordinary sender alias remains unknown through permission failure and can recover on the next run", (t) => {
+  const fixture = aliasEnrichmentFixture(t,
+    { name: ENRICHMENT_ALIASES.user_id, display_name: ENRICHMENT_ALIASES.union_id }, { denyLookups: true });
+  const before = readRecords(fixture.dbPath)[0];
+  const denied = runEnrichment(fixture);
+  assert.equal(denied.status, 0, denied.stderr);
+  assert.equal(JSON.parse(readRecords(fixture.dbPath)[0].canonical_json).sender_name, null);
+  installFakeLarkCli(fixture.dir, { dbPath: fixture.dbPath, assertNoMaintenanceLock: true,
+    contactUsers: [{ open_id: ENRICHMENT_ALIASES.open_id, name: ALIAS_PERSON }], callLogPath: fixture.callsPath });
+  const recovered = runEnrichment(fixture);
+  assert.equal(recovered.status, 0, recovered.stderr);
+  const after = readRecords(fixture.dbPath)[0];
+  assert.equal(JSON.parse(after.canonical_json).sender_name, ALIAS_PERSON);
+  assertAliasSourcePreserved(before, after);
+});
+
+// These remote-alias counterexamples were added after the original 9b8e750
+// RED capture; the remote item intentionally omits its alternate-ID fields.
+test("ordinary sender remote alias contact echo falls back to a genuine member name", (t) => {
+  const fixture = aliasEnrichmentFixture(t, {}, {
+    contactUsers: [{ open_id: ENRICHMENT_ALIASES.open_id, name: ENRICHMENT_ALIASES.user_id }],
+    memberItems: [{ member_id: ENRICHMENT_ALIASES.open_id, name: ALIAS_PERSON }],
+  });
+  const before = readRecords(fixture.dbPath)[0];
+  const result = runEnrichment(fixture);
+  assert.equal(result.status, 0, result.stderr);
+  const after = readRecords(fixture.dbPath)[0];
+  assert.equal(JSON.parse(after.canonical_json).sender_name, ALIAS_PERSON);
+  assert.equal(JSON.parse(after.canonical_json).sender_name_source, "chat_member");
+  assertAliasSourcePreserved(before, after);
+  assert.deepEqual(enrichmentCalls(fixture.callsPath).map(args => args.slice(0, 2)),
+    [["contact", "+get-user"], ["contact", "+search-user"], ["im", "chat.members"]]);
+});
+
+test("ordinary sender remote alias contact and member echoes remain unwritten and recover next run", (t) => {
+  const fixture = aliasEnrichmentFixture(t, {}, {
+    contactUsers: [{ open_id: ENRICHMENT_ALIASES.open_id, name: ENRICHMENT_ALIASES.user_id }],
+    memberItems: [{ member_id: ENRICHMENT_ALIASES.open_id, name: ENRICHMENT_ALIASES.union_id }],
+  }, { sender_id_type: "open_id" });
+  const before = readRecords(fixture.dbPath)[0];
+  const unresolved = runEnrichment(fixture);
+  assert.equal(unresolved.status, 0, unresolved.stderr);
+  assert.equal(JSON.parse(unresolved.stdout).updated, 0);
+  assert.deepEqual(readRecords(fixture.dbPath)[0], before);
+  assert.deepEqual(enrichmentCalls(fixture.callsPath).map(args => args.slice(0, 2)),
+    [["contact", "+get-user"], ["contact", "+search-user"], ["im", "chat.members"]]);
+  installFakeLarkCli(fixture.dir, { dbPath: fixture.dbPath, assertNoMaintenanceLock: true,
+    contactUsers: [{ open_id: ENRICHMENT_ALIASES.open_id, name: ALIAS_PERSON }], callLogPath: fixture.callsPath });
+  const recovered = runEnrichment(fixture);
+  assert.equal(recovered.status, 0, recovered.stderr);
+  const after = readRecords(fixture.dbPath)[0];
+  assert.equal(JSON.parse(after.canonical_json).sender_name, ALIAS_PERSON);
+  assertAliasSourcePreserved(before, after);
+});
+
+test("ordinary sender remote alias member echo remains unknown after an empty contact response", (t) => {
+  const fixture = aliasEnrichmentFixture(t, {}, { contactUsers: [],
+    memberItems: [{ member_id: ENRICHMENT_ALIASES.open_id, name: ENRICHMENT_ALIASES.user_id }],
+  }, { sender_id_type: "open_id" });
+  const before = readRecords(fixture.dbPath)[0];
+  const result = runEnrichment(fixture);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).updated, 0);
+  assert.deepEqual(readRecords(fixture.dbPath)[0], before);
+  assert.deepEqual(enrichmentCalls(fixture.callsPath).map(args => args.slice(0, 2)),
+    [["contact", "+get-user"], ["contact", "+search-user"], ["im", "chat.members"]]);
+});

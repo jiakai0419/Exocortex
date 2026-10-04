@@ -30,6 +30,10 @@
 | 原生 `at.userID`、`<at id>` | `nativeRef`，先走显式附件桥；有附件但无可用桥时保持未知 |
 | 旧格式无附件的裸 literal | 只作 exact alias 兼容，且必须唯一对应一个身份与命名空间；碰到多 namespace 或冲突即未知，不靠 `ou_` 前缀挑一个 |
 
+sender 的兼容输入范围是有限的：接受 `sender.id` 配合显式 `id_type`、直接 `open_id/user_id/union_id/app_id`、`sender.sender_id` 对象里的同名 typed 槽，以及旧字符串 `sender_id`。actor 始终是非空字符串或缺失，按 `id → open_id → sender_id.open_id → sender_id.user_id → sender_id.union_id → 字符串 sender_id → user_id → union_id → app_id → sender_id.app_id` 的固定顺序选择；选择与声明的 namespace 必须一致。这个顺序保留原先有效字符串槽的优先级，SQL 与 JS 用组合测试校验一致。对象、数组或其他非字符串 typed 值，以及没有任何支持的 typed ID 的 `sender_id` 对象，均为不可信身份，不能直接供名或联网。IDless 消息仍可保留自身明确姓名，但没有可继承或查询的身份；无类型或未知类型的标量 ID 不授权 open-ID 查询。这是本地兼容输入合同，不表示每个形状都已在当前远端 API 观测到。
+
+所有明确 ID 槽构成同一条源消息的 alias 集合。直接姓名、远端候选与已存姓名若等于其中任何 ID，均为 unknown；原消息明确给出的 alias 即使未出现在远端响应中也有效。先做这项校验，再决定是否查询成员 fallback，不能用回显值计为 resolved 或抑制补全。共享正向缓存也不能把本次已知的 ID 回显当作成功；真实姓名、显式 clear 和同版本改进的既有规则保持。历史 sender-only 仍只修可信匹配的 open-ID 姓名，不隐式迁移错误 actor 或增加 user/union-ID 远端查询通道。
+
 sender 持久投影新增 `canonical.sender_id_type`。姓名 SQL 合并只有 effective namespace、actor 与适用的 chat 均相同才可继承。旧 canonical 缺 type 时先核对 raw 的显式类型；raw/canonical 相互矛盾不得继承。仅当两者都无类型证据时，`ou_` 兼容解释为 `open_id`、`cli_` 为 `app_id`，其他为 opaque legacy；显式 `user_id`/`union_id` 不能与这些旧兼容类型相等。该旧记录规则只服务合并兼容，不能授权联网；网络查询仍要求原始显式 typed 证据。新增类型须与 `message-record`、resolver 和补全共用同一小型身份函数，不让每条路径自行猜测。
 
 姓名状态沿用已实现的 SQL 合并合同：`resolved` 保留姓名与来源；缺字段、空 lookup、超时、拒绝、冲突为 `unknown`，不能抹掉同身份已有值；只有显式 `*_name_state=cleared`（对方为 `chat_partner.name_state`）才是权威清空。未知不能复活已清空值，新可信解析可以更新它。缓存会话名等历史证据只能补未知，不覆盖已知或权威清空。原始消息中的新姓名及同版本投影改善仍按既有版本保护规则处理。卡片临时映射只决定本次展示，不产生权威清空或修改 sender 的存储姓名。
@@ -43,7 +47,7 @@ sender 持久投影新增 `canonical.sender_id_type`。姓名 SQL 合并只有 e
 
 ## 正文、动作与诊断
 
-按节点语义遍历，而不是把所有子节点拼成一串：块级标题、段落、独立容器和字段保留边界；字段标签与值保持关联；行内文字、提及与链接连续输出，前后及尾部有语义的文本不能丢。`br` 节点换行，不承诺把任意文本里的 `<br>` 当作 HTML。语言选择沿用明确优先级，不拼接多种语言副本。
+按节点语义遍历，而不是把所有子节点拼成一串：块级标题、段落、独立容器和字段保留边界；字段标签与值保持关联。容器的 text、fields、elements、actions、columns、extra 是不同内容槽，切换到实际输出内容的槽时保留块边界；空数组或全部收起的动作不凭空增加换行，显式 br 仍保留；同一 elements 槽里的行内文字、提及与链接连续输出，前后及尾部有语义的文本不能丢。`br` 节点换行，不承诺把任意文本里的 `<br>` 当作 HTML。语言选择沿用明确优先级，不拼接多种语言副本。
 
 | 分类 | 展示规则 |
 | --- | --- |
@@ -52,6 +56,8 @@ sender 持久投影新增 `canonical.sender_id_type`。姓名 SQL 合并只有 e
 | 动作 | 只正向识别已知 request/action_request 动作，或无 navigation 且无 actions 的简单 button，确认没有可用导航链接才收起；不执行 callback/value，不把“收起”解释为完成或同意，完整数据仍在 raw。已确认纯动作被有意收起可以保持 rendered；未知 action type、未确认分类或检查超限仍为关键 partial，不默认为纯动作 |
 | 装饰 | 只有已知且不携带正文语义的装饰才可省略；不能按未知 tag、颜色或位置猜它是装饰 |
 | 未知 | 默认视为可能缺少正文，保留 partial 诊断；非空无效 URL 不得通过“无链接动作”分类被静默隐藏 |
+
+导航的 `url`、`href` 是有顺序的显式目标槽。先按既有资源预算解开支持的 `{url: …}` 包装，再统一判断 `undefined`、`null`、空串为无目标，允许选择后续槽。非空但非法、类型不支持或资源超限的首选目标仍保留诊断，不能以回退成功掩盖损坏的证据；callback/value 仍不提供导航目标。按钮是否收起在这一统一选择和安全校验之后判定。
 
 未知身份在提及原位置显示占位。若唯一问题是未知提及，`status=partial`、`reason=unresolved_card_mention` 仍保留，文本不再重复通用整行说明。内部应保留全部问题类别后再决定摘要：未知提及与无效链接、未知正文或超限并存时，后者不能被占位或折叠动作掩盖。现有单个 `reason` 字段保持兼容；采用确定的摘要优先级：存在非 mention 问题时优先选它并展示说明，例如未知提及与非法 button URL 并存不能只返回 mention reason；必要的人类缺失说明必须覆盖仍存在的关键问题，不能从“只返回一个 reason”推导“只有一个问题”。
 

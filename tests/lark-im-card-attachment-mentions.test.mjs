@@ -9,6 +9,125 @@ const moduleUrl = new URL("../src/adapters/lark-im/card-content.mjs", import.met
 const text = (content) => ({ tag: "plain_text", content });
 const at = (userID) => ({ tag: "at", property: { userID } });
 const card = (...elements) => ({ elements });
+
+test("empty navigation url does not suppress an explicit usable href", () => {
+  const result = renderCardContent(card({ tag: "button", text: text("Synthetic reference"),
+    url: "", href: "https://example.invalid/invented-reference" }));
+  assert.equal(result.text, "Synthetic reference （链接：https://example.invalid/invented-reference）");
+  assert.equal(result.status, "rendered");
+  assert.equal(result.omitted_actions, undefined);
+});
+
+test("container fields and following elements keep separate slots while inline fragments stay joined", () => {
+  const result = renderCardContent(card({ tag: "div", fields: [
+    { text: { tag: "markdown", elements: [text("Field: "), text("invented value")] } },
+  ], elements: [text("Meaningful "), text("tail")] }));
+  assert.equal(result.text, "Field: invented value\nMeaningful tail");
+  assert.equal(result.status, "rendered");
+});
+
+for (const tag of ["button", "a", "link", ""]) {
+  for (const wrappedTarget of [false, true]) {
+    for (const missing of [undefined, null, ""]) {
+      test(`${tag || "untagged"} selects href for ${wrappedTarget ? "wrapped" : "direct"} ${String(missing)} target`, () => {
+        const fixture = card({ tag, text: text("Synthetic reference"),
+          url: wrappedTarget ? { url: missing } : missing,
+          href: "https://synthetic-user:synthetic-password@example.invalid/reference?private=SYNTHETIC_QUERY#SYNTHETIC_FRAGMENT" });
+        const before = JSON.stringify(fixture);
+        const result = renderCardContent(fixture);
+        assert.equal(result.text, "Synthetic reference （链接：https://example.invalid/reference [链接敏感部分已省略]）");
+        assert.equal(result.status, "rendered");
+        assert.equal(result.reason, null);
+        assert.equal(result.omitted_actions, undefined);
+        assert.equal(JSON.stringify(fixture), before);
+      });
+    }
+  }
+}
+
+for (const [kind, value, reason] of [
+  ["scheme", "javascript:SYNTHETIC_SECRET", "unsupported_card_link"],
+  ["whitespace", " ", "unsupported_card_link"],
+  ["control", "https://synthetic-user\u001b[31m:SYNTHETIC_SECRET@example.invalid/private", "unsupported_card_link"],
+  ["shape", { nested: "SYNTHETIC_SECRET" }, "unsupported_card_structure"],
+  ["limit", "x".repeat(270_000), "card_input_limit"],
+]) {
+  for (const wrappedTarget of [false, true]) {
+    test(`invalid nonempty ${kind} ${wrappedTarget ? "wrapped" : "direct"} target stays diagnostic and never falls back to href`, () => {
+      const result = renderCardContent(card(text("Meaningful body"), {
+        tag: "button", text: text("Hidden invalid navigation"),
+        url: wrappedTarget ? { url: value } : value,
+        href: "https://example.invalid/SHOULD_NOT_BORROW_HREF",
+      }));
+      assert.equal(result.status, "partial");
+      assert.equal(result.reason, reason);
+      assert.equal(result.omitted_actions, 1);
+      assert.match(result.text, /Meaningful body\n\[卡片部分内容未展开/);
+      assert.doesNotMatch(result.text, /SYNTHETIC_SECRET|Hidden invalid navigation|SHOULD_NOT_BORROW_HREF|\u001b/);
+      assert.ok(result.text.length <= 16_000);
+    });
+  }
+}
+
+test("navigation precedence does not read ignored href, inherited wrapper data, or wrapper getters", () => {
+  let calls = 0;
+  const primary = { tag: "button", text: text("Primary"), url: { url: "https://example.invalid/primary" } };
+  Object.defineProperty(primary, "href", { get() { calls += 1; throw new Error("unselected href"); } });
+  assert.equal(renderCardContent(card(primary)).text, "Primary （链接：https://example.invalid/primary）");
+  const getter = {};
+  Object.defineProperty(getter, "url", { get() { calls += 1; return "https://example.invalid/getter"; } });
+  for (const invalid of [Object.create({ url: "https://example.invalid/inherited" }), getter]) {
+    const result = renderCardContent(card(text("Body"), { tag: "button", url: invalid,
+      href: "https://example.invalid/SHOULD_NOT_BORROW_HREF" }));
+    assert.equal(result.reason, "unsupported_card_structure");
+    assert.doesNotMatch(result.text, /inherited|getter|SHOULD_NOT_BORROW_HREF/);
+  }
+  assert.equal(calls, 0);
+});
+
+test("empty URL wrappers share target semantics in platform and explicit action navigation", () => {
+  const result = renderCardContent(card({ tag: "button", text: text("Platforms"), multi_url: {
+    url: { url: "" }, pc_url: { url: null }, ios_url: { url: "https://example.invalid/mobile" },
+  } }, { tag: "button", actions: [{ type: "open_url", action: { url: { url: "" } } }] }));
+  assert.match(result.text, /Platforms\niOS链接：https:\/\/example.invalid\/mobile/);
+  assert.equal(result.reason, "unsupported_card_structure", "an explicit open_url action still requires a target");
+  assert.equal(result.omitted_actions, 1);
+});
+
+test("empty container slots do not create boundaries inside one surrounding inline run", () => {
+  const result = renderCardContent(card({ tag: "markdown", elements: [text("A"),
+    { fields: [], elements: [text("B"), text("C")] }, text("D"), { tag: "br" },
+    text("E"), { tag: "br" }, { tag: "br" }, text("F")] }));
+  assert.equal(result.text, "ABCD\nE\n\nF");
+  assert.equal(result.status, "rendered");
+});
+
+test("trailing empty or folded slots do not add layout while explicit br still does", () => {
+  for (const emptySlot of [{ fields: [] }, { actions: [{ tag: "button" }] }, { extra: { tag: "button" } }]) {
+    const result = renderCardContent(card({ tag: "markdown", elements: [
+      { text: "A", ...emptySlot }, text("B"), { ...emptySlot }, text("C"),
+      { text: "D", elements: [{ tag: "br" }] }, text("E"),
+    ] }));
+    assert.equal(result.text, "ABCD\n\nE");
+    assert.equal(result.status, "rendered");
+  }
+});
+
+test("empty slot separators do not consume the output limit but real following content still does", () => {
+  for (const empty of [{ fields: [] }, { actions: [{ tag: "button" }] }]) {
+    const result = renderCardContent(card({ text: text("X".repeat(16_000)), ...empty }));
+    assert.equal(result.status, "rendered");
+    assert.equal(result.text.length, 16_000);
+    assert.equal(result.reason, null);
+  }
+  for (const following of [text("Y"), { tag: "br" }]) {
+    const result = renderCardContent(card({ text: text("X".repeat(16_000)), elements: [following] }));
+    assert.equal(result.reason, "card_output_limit");
+    assert.equal(result.status, "partial");
+    assert.equal(result.text.length, 16_000);
+  }
+});
+
 const sourceNames = [
   { key: "@_user_1", id: "ou_fixture_dial_maker", id_type: "open_id", name: "Dial Maker" },
   { key: "@_user_2", id: { open_id: "ou_fixture_dial_reader" }, name: "Dial Reader" },
