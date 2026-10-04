@@ -1,5 +1,7 @@
 // @ts-check
 
+import { ACTIVITY_GAP_MS, ACTIVITY_GRACE_MS, createActivityWriter } from "../diagnostics/lark-im-activity-evidence.mjs";
+
 import { spawnSync } from "node:child_process";
 import {
   appendFileSync,
@@ -91,6 +93,7 @@ const STEP_OPERATIONS = {
  * @property {number=} timeoutSeconds
  * @property {string=} scriptPath
  * @property {Record<string, number>=} cooldownsByOperation
+ * @property {Record<string, string>=} activityEnv
  * @property {() => number=} nowMs
  *
  * @typedef {object} WriteLogDeps
@@ -105,6 +108,8 @@ const STEP_OPERATIONS = {
  * @property {(path: string, ...paths: string[]) => string=} resolvePath
  *
  * @typedef {object} RunCycleDeps
+ * @property {ReturnType<typeof createActivityWriter>=} activity
+ * @property {Record<string, string>=} activityEnv
  * @property {RunStepDeps=} runStep
  * @property {WriteLogDeps=} writeLog
  * @property {() => string=} now
@@ -113,6 +118,7 @@ const STEP_OPERATIONS = {
  * @property {(steps: JsonObject[], payload: JsonObject) => void=} onComplete
  *
  * @typedef {object} RunWorkerDeps
+ * @property {ReturnType<typeof createActivityWriter>=} activity
  * @property {(opts: WorkerOptions, cycle: number, deps?: RunCycleDeps) => unknown=} runCycle
  * @property {(seconds: number) => void=} sleepSeconds
  * @property {() => number=} nowMs
@@ -262,8 +268,9 @@ function runStep(name, args, deps = {}) {
     maxBuffer: 100 * 1024 * 1024,
     timeout: Number(deps.timeoutSeconds || DEFAULT_STEP_TIMEOUT_SECONDS) * 1000,
     killSignal: "SIGKILL",
-    ...(deps.cooldownsByOperation !== undefined ? { env: {
+    ...(deps.cooldownsByOperation !== undefined || deps.activityEnv ? { env: {
       ...process.env,
+      ...deps.activityEnv,
       EXOCORTEX_LARK_COOLDOWNS_JSON: JSON.stringify(mergeTransportCooldowns(
         deps.cooldownsByOperation, {}, (deps.nowMs || Date.now)(),
       )),
@@ -401,13 +408,16 @@ function runCycle(opts, cycle, deps = {}) {
           stderr: "worker step deferred until its operation cooldown expires",
         };
       }
+      deps.activity?.update("step", { cycle, step: name, durationMs: opts.stepTimeoutSeconds * 1000 + ACTIVITY_GRACE_MS });
       const step = runStep(name, args, {
         ...deps.runStep,
+        activityEnv: deps.activityEnv,
         timeoutSeconds: opts.stepTimeoutSeconds,
         scriptPath: command === "maintenance" ? MAINTENANCE_SCRIPT : SYNC_SCRIPT,
         cooldownsByOperation: cooldowns,
         nowMs,
       });
+      deps.activity?.update("between_steps", { cycle, durationMs: ACTIVITY_GAP_MS });
       const merged = mergeTransportCooldowns(cooldowns, step.summary?.transport?.cooldowns_by_operation, nowMs());
       for (const key of Object.keys(cooldowns)) delete cooldowns[key];
       Object.assign(cooldowns, merged);
@@ -429,17 +439,24 @@ function runWorker(opts, deps = {}) {
   const nowMs = deps.nowMs || Date.now;
   const logScheduler = deps.writeScheduler || writeLog;
   const cooldowns = deps.cooldownsByOperation || {};
+  const activity = deps.activity || (!deps.runCycle ? createActivityWriter({ db: opts.db, role: "worker", now: nowMs,
+    emit: (event) => writeLog(opts, event, { stdout: { write() {} } }), }) : undefined);
+  const activityEnv = activity ? { EXOCORTEX_ACTIVITY_PARENT: activity.instanceId, EXOCORTEX_ACTIVITY_LOG_DIR: resolve(opts.logDir),
+    EXOCORTEX_ACTIVITY_STEP_TIMEOUT_MS: String(opts.stepTimeoutSeconds * 1000) } : undefined;
   let adaptiveState = createAdaptiveFairState(opts);
   let cycle = 0;
   let ok = true;
+  try {
   while (opts.maxCycles === null || cycle < opts.maxCycles) {
     cycle += 1;
     const startedMs = nowMs();
+    activity?.update("cycle", { cycle, durationMs: ACTIVITY_GAP_MS });
     /** @type {JsonObject[] | undefined} */
     let observedSteps;
     const cycleOpts = opts.adaptiveFair ? { ...opts, receivedScopesPerCycle: adaptiveState.batch } : opts;
     const cycleOk = Boolean(runOneCycle(cycleOpts, cycle, {
       cooldownsByOperation: cooldowns,
+      activity, activityEnv,
       nowMs,
       onComplete: (steps) => { observedSteps = steps; },
     }));
@@ -454,9 +471,11 @@ function runWorker(opts, deps = {}) {
       logScheduler(cycleOpts, { type: "lark_im_worker_scheduler", cycle, at: new Date(nowMs()).toISOString(), ...outcome.decision });
     }
     if (opts.maxCycles !== null && cycle >= opts.maxCycles) break;
+    activity?.update("waiting", { cycle, durationMs: opts.intervalSeconds * 1000 + ACTIVITY_GRACE_MS });
     sleep(opts.intervalSeconds);
   }
   return ok;
+  } finally { activity?.update("stopped", { cycle }); }
 }
 
 function main(argv = process.argv.slice(2)) {

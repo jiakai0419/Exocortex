@@ -155,7 +155,7 @@ for (const storageRoute of ["legacy", "normalize_record_store"]) {
       assert.equal(json.raw_json, nativeBefore);
       assert.equal(JSON.parse(json.raw.body.content).elements[0].text.content, input);
       assert.deepEqual(json.raw.mentions, [MENTION]);
-      assert.equal(json.display.card.version, 2);
+      assert.equal(json.display.card.version, 3);
       assert.equal(json.display.card.status, "rendered");
       assert.equal(json.display.card.text, normalized.content);
       if (storageRoute === "legacy") {

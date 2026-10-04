@@ -1,4 +1,5 @@
 // @ts-check
+import { databaseActivityEvidence } from "./lark-im-activity-evidence.mjs";
 
 /**
  * @typedef {Record<string, any>} Row
@@ -15,7 +16,7 @@
  * @property {Row[]} runCounts
  * @property {{evidence?: string, pending_count?: number | null}=} details
  *
- * @typedef {"syncing" | "catching_up" | "not_ready" | "needs_attention" | "ok_with_history" | "ok"} HealthState
+ * @typedef {"unknown" | "syncing" | "catching_up" | "not_ready" | "needs_attention" | "ok_with_history" | "ok"} HealthState
  */
 
 /**
@@ -42,7 +43,7 @@ function summarizeHealth({ discoveryCursor, scopeCounts, locks, runCounts, detai
   const receivedWithoutCursor = Number(scopeCounts.received_without_cursor || 0);
   if (details?.evidence === "unavailable") return "needs_attention";
   if (Number(details?.pending_count || 0) > 0) return "catching_up";
-  if (locks.length > 0 || running > 0) return "syncing";
+  if (databaseActivityEvidence(locks, running).reason === "unverified_sync_history") return "unknown";
   if (succeeded === 0 && failed > 0) return "needs_attention";
   if (succeeded === 0 || Number(scopeCounts.message_enabled || 0) === 0) return "not_ready";
   if (receivedWithoutCursor > 0 || discoveryCursor?.has_more === true) return "catching_up";
@@ -60,7 +61,7 @@ function healthDetail({ discoveryCursor, scopeCounts, locks, runCounts, details 
   if (health === "needs_attention") return "sync history contains failures but no successful run";
   const running = Number(countBy(runCounts, "status", "count").running || 0);
   const receivedWithoutCursor = Number(scopeCounts.received_without_cursor || 0);
-  if (locks.length > 0 || running > 0) return "worker is currently syncing";
+  if (databaseActivityEvidence(locks, running).reason === "unverified_sync_history") return "unfinished sync history requires current process and phase evidence";
   if (discoveryCursor?.has_more === true && receivedWithoutCursor > 0) {
     return `initial catch-up: discovery still has more pages, ${receivedWithoutCursor} chat scopes need cursors`;
   }

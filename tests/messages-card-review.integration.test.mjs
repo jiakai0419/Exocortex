@@ -112,7 +112,8 @@ function verifyReadOnlyProjection(t, originals, verify) {
     const normalized = normalizeApiMessage(original.raw);
     assert.equal(normalized.content, displayed.display.card.text);
     assert.deepEqual(normalized.content_rendering, {
-      status: displayed.display.card.status, reason: displayed.display.card.reason, version: 2,
+      status: displayed.display.card.status, reason: displayed.display.card.reason, version: 3,
+      ...(displayed.display.card.omitted_actions ? { omitted_actions: displayed.display.card.omitted_actions } : {}),
     });
     assert.deepEqual(normalized.raw_api, original.raw);
   }
@@ -193,11 +194,12 @@ test("unsupported subtitle, extra and multi_url shapes cannot silently claim a c
   ];
   verifyReadOnlyProjection(t, originals, (json, text) => {
     for (const displayed of json) {
-      assert.equal(displayed.display.card.status, "partial", displayed.external_id);
-      assert.ok(displayed.display.card.reason);
+      assert.equal(displayed.display.card.status, displayed.display.card.omitted_actions ? "structured_fallback" : "partial", displayed.external_id);
+      assert.equal(displayed.display.card.reason, "unsupported_card_structure");
+      assert.match(displayed.display.card.text, /卡片.*未展开/);
     }
-    for (const visible of ["Visible unsupported subtitle title", "Visible unsupported extra body",
-      "Visible unsupported platform button", "Visible malformed platform button"]) assert.ok(text.includes(visible));
+    for (const visible of ["Visible unsupported subtitle title", "Visible unsupported extra body"]) assert.ok(text.includes(visible));
+    assert.doesNotMatch(text, /Visible unsupported platform button|Visible malformed platform button/);
     assert.doesNotMatch(text, /NEVER_RENDER_|synthetic_future_|synthetic_console_url|"hidden"/);
   });
 });

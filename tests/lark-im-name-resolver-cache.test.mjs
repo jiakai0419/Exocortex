@@ -51,7 +51,7 @@ test("people contexts reuse positive user and application names across scopes", 
 
   for (const chat of ["oc_first", "oc_second", "oc_third"]) {
     const context = resolver.buildPeopleContext([
-      { sender: { id: "ou_person" }, chat_id: chat, chat_type: "group" },
+      { sender: { id: "ou_person", id_type: "open_id" }, chat_id: chat, chat_type: "group" },
       { sender: { id: "cli_app", sender_type: "app" }, chat_id: chat, chat_type: "group" },
     ], opts, null);
     assert.equal(context.contacts.get("ou_person"), "Person");

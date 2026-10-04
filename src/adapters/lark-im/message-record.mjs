@@ -2,6 +2,7 @@
 
 import { createHash } from "node:crypto";
 import { renderSystemContent } from "./system-content.mjs";
+import { personName, senderIdentity } from "./sender-identity.mjs";
 
 /**
  * @typedef {"sent" | "received"} MessageDirection
@@ -91,7 +92,7 @@ function senderId(message) {
 function senderName(message) {
   const sender = message?.sender;
   if (!sender || typeof sender !== "object") return "";
-  return sender.name || sender.display_name || "";
+  return personName(sender.name, [senderId(message)]) || personName(sender.display_name, [senderId(message)]);
 }
 
 /** @param {LarkMessage | null | undefined} message */
@@ -280,11 +281,12 @@ function lookupDisplayNameDetails(context, id, chatIdValue) {
   const appFallback = nameCandidate(context.app_fallbacks?.get(`${chatIdValue}:${id}`), "chat_bot_unique", "medium");
   if (appFallback) return appFallback;
   const chatMember = nameCandidate(context.chat_members?.get(`${chatIdValue}:${id}`), "chat_member", "high");
-  if (chatMember) return chatMember;
+  if (chatMember && (chatMember.state === "cleared" || personName(chatMember.name, [id]))) return chatMember;
   const contact = nameCandidate(context.contacts?.get(id), "contact", "high");
-  if (contact) return contact;
+  if (contact && (contact.state === "cleared" || personName(contact.name, [id]))) return contact;
   if (context.self?.open_id === id) {
-    return { name: context.self.name || context.self.open_id, source: "self", confidence: "high" };
+    const name = personName(context.self.name, [id]);
+    if (name) return { name, source: "self", confidence: "high" };
   }
   return null;
 }
@@ -313,6 +315,8 @@ function recordFromMessage(message, scopeId, direction, context = {}, scopeConfi
   const version = externalVersion(message);
   const updatedAtMs = version === null ? null : Number(version);
   const actorId = senderId(message);
+  const identity = senderIdentity(message);
+  const senderIdentityConflict = identity.conflict || Boolean(identity.id && identity.id !== actorId);
   const containerId = chatId(message) || scopeConfig.chat_id || "";
   const sender = message?.sender && typeof message.sender === "object" ? message.sender : {};
   const chatPartner =
@@ -321,11 +325,17 @@ function recordFromMessage(message, scopeId, direction, context = {}, scopeConfi
   const partnerId = chatPartner?.open_id || chatPartner?.id || chatPartner?.user_id || null;
   const directChatName = message?.chat_name || message?.chat?.name || "";
   const chatName = directChatName || scopeConfig.chat_name || null;
-  const senderDirectName = sender.name || sender.display_name || "";
+  const senderDirectName = senderIdentityConflict ? "" : senderName(message);
+  // Person lookup maps contain open IDs only. A user_id with the same spelling
+  // cannot consume those names, even when it starts with a familiar prefix.
+  const senderContext = senderIdentityConflict ? {} : identity.verified && identity.type === "open_id"
+    ? { contacts: context.contacts, chat_members: context.chat_members, self: context.self }
+    : identity.type === "app_id" || !identity.type && senderType(message) === "app"
+      ? { apps: context.apps, app_fallbacks: context.app_fallbacks } : {};
   /** @type {NameDetails | null} */
   const senderNameDetails = senderDirectName
     ? { name: senderDirectName, source: "message_sender", confidence: "high" }
-    : lookupDisplayNameDetails(context, actorId, containerId);
+    : lookupDisplayNameDetails(senderContext, actorId, containerId);
   const senderDisplayName = senderNameDetails?.name || "";
   const partnerDirectName = chatPartner?.name || chatPartner?.display_name || "";
   /** @type {NameDetails | null} */
@@ -341,6 +351,7 @@ function recordFromMessage(message, scopeId, direction, context = {}, scopeConfi
     update_time: message?.update_time ?? null,
     update_time_ms: updatedAtMs,
     sender_id: actorId,
+    sender_id_type: senderIdentityConflict ? "conflicting" : identity.type,
     sender_name: senderDisplayName || null,
     ...(senderNameDetails?.state === "cleared" ? { sender_name_state: "cleared" } : {}),
     sender_name_source: senderDisplayName || senderNameDetails?.state === "cleared" ? senderNameDetails?.source || null : null,

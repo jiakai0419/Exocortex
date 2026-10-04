@@ -115,13 +115,13 @@ test("old native card records render title, long multiline body, fields and butt
   const before = snapshot(fixture);
   const [json] = messages(fixture, "json");
   assertOriginalContract(json, original);
-  assert.equal(json.display.card.version, 2);
+  assert.equal(json.display.card.version, 3);
   assert.equal(json.display.card.status, "rendered");
   assert.equal(json.display.card.reason, null);
   assert.ok(json.display.card.text.length > 240);
   const normalized = normalizeApiMessage(original.raw);
   assert.equal(normalized.content, json.display.card.text, "new native ingestion and old-record display use the same card projection");
-  assert.deepEqual(normalized.content_rendering, { status: "rendered", reason: null, version: 2 });
+  assert.deepEqual(normalized.content_rendering, { status: "rendered", reason: null, version: 3 });
   assert.deepEqual(normalized.raw_api, original.raw, "projection preserves native source evidence");
   const text = messages(fixture, "text");
   for (const visible of ["Synthetic release review", ...paragraphs, "Owner: Synthetic Team", "Status: Review pending",
@@ -165,7 +165,7 @@ test("nested json_card and schema-2 body envelopes remain readable from persiste
     const displayed = json.find((record) => record.external_id === original.raw.message_id);
     assertOriginalContract(displayed, original);
     assert.equal(displayed.display.card.status, "rendered");
-    assert.equal(displayed.display.card.version, 2);
+    assert.equal(displayed.display.card.version, 3);
   }
   const text = messages(fixture, "text");
   for (const visible of ["Nested synthetic title", "Nested synthetic body", "Synthetic v2 title",

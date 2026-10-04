@@ -18,7 +18,7 @@
 
 - coverage-check 从保留的 `sync_runs` 重建覆盖；清理旧 run 会失去窗口证明，即使记录和 cursor 未变。worker 默认每 1440 个周期自动执行 `prune-runs --apply`，当前 CLI 不接受间隔 0，没有永久禁用开关。调大间隔只能延期，不能解决证据丢失；需要长期连续覆盖证明时，这仍是未解决限制。
 - doctor 子命令非零退出但输出合法健康 JSON 时，可能仍显示本地就绪；不能只靠 doctor 验收。
-- 名称解析仍可能把返回的 ID 当名称；独立 enrich-records 脚本没有自动 resolver 的全部批次和超时限制。
+- 姓名查询受远端可见性和有界群成员扫描限制；ID 回显或失败保持未知。单目标 sender-only 补全有整轮预算，常规 enrich 的记录扫描上限不等于整轮时间上限。
 - 非整分钟初始基线在短首轮成功后，游标向下取整可能落到基线之前；后续窗口可能包含起点前记录。整分钟起点不触发此特定边界，非整分钟使用仍需修复。
 - SQLite 只读查询禁止业务写入，不保证活跃 WAL 的共享内存协调文件逐字节不变。
 
@@ -97,19 +97,18 @@ PROBLEM      当前有需要处理的问题。
 
 ### Activity
 
-当前是否有同步活动的有效证据，包含独立前台同步。
+当前同步活动需要同一数据库上的阶段记录、匹配的进程实例和时间证据。完整设计与合成反例见 [Activity 证据](activity-evidence.md)。
 
 ```text
-IDLE     当前没有同步 step 在跑。
-SYNCING  观察到时间有效且未超过硬租约上限的同步锁。
-UNKNOWN  只有未结束周期或遗留 running 状态，或无法读取当前证据。
+SYNCING  当前实例处于已验证的周期/步骤，或观察到独立前台同步阶段。
+WAITING  已验证的 worker 声明处于周期间隔，且没有矛盾活动证据。
+STOPPED  后台已停，且未观察到活跃或身份未知的同步进程。
+UNKNOWN  缺阶段、过期、进程检查失败、重启身份变化或证据矛盾。
 ```
 
-`SYNCING` 通常是正常活动，不等于故障，也不证明远端完整性。worker 日志在 step 完成后才写入，最近甚至尚未收尾的历史周期都不能单独证明有 step 在跑。周期号在重启后归零，历史顺序按日志顺序处理。Service STOPPED 仍可能同时显示前台同步 Activity SYNCING。
+锁表示互斥，遗留 running 行和未结束的历史 cycle 都不能单独证明当前活动。当前阶段按日志追加顺序、实例及数据库绑定选择，不按可重置的周期号或最大时间戳猜测。worker 步骤使用真实子进程硬超时；间隔使用下次运行时间。独立前台没有整体硬期限，只在真实阶段转换后的五秒观察窗口内可证明活跃，长阻塞后诚实显示 UNKNOWN。新 worker 启动后才会产生这些阶段；旧日志不能补造它们。
 
-租约判断使用 `locked_at <= now < min(expires_at, locked_at + 1 小时)`，拒绝未来、无效和超过硬上限的时间。未过期锁是活动证据，不是 owner 进程仍存活的独立证明。
-
-Service 总览不把原始 `sync-status` 的 `health=syncing` 直接当作当前活动；该底层摘要仍可能包含遗留 run/lock，需结合 Service 的有效租约判断，不应将历史状态作为运行验收。
+Service STOPPED 仍可同时存在独立前台 Activity SYNCING。`sync-status` 和 doctor 只读取数据库证据，其 `current_activity.evidence=database_only` 不能证明阶段；锁或遗留 run 导致 UNKNOWN，不再声称 currently syncing。Service 另有阶段与 OS 观察，因此可得出更具体结果；这些检查并非原子 OS 快照，期限按最终观察时间校验。公共 JSON 保留兼容 `status`（waiting/stopped 对应 idle），新增精确 `state` 和有限时间证据，不公开进程或原始锁标识。Activity 不证明健康、完整覆盖或远端新鲜度。
 
 ### Freshness
 
@@ -136,12 +135,12 @@ node scripts/doctor.mjs --db /absolute/path/to/exocortex.sqlite \
 
 缓存写入执行项目的 `logs/lark-im/live-probe.json`，service 的 log directory 必须对应。去掉 `--write-live-cache` 即仅查看本次结果。有效样本在 service 中显示 SAMPLED，并展示范围、窗口、数量、检查/失效时间及身份未知；五分钟后回到 UNKNOWN 是预期行为。`UNAVAILABLE / keychain_unavailable` 只说明当前 shell 未完成远端采样，本地仍可能是 LOCAL_READY。
 
-### Last 24h
+### Recent cycles (up to 24h)
 
 `lark-im-service status` 展示请求窗口内保留的 worker 日志证据，不把它当作服务运行时长或完整监控覆盖。
 
 ```text
-Statistics range             可用保留日志与请求窗口相交的起点 → 本次统计时刻，明确标注不足 24h 和日志截取。
+Statistics range             例如 Today 03:11–07:26 · 4h15m；同日省略重复日期，跨日保留两端。
 Cycles                       窗口内实际读到的成功/失败/总 cycle 数。
 Last success                 窗口内最近一次成功 cycle，以及距本次统计时刻多久。
 Longest between successes    窗口内相邻两次已观察到的成功 cycle 之间的最长间隔。
@@ -149,6 +148,8 @@ Failures                     窗口内失败 cycle、失败 step 和可分类失
 ```
 
 最长间隔不包含窗口左边界到首成功，也不包含末成功到现在；后者已由 `Last success` 单列。少于两次成功时显示证据不足，JSON 为 `null`，不能显示零或整段窗口。JSON 保留精确毫秒，最长间隔的终端显示四舍五入到秒；距最近成功沿用已过去整秒。窗口起点和统计时刻都是包含边界，窗口外或未来的成功不参与相邻间隔。
+
+整段输出声明一次本地 IANA 时区；夏令时切换或重复本地小时按需保留端点偏移以消歧。正常短窗口不再重复附加不足 24h 的长说明，截断保留简短 log truncated 提示，JSON 精确范围及 coverage 语义不变。详见 [状态展示契约](status-unsupported-presentation.md)。
 
 统计范围的起点来自保留的有效 worker 事件，可能早于首成功；它不是服务启动时间。当前只读 `worker.jsonl` 的有界尾部（最多 8 MiB、20,000 个非空行），不读轮转历史；截取、损坏行或轮转都可能遗漏事件。即使保留记录达到窗口起点，也只证明读到了那个时间范围，不能证明连续运行或无遗漏。没有有效事件时范围未知，不凭空展示完整 24 小时。
 
@@ -158,7 +159,7 @@ Failures                     窗口内失败 cycle、失败 step 和可分类失
 
 这两种发现当前默认都通过 `im +chat-list --as user --exclude-muted --types group,p2p --sort active_time --page-size 100` 读取未静音群聊和私聊名单，并不是无限范围的全部会话。reconcile 默认每个 cycle 续读一页，直到 `has_more=false`，最后一页成功后在事务中记录完成时间；完成后至少间隔配置的复核周期（默认 24 小时）再开始。hot discovery 每个 cycle 从首页刷新，代码默认最多五页；当前部署通过 `--hot-discovery-pages-per-cycle 1` 限为一页，这不是代码默认值。它展示拉取成功后、提交前采集并随成功事务保存的刷新时间。两者都只是会话名单，不表示这些会话的消息已扫描完整。
 
-整体 `Health` 只在 Overview 显示一次。正常租约已由 `Activity` 的现有租约证据表达，不另列 `Locks`。过期、超过硬期限、未来开始时间或无效时间区间等已有时间戳证据会显示原因与诊断检查建议；过期不能证明进程已死亡，租约存在也不能证明进程存活或存在等待。没有阻塞证据时不声称正在等待，不猜等待时长。详细诊断仍保留原有数量、时间等信息，不默认增加原始持有者标识。
+整体 `Health` 只在 Overview 显示一次。正常租约不另列 `Locks`，也不作为 Activity 正判。过期、超过硬期限、未来开始时间或无效时间区间等已有时间戳证据会显示原因与诊断检查建议；过期不能证明进程已死亡，租约存在也不能证明进程存活或存在等待。没有阻塞证据时不声称正在等待，不猜等待时长。详细诊断仍保留原有数量、时间等信息，不默认增加原始持有者标识。
 
 ### Transient Lark Failures
 
@@ -186,7 +187,7 @@ node scripts/sync-status.mjs
 
 默认 `sync-status`、`doctor`、`lark-im-quality`、`messages`、`lark-im-service status` 的 SQLite 查询使用已有库上的 `-readonly` 与 `query_only`，不 recovery、不执行 DDL/DML、不 chmod、不写 freshness cache。缺库或缺表会失败，不自动初始化。Messages 仍是展示本人私有内容的阅读入口。`--live` 与 lag-check 会读取远端，显式缓存写入另由 `--write-live-cache` 控制。
 
-Doctor 的 LOCAL_READY 只表示本地证据；SYNCING/CATCHING_UP 是活动或追赶；NOT_READY/UNKNOWN/NEEDS_ATTENTION 不能作为完成验收。空库或缺少发现/成功消息 scope 证据是 NOT_READY，只有失败记录是 NEEDS_ATTENTION。非空有界 live 样本通过时可显示 SAMPLED；若本地仍在同步或追赶，overall 保留相应状态，live 部分单独展示样本。
+Doctor 的 LOCAL_READY 只表示本地证据；CATCHING_UP 表示本地追赶事实；旧式仅凭 run/lock 的 SYNCING 会降为 UNKNOWN；NOT_READY/UNKNOWN/NEEDS_ATTENTION 不能作为完成验收。空库或缺少发现/成功消息 scope 证据是 NOT_READY，只有失败记录是 NEEDS_ATTENTION。非空有界 live 样本通过时可显示 SAMPLED；若本地仍在追赶或缺少当前活动证据，overall 保留相应的 CATCHING_UP / UNKNOWN 状态，live 部分单独展示样本。
 
 只读查看遗留锁/run 的结构计数：
 
@@ -558,6 +559,8 @@ node scripts/doctor.mjs --live
 
 ### Unsupported Chat Scopes
 
+Service 以正常键值行显示 `Unsupported scopes`：单原因与总数同行，多原因缩进展示各自数量；保留非空错误码，不再单列空的 Lark CLI 列或重复表格。公共 JSON 原样保留原因分组。
+
 Received chat scope 的列表读取可能进入 unsupported 状态。它表示同步器识别到当前 lark-cli 身份不能读取会话列表，后续会暂停这个 scope，但本地已同步的 records 会保留。单条合并转发的详情失败不证明整个会话不可读取，不会禁用 scope。
 
 候选修复不会自动重启用历史已被禁用的 scope；纠正已有运行数据需另行确认原因并授权，不属于代码升级的隐式动作。
@@ -690,15 +693,27 @@ received 直接分页读取原生消息列表，显式请求 `only_thread_root_m
 
 ### 卡片阅读与原始数据契约
 
+身份命名空间、内容语义、诊断与实现边界统一遵循 [卡片与身份投影设计](card-and-identity-projection.md)。
+
 `messages` 的卡片阅读从已存 `raw_json` 构建展示结果，不联网、不执行按钮、不回写正文或 canonical，也不需要重同步。优先读取原生 `body.content`，解开外层 JSON 与 `json_card` 字符串；兼容旧 CLI 原始 `content`。不会把旧的格式化 fallback 或派生 canonical 正文猜成卡片原文。
 
-人类文本输出按标题、副标题、段落、字段和按钮分行，卡片不再经过普通消息的 240 字符单行压缩。解析器只处理明确支持的文本与布局节点，包括 `property` 包装、选定语言的 `i18nContent` / `i18nElements`、常见文本/Markdown、分栏、字段、容器的 `extra` 和按钮。按钮的直接地址与 `multi_url` 中默认、桌面、iOS、Android 地址分别显示；未配置的平台槽可为空，非空无效值不能被其他有效链接掩盖。它是文本投影，不是完整飞书客户端：图片、图表和未知可见节点会标明部分解析；缺少可读内容时显示说明，不将原始 JSON 倾倒到文本界面。人员提及只接受原始 mentions 中明确且无歧义的 ID 对应，不按出现顺序或 ID 前缀猜姓名。
+人类文本输出按标题、副标题、段落、字段和导航按钮分行，卡片不再经过普通消息的 240 字符单行压缩；`br` 节点和独立块边界保留为实际换行，行内节点与尾部有语义的文本仍按原顺序展示。解析器只处理明确支持的文本与布局节点，包括 `property` 包装、选定语言的 `i18nContent` / `i18nElements`、常见文本/Markdown、分栏、字段、容器的 `extra` 和按钮。明确没有可用导航链接的动作按钮默认收起，不执行回调，完整节点仍保留在 raw；有安全 HTTP(S) 地址的导航按钮继续显示。导航链接支持直接字符串地址及原生 `link.url = {url: string}` 的明确包装；按钮的直接地址与 `multi_url` 中默认、桌面、iOS、Android 地址分别显示；未配置的平台槽可为空，非空无效值不能被其他有效链接掩盖。它是文本投影，不是完整飞书客户端：图片、图表、未知可见节点、无效链接和解析超限仍明确提示，不将原始 JSON 倾倒到文本界面。
 
-`--format json` 保留已有 `body`、`canonical`、`raw`、对应 JSON 字符串与 `display.body` 的含义；卡片只新增 `display.card = {text, status, reason, version}`。展示版本为 2，旧记录 canonical 中的历史渲染版本不会被阅读命令改写。普通消息仍使用原有展示。新同步的卡片也调用同一解析器，派生正文和渲染元数据可以改善，但 source `raw_json`、content hash 与源版本不因文本投影变化而变化；同版本投影改善仍遵守已有入库比较规则。
+人员提及只接受同条原始消息中明确且无歧义的对应。除了直接匹配 `mentions` 的 ID，还读取 `body.content` 包装中的 `json_attachment.at_users`：卡片原生引用通过 `at_users` 的自有字典键或条目的 `user_id` 对应 `mention_key`，再连接同条消息的 `mentions` 取姓名。缺失或冲突的映射保持未知，不按出现顺序、ID 前缀或相似姓名猜测，不使用其他消息、缓存或联网查询补充。只有未解析提及时，在原位置显示未知提及占位，JSON 中仍保留 `status=partial` 和 `reason=unresolved_card_mention`，不再重复追加整行通用说明；同时存在其他关键缺失时，仍显示相应说明。
+
+`--format json` 保留已有 `body`、`canonical`、`raw`、对应 JSON 字符串与 `display.body` 的含义；卡片只新增 `display.card = {text, status, reason, version}`。展示版本为 3，旧记录 canonical 中的历史渲染版本不会被阅读命令改写。普通消息仍使用原有展示。新同步的卡片也调用同一解析器，派生正文和渲染元数据可以改善，但 source `raw_json`、content hash 与源版本不因文本投影变化而变化；同版本投影改善仍遵守已有入库比较规则。
 
 按钮地址、Markdown 和裸链接只展示 HTTP(S) 的 origin/path，省略凭证、查询参数和 fragment 时明确标记；其他协议或无效地址显示安全说明，不自动发请求。链接扫描在任何姓名替换之前，先消费原始文本中完整的连续非空白 URL，再识别 URL 外的 Markdown；这条规则也适用于链接标签中的 URL。URL 内的提及形状只是地址数据，不能查询姓名或消耗提及展开预算。方括号、IPv6 主机及查询中的 Markdown 形状不会把地址切成普通正文或独立链接。Markdown 目标用有界括号扫描；若 URL 吞入疑似标签闭合符，则保留安全可读内容并标为部分解析，不拆开地址来恢复语法。扫描位置只向前移动，成功或失败都消费已经检查的目标。Markdown 目标只读原始值，不展开提及；普通正文和标签中的外部提及按原始 ID 解析。每个姓名作为独立值生成并缓存安全文本，姓名中的提及不递归展开，姓名和链接的生成结果只追加到输出，不能改变父文本的 URL、标签或目标语法。完整链接仍在私有 raw 中，JSON 输出也保留原始数据。路径和正文仍可能包含私密信息，这不是可公开分享的诊断输出。原用户应通过私有 JSON 原文查看必要的完整地址，不能将显示后的省略地址当作原链接。
 
 解析的累计 JSON 字符串和待检查文本分别最多 256 Ki 个 UTF-16 单元，嵌套最多 24 层、节点访问最多 2048 次，输出含说明最多 16,000 个 UTF-16 单元。每份待处理文本及允许展开的姓名来源字符合计最多 256 Ki 个 UTF-16 单元。外部提及按完整姓名接受；预算不足时输出固定提及占位并标为不完整，不回写或拼接源文本。缓存姓名的终态投影，不先生成“提及次数 × 姓名长度”的完整中间字符串。超过累计输入预算的文本、姓名或地址整值省略并标明限制，不能在解析前截断 URL；只有完成链接投影后才截取最终展示。终端控制序列和其隐藏内容作为完整原始区间消费，不在里面解析提及或 Markdown；未闭合的控制字符串消耗剩余内容，不反复寻找结束符。文本清理与词法扫描复用同一控制区间规则，提及内部开始而越过结束标签的控制序列也不会因替换而暴露尾部；双向控制符同样移除。如果一份文本含可能改变字面结构的控制符，并且原文或清理后的文本含链接 scheme，则整份当前文本显示不支持说明，其他节点仍可阅读；因为删除控制符可能把凭证变成主机名，或只留下查询值。独立按钮地址含这些控制符也整值拒绝。普通无链接的控制文本继续清理，正常换行和制表符不触发此规则。超限明确标注不完整。限制只作用于投影，不删除已存原文。`--search` 仍匹配数据库中已有 body，读取时的卡片投影不会建立新索引或改变筛选语义。
+
+### 卡片动作状态的读取边界
+
+卡片视图显示已存原始快照中的可见内容，收起动作按钮不表示动作已完成。正常同步按 `create_time` 推进列表游标，不按 `update_time` 回查旧卡片；普通 `interactive` 卡片不进入合并转发详情队列，`--scope details` 不能用于刷新它们。本次没有新增卡片状态轮询，也不保证实时审批状态或与客户端当前视图一致。
+
+状态不一致时，先核对同一条消息的本地 raw 是否包含目标可见状态，再检查 `display.card` 的投影与状态。经授权的单条只读 GET/mget 对比可用于区分原始快照变化与 API 视图差异；应使用同一身份和 `raw_card_content`，比较源版本、原文内容与投影，不把客户端显示、单个按钮标签或解析成功当作远端状态证明。一次限定单条消息的核查中，同身份 GET 与 mget 返回的卡片内容均与本地结构一致，API 快照没有提供客户端显示的处理状态。这只能说明该次读取没有相应证据，不能直接归因于本地解析遗漏，也不能推广为所有卡片的 API 行为；不同接口返回仍可能需要进一步核对。
+
+有界回填仍使用 received 列表接口且只接受严格更高的数字版本。单条 GET 返回新内容不证明列表也已更新；同版本内容冲突会保留现状，因此不能承诺重跑回填必然刷新卡片。只读核查不改记录、游标或详情待办；后续写入和部署需要分别授权与验收。
 
 ### 列表覆盖与详情重试
 
@@ -746,3 +761,16 @@ live freshness 对热会话原始列表的首屏（含回复）仅做消息 ID �
 公平队列为已有游标和未初始化会话交替保留执行名额；同一类遇锁先在本类补位，该类无可用候选后才借出余量。失败尝试重新排队，新会话以创建时间参与排序，持续发现不会使旧会话失去执行机会。每类最多检查 `max(3×limit, limit+20)` 个候选；实际开始的 scope 不超过批量，HTTP 分页和重试次数仍由各自预算控制。维护锁使本轮立即停止。
 
 正常锁跳过不会计为采集失败，也不会作为成功吞吐帮助自适应增长。有效批次不足时保持批量；明确失败、限流和超时仍收缩。验收应分开报告热池与其余会话的 cursor 延迟、实际执行的不同 scope 数和冷队列进展。热池及时不等于全部会话都达到分钟级实时。
+
+### 精确补全历史发送者
+
+联系人与群成员请求由同一 `name-resolver.mjs` 实现，在线同步、常规 enrich 和 sender-only 模式共享 30-ID 批次、显式 page-size、localized_name 归一化、self seed 优先和失败重试语义。常规 enrich 保留其扫描范围、dry-run、诊断和事务提交；单次请求最多五秒，它仍可能包含许多批次。
+
+单目标修复使用 `--sender-only --sender-id`，需提前从可信记录取得确切 open ID。以下示例中的变量由操作者设置，不从姓名或截图猜 ID：
+
+```bash
+node scripts/lark-im-enrich-records.mjs --db "$DB_PATH" \
+  --sender-only --sender-id "$TARGET_OPEN_ID" --limit 50 --dry-run
+```
+
+此预览会发起有界只读远端查询，不写业务数据或获取维护锁。默认最多 50、上限 100 条，先筛选匹配且缺名记录再截断；总远端预算 30 秒、每次最多五秒、最多三个群和五页。零候选不联网。报告区分 unresolved、预算/页数限制、更多候选与提交冲突，未完成返回非零，不能把 updated=0 当作已修复。若预览确有可靠姓名，去掉 `--dry-run` 才是显式业务写入，需相应操作授权；只更新 sender 投影及必要身份类型，保留 raw/hash/source version/body。详情见 [共同设计](card-and-identity-projection.md)。

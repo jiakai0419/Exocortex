@@ -49,7 +49,7 @@ function expectedNameProjection(name) {
 }
 
 function assertSafe(result) {
-  assert.equal(result.version, 2);
+  assert.equal(result.version, 3);
   assert.ok(["rendered", "partial"].includes(result.status), JSON.stringify(result));
   if (result.status === "partial") assert.equal(typeof result.reason, "string");
   assert.doesNotMatch(result.text, confidential);
@@ -210,7 +210,7 @@ test("native projection preserves raw evidence, source hash and version while ke
   const normalized = normalizeApiMessage(raw);
   const record = recordFromMessage(normalized, "lark.im.sent_by_me", "sent");
   assert.equal(normalized.content, expected.text);
-  assert.deepEqual(normalized.content_rendering, { status: expected.status, reason: expected.reason, version: 2 });
+  assert.deepEqual(normalized.content_rendering, { status: expected.status, reason: expected.reason, version: 3 });
   assert.deepEqual(normalized.raw_api, raw);
   assert.equal(record.raw_json, before);
   assert.equal(record.content_hash, createHash("sha256").update(before).digest("hex"));

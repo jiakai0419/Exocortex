@@ -6,6 +6,7 @@ import {
   senderName,
   senderType,
 } from "./core.mjs";
+import { displayNameFromUser, personName, senderOpenId } from "./sender-identity.mjs";
 
 /**
  * @typedef {Record<string, any>} JsonObject
@@ -53,13 +54,6 @@ import {
 /** @param {...unknown} values */
 function firstArray(...values) {
   return values.find((value) => Array.isArray(value)) || [];
-}
-
-/** @param {unknown} user */
-function displayNameFromUser(user) {
-  if (!user || typeof user !== "object") return "";
-  const objectUser = /** @type {JsonObject} */ (user);
-  return objectUser.localized_name || objectUser.name || objectUser.display_name || objectUser.en_name || objectUser.open_id || "";
 }
 
 /**
@@ -151,7 +145,7 @@ function createNameResolver({ run, now = Date.now }) {
    * @param {Map<string, string>} [seed]
    */
   function resolveContactNames(openIds, opts, seed = new Map()) {
-    const names = new Map(seed);
+    const names = new Map([...seed].filter(([id, name]) => personName(name, [id])));
     const unresolved = uniqueOpenIds(openIds).filter((id) => {
       if (names.has(id)) return false;
       const name = cachedName(`user:${id}`);
@@ -183,14 +177,19 @@ function createNameResolver({ run, now = Date.now }) {
           },
         );
         const users = firstArray(json?.users, json?.data?.users);
+        /** @type {Map<string, string | null>} */
+        const responseNames = new Map();
         for (const user of users) {
           const openId = user?.open_id;
+          if (!ids.includes(openId)) continue;
           const name = displayNameFromUser(user);
-          if (openId && name && !seed.has(openId)) {
-            names.set(openId, name);
-            // An ID echoed as a display fallback is not a resolved name.
-            if (ids.includes(openId) && name !== openId) cacheName(`user:${openId}`, name);
-          }
+          const previous = responseNames.get(openId);
+          responseNames.set(openId, !name || responseNames.has(openId) && previous !== name ? null : name);
+        }
+        for (const [openId, name] of responseNames) {
+          if (!name) { nameCache.delete(`user:${openId}`); continue; }
+          names.set(openId, name);
+          cacheName(`user:${openId}`, name);
         }
       } catch {
         // Name enrichment is best-effort; message sync correctness must not depend on it.
@@ -218,6 +217,9 @@ function createNameResolver({ run, now = Date.now }) {
     }
 
     let pageToken = "";
+    const requestedIds = new Set(targetIds);
+    /** @type {Map<string, string | null>} */
+    const responseNames = new Map();
     for (let page = 0; page < 50 && targetIds.size > 0; page += 1) {
       const params = {
         chat_id: chatIdValue,
@@ -248,12 +250,17 @@ function createNameResolver({ run, now = Date.now }) {
         const items = firstArray(json?.items, json?.data?.items);
         for (const item of items) {
           const memberId = item?.member_id;
-          const name = item?.name || item?.localized_name || "";
-          if (memberId && targetIds.has(memberId) && name) {
-            names.set(memberId, name);
-            cacheName(`member:${JSON.stringify([chatIdValue, memberId])}`, name);
-            targetIds.delete(memberId);
-          }
+          if (!requestedIds.has(memberId)) continue;
+          const name = item?.member_id_type && item.member_id_type !== "open_id" ? "" : displayNameFromUser(item);
+          const previous = responseNames.get(memberId);
+          responseNames.set(memberId, !name || responseNames.has(memberId) && previous !== name ? null : name);
+        }
+        for (const [memberId, name] of responseNames) {
+          const key = `member:${JSON.stringify([chatIdValue, memberId])}`;
+          if (!name) { names.delete(memberId); nameCache.delete(key); targetIds.add(memberId); continue; }
+          names.set(memberId, name);
+          cacheName(key, name);
+          targetIds.delete(memberId);
         }
         const hasMore = Boolean(json?.has_more ?? json?.data?.has_more);
         pageToken = json?.page_token || json?.data?.page_token || "";
@@ -386,7 +393,8 @@ function createNameResolver({ run, now = Date.now }) {
     for (const message of messages) {
       const id = senderId(message);
       const isAppSender = senderType(message) === "app" || String(id || "").startsWith("cli_");
-      if (id && !senderName(message) && !isAppSender) contactIds.push(id);
+      const openId = senderOpenId(message);
+      if (openId && !senderName(message) && !isAppSender) contactIds.push(openId);
       const effectiveChatId = chatId(message) || scopeConfig.chat_id || "";
       if (id && !senderName(message) && isAppSender) {
         appIds.push(id);
@@ -401,9 +409,9 @@ function createNameResolver({ run, now = Date.now }) {
       if (partnerId && !(partner.name || partner.display_name)) contactIds.push(partnerId);
 
       const effectiveChatType = message?.chat_type || message?.chat?.chat_type || scopeConfig.chat_type || "";
-      if (effectiveChatId && effectiveChatType !== "p2p" && id && !senderName(message) && !isAppSender) {
+      if (effectiveChatId && effectiveChatType !== "p2p" && openId && !senderName(message) && !isAppSender) {
         if (!unresolvedByChat.has(effectiveChatId)) unresolvedByChat.set(effectiveChatId, new Set());
-        unresolvedByChat.get(effectiveChatId).add(id);
+        unresolvedByChat.get(effectiveChatId).add(openId);
       }
     }
 

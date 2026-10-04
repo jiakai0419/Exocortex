@@ -43,11 +43,11 @@ python3 -B scripts/lark-im-coverage-check.py --target "$COVERAGE_TARGET_ISO"
 - 备份先验证再发布，自动清理仅处理同一来源的有效备份。
 - received 使用原生分页并包含主题回复；sent 使用搜索与 mget 核对详情；原始内容和主题关系保留。
 - 合并转发详情失败不禁用整个会话：完整列表中的普通消息、逐根详情待办与列表进度原子保存；列表可继续向前，完整内容游标仅在欠账清零后闭合。支持 `--scope details` 有界独立补齐。列表窗口耗尽总时间预算后只再尝试一个最小前缀。
-- service 区分未加载与无法确认，启动请求失败会报错；已结束的历史 step 不证明当前同步，活动需要有效租约证据。
+- service 区分未加载与无法确认，启动请求失败会报错；已结束的历史 step 不证明当前同步，活动需要当前阶段、匹配的进程实例与有限新鲜度证据；锁只证明互斥。
 - 同步与姓名补全共用合并规则：同一身份的未知姓名保留已有值，明确清空与解析失败分开，缓存会话名不能覆盖已知或已清空姓名，同版本新证据改善仍可写入。
 - hot/fair 队列轮转并保留公平容量。自适应为可选参数；操作组冷却与重试预算不等于逐 endpoint QPS 限流。
 
-这些是代码能力，不能代替当前环境的运行验收。详细参数、默认值和边界见 [Operations](docs/operations.md)。
+这些是代码能力，不能代替当前环境的运行验收。详细参数、默认值和边界见 [Operations](docs/operations.md)。共同规则见 [身份与内容投影](docs/card-and-identity-projection.md) 和 [Activity 证据](docs/activity-evidence.md)。
 
 ## Documents
 

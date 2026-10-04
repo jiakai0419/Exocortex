@@ -86,7 +86,9 @@ function seedStaleState(db) {
 }
 
 function exerciseDiagnostics(dir, db) {
-  assert.equal(buildStatus(db).health, "syncing");
+  const status = buildStatus(db);
+  assert.equal(status.health, "unknown");
+  assert.equal(status.current_activity.reason, "unverified_sync_history");
   collectQualityReport(db);
   assert.deepEqual(loadMessages(db, { db, direction: "all", limit: 2, search: "" }), []);
   const lag = collectLagReport(db, { startMs: 0, endMs: 1000, hotChats: 1, messagesPerChat: 1 }, {
@@ -95,7 +97,8 @@ function exerciseDiagnostics(dir, db) {
   });
   assert.equal(lag.status, "inconclusive");
   const report = executeDoctor({ db, live: false, hotChats: 1, messagesPerChat: 1, format: "json" });
-  assert.equal(report.overall, "syncing");
+  assert.equal(report.overall, "unknown");
+  assert.equal(report.ok, false);
   buildServiceStatusReport({ db, label: "test", target: "test", logDir: dir }, {
     runCommand: (_cmd, args) => {
       if (args[0] === "print") return { status: 1, stdout: "", stderr: "", pid: 0, output: [], signal: null };

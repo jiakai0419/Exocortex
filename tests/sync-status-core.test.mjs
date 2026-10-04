@@ -33,13 +33,13 @@ test("countBy normalizes grouped sqlite rows", () => {
   );
 });
 
-test("health is syncing when a lock exists or a run is still running", () => {
-  assert.equal(summarizeHealth(state({ locks: [{ scope_id: "scope" }] })), "syncing");
+test("locks and running history cannot establish live synchronization", () => {
+  assert.equal(summarizeHealth(state({ locks: [{ scope_id: "scope" }] })), "unknown");
   assert.equal(
     summarizeHealth(state({ runCounts: [{ status: "running", count: 1 }] })),
-    "syncing",
+    "unknown",
   );
-  assert.equal(healthDetail(state({ locks: [{ scope_id: "scope" }] })), "worker is currently syncing");
+  assert.equal(healthDetail(state({ locks: [{ scope_id: "scope" }] })), "unfinished sync history requires current process and phase evidence");
 });
 
 test("health is catching_up while discovery or received cursors are incomplete", () => {

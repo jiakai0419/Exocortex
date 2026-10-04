@@ -1,4 +1,5 @@
 // @ts-check
+import { databaseOnlyHealth } from "./lark-im-activity-evidence.mjs";
 
 /**
  * @typedef {object} CommandResult
@@ -98,11 +99,11 @@ function buildFindings({ status, quality, live }) {
   const invalidRenderedBody = Number(quality.quality?.invalid_rendered_body || 0);
   if (status.status === "command_failed") findings.push("local status command failed");
   if (quality.status === "command_failed") findings.push("local quality command failed");
-  if (status.health === "syncing") findings.push("worker is currently syncing");
+  if (status.health === "syncing") findings.push("current activity is unverified; historical sync state is not a live phase");
   if (status.health === "catching_up") findings.push(status.health_detail || "initial catch-up is still in progress");
   if (status.health === "not_ready") findings.push("initial discovery or successful message-scope evidence is missing");
   if (status.health === "needs_attention") findings.push("local sync state needs attention");
-  if (!["syncing", "catching_up", "not_ready", "needs_attention", "ok", "ok_with_history"].includes(status.health || "")) {
+  if (!["catching_up", "not_ready", "needs_attention", "ok", "ok_with_history"].includes(databaseOnlyHealth(status.health))) {
     findings.push("local sync state is unknown");
   }
   if (missingSenderName > 0) findings.push("some senders still lack display names");
@@ -134,7 +135,7 @@ function overallStatus({ status, quality, live }) {
   ) return "needs_attention";
   if (hasActionableQualityIssues(state)) return "needs_attention";
   if (live?.status === "delayed") return "delayed";
-  if (status.health === "syncing") return "syncing";
+  if (databaseOnlyHealth(status.health) === "unknown") return "unknown";
   if (status.health === "catching_up") return "catching_up";
   if (status.health === "not_ready") return "not_ready";
   if (!["ok", "ok_with_history"].includes(status.health || "")) return "unknown";

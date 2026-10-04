@@ -742,7 +742,7 @@ function mergedCanonicalSql(existingAlias, incomingAlias) {
     const incoming = incomingAlias;
     return `(CASE WHEN ${existing}.source_id = 'lark.im' AND ${incoming}.source_id = 'lark.im'
     AND ${existing}.record_type = 'lark.im.message' AND ${incoming}.record_type = 'lark.im.message'
-    THEN ${mergeLarkNameProjectionSql(`${existing}.canonical_json`, `${incoming}.canonical_json`, `${existing}.actor_id`, `${incoming}.actor_id`, `${existing}.container_id`, `${incoming}.container_id`)}
+    THEN ${mergeLarkNameProjectionSql(`${existing}.canonical_json`, `${incoming}.canonical_json`, `${existing}.actor_id`, `${incoming}.actor_id`, `${existing}.container_id`, `${incoming}.container_id`, `${existing}.raw_json`, `${incoming}.raw_json`)}
     ELSE ${incoming}.canonical_json END)`;
 }
 function recordDiffSql(existingAlias, incomingAlias) {

@@ -28,7 +28,10 @@ function syntheticRecord({ key = "calibration", ordinal = 0, room = LAB.room,
   const messageId = ["om", "fixture", "bench", key, ordinal].join("_");
   const raw = {
     message_id: messageId, msg_type: msgType, create_time: String(occurredAt),
-    update_time: String(occurredAt + 137), chat_id: room.id, sender: { ...sender },
+    update_time: String(occurredAt + 137), chat_id: room.id,
+    // These authored person fixtures use open IDs. Explicit per-case overrides
+    // remain available; app fixtures keep their separate namespace contract.
+    sender: { ...(sender.sender_type === "user" ? { id_type: "open_id" } : {}), ...sender },
     content: content ?? { text: body },
   };
   const canonical = {
@@ -86,22 +89,25 @@ function quoteSql(value) {
   return `'${String(value).replaceAll("'", "''")}'`;
 }
 
-function installFakeLarkCli(dir, { dbPath = null, beforeSelfSql = "", assertNoMaintenanceLock = false, denyLookups = false, contactUsers = null } = {}) {
+function installFakeLarkCli(dir, { dbPath = null, beforeSelfSql = "", assertNoMaintenanceLock = false,
+  denyLookups = false, contactUsers = null, paginateContacts = false, memberItems = null, callLogPath = null } = {}) {
   const path = join(dir, "fake-lark-cli.mjs");
   writeFileSync(
     path,
     `#!/usr/bin/env node
 import { spawnSync } from "node:child_process";
+import { appendFileSync } from "node:fs";
 const args = process.argv.slice(2);
-if (args.join(" ") === "contact +get-user --as user --format json") {
-  const dbPath = ${JSON.stringify(dbPath)};
-  if (${JSON.stringify(assertNoMaintenanceLock)}) {
-    const locks = spawnSync("sqlite3", ["-readonly", dbPath, "SELECT count(*) FROM maintenance_locks;"], { encoding: "utf8" });
-    if (locks.status !== 0 || locks.stdout.trim() !== "0") {
-      process.stderr.write("network lookup unexpectedly held maintenance lock");
-      process.exit(1);
-    }
+if (${JSON.stringify(callLogPath)} !== null) appendFileSync(${JSON.stringify(callLogPath)}, JSON.stringify(args) + "\\n");
+const dbPath = ${JSON.stringify(dbPath)};
+if (${JSON.stringify(assertNoMaintenanceLock)}) {
+  const locks = spawnSync("sqlite3", ["-readonly", dbPath, "SELECT count(*) FROM maintenance_locks;"], { encoding: "utf8" });
+  if (locks.status !== 0 || locks.stdout.trim() !== "0") {
+    process.stderr.write("network lookup unexpectedly held maintenance lock");
+    process.exit(1);
   }
+}
+if (args.join(" ") === "contact +get-user --as user --format json") {
   const sql = ${JSON.stringify(beforeSelfSql)};
   if (sql) {
     const changed = spawnSync("sqlite3", [dbPath], { input: ".bail on\\n" + sql, encoding: "utf8" });
@@ -118,7 +124,17 @@ if (${JSON.stringify(denyLookups)}) {
   process.exit(1);
 }
 if (args[0] === 'contact' && args[1] === '+search-user' && ${JSON.stringify(contactUsers)} !== null) {
-  process.stdout.write(JSON.stringify({ users: ${JSON.stringify(contactUsers)} }));
+  let users = ${JSON.stringify(contactUsers)};
+  if (${JSON.stringify(paginateContacts)}) {
+    const requested = new Set((args[args.indexOf('--user-ids') + 1] || '').split(','));
+    const pageSize = args.includes('--page-size') ? Number(args[args.indexOf('--page-size') + 1]) : 20;
+    users = users.filter(user => requested.has(user.open_id)).slice(0, pageSize);
+  }
+  process.stdout.write(JSON.stringify({ users }));
+  process.exit(0);
+}
+if (args[0] === 'im' && args[1] === 'chat.members' && args[2] === 'get' && ${JSON.stringify(memberItems)} !== null) {
+  process.stdout.write(JSON.stringify({ items: ${JSON.stringify(memberItems)}, has_more: false }));
   process.exit(0);
 }
 process.stderr.write("unexpected lark-cli call: " + args.join(" "));
@@ -664,6 +680,115 @@ test("historical room enrichment fills unknown names once with explicit provenan
   assert.equal(canonical.chat_name, LAB.room.name);
   assert.equal(canonical.chat_name_source, "local_history");
   for (const field of ["raw_json", "content_hash", "external_version", "body"]) assert.equal(after[field], before[field]);
+  const repeated = runEnrichment(fixture);
+  assert.equal(repeated.status, 0, repeated.stderr);
+  assert.equal(JSON.parse(repeated.stdout).updated, 0);
+  assert.deepEqual(readRecords(fixture.dbPath)[0], after);
+});
+
+function enrichmentCalls(path) {
+  return existsSync(path) ? readFileSync(path, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse) : [];
+}
+
+test("ordinary enrichment resolves 65 distinct missing person names through explicit 30/30/5 contact pages", (t) => {
+  const users = Array.from({ length: 65 }, (_, index) => ({
+    open_id: `ou_fixture_parity_tessellation_${index}`, name: `Synthetic Tessellation Maker ${index}`,
+  }));
+  const fixture = enrichmentFixture(t, {
+    record: { key: "parity_contact_0", ordinal: 1,
+      sender: { id: users[0].open_id, sender_type: "user" }, canonical: { chat_name: LAB.room.name } },
+    contactUsers: users, paginateContacts: true,
+  });
+  const callsPath = join(fixture.dir, "parity-calls.jsonl");
+  installFakeLarkCli(fixture.dir, { dbPath: fixture.dbPath, assertNoMaintenanceLock: true,
+    contactUsers: users, paginateContacts: true, callLogPath: callsPath });
+  users.slice(1).forEach((user, index) => insertRecord(fixture.dbPath, {
+    key: `parity_contact_${index + 1}`, ordinal: index + 2,
+    sender: { id: user.open_id, sender_type: "user" }, canonical: { chat_name: LAB.room.name },
+  }));
+  const before = readRecords(fixture.dbPath);
+  const result = runEnrichment(fixture, ["--limit", "65"]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).updated, 65);
+  const requests = enrichmentCalls(callsPath).filter(args => args[0] === "contact" && args[1] === "+search-user");
+  const requestedIds = requests.map(args => args[args.indexOf("--user-ids") + 1].split(","));
+  assert.deepEqual(requestedIds.map(ids => ids.length), [30, 30, 5]);
+  for (const args of requests) assert.equal(args[args.indexOf("--page-size") + 1], "30");
+  assert.deepEqual(new Set(requestedIds.flat()), new Set(users.map(user => user.open_id)));
+  const expected = new Map(users.map(user => [user.open_id, user.name]));
+  const after = readRecords(fixture.dbPath);
+  for (let index = 0; index < after.length; index += 1) {
+    const canonical = JSON.parse(after[index].canonical_json);
+    assert.equal(canonical.sender_name, expected.get(after[index].actor_id));
+    assert.equal(canonical.sender_name_source, "contact");
+    for (const field of ["raw_json", "content_hash", "external_version", "body"])
+      assert.equal(after[index][field], before[index][field], field);
+  }
+  assert.deepEqual(maintenanceLocks(fixture.dbPath), []);
+});
+
+test("ordinary enrichment accepts a localized-only chat member name through the shared resolver", (t) => {
+  const personId = "ou_fixture_parity_localized_weaver";
+  const fixture = enrichmentFixture(t, {
+    contactUsers: [], memberItems: [{ member_id: personId, localized_name: "Synthetic Localized Weaver" }],
+    record: { sender: { id: personId, sender_type: "user" }, canonical: { chat_name: LAB.room.name } },
+  });
+  const before = readRecords(fixture.dbPath)[0];
+  const result = runEnrichment(fixture);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).updated, 1);
+  const after = readRecords(fixture.dbPath)[0];
+  const canonical = JSON.parse(after.canonical_json);
+  assert.equal(canonical.sender_name, "Synthetic Localized Weaver");
+  assert.equal(canonical.sender_name_source, "chat_member");
+  for (const field of ["raw_json", "content_hash", "external_version", "body"])
+    assert.equal(after[field], before[field], field);
+});
+
+test("ordinary enrichment keeps the fresh self seed when another lookup returns an unsolicited old self name", (t) => {
+  const otherId = "ou_fixture_parity_glaze_reader";
+  const responses = [{ open_id: LAB.self.open_id, name: "Synthetic Obsolete Operator" },
+    { open_id: otherId, name: "Synthetic Glaze Reader" }];
+  const fixture = enrichmentFixture(t, {
+    contactUsers: responses,
+    record: { key: "parity_self", ordinal: 1,
+      sender: { id: LAB.self.open_id, sender_type: "user" }, canonical: { chat_name: LAB.room.name } },
+  });
+  insertRecord(fixture.dbPath, { key: "parity_other", ordinal: 2,
+    sender: { id: otherId, sender_type: "user" }, canonical: { chat_name: LAB.room.name } });
+  const callsPath = join(fixture.dir, "parity-calls.jsonl");
+  installFakeLarkCli(fixture.dir, { dbPath: fixture.dbPath, assertNoMaintenanceLock: true,
+    contactUsers: responses, callLogPath: callsPath });
+  const result = runEnrichment(fixture);
+  assert.equal(result.status, 0, result.stderr);
+  const rows = readRecords(fixture.dbPath);
+  assert.equal(JSON.parse(rows.find(row => row.actor_id === LAB.self.open_id).canonical_json).sender_name, LAB.self.name);
+  assert.equal(JSON.parse(rows.find(row => row.actor_id === otherId).canonical_json).sender_name, "Synthetic Glaze Reader");
+  const requests = enrichmentCalls(callsPath).filter(args => args[0] === "contact" && args[1] === "+search-user");
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0][requests[0].indexOf("--user-ids") + 1], otherId);
+  assert.doesNotMatch(JSON.stringify(rows), /Synthetic Obsolete Operator/);
+});
+
+test("ordinary enrichment retries a permission failure on a later run and fills the same source version once", (t) => {
+  const personId = "ou_fixture_parity_pottery_reader";
+  const fixture = enrichmentFixture(t, {
+    denyLookups: true,
+    record: { sender: { id: personId, sender_type: "user" }, canonical: { chat_name: LAB.room.name } },
+  });
+  const before = readRecords(fixture.dbPath)[0];
+  const denied = runEnrichment(fixture);
+  assert.equal(denied.status, 0, denied.stderr);
+  assert.equal(JSON.parse(readRecords(fixture.dbPath)[0].canonical_json).sender_name, null);
+  installFakeLarkCli(fixture.dir, { dbPath: fixture.dbPath, assertNoMaintenanceLock: true,
+    contactUsers: [{ open_id: personId, name: "Synthetic Pottery Reader" }] });
+  const recovered = runEnrichment(fixture);
+  assert.equal(recovered.status, 0, recovered.stderr);
+  assert.equal(JSON.parse(recovered.stdout).updated, 1);
+  const after = readRecords(fixture.dbPath)[0];
+  assert.equal(JSON.parse(after.canonical_json).sender_name, "Synthetic Pottery Reader");
+  for (const field of ["raw_json", "content_hash", "external_version", "body"])
+    assert.equal(after[field], before[field], field);
   const repeated = runEnrichment(fixture);
   assert.equal(repeated.status, 0, repeated.stderr);
   assert.equal(JSON.parse(repeated.stdout).updated, 0);

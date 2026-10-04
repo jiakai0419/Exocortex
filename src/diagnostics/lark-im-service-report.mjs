@@ -1,6 +1,7 @@
 // @ts-check
 
 import { readOnlySqliteJson } from "../storage/sqlite/readonly-query.mjs";
+import { summarizeHealth } from "./sync-status-core.mjs";
 import { summarizeLockEvidence } from "./lark-im-lock-evidence.mjs";
 
 import { spawnSync } from "node:child_process";
@@ -13,7 +14,7 @@ import {
 } from "node:fs";
 import { resolve } from "node:path";
 import { summarizeWorkerEvents } from "../../dist/runtime/worker/lark-im-worker-core.js";
-import { DEFAULT_HARD_LEASE_SECONDS } from "../../dist/storage/sqlite/ingestion-store.js";
+import { activityDatabaseKey, inspectActivityProcesses, latestActivityEvents, evaluateActivityEvent } from "./lark-im-activity-evidence.mjs";
 import { classifyLarkFailure } from "../adapters/lark-im/transport.mjs";
 import { readLiveProbeCache, liveProbeContext, DEFAULT_LIVE_PROBE_TTL_MS } from "./live-probe-cache.mjs";
 import { diagnosticSubprocessError } from "./public-safe.mjs";
@@ -33,6 +34,7 @@ const DEFAULT_DB = "data/exocortex.sqlite";
  * @property {boolean} exists
  * @property {JsonObject[]} events
  * @property {boolean=} truncated
+ * @property {boolean=} activity_integrity
  *
  * @typedef {object} ServiceStatusOptions
  * @property {string} label
@@ -47,6 +49,7 @@ const DEFAULT_DB = "data/exocortex.sqlite";
  * @property {(path: string) => JsonObject | null=} readLiveProbeCache
  * @property {(path: string) => JsonObject | null=} liveProbeContext
  * @property {(dbPath: string, sql: string, label: string) => JsonObject[]=} sqliteJson
+ * @property {typeof inspectActivityProcesses=} inspectActivityProcesses
  * @property {number=} nowMs
  * @property {() => number=} clock
  * @property {number=} freshnessMaxAgeMs
@@ -61,7 +64,7 @@ const DEFAULT_DB = "data/exocortex.sqlite";
  * @property {ReturnType<typeof summarizeLockEvidence>} leases
  * @property {{status: ServiceRuntimeStatus, detail: string}} service
  * @property {{status: ServiceHealthStatus, detail: string}} health
- * @property {{status: ServiceActivityStatus, detail: string}} activity
+ * @property {{status: ServiceActivityStatus, state: string, detail: string}} activity
  * @property {{status: ServiceFreshnessStatus, detail: string}} freshness
  */
 
@@ -183,14 +186,19 @@ function readRecentWorkerEvents(logDir, limits = {}) {
   const lines = allLines.slice(-maxEvents);
   /** @type {JsonObject[]} */
   const events = [];
+  let activityIntegrity = tail.text.endsWith("\n");
   for (const line of lines) {
     try {
-      events.push(JSON.parse(line));
+      const event = JSON.parse(line);
+      if (!event || typeof event !== "object" || Array.isArray(event)) { activityIntegrity = false; continue; }
+      if (!["lark_im_worker_cycle", "lark_im_worker_step", "lark_im_worker_scheduler", "lark_im_worker_activity"].includes(event.type)) activityIntegrity = false;
+      events.push(event);
     } catch {
-      // Ignore partial or non-JSON lines; retained events do not prove continuity.
+      // Never fall back to an older phase after a damaged or partial event.
+      activityIntegrity = false;
     }
   }
-  return { path, exists: true, events, truncated: tail.truncated || allLines.length > maxEvents };
+  return { path, exists: true, events, truncated: tail.truncated || allLines.length > maxEvents, activity_integrity: activityIntegrity };
 }
 
 /**
@@ -350,19 +358,32 @@ function summarizeServiceHealth({ service, syncStatus, syncErrorText = "", worke
   if (service.status !== "running") return { status: "problem", detail: "background service is stopped" };
   if (!syncStatus) return { status: "problem", detail: syncErrorText || "sync status unavailable" };
   const rawHealth = String(syncStatus.health || "").toLowerCase();
-  if (["failed", "needs_attention", "problem", "command_failed", "not_ready", "unknown"].includes(rawHealth)) {
+  const databasePhaseUnknown = rawHealth === "unknown" && syncStatus.current_activity?.evidence === "database_only"
+    && syncStatus.current_activity?.reason === "unverified_sync_history";
+  const historicalHealth = databasePhaseUnknown ? summarizeHealth({
+    discoveryCursor: syncStatus.discovery?.cursor, scopeCounts: syncStatus.scopes || {}, locks: [],
+    runCounts: Object.entries(syncStatus.runs?.by_status || {}).filter(([status]) => status !== "running")
+      .map(([status, count]) => ({ status, count })), details: syncStatus.details,
+  }) : null;
+  if (databasePhaseUnknown && activity?.status === "syncing" && ["needs_attention", "not_ready"].includes(String(historicalHealth))) {
+    return { status: "problem", detail: historicalHealth === "not_ready"
+      ? "initial discovery or successful message-scope evidence is missing"
+      : "sync history contains failures but no successful run" };
+  }
+  if (["failed", "needs_attention", "problem", "command_failed", "not_ready", "unknown"].includes(rawHealth)
+    && !(databasePhaseUnknown && activity?.status === "syncing")) {
     return { status: "problem", detail: syncStatus.health_detail || rawHealth };
   }
   if (workerSummary.last_cycle?.ok === false && activity?.status !== "syncing") {
     return { status: "problem", detail: "last worker cycle failed" };
   }
-  if (isCatchingUp(syncStatus)) {
+  if (isCatchingUp(syncStatus) || historicalHealth === "catching_up") {
     if (Number(syncStatus.details?.pending_count || 0) > 0) {
       return { status: "catching_up", detail: `${Number(syncStatus.details.pending_count)} message details await retry` };
     }
     return { status: "catching_up", detail: rawHealth === "catching_up" ? syncStatus.health_detail || "sync is still catching up" : "known scopes still need catch-up" };
   }
-  if (rawHealth === "syncing") {
+  if (rawHealth === "syncing" || databasePhaseUnknown) {
     if (activity?.status !== "syncing") return { status: "problem", detail: "unfinished sync history has no current activity evidence" };
     return { status: "ok", detail: "sync activity observed; this does not verify remote freshness" };
   }
@@ -371,29 +392,73 @@ function summarizeServiceHealth({ service, syncStatus, syncErrorText = "", worke
 }
 
 /**
- * @param {{service: {status: ServiceRuntimeStatus}, syncStatus: JsonObject | null, workerSummary: JsonObject, nowMs?: number}} input
- * @returns {{status: ServiceActivityStatus, detail: string}}
+ * Current phases and OS identity establish activity; leases only diagnose
+ * unidentified possible work. Historical completed events never establish it.
+ * @param {{service: {status: ServiceRuntimeStatus}, syncStatus: JsonObject | null, workerSummary: JsonObject, nowMs?: number, activityEvidence?: JsonObject, launchd?: JsonObject}} input
  */
-function summarizeServiceActivity({ service, syncStatus, workerSummary, nowMs = Date.now() }) {
-  if (!syncStatus || syncStatus.status === "command_failed" || !syncStatus.health) {
-    return { status: "unknown", detail: "sync status unavailable; current activity cannot be determined" };
-  }
-  const activeLease = (Array.isArray(syncStatus?.locks) ? syncStatus.locks : []).some((lock) => {
-    const lockedAt = Date.parse(String(lock.locked_at || ""));
-    const expiresAt = Date.parse(String(lock.expires_at || ""));
-    return Number.isFinite(lockedAt) && Number.isFinite(expiresAt) && lockedAt <= nowMs &&
-      nowMs < Math.min(expiresAt, lockedAt + DEFAULT_HARD_LEASE_SECONDS * 1000);
+function summarizeServiceActivity({ service, syncStatus, nowMs = Date.now(), activityEvidence, launchd = {} }) {
+  /** @param {string} state @param {string} detail @param {JsonObject} [fields] */
+  const result = (state, detail, fields = {}) => ({
+    status: /** @type {ServiceActivityStatus} */ (state === "waiting" || state === "stopped" ? "idle" : state), state, detail, ...fields,
   });
-  // Foreground sync owns the same database leases even while launchd is stopped.
-  if (activeLease) return { status: "syncing", detail: "unexpired sync lease observed" };
-  if (workerSummary.unfinished_cycle || workerSummary.in_progress || String(syncStatus?.health || "").toLowerCase() === "syncing") {
-    return { status: "unknown", detail: "unfinished sync history has no current activity evidence" };
+  if (!syncStatus || syncStatus.status === "command_failed" || !syncStatus.health) {
+    return result("unknown", "sync status unavailable; current activity cannot be determined");
   }
-  if (workerSummary.last_cycle) {
-    return { status: "idle", detail: `last cycle #${workerSummary.last_cycle.cycle}` };
+  if (activityEvidence?.database_identity_stable === false) return result("unknown", "database file identity changed or is unavailable");
+  if (activityEvidence?.integrity === false || activityEvidence?.truncated) {
+    return result("unknown", "current phase evidence is incomplete");
   }
-  if (service.status === "stopped") return { status: "idle", detail: "service stopped" };
-  return { status: "idle", detail: "no worker cycle yet" };
+  const events = activityEvidence?.events || [];
+  const processes = activityEvidence?.processes || new Map();
+  const evaluated = events.map((event) => ({ event,
+    value: evaluateActivityEvent(event, processes.get(event.pid), activityEvidence?.database_key || "", nowMs),
+  })).filter((item) => item.value.state !== "other_database" && item.value.state !== "dead");
+  const workerPids = new Set(events.filter((event) => event.role === "worker").map((event) => event.pid));
+  if (launchd.pid) workerPids.add(Number(launchd.pid));
+  const worker = evaluated.find((item) => item.event.role === "worker"
+    && (service.status !== "running" || item.event.pid === Number(launchd.pid)));
+  const children = evaluated.filter((item) => item.event.role === "sync" && item.value.state !== "stopped");
+  const independent = [];
+  for (const child of children) {
+    const ppid = processes.get(child.event.pid)?.ppid;
+    const parent = child.event.parent_instance;
+    if (parent || workerPids.has(ppid)) {
+      if (!worker || parent !== worker.event.instance_id || ppid !== worker.event.pid
+        || worker.value.state !== "syncing") {
+        return result("unknown", "worker and child phase evidence disagree");
+      }
+    } else if (!Number.isSafeInteger(ppid) || ppid < 1) {
+      return result("unknown", "foreground process parent is unavailable");
+    } else independent.push(child);
+  }
+  const foreground = independent.find((item) => item.value.state === "syncing");
+  if (foreground) return result("syncing", "foreground sync observed", {
+    phase: "sync", updated_at: foreground.value.updated_at, valid_until: foreground.value.valid_until,
+    evidence: "recent_foreground_phase", observed_at: activityEvidence?.observed_at || null,
+  });
+  if (worker?.value.state === "syncing" && service.status !== "unknown") {
+    const value = worker.value;
+    return result("syncing", `cycle #${value.cycle || "?"}${value.step ? ` · ${value.step}` : " · between steps"}`, {
+      phase: value.phase, cycle: value.cycle, updated_at: value.updated_at, valid_until: value.valid_until,
+      evidence: "verified_worker_phase", observed_at: activityEvidence?.observed_at || null,
+    });
+  }
+  const uncertainEvent = evaluated.some((item) => item.value.state === "unknown" || item.value.state === "syncing");
+  // Expiry ends the reservation, not the owner's process. Both live and
+  // uninspectable owners prevent an unsupported overall WAITING/STOPPED claim.
+  const uncertainOwner = !Array.isArray(syncStatus.locks) || syncStatus.locks.some((lock) => {
+    const at = Date.parse(String(lock.owner_observed_at || ""));
+    return lock.owner_state !== "dead" || !Number.isFinite(at) || at > nowMs || nowMs - at > 5000;
+  });
+  if (uncertainEvent || uncertainOwner) return result("unknown", "current phase or owner evidence is unavailable");
+  if (worker?.value.state === "waiting" && service.status !== "unknown") {
+    return result("waiting", `between cycles · last cycle #${worker.value.cycle || "?"}`, {
+      phase: "waiting", cycle: worker.value.cycle, updated_at: worker.value.updated_at, valid_until: worker.value.valid_until,
+      evidence: "verified_worker_phase", observed_at: activityEvidence?.observed_at || null,
+    });
+  }
+  if (service.status === "stopped") return result("stopped", "no current local sync process observed");
+  return result("unknown", "current worker phase is unavailable");
 }
 
 /**
@@ -459,7 +524,7 @@ function summarizeServiceFreshness(liveProbe, nowMs = Date.now(), maxAgeMs = DEF
 }
 
 /**
- * @param {{launchd: JsonObject, syncStatus: JsonObject | null, syncErrorText?: string, workerSummary: JsonObject, liveProbe?: JsonObject | null, expectedContext?: JsonObject | null, nowMs?: number, freshnessMaxAgeMs?: number}} input
+ * @param {{launchd: JsonObject, syncStatus: JsonObject | null, syncErrorText?: string, workerSummary: JsonObject, liveProbe?: JsonObject | null, expectedContext?: JsonObject | null, nowMs?: number, freshnessMaxAgeMs?: number, activityEvidence?: JsonObject}} input
  * @returns {ServiceOverview}
  */
 function buildServiceOverview({
@@ -471,9 +536,10 @@ function buildServiceOverview({
   expectedContext = null,
   nowMs = Date.now(),
   freshnessMaxAgeMs = DEFAULT_FRESHNESS_MAX_AGE_MS,
+  activityEvidence,
 }) {
   const service = summarizeServiceRuntime(launchd);
-  const activity = summarizeServiceActivity({ service, syncStatus, workerSummary, nowMs });
+  const activity = summarizeServiceActivity({ service, syncStatus, workerSummary, nowMs, activityEvidence, launchd });
   return {
     service,
     leases: summarizeLockEvidence(syncStatus?.locks, nowMs),
@@ -493,6 +559,7 @@ function buildServiceStatusReport(opts, deps = {}) {
   const summarize = deps.summarizeWorkerEvents || summarizeWorkerEvents;
   const readFreshnessCache = deps.readLiveProbeCache || readLiveProbeCache;
   const now = () => deps.nowMs ?? (deps.clock || Date.now)();
+  const initialDatabaseKey = activityDatabaseKey(opts.db || DEFAULT_DB);
   const launchd = run("launchctl", ["print", opts.target], { allowFailure: true });
   const inspection = classifyLaunchdPrint(launchd);
   const loaded = inspection === "unknown" ? null : inspection === "loaded";
@@ -516,8 +583,14 @@ function buildServiceStatusReport(opts, deps = {}) {
   }
   // Synchronous diagnostic reads can outlast a lease or observe one acquired
   // after collection began. Evaluate all temporal evidence after those reads.
+  const candidates = latestActivityEvents(workerLog.events, initialDatabaseKey, now());
+  const processes = (deps.inspectActivityProcesses || inspectActivityProcesses)(candidates.events.map((event) => Number(event.pid)));
+  const finalDatabaseKey = activityDatabaseKey(opts.db || DEFAULT_DB);
   const nowMs = now();
-  const workerSummary = summarize(workerLog.events, nowMs);
+  const activityEvidence = { ...candidates, processes, database_key: finalDatabaseKey,
+    database_identity_stable: initialDatabaseKey !== null && initialDatabaseKey === finalDatabaseKey,
+    integrity: workerLog.activity_integrity !== false, observed_at: new Date(nowMs).toISOString() };
+  const workerSummary = summarize(workerLog.events.filter((event) => event.type !== "lark_im_worker_activity"), nowMs);
   const workerStability = summarizeWorkerStability(
     workerLog.events,
     nowMs,
@@ -546,6 +619,7 @@ function buildServiceStatusReport(opts, deps = {}) {
       syncStatus,
       syncErrorText,
       workerSummary,
+      activityEvidence,
       liveProbe,
       expectedContext,
       nowMs,
@@ -558,7 +632,7 @@ function buildServiceStatusReport(opts, deps = {}) {
       error_text: syncErrorText,
     },
     worker: {
-      log: workerLog,
+      log: { ...workerLog, events: workerLog.events.filter((event) => event.type !== "lark_im_worker_activity") },
       summary: workerSummary,
     },
     stability: workerStability,

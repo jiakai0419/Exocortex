@@ -15,6 +15,16 @@ import {
 } from "../src/diagnostics/lark-im-service-report.mjs";
 import { renderServiceStatusText } from "../src/terminal/lark-im-service-view.mjs";
 
+
+function activePhaseEvidence(nowMs) {
+  const started = nowMs - 60000;
+  return { database_key: "b".repeat(64), events: [{ type: "lark_im_worker_activity", version: 1,
+    role: "worker", pid: 123, instance_id: "synthetic-worker", parent_instance: null,
+    process_started_at_ms: started, database_key: "b".repeat(64), phase: "step", cycle: 13, step: "sent",
+    updated_at: new Date(nowMs - 1000).toISOString(), valid_until: new Date(nowMs + 10000).toISOString() }],
+    processes: new Map([[123, { state: "alive", started_at_ms: started, ppid: 111 }]]) };
+}
+
 function spawnResult(overrides = {}) {
   return {
     status: 0,
@@ -192,7 +202,7 @@ test("service status report parses launchd, sync status, and worker log summary"
   assert.equal(report.sync.status.health, "ok_with_history");
   assert.equal(report.overview.service.status, "running");
   assert.equal(report.overview.health.status, "ok");
-  assert.equal(report.overview.activity.status, "idle");
+  assert.equal(report.overview.activity.status, "unknown");
   assert.equal(report.overview.freshness.status, "sampled");
   assert.equal(report.overview.freshness.detail, "3 recent hot messages sampled 1m ago; auth identity unknown");
   assert.match(report.freshness.cache_path, /logs\/test\/live-probe\.json$/);
@@ -309,6 +319,7 @@ test("service overview separates service, health, activity, and freshness", () =
     }),
     liveProbe: probeFixture("2026-06-20T00:01:00.000Z"),
     expectedContext: probeContext,
+    activityEvidence: activePhaseEvidence(Date.parse("2026-06-20T00:01:00.000Z")),
     nowMs: Date.parse("2026-06-20T00:01:00.000Z"),
   });
 
@@ -338,7 +349,7 @@ test("service overview keeps catch-up as health, not activity", () => {
 
   assert.equal(overview.service.status, "running");
   assert.equal(overview.health.status, "catching_up");
-  assert.equal(overview.activity.status, "idle");
+  assert.equal(overview.activity.status, "unknown");
   assert.equal(overview.freshness.status, "unknown");
 });
 
@@ -366,7 +377,7 @@ test("service overview maps delayed and stale live caches to freshness states", 
   assert.equal(stale.freshness.detail, "last live probe stale, checked 2d ago");
 });
 
-test("service overview can show sync activity from locks without claiming worker log progress", () => {
+test("service overview does not treat a reservation as current synchronization", () => {
   const overview = buildServiceOverview({
     launchd: { loaded: true, state: "running", pid: "123" },
     syncStatus: syncStatusFixture({ health: "syncing", locks: [{ locked_at: "2026-06-20T00:00:00.000Z", expires_at: "2026-06-20T00:02:00.000Z" }] }),
@@ -374,9 +385,9 @@ test("service overview can show sync activity from locks without claiming worker
     nowMs: Date.parse("2026-06-20T00:01:00.000Z"),
   });
 
-  assert.equal(overview.health.status, "ok");
-  assert.equal(overview.activity.status, "syncing");
-  assert.equal(overview.activity.detail, "unexpired sync lease observed");
+  assert.equal(overview.health.status, "problem");
+  assert.equal(overview.activity.status, "unknown");
+  assert.match(overview.activity.detail, /phase or owner evidence/);
 });
 
 test("service status view renders launchd, sync, unsupported scopes, and worker sections", () => {
@@ -408,14 +419,14 @@ test("service status view renders launchd, sync, unsupported scopes, and worker 
   assert.match(output, /Activity\s+IDLE/);
   assert.match(output, /Freshness\s+UNKNOWN no cached live probe/);
   assert.doesNotMatch(output, /OK_WITH_HISTORY/);
-  assert.match(output, /Last 24h/);
+  assert.match(output, /Recent cycles \(up to 24h\)/);
   assert.match(output, /Cycles\s+11 ok, 1 failed, 12 total/);
   assert.match(output, /Last success\s+#12 1m ago/);
   assert.match(output, /Longest between successes\s+41m/);
   assert.match(output, /Failures\s+1 failed cycle, received-catchup x2, rate_limited x1/);
   assert.match(output, /LaunchAgent/);
   assert.match(output, /Records\s+3 total, 1 sent, 2 received/);
-  assert.match(output, /Unsupported scopes\s+1 total/);
+  assert.match(output, /Unsupported scopes\s+1 · restricted_mode \(access restricted\)/);
   assert.match(output, /restricted_mode/);
   assert.match(output, /Worker/);
   assert.match(output, /received-catchup/);
@@ -563,7 +574,7 @@ test("unavailable launchd inspection is UNKNOWN in report and view, not stopped"
   assert.doesNotMatch(output, /STOPPED|NOT LOADED/);
 });
 
-test("foreground leases establish activity even when background service is stopped", () => {
+test("foreground leases alone cannot establish activity when background service is stopped", () => {
   const now = Date.parse("2026-06-20T12:00:00.000Z");
   const overview = buildServiceOverview({
     launchd: { loaded: false },
@@ -573,8 +584,8 @@ test("foreground leases establish activity even when background service is stopp
   });
   assert.equal(overview.service.status, "stopped");
   assert.equal(overview.health.status, "problem");
-  assert.equal(overview.activity.status, "syncing");
-  assert.equal(overview.activity.detail, "unexpired sync lease observed");
+  assert.equal(overview.activity.status, "unknown");
+  assert.match(overview.activity.detail, /phase or owner evidence/);
 });
 
 test("expired, malformed, future and hard-expired leases cannot establish activity", () => {
@@ -611,7 +622,8 @@ test("unfinished steps or running rows without leases never masquerade as active
         workerSummary,
         nowMs: now,
       });
-      assert.equal(overview.activity.status, "unknown");
+      assert.equal(overview.activity.status, loaded ? "unknown" : "idle");
+      assert.notEqual(overview.activity.state, "syncing");
       assert.equal(overview.health.status, "problem");
       assert.equal(workerSummary.last_step.cycle, 91);
     }
@@ -641,11 +653,12 @@ test("catch-up detail does not repeat a stale raw syncing claim", () => {
   assert.equal(overview.health.detail, "known scopes still need catch-up");
 });
 
-test("current lease permits recovery activity after a failed historical cycle", () => {
+test("verified current phase permits recovery activity after a failed historical cycle", () => {
   const overview = buildServiceOverview({
-    launchd: { loaded: true, state: "running" },
+    launchd: { loaded: true, state: "running", pid: 123 },
     syncStatus: syncStatusFixture({ health: "syncing", locks: [{ locked_at: "2026-06-20T11:59:00.000Z", expires_at: "2026-06-20T12:01:00.000Z" }] }),
     workerSummary: workerSummaryFixture({ last_cycle: { cycle: 1, ok: false }, in_progress: false }),
+    activityEvidence: activePhaseEvidence(Date.parse("2026-06-20T12:00:00.000Z")),
     nowMs: Date.parse("2026-06-20T12:00:00.000Z"),
   });
   assert.equal(overview.health.status, "ok");
@@ -691,7 +704,8 @@ test("service evaluates a foreground lease acquired during a slow sync query aga
     },
   );
   assert.equal(report.overview.service.status, "stopped");
-  assert.equal(report.overview.activity.status, "syncing");
+  assert.equal(report.overview.activity.status, "unknown");
+  assert.equal(report.overview.leases.occupied_count, 1);
   assert.equal(report.stability.window_started_at, new Date(clockMs - report.stability.window_ms).toISOString());
 });
 
@@ -742,7 +756,8 @@ test("service reads its evaluation clock after optional evidence queries, while 
         sqliteJson: () => { clockMs += 1000; return []; },
       },
     );
-    assert.equal(report.overview.activity.status, fixedClock ? "syncing" : "unknown");
+    assert.equal(report.overview.activity.status, "unknown");
+    assert.equal(report.overview.leases.occupied_count, fixedClock ? 1 : 0);
     assert.equal(report.stability.window_started_at, new Date((fixedClock ? startedAt : clockMs) - report.stability.window_ms).toISOString());
   }
 });
@@ -751,13 +766,14 @@ test("pending message details prevent service health from claiming completion ev
   const nowMs = Date.parse("2026-06-20T12:00:00.000Z");
   for (const health of ["ok", "ok_with_history", "syncing", "catching_up"]) {
     const overview = buildServiceOverview({
-      launchd: { loaded: true, state: "running" },
+      launchd: { loaded: true, state: "running", pid: 123 },
       syncStatus: syncStatusFixture({
         health, health_detail: "all known enabled scopes have cursors", details: { pending_count: 2 },
         locks: [{ locked_at: "2026-06-20T11:59:00.000Z", expires_at: "2026-06-20T12:01:00.000Z" }],
       }),
       workerSummary: workerSummaryFixture(),
       nowMs,
+      activityEvidence: activePhaseEvidence(nowMs),
     });
     assert.equal(overview.health.status, "catching_up");
     assert.equal(overview.health.detail, "2 message details await retry");

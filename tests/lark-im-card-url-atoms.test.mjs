@@ -20,7 +20,7 @@ const atoms = [
 ];
 
 function assertSafe(result) {
-  assert.equal(result.version, 2);
+  assert.equal(result.version, 3);
   assert.ok(["rendered", "partial"].includes(result.status), JSON.stringify(result));
   if (result.status === "partial") assert.equal(typeof result.reason, "string");
   assert.doesNotMatch(result.text, secret);
@@ -94,7 +94,7 @@ test("the same native mention has one identical URL projection in a node or inli
 });
 
 function assertNoUserinfoDisclosure(result) {
-  assert.equal(result.version, 2);
+  assert.equal(result.version, 3);
   assert.ok(["rendered", "partial", "structured_fallback"].includes(result.status));
   if (result.status !== "rendered") assert.equal(typeof result.reason, "string");
   // A truncated userinfo prefix can become a hostname, which URL() lowercases.
@@ -176,7 +176,10 @@ for (const kind of ["body", "button URL"]) {
     assert.notEqual(result.status, "rendered");
     assert.match(result.text, /Before/);
     assert.doesNotMatch(result.text, /After/, "the rejected value exhausts the remaining input budget");
-    if (kind === "button URL") assert.match(result.text, /Open/);
+    if (kind === "button URL") {
+      assert.doesNotMatch(result.text, /Open/, "an unusable action is folded, with its input-limit diagnosis preserved");
+      assert.equal(result.omitted_actions, 1);
+    }
   });
 }
 
@@ -243,7 +246,9 @@ for (const entry of controlChangedLinks) {
     for (const slot of ["url", "href"]) {
       const result = renderCardContent(withSurroundingText({ tag: "button", text: plain("Open"), [slot]: entry.text }));
       assertControlledLinkRejected(result);
-      for (const visible of ["Before", "Open", "After"]) assert.ok(result.text.includes(visible));
+      for (const visible of ["Before", "After"]) assert.ok(result.text.includes(visible));
+      assert.doesNotMatch(result.text, /Open/);
+      assert.equal(result.omitted_actions, 1);
     }
   });
 
@@ -254,8 +259,9 @@ for (const entry of controlChangedLinks) {
       { tag: "button", text: plain("Clean"), url: "https://clear.invalid/public?token=SYNTHETIC_QUERY" },
     ] });
     assertControlledLinkRejected(result);
-    for (const visible of ["Platforms", "默认", "桌面", "iOS", "Android", "Clean", "https://clear.invalid/public"])
-      assert.ok(result.text.includes(visible));
+    for (const visible of ["Clean", "https://clear.invalid/public"]) assert.ok(result.text.includes(visible));
+    assert.doesNotMatch(result.text, /Platforms/);
+    assert.equal(result.omitted_actions, 1);
   });
 }
 

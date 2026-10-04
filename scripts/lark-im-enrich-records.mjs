@@ -9,7 +9,10 @@ import {
   releaseMaintenanceLock,
 } from "../dist/storage/sqlite/ingestion-store.js";
 
-import { mergeLarkNameProjectionSql } from "../dist/storage/sqlite/lark-name-projection.js";
+import { larkSenderNamespaceSql, mergeLarkNameProjectionSql } from "../dist/storage/sqlite/lark-name-projection.js";
+import { createNameResolver } from "../src/adapters/lark-im/name-resolver.mjs";
+import { displayNameFromUser, personName, senderIdentity, senderOpenId } from "../src/adapters/lark-im/sender-identity.mjs";
+import { createLarkCliRunner, createTransportState } from "../src/adapters/lark-im/transport.mjs";
 
 const DEFAULT_DB = "data/exocortex.sqlite";
 
@@ -19,6 +22,9 @@ function usage() {
 Options:
   --db <path>       SQLite database path. Default: ${DEFAULT_DB}
   --limit <n>       Max records to scan. Default: 1000
+  --sender-only     Only repair missing names for the exact --sender-id.
+  --sender-id <id>  Required with --sender-only. Explicit open ID; no prefix search.
+                    Sender-only limit defaults to 50, maximum 100 eligible rows.
   --probe-apps      Re-check all app senders with the Application API.
   --dry-run         Report proposed changes without writing or acquiring locks.
   --unsafe-details  Include local IDs, names, and detailed lookup results in stdout.
@@ -34,7 +40,8 @@ function parsePositiveInt(value, name) {
 }
 
 function parseArgs(argv) {
-  const opts = { db: DEFAULT_DB, limit: 1000, probeApps: false, unsafeDetails: false, dryRun: false };
+  const opts = { db: DEFAULT_DB, limit: 1000, probeApps: false, unsafeDetails: false, dryRun: false,
+    senderOnly: false, senderId: "", limitSpecified: false };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--help" || arg === "-h") {
@@ -45,6 +52,7 @@ function parseArgs(argv) {
       opts.probeApps = true;
       continue;
     }
+    if (arg === "--sender-only") { opts.senderOnly = true; continue; }
     if (arg === "--dry-run") {
       opts.dryRun = true;
       continue;
@@ -56,9 +64,18 @@ function parseArgs(argv) {
     const next = argv[i + 1];
     if (!next || next.startsWith("--")) throw new Error(`${arg} requires a value`);
     if (arg === "--db") opts.db = next;
-    else if (arg === "--limit") opts.limit = parsePositiveInt(next, "limit");
+    else if (arg === "--limit") { opts.limit = parsePositiveInt(next, "limit"); opts.limitSpecified = true; }
+    else if (arg === "--sender-id") opts.senderId = next;
     else throw new Error(`Unknown option: ${arg}`);
     i += 1;
+  }
+  if (opts.senderOnly !== Boolean(opts.senderId)) throw new Error("--sender-only and --sender-id are required together");
+  if (opts.senderOnly) {
+    if (!/^ou_[A-Za-z0-9_-]+$/.test(opts.senderId) || opts.senderId.length > 512)
+      throw new Error("--sender-id must be an explicit open ID");
+    if (opts.probeApps) throw new Error("--probe-apps cannot be used with --sender-only");
+    if (!opts.limitSpecified) opts.limit = 50;
+    if (opts.limit > 100) throw new Error("sender-only --limit must be at most 100");
   }
   return opts;
 }
@@ -99,9 +116,11 @@ function parseMaybeJson(value) {
   }
 }
 
-function runLark(args) {
+function runLark(args, options = {}) {
   const bin = process.env.LARK_CLI || "lark-cli";
-  const result = spawnSync(bin, args, { encoding: "utf8", maxBuffer: 50 * 1024 * 1024 });
+  const budget = Number(options.retryBudgetMs) || 5000;
+  const result = spawnSync(bin, args, { encoding: "utf8", maxBuffer: 50 * 1024 * 1024,
+    timeout: Math.max(1, Math.min(5000, budget)), killSignal: "SIGKILL" });
   if (result.status !== 0) throw new Error(result.stderr.trim() || `${bin} ${args.join(" ")} failed`);
   const trimmed = result.stdout.trim();
   return trimmed ? JSON.parse(trimmed) : null;
@@ -120,11 +139,6 @@ function acquireWriteMaintenanceLock(dbPath, reason) {
 
 function firstArray(...values) {
   return values.find((value) => Array.isArray(value)) || [];
-}
-
-function displayNameFromUser(user) {
-  if (!user || typeof user !== "object") return "";
-  return user.localized_name || user.name || user.display_name || user.en_name || user.open_id || "";
 }
 
 function getSelfProfile() {
@@ -152,7 +166,14 @@ function senderId(raw, row, canonical) {
 
 function senderName(raw, canonical) {
   const sender = raw?.sender && typeof raw.sender === "object" ? raw.sender : {};
-  return canonical.sender_name_state === "cleared" ? "" : canonical.sender_name || sender.name || sender.display_name || "";
+  const id = canonical.sender_id || sender.id || sender.open_id;
+  if (canonical.sender_name_state === "cleared") return "";
+  const known = personName(canonical.sender_name, [id]);
+  if (known) return known;
+  const identity = senderIdentity(raw);
+  if (identity.conflict || identity.id && id && identity.id !== id
+    || canonical.sender_id_type && identity.type && canonical.sender_id_type !== identity.type) return "";
+  return personName(sender.name, [id]) || personName(sender.display_name, [id]);
 }
 
 function senderType(raw, canonical) {
@@ -231,75 +252,6 @@ function botName(bot) {
 function botAppId(bot) {
   if (!bot || typeof bot !== "object") return "";
   return bot.app_id || bot.application_id || bot.bot_app_id || bot.cli_id || "";
-}
-
-function chunk(values, size) {
-  const chunks = [];
-  for (let i = 0; i < values.length; i += size) chunks.push(values.slice(i, i + size));
-  return chunks;
-}
-
-function resolveContactNames(openIds, seed = new Map(), diagnostics = null) {
-  const names = new Map(seed);
-  const unresolved = uniqueOpenIds(openIds).filter((id) => !names.has(id));
-  if (diagnostics) diagnostics.contact_ids_requested = unresolved.length;
-  for (const ids of chunk(unresolved, 100)) {
-    try {
-      const json = runLark([
-        "contact",
-        "+search-user",
-        "--user-ids",
-        ids.join(","),
-        "--as",
-        "user",
-        "--format",
-        "json",
-      ]);
-      for (const user of firstArray(json?.users, json?.data?.users)) {
-        const name = displayNameFromUser(user);
-        if (user?.open_id && name) names.set(user.open_id, name);
-      }
-    } catch (error) {
-      if (diagnostics) diagnostics.contact_lookup_failures += 1;
-      if (diagnostics) diagnostics.contact_lookup_errors.push(String(error.message || error).slice(0, 500));
-    }
-  }
-  return names;
-}
-
-function resolveChatMemberNames(chatIdValue, openIds) {
-  const targetIds = new Set(uniqueOpenIds(openIds));
-  const names = new Map();
-  let pageToken = "";
-  for (let page = 0; page < 50 && targetIds.size > 0; page += 1) {
-    const params = { chat_id: chatIdValue, member_id_type: "open_id", page_size: 100 };
-    if (pageToken) params.page_token = pageToken;
-    try {
-      const json = runLark([
-        "im",
-        "chat.members",
-        "get",
-        "--as",
-        "user",
-        "--params",
-        JSON.stringify(params),
-        "--format",
-        "json",
-      ]);
-      for (const item of firstArray(json?.items, json?.data?.items)) {
-        if (targetIds.has(item?.member_id) && item?.name) {
-          names.set(item.member_id, item.name);
-          targetIds.delete(item.member_id);
-        }
-      }
-      const hasMore = Boolean(json?.has_more ?? json?.data?.has_more);
-      pageToken = json?.page_token || json?.data?.page_token || "";
-      if (!hasMore || !pageToken) break;
-    } catch {
-      break;
-    }
-  }
-  return names;
 }
 
 function resolveApplicationNames(appIds, diagnostics = null) {
@@ -500,15 +452,180 @@ function scalarDiagnostics(diagnostics) {
   };
 }
 
+function prepareUpdates(dbPath, rows, proposals, senderOnly = false) {
+  const merged = proposals.length === 0 ? [] : sqliteJson(dbPath, `
+    WITH proposals AS (
+      SELECT json_extract(value, '$.id') AS id, json_extract(value, '$.old') AS old,
+        json_extract(value, '$.next') AS next, json_extract(value, '$.actor') AS actor,
+        json_extract(value, '$.container') AS container, json_extract(value, '$.body') AS body,
+        json_extract(value, '$.raw') AS raw
+      FROM json_each(${quoteSql(JSON.stringify(proposals))})
+    )
+    SELECT id, body, ${mergeLarkNameProjectionSql('p.old', 'p.next', 'p.actor', 'p.actor',
+      'p.container', 'p.container', 'p.raw', 'p.raw')} AS canonical_json
+    FROM proposals p;`, 'merge name projections');
+  const rowsById = new Map(rows.map((row) => [row.id, row]));
+  const updates = [];
+  for (const result of merged) {
+    const row = rowsById.get(result.id);
+    if (result.canonical_json === row.canonical_json && result.body === row.body) continue;
+    updates.push(`UPDATE records
+       SET canonical_json = ${quoteSql(result.canonical_json)},
+           ${senderOnly ? '' : `body = ${quoteSql(result.body)},`}
+           updated_at = ${quoteSql(new Date().toISOString())}
+       WHERE id = ${Number(row.id)}
+         AND source_id = 'lark.im' AND record_type = 'lark.im.message'
+         AND external_id IS ${quoteSql(row.external_id)}
+         AND external_version IS ${quoteSql(row.external_version)}
+         AND content_hash IS ${quoteSql(row.content_hash)}
+         AND actor_id IS ${quoteSql(row.actor_id)}
+         AND container_id IS ${quoteSql(row.container_id)}
+         AND raw_json IS ${quoteSql(row.raw_json)}
+         AND canonical_json IS ${quoteSql(row.canonical_json)}
+         AND body IS ${quoteSql(row.body)};
+       INSERT INTO __enrichment_effects (updated) VALUES (changes());`);
+  }
+  return updates;
+}
+
+function commitUpdates(dbPath, updates, dryRun) {
+  if (updates.length === 0 || dryRun) return { updated: 0, skippedConflicts: 0 };
+  const lockOwner = acquireWriteMaintenanceLock(dbPath, 'lark-im-enrich-records');
+  try {
+    const effects = sqliteExec(dbPath, `
+      BEGIN IMMEDIATE;
+      CREATE TEMP TABLE __enrichment_fence (allowed INTEGER NOT NULL CHECK (allowed = 1));
+      INSERT INTO __enrichment_fence (allowed)
+      SELECT CASE WHEN EXISTS (
+        SELECT 1 FROM maintenance_locks
+        WHERE name = 'global' AND owner = ${quoteSql(lockOwner)}
+          AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+      ) AND NOT EXISTS (SELECT 1 FROM sync_locks) THEN 1 ELSE 0 END;
+      CREATE TEMP TABLE __enrichment_effects (updated INTEGER NOT NULL);
+      ${updates.join('\n')}
+      SELECT COALESCE(SUM(updated), 0) AS updated FROM __enrichment_effects;
+      COMMIT;`, 'update records');
+    const updated = Number(effects[0]?.updated || 0);
+    return { updated, skippedConflicts: updates.length - updated };
+  } finally {
+    releaseMaintenanceLock(dbPath, lockOwner);
+  }
+}
+
+function nativeRow(raw) {
+  return raw?.raw_api && typeof raw.raw_api === 'object' ? raw.raw_api : raw;
+}
+
+function rowOpenId(row) {
+  const id = senderOpenId(row.raw);
+  return id && id === row.actor_id && (!row.canonical.sender_id || row.canonical.sender_id === id)
+    && (!row.canonical.sender_id_type || row.canonical.sender_id_type === 'open_id') ? id : '';
+}
+
+function runSenderOnly(dbPath, opts) {
+  // All selection guards precede LIMIT, so recent unrelated rows cannot hide
+  // an eligible historical sender. An extra row reports the bounded coverage.
+  const candidates = sqliteJson(dbPath, `
+    SELECT r.* FROM records r
+    WHERE source_id = 'lark.im' AND record_type = 'lark.im.message'
+      AND actor_id = ${quoteSql(opts.senderId)}
+      AND json_valid(canonical_json) AND json_valid(raw_json)
+      AND json_extract(canonical_json, '$.sender_id') = actor_id
+      AND COALESCE(json_extract(canonical_json, '$.msg_type'), '') <> 'system'
+      AND COALESCE(json_extract(raw_json, '$.msg_type'), '') <> 'system'
+      AND COALESCE(json_extract(raw_json, '$.raw_api.msg_type'), '') <> 'system'
+      AND COALESCE(json_extract(canonical_json, '$.sender_type'), '') <> 'app'
+      AND COALESCE(json_extract(canonical_json, '$.sender_name_state'), '') <> 'cleared'
+      AND (COALESCE(trim(json_extract(canonical_json, '$.sender_name')), '') = ''
+        OR trim(json_extract(canonical_json, '$.sender_name')) = actor_id)
+      AND ${larkSenderNamespaceSql('r.canonical_json', 'r.raw_json', 'r.actor_id', false)} = 'typed:open_id'
+      AND COALESCE(json_extract(raw_json, '$.sender.sender_type'), '') <> 'app'
+      AND COALESCE(json_extract(raw_json, '$.raw_api.sender.sender_type'), '') <> 'app'
+    ORDER BY occurred_at_ms ASC, id ASC LIMIT ${opts.limit + 1};`, 'load sender candidates');
+  const hasMore = candidates.length > opts.limit;
+  const rows = candidates.slice(0, opts.limit).map((row) => ({
+    ...row, canonical: parseMaybeJson(row.canonical_json) || {}, raw: nativeRow(parseMaybeJson(row.raw_json) || {}),
+  }));
+  if (rows.some((row) => senderOpenId(row.raw) !== opts.senderId)) throw new Error('sender candidate identity validation failed');
+  const remote = { calls: 0, member_pages: 0, member_chats: 0, failures: 0,
+    budget_exhausted: false, page_limit_reached: false, chat_limit_reached: false };
+  const deadline = Date.now() + 30_000;
+  const transport = createLarkCliRunner({ timeoutMs: 5000, state: createTransportState() });
+  const memberChats = new Set();
+  const run = (args, options = {}) => {
+    const remaining = Math.floor(deadline - Date.now());
+    if (remaining <= 0) { remote.budget_exhausted = true; throw new Error('sender lookup budget exhausted'); }
+    if (args[0] === 'im' && args[1] === 'chat.members') {
+      const cid = JSON.parse(args[args.indexOf('--params') + 1]).chat_id;
+      if (remote.member_pages >= 5) { remote.page_limit_reached = true; throw new Error('sender member page limit'); }
+      if (!memberChats.has(cid) && memberChats.size >= 3) {
+        remote.chat_limit_reached = true; throw new Error('sender member chat limit');
+      }
+      memberChats.add(cid);
+      remote.member_chats = memberChats.size;
+      remote.member_pages += 1;
+    }
+    remote.calls += 1;
+    try {
+      return transport(args, { ...options, retries: 0, timeoutMs: Math.min(5000, remaining),
+        retryBudgetMs: Math.min(5000, remaining) });
+    } catch (error) {
+      remote.failures += 1;
+      if (Date.now() >= deadline) remote.budget_exhausted = true;
+      throw error;
+    }
+  };
+  const resolver = createNameResolver({ run });
+  const lookupOpts = { retries: 0, retryDelayMs: 0 };
+  const directName = (row) => personName(row.raw?.sender?.name, [opts.senderId])
+    || personName(row.raw?.sender?.display_name, [opts.senderId]);
+  const needsLookup = rows.some((row) => !directName(row));
+  const contacts = needsLookup ? resolver.resolveContactNames([opts.senderId], lookupOpts) : new Map();
+  const members = new Map();
+  if (needsLookup && !contacts.has(opts.senderId)) {
+    const chats = [...new Set(rows.filter((row) => !directName(row)
+      && row.container_id && row.canonical.chat_id === row.container_id && row.raw.chat_id === row.container_id
+      && (row.canonical.chat_type || row.raw.chat_type) !== 'p2p').map((row) => row.container_id))];
+    remote.chat_limit_reached = chats.length > 3;
+    for (const cid of chats.slice(0, 3)) {
+      if (remote.budget_exhausted || remote.page_limit_reached) break;
+      const names = resolver.resolveChatMemberNames(cid, [opts.senderId], lookupOpts);
+      if (names.has(opts.senderId)) members.set(cid, names.get(opts.senderId));
+    }
+  }
+  const proposals = [];
+  for (const row of rows) {
+    const direct = directName(row);
+    const member = members.get(row.container_id);
+    const name = direct || member || contacts.get(opts.senderId);
+    if (!name) continue;
+    const next = { ...row.canonical, sender_id_type: 'open_id', sender_name: name,
+      sender_name_source: direct ? 'message_sender' : member ? 'chat_member' : 'contact', sender_name_confidence: 'high' };
+    proposals.push({ id: row.id, old: row.canonical_json, next: JSON.stringify(next),
+      actor: row.actor_id, container: row.container_id, body: row.body, raw: row.raw_json });
+  }
+  const updates = prepareUpdates(dbPath, rows, proposals, true);
+  const { updated, skippedConflicts } = commitUpdates(dbPath, updates, opts.dryRun);
+  const unresolved = rows.length - proposals.length;
+  process.stdout.write(`${JSON.stringify({
+    ok: true, mode: 'sender-only', dry_run: opts.dryRun, scanned: rows.length,
+    planned: updates.length, updated, skipped_conflicts: skippedConflicts,
+    unchanged: rows.length - updates.length, resolved: proposals.length, unresolved,
+    has_more_candidates: hasMore, remote,
+  }, null, 2)}\n`);
+  if (unresolved > 0 || hasMore || skippedConflicts > 0) process.exitCode = 1;
+}
+
 function main() {
   const opts = parseArgs(process.argv.slice(2));
   const dbPath = resolve(opts.db);
   if (!existsSync(dbPath)) throw new Error(`database not found: ${dbPath}`);
+  if (opts.senderOnly) return runSenderOnly(dbPath, opts);
 
   const rows = loadRows(dbPath, opts.limit).map((row) => ({
     ...row,
     canonical: parseMaybeJson(row.canonical_json) || {},
-    raw: parseMaybeJson(row.raw_json) || {},
+    raw: nativeRow(parseMaybeJson(row.raw_json) || {}),
     config: parseMaybeJson(row.scope_config_json) || {},
   }));
   const knownChatNames = loadKnownChatNames(dbPath);
@@ -527,7 +644,8 @@ function main() {
     const sname = senderName(row.raw, row.canonical);
     const isAppSender = senderType(row.raw, row.canonical) === "app" || String(sid || "").startsWith("cli_");
     const cid = chatId(row.raw, row, row.canonical, row.config);
-    if (sid && !sname && !isAppSender) contactIds.push(sid);
+    const openId = rowOpenId(row);
+    if (openId && !sname && !isAppSender) contactIds.push(openId);
     if (sid && isAppSender) {
       if (!appStats.has(sid)) appStats.set(sid, { app_id: sid, records: 0, existing_names: new Set() });
       const stat = appStats.get(sid);
@@ -548,9 +666,9 @@ function main() {
     if (partnerId && !partnerName) contactIds.push(partnerId);
 
     const ctype = chatType(row.raw, row.canonical, row.config);
-    if (cid && ctype !== "p2p" && sid && !sname && !isAppSender) {
+    if (cid && ctype !== "p2p" && openId && !sname && !isAppSender) {
       if (!groupUnresolved.has(cid)) groupUnresolved.set(cid, new Set());
-      groupUnresolved.get(cid).add(sid);
+      groupUnresolved.get(cid).add(openId);
     }
   }
 
@@ -571,10 +689,24 @@ function main() {
     app_fallback_ambiguous: 0,
     app_fallback_errors: [],
   };
-  const contactNames = resolveContactNames(contactIds, seed, diagnostics);
+  // Request construction, response validation and seed priority have one
+  // implementation shared with ingestion and the bounded sender-only mode.
+  const resolver = createNameResolver({ run(args, options) {
+    const contact = args[0] === "contact" && args[1] === "+search-user";
+    if (contact) diagnostics.contact_ids_requested += args[args.indexOf("--user-ids") + 1].split(",").length;
+    try { return runLark(args, options); } catch (error) {
+      if (contact) {
+        diagnostics.contact_lookup_failures += 1;
+        diagnostics.contact_lookup_errors.push(String(error.message || error).slice(0, 500));
+      }
+      throw error;
+    }
+  } });
+  const lookupOpts = { retries: 0, retryDelayMs: 0 };
+  const contactNames = resolver.resolveContactNames(contactIds, lookupOpts, seed);
   const memberNames = new Map();
   for (const [cid, ids] of groupUnresolved.entries()) {
-    const names = resolveChatMemberNames(cid, [...ids].filter((id) => !contactNames.has(id)));
+    const names = resolver.resolveChatMemberNames(cid, [...ids].filter((id) => !contactNames.has(id)), lookupOpts);
     for (const [id, name] of names.entries()) memberNames.set(`${cid}:${id}`, name);
   }
   const appNames = resolveApplicationNames(appIds, diagnostics);
@@ -590,6 +722,9 @@ function main() {
     const sid = senderId(row.raw, row, row.canonical);
     const isAppSender = senderType(row.raw, row.canonical) === "app" || String(sid || "").startsWith("cli_");
     const existingSenderName = senderName(row.raw, row.canonical);
+    const openId = rowOpenId(row);
+    const memberName = openId ? memberNames.get(`${cid}:${openId}`) : null;
+    const contactName = openId ? contactNames.get(openId) : null;
     const appName = appNames.get(sid);
     const appFallback = appFallbackNames.get(`${cid}:${sid}`);
     const appFallbackName = appFallback?.name || "";
@@ -599,8 +734,8 @@ function main() {
       existingSenderName ||
       appName ||
       appFallbackName ||
-      memberNames.get(`${cid}:${sid}`) ||
-      contactNames.get(sid) ||
+      memberName ||
+      contactName ||
       null;
     const partner = chatPartner(row.raw, row.canonical);
     const partnerId = partner?.open_id || partner?.id || partner?.user_id || null;
@@ -608,6 +743,7 @@ function main() {
 
     next.sender_id = next.sender_id || sid || null;
     next.sender_name = sname;
+    if (openId && sname && !existingSenderName) next.sender_id_type = "open_id";
     // This scan supplies a fresh resolved name or unknown, never a new clear.
     delete next.sender_name_state;
     if (sname) {
@@ -625,10 +761,10 @@ function main() {
     } else if (appFallbackName && (opts.probeApps || !existingSenderName)) {
       next.sender_name_source = appFallback.source || "chat_bot_unique";
       next.sender_name_confidence = appFallback.confidence || "medium";
-    } else if (!existingSenderName && memberNames.get(`${cid}:${sid}`)) {
+    } else if (!existingSenderName && memberName) {
       next.sender_name_source = "chat_member";
       next.sender_name_confidence = "high";
-    } else if (!existingSenderName && contactNames.get(sid)) {
+    } else if (!existingSenderName && contactName) {
       next.sender_name_source = "contact";
       next.sender_name_confidence = "high";
     }
@@ -656,74 +792,12 @@ function main() {
     const proposedJson = JSON.stringify(next);
     if (proposedJson !== row.canonical_json || body !== row.body) {
       proposals.push({ id: row.id, old: row.canonical_json, next: proposedJson,
-        actor: row.actor_id, container: row.container_id, body });
+        actor: row.actor_id, container: row.container_id, body, raw: row.raw_json });
     }
   }
 
-  // Batch the shared SQL projection calculation in one read-only query. Dry-run
-  // sees exactly the commit policy without acquiring a lease or writing data.
-  const merged = proposals.length === 0 ? [] : sqliteJson(dbPath, `
-    WITH proposals AS (
-      SELECT json_extract(value, '$.id') AS id, json_extract(value, '$.old') AS old,
-        json_extract(value, '$.next') AS next, json_extract(value, '$.actor') AS actor,
-        json_extract(value, '$.container') AS container, json_extract(value, '$.body') AS body
-      FROM json_each(${quoteSql(JSON.stringify(proposals))})
-    )
-    SELECT id, body, ${mergeLarkNameProjectionSql("p.old", "p.next", "p.actor", "p.actor", "p.container", "p.container")} AS canonical_json
-    FROM proposals p;`, "merge name projections");
-  const rowsById = new Map(rows.map((row) => [row.id, row]));
-  const updates = [];
-  for (const result of merged) {
-    const row = rowsById.get(result.id);
-    if (result.canonical_json === row.canonical_json && result.body === row.body) continue;
-    updates.push(
-      `UPDATE records
-       SET canonical_json = ${quoteSql(result.canonical_json)},
-           body = ${quoteSql(result.body)},
-           updated_at = ${quoteSql(new Date().toISOString())}
-       WHERE id = ${Number(row.id)}
-         AND source_id = 'lark.im'
-         AND record_type = 'lark.im.message'
-         AND external_id IS ${quoteSql(row.external_id)}
-         AND external_version IS ${quoteSql(row.external_version)}
-         AND content_hash IS ${quoteSql(row.content_hash)}
-         AND actor_id IS ${quoteSql(row.actor_id)}
-         AND container_id IS ${quoteSql(row.container_id)}
-         AND raw_json IS ${quoteSql(row.raw_json)}
-         AND canonical_json IS ${quoteSql(row.canonical_json)}
-         AND body IS ${quoteSql(row.body)};
-       INSERT INTO __enrichment_effects (updated) VALUES (changes());`,
-    );
-  }
-
-  let updated = 0;
-  let skippedConflicts = 0;
-  if (updates.length > 0 && !opts.dryRun) {
-    const lockOwner = acquireWriteMaintenanceLock(dbPath, "lark-im-enrich-records");
-    try {
-      // Recheck authority under the write transaction. CAS protects each
-      // snapshot even if synchronization committed during the remote lookups.
-      const effects = sqliteExec(dbPath, `
-        BEGIN IMMEDIATE;
-        CREATE TEMP TABLE __enrichment_fence (allowed INTEGER NOT NULL CHECK (allowed = 1));
-        INSERT INTO __enrichment_fence (allowed)
-        SELECT CASE WHEN EXISTS (
-          SELECT 1 FROM maintenance_locks
-          WHERE name = 'global'
-            AND owner = ${quoteSql(lockOwner)}
-            AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-        ) AND NOT EXISTS (SELECT 1 FROM sync_locks) THEN 1 ELSE 0 END;
-        CREATE TEMP TABLE __enrichment_effects (updated INTEGER NOT NULL);
-        ${updates.join("\n")}
-        SELECT COALESCE(SUM(updated), 0) AS updated FROM __enrichment_effects;
-        COMMIT;
-      `, "update records");
-      updated = Number(effects[0]?.updated || 0);
-      skippedConflicts = updates.length - updated;
-    } finally {
-      releaseMaintenanceLock(dbPath, lockOwner);
-    }
-  }
+  const updates = prepareUpdates(dbPath, rows, proposals);
+  const { updated, skippedConflicts } = commitUpdates(dbPath, updates, opts.dryRun);
   const appFallbacksById = new Map();
   for (const [key, fallback] of appFallbackNames.entries()) {
     const separatorIndex = key.lastIndexOf(":");

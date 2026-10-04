@@ -112,7 +112,7 @@ function verifyReadOnlyProjection(t, originals, verify) {
     const normalized = normalizeApiMessage(original.raw);
     assert.equal(normalized.content, displayed.display.card.text);
     assert.deepEqual(normalized.content_rendering, {
-      status: displayed.display.card.status, reason: displayed.display.card.reason, version: 2,
+      status: displayed.display.card.status, reason: displayed.display.card.reason, version: 3,
     });
     assert.deepEqual(normalized.raw_api, original.raw);
   }

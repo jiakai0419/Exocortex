@@ -1,6 +1,7 @@
 // @ts-check
 
 import { basename } from "node:path";
+import { publicUnsupportedReasons } from "../diagnostics/public-safe.mjs";
 
 import {
   block,
@@ -9,7 +10,6 @@ import {
   section,
   statusBadge,
   subtitle,
-  table,
   title,
 } from "../../dist/terminal/index.js";
 
@@ -69,6 +69,53 @@ function localTimestamp(value) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())} UTC${offset}`;
 }
 
+/** @param {Date} date */
+function localDay(date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+/** @param {Date} date */
+function ambiguousLocalTime(date) {
+  const offset = date.getTimezoneOffset();
+  return [-86400000, 86400000].some((delta) => {
+    const otherOffset = new Date(date.getTime() + delta).getTimezoneOffset();
+    if (otherOffset === offset) return false;
+    const other = new Date(date.getTime() + (otherOffset - offset) * 60000);
+    return localDay(other) === localDay(date) && other.getHours() === date.getHours() && other.getMinutes() === date.getMinutes();
+  });
+}
+
+/** @param {Date} date @param {boolean} seconds @param {boolean} offset */
+function serviceClock(date, seconds, offset) {
+  const parts = localTimestamp(date.toISOString()).split(" ");
+  return `${seconds ? parts[1] : parts[1].slice(0, 5)}${offset ? ` ${parts[2]}` : ""}`;
+}
+
+/** Service-only local timestamp; the renderer declares the IANA zone once.
+ * @param {unknown} value @param {number} [referenceMs]
+ */
+function serviceTimestamp(value, referenceMs = Date.now()) {
+  const date = new Date(String(value || ""));
+  if (!Number.isFinite(date.getTime())) return "unknown";
+  const day = localDay(date) === localDay(new Date(referenceMs)) ? "Today" : localDay(date);
+  return `${day} ${serviceClock(date, true, ambiguousLocalTime(date))}`;
+}
+
+/** @param {unknown} from @param {unknown} to @param {number} referenceMs @param {boolean} [seconds] */
+function serviceTimeRange(from, to, referenceMs, seconds = false) {
+  const start = new Date(String(from || ""));
+  const end = new Date(String(to || ""));
+  if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime()) || end < start) return "unknown";
+  const offsetsDiffer = start.getTimezoneOffset() !== end.getTimezoneOffset();
+  const firstClock = serviceClock(start, seconds, offsetsDiffer || ambiguousLocalTime(start));
+  const lastClock = serviceClock(end, seconds, offsetsDiffer || ambiguousLocalTime(end));
+  if (localDay(start) === localDay(end)) {
+    const day = localDay(start) === localDay(new Date(referenceMs)) ? "Today" : localDay(start);
+    return `${day} ${firstClock}–${lastClock}`;
+  }
+  return `${localDay(start)} ${firstClock}–${localDay(end)} ${lastClock}`;
+}
+
 /** @param {JsonObject} summary */
 function formatWorkerEvent(summary) {
   if (!summary.has_events) return "no worker events yet";
@@ -76,11 +123,11 @@ function formatWorkerEvent(summary) {
   return `${eventType || "event"} ${ageText(summary.last_event_age_ms)}`;
 }
 
-/** @param {JsonObject} summary */
-function formatWorkerCycle(summary) {
+/** @param {JsonObject} summary @param {number} [referenceMs] */
+function formatWorkerCycle(summary, referenceMs = Date.now()) {
   if (!summary.last_cycle) return "none";
-  return `#${summary.last_cycle.cycle} ${summary.last_cycle.ok ? statusBadge("ok") : statusBadge("failed")} ${localIso(
-    summary.last_cycle.at,
+  return `#${summary.last_cycle.cycle} ${summary.last_cycle.ok ? statusBadge("ok") : statusBadge("failed")} ${serviceTimestamp(
+    summary.last_cycle.at, referenceMs,
   )} (${ageText(summary.last_cycle.age_ms)})`;
 }
 
@@ -150,20 +197,22 @@ function formatStabilityInterval(stability) {
   return parts.join("") || "0s";
 }
 
-/** @param {JsonObject | null | undefined} stability */
-function formatStatisticsRange(stability) {
+/** @param {JsonObject | null | undefined} stability @param {number} [referenceMs] */
+function formatStatisticsRange(stability, referenceMs = Date.now()) {
   const observed = stability?.observation;
-  const from = localTimestamp(observed?.range_started_at);
-  const to = localTimestamp(observed?.range_ended_at);
-  if (from === "unknown" || to === "unknown") return "unavailable (no current-window log evidence)";
-  const partial = observed?.window_start_reached === true ? "" : `less than ${windowText(stability?.window_ms || 24 * 60 * 60 * 1000)} observed; `;
-  return `${from} → ${to} (${partial}${observed?.tail_truncated ? "retained log tail only" : "retained log only"})`;
+  const range = serviceTimeRange(observed?.range_started_at, observed?.range_ended_at, referenceMs);
+  if (range === "unknown") return "unavailable (no current-window log evidence)";
+  const elapsedMs = Date.parse(observed.range_ended_at) - Date.parse(observed.range_started_at);
+  const minutes = Math.floor(elapsedMs / 60000);
+  const duration = minutes === 0 ? elapsedMs === 0 ? "0m" : "<1m"
+    : `${Math.floor(minutes / 60) || ""}${minutes >= 60 ? "h" : ""}${minutes % 60 ? `${minutes % 60}m` : ""}`;
+  return `${range} · ${duration}${observed.tail_truncated ? " · log truncated" : ""}`;
 }
 
-/** @param {JsonObject | null | undefined} reconcile */
-function formatReconcile(reconcile) {
+/** @param {JsonObject | null | undefined} reconcile @param {number} [referenceMs] */
+function formatReconcile(reconcile, referenceMs = Date.now()) {
   if (reconcile?.complete) {
-    const completedAt = localTimestamp(reconcile.cursor?.completed_at);
+    const completedAt = serviceTimestamp(reconcile.cursor?.completed_at, referenceMs);
     return `complete; ${completedAt === "unknown" ? "completion time unavailable" : `completed ${completedAt}`}`;
   }
   return reconcile?.cursor?.has_more ? "in progress" : "not started";
@@ -187,6 +236,27 @@ function formatLeaseIssues(leases) {
   return parts.join(", ") || "lease state needs inspection";
 }
 
+/**
+ * @param {JsonObject | null | undefined} scopes
+ * @returns {Array<[string, string]>}
+ */
+function unsupportedScopeRows(scopes) {
+  const total = Number(scopes?.received_unsupported || 0);
+  const reasons = publicUnsupportedReasons(Array.isArray(scopes?.unsupported_reasons) ? scopes.unsupported_reasons : []);
+  const describe = (row) => {
+    const reason = row.reason === "restricted_mode" ? "restricted_mode (access restricted)"
+      : row.reason === "bot_user_out_of_chat" ? "bot_user_out_of_chat (bot or user outside chat)" : row.reason;
+    return `${reason}${row.error_code === null ? "" : ` · code ${row.error_code}`}`;
+  };
+  if (reasons.length === 1 && reasons[0].count === total) {
+    return [["Unsupported scopes", `${total} · ${describe(reasons[0])}`]];
+  }
+  return [
+    ["Unsupported scopes", String(total)],
+    ...reasons.map((row) => /** @type {[string, string]} */ (["", `${row.count} · ${describe(row)}`])),
+  ];
+}
+
 /** @param {JsonObject | null | undefined} stability */
 function formatStabilityFailures(stability) {
   if (!stability) return "unknown";
@@ -206,7 +276,7 @@ function formatStabilityFailures(stability) {
 
 /** @param {JsonObject | null | undefined} stability */
 function stabilitySectionTitle(stability) {
-  return `Last ${windowText(stability?.window_ms || 24 * 60 * 60 * 1000)}`;
+  return `Recent cycles (up to ${windowText(stability?.window_ms || 24 * 60 * 60 * 1000)})`;
 }
 
 /** @param {JsonObject} report */
@@ -215,6 +285,8 @@ function renderServiceStatusText(report) {
   const workerLog = report.worker?.log || { exists: false, path: "logs/lark-im/worker.jsonl" };
   const workerSummary = report.worker?.summary || {};
   const stability = report.stability || null;
+  const observedAt = Date.parse(String(stability?.observation?.range_ended_at || report.overview?.leases?.observed_at || ""));
+  const referenceMs = Number.isFinite(observedAt) ? observedAt : Date.now();
   const overview = report.overview || {
     service: {
       status: report.service_state === "unknown" ? "unknown" : report.service_state === "not loaded" ? "stopped" : "running",
@@ -236,19 +308,20 @@ function renderServiceStatusText(report) {
   const lines = [
     `${title("Lark IM service")} ${statusBadge(overview.service?.status || "unknown")}`,
     subtitle(report.label),
+    kv([["Time zone", Intl.DateTimeFormat().resolvedOptions().timeZone]]),
     "",
     section("Overview"),
     kv(
       [
         ["Service", formatOverviewItem(overview.service)],
         ["Health", formatOverviewItem(overview.health)],
-        ["Activity", formatOverviewItem(overview.activity)],
+        ["Activity", formatOverviewItem({ ...overview.activity, status: overview.activity?.state || overview.activity?.status })],
         ["Freshness", formatOverviewItem(overview.freshness)],
         ...(overview.freshness?.sample_count > 0 ? /** @type {Array<[unknown, unknown]>} */ ([
           ["Sample", `${overview.freshness.scope}, ${overview.freshness.sample_count} messages`],
-          ["Window", `${overview.freshness.window?.start} → ${overview.freshness.window?.end}`],
-          ["Checked", overview.freshness.checked_at],
-          ["Expires", overview.freshness.expires_at],
+          ["Window", serviceTimeRange(overview.freshness.window?.start, overview.freshness.window?.end, referenceMs, true)],
+          ["Checked", serviceTimestamp(overview.freshness.checked_at, referenceMs)],
+          ["Expires", serviceTimestamp(overview.freshness.expires_at, referenceMs)],
           ["Identity", "current authenticated principal unknown"],
         ]) : []),
       ],
@@ -257,7 +330,7 @@ function renderServiceStatusText(report) {
     "",
     section(stabilitySectionTitle(stability)),
     kv([
-      ["Statistics range", formatStatisticsRange(stability)],
+      ["Statistics range", formatStatisticsRange(stability, referenceMs)],
       ["Cycles", formatStabilityCycles(stability)],
       ["Last success", formatStabilityLastSuccess(stability)],
       ["Longest between successes", formatStabilityInterval(stability)],
@@ -280,7 +353,7 @@ function renderServiceStatusText(report) {
     lines.push("");
     lines.push(section("Sync"));
     const hotDiscoveryState = syncStatus.hot_discovery?.ran
-      ? `last success ${localIso(syncStatus.hot_discovery.cursor_updated_at)}`
+      ? `last success ${serviceTimestamp(syncStatus.hot_discovery.cursor_updated_at, referenceMs)}`
       : "not started";
     lines.push(
       kv([
@@ -296,30 +369,14 @@ function renderServiceStatusText(report) {
             syncStatus.scopes?.received_without_cursor || 0
           } without cursor`,
         ],
-        ["Unsupported scopes", `${syncStatus.scopes?.received_unsupported || 0} total`],
+        ...unsupportedScopeRows(syncStatus.scopes),
         ["Active chat refresh", hotDiscoveryState],
-        ["Chat list review", formatReconcile(syncStatus.reconcile)],
+        ["Chat list review", formatReconcile(syncStatus.reconcile, referenceMs)],
         overview.leases?.evidence === "available" && Number(overview.leases.abnormal_count || 0) > 0
           ? ["Warning", `${formatLeaseIssues(overview.leases)}; check sync diagnostics and system clock`]
           : null,
       ]),
     );
-    if (syncStatus.scopes?.unsupported_reasons?.length > 0) {
-      lines.push(
-        table(syncStatus.scopes.unsupported_reasons, [
-          { key: "reason", header: "Reason", render: (row) => row.reason },
-          {
-            key: "lark_cli",
-            header: "Lark CLI",
-            render: (row) =>
-              row.lark_cli_error_message
-                ? `${row.lark_cli_error_code}: ${row.lark_cli_error_message}`
-                : "",
-          },
-          { key: "count", header: "Count", render: (row) => row.count },
-        ]),
-      );
-    }
   } else {
     lines.push("");
     lines.push(section("Sync"));
@@ -330,7 +387,7 @@ function renderServiceStatusText(report) {
   lines.push(section("Worker"));
   lines.push(
     kv([
-      ["Last cycle", formatWorkerCycle(workerSummary)],
+      ["Last cycle", formatWorkerCycle(workerSummary, referenceMs)],
       ["Last event", formatWorkerEvent(workerSummary)],
       ["Last step", formatWorkerStep(workerSummary)],
       ["In progress", workerSummary.in_progress || workerSummary.unfinished_cycle ? "unknown (unfinished history)" : "no"],
@@ -353,11 +410,14 @@ export {
   formatStatisticsRange,
   formatReconcile,
   formatLeaseIssues,
+  unsupportedScopeRows,
   formatWorkerCycle,
   formatWorkerEvent,
   formatWorkerFailure,
   formatWorkerStep,
   localIso,
   localTimestamp,
+  serviceTimestamp,
+  serviceTimeRange,
   renderServiceStatusText,
 };

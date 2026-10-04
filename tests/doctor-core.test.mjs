@@ -37,7 +37,7 @@ test("keychain failures are classified as live unavailable, not sync failure", (
   assert.deepEqual(buildFindings(localState({ live })), ["live lag probe unavailable in this shell"]);
 });
 
-test("live unavailable preserves local syncing and catching_up states", () => {
+test("live unavailable cannot turn unverified syncing history into active work", () => {
   const live = normalizeLiveResult({
     status: "command_failed",
     stderr: "keychain Get failed: keychain not initialized",
@@ -45,7 +45,7 @@ test("live unavailable preserves local syncing and catching_up states", () => {
 
   assert.equal(
     overallStatus(localState({ status: { health: "syncing" }, live })),
-    "syncing",
+    "unknown",
   );
   assert.equal(
     overallStatus(localState({ status: { health: "catching_up" }, live })),
@@ -119,7 +119,8 @@ test("doctor uses highest severity and includes missing chat names", () => {
 
   assert.equal(overallStatus(state), "needs_attention");
   assert.deepEqual(buildFindings(state), [
-    "worker is currently syncing",
+    "current activity is unverified; historical sync state is not a live phase",
+    "local sync state is unknown",
     "some group messages still lack chat names",
   ]);
 });

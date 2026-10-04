@@ -17,7 +17,7 @@ const partner = "ou_fixture_clock_reader";
 const room = "oc_fixture_clock_studio";
 function message(overrides = {}) {
   return { message_id: "om_fixture_clock_draft", create_time: String(EPOCH), update_time: String(EPOCH + 500),
-    sender: { id: person, sender_type: "user" }, chat_id: room, chat_type: "p2p",
+    sender: { id: person, id_type: "open_id", sender_type: "user" }, chat_id: room, chat_type: "p2p",
     chat_partner: { open_id: partner }, content: { text: "Arrange nine wooden clock hands." }, ...overrides };
 }
 function candidate(context = {}, source = message()) {
@@ -206,7 +206,7 @@ test("a hundred synthetic names survive an exact unknown replay under an outer p
     ensureInitialized(db);
     const messages = Array.from({ length: 100 }, (_, index) => ({
       message_id: 'om_fixture_bounded_batch_' + index, create_time: String(epoch), update_time: String(epoch + 100),
-      sender: { id: 'ou_fixture_bounded_maker', sender_type: 'user' }, chat_id: 'oc_fixture_bounded_studio',
+      sender: { id: 'ou_fixture_bounded_maker', id_type: 'open_id', sender_type: 'user' }, chat_id: 'oc_fixture_bounded_studio',
       content: { text: 'Synthetic dial position ' + index },
     }));
     const known = { contacts: new Map([['ou_fixture_bounded_maker', 'Bounded Dial Maker']]) };

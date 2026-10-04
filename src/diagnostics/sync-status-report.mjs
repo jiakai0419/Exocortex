@@ -1,5 +1,7 @@
 // @ts-check
 
+import { databaseActivityEvidence, databaseOnlyHealth, observeLockOwners } from "./lark-im-activity-evidence.mjs";
+
 import { readOnlySqliteJson } from "../storage/sqlite/readonly-query.mjs";
 
 import { classifyLarkFailure } from "../adapters/lark-im/transport.mjs";
@@ -21,6 +23,8 @@ import {
  *
  * @typedef {object} SyncStatusReportDeps
  * @property {(dbPath: string, sql: string, label: string) => Row[]=} sqliteJson
+ * @property {typeof import("./lark-im-activity-evidence.mjs").inspectActivityProcesses=} inspectActivityProcesses
+ * @property {() => number=} now
  */
 
 /**
@@ -108,7 +112,7 @@ function publicHealthDetail(health, scopes, discoveryCursor, details, listProgre
   if (Number(details.pending_count || 0) > 0) return `${details.pending_count} message details await retry; list progress does not prove full content`;
   if (health === "not_ready") return "initial discovery or successful message-scope evidence is missing";
   if (health === "needs_attention") return "sync history contains failures but no successful run";
-  if (health === "syncing") return "worker is currently syncing";
+  if (health === "unknown") return "current activity is unverified; database history does not prove a running sync";
   if (health === "catching_up") {
     /** @type {string[]} */
     const details = [];
@@ -136,7 +140,7 @@ function sanitizeStatusReportForPublicOutput(report) {
     };
   }
   let health = ["syncing", "catching_up", "not_ready", "needs_attention", "ok", "ok_with_history"].includes(report?.health)
-    ? report.health
+    ? databaseOnlyHealth(report.health)
     : "unknown";
   const detailEvidence = progressEvidence(report?.details, ["pending_count", "due_count", "scopes_pending"]);
   const details = {
@@ -220,9 +224,11 @@ function sanitizeStatusReportForPublicOutput(report) {
         error_code: publicErrorCode(run.error_code),
       })),
     },
+    current_activity: databaseActivityEvidence(report?.locks, Number(report?.runs?.by_status?.running || 0)),
     locks: (Array.isArray(report?.locks) ? report.locks : []).map((lock) => ({
       locked_at: publicTimestamp(lock.locked_at),
       expires_at: publicTimestamp(lock.expires_at),
+      ...(lock.owner_state ? { owner_state: ["alive", "dead", "unknown"].includes(lock.owner_state) ? lock.owner_state : "unknown", owner_observed_at: publicTimestamp(lock.owner_observed_at) } : {}),
     })),
     recovery: {
       performed: false,
@@ -286,8 +292,8 @@ function readStatusSnapshot(dbPath, query) {
     { label: "read recent runs", columns: ["status", "started_at", "finished_at", "scanned_count", "inserted_count", "updated_count", "duplicate_count", "error_message"],
       sql: `SELECT status, started_at, finished_at, scanned_count, inserted_count, updated_count, duplicate_count, error_message
         FROM sync_runs ORDER BY id DESC LIMIT 10` },
-    { label: "read locks", columns: ["locked_at", "expires_at"],
-      sql: "SELECT locked_at, expires_at FROM sync_locks ORDER BY locked_at DESC" },
+    { label: "read locks", columns: ["locked_at", "expires_at", "locked_by"],
+      sql: "SELECT locked_at, expires_at, locked_by FROM sync_locks ORDER BY locked_at DESC" },
   ];
   if (present === 2) sections.push(
     { label: "read pending detail totals", columns: ["pending_count", "scopes_pending", "due_count", "oldest_pending_ms", "next_retry_at"],
@@ -360,7 +366,7 @@ function buildStatus(dbPath, deps = {}) {
   const reconcileRow = first(rows("read reconcile scope"));
   const runCounts = rows("read run counts");
   const recentRuns = rows("read recent runs");
-  const locks = rows("read locks");
+  const locks = observeLockOwners(rows("read locks"), deps.inspectActivityProcesses, deps.now);
 
   const discoveryCursor = parseMaybeJson(discoveryRow.cursor_json);
   const hotDiscoveryCursor = parseMaybeJson(hotDiscoveryRow.cursor_json);

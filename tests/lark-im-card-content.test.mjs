@@ -13,7 +13,7 @@ function complete(input, mentions = []) {
   const result = renderCardContent(input, mentions);
   assert.equal(result.status, "rendered", JSON.stringify(result));
   assert.equal(result.reason, null);
-  assert.equal(result.version, 2);
+  assert.equal(result.version, 3);
   return result.text;
 }
 
@@ -29,7 +29,7 @@ test("standard card titles, paragraphs, fields, columns and buttons retain their
     { tag: "button", text: text("Local action"), value: { secret: "HIDDEN_BUTTON_VALUE" } },
   ] });
   const before = JSON.stringify(input);
-  assert.equal(complete(input), "Invented card title\nFirst paragraph\nSecond paragraph\nOwner: Synthetic team\nState: pending\nColumn one\nColumn one end\nColumn two\nReview plan （链接：https://example.invalid/plan）\nLocal action");
+  assert.equal(complete(input), "Invented card title\nFirst paragraph\nSecond paragraph\nOwner: Synthetic team\nState: pending\nColumn one\nColumn one end\nColumn two\nReview plan （链接：https://example.invalid/plan）");
   assert.equal(JSON.stringify(input), before);
 });
 
@@ -47,7 +47,7 @@ test("native property and locale slots render without requiring an unobserved ta
       { type: "button", property: { text: { property: { i18nContent: { zh_cn: "继续" } } } } }],
   } }] } };
   assert.equal(complete(input, [{ id: { open_id: "ou_invented_exact" }, name: "准确姓名" }]),
-    "合成标题\nAssigned to @准确姓名; review tomorrow.\nField one: ready\nField two\nRead synthetic plan\n继续");
+    "合成标题\nAssigned to @准确姓名; review tomorrow.\nField one: ready\nField two\nRead synthetic plan");
 });
 
 test("outer JSON, object/string json_card wrappers and schema-2 body share one parser", () => {
@@ -152,11 +152,19 @@ test("unsafe protocols are explained without executable links or callback/value 
 
 test("terminal controls, OSC, bidi and mention-name controls cannot enter output", () => {
   const bad = "visible\u001b[31m-red\u001b[0m\u001b]52;c;HIDDEN_OSC\u0007\u009b31m\u202E-end\u0000";
-  const output = complete(card(paragraph(`First\n${bad}\nLast`), { tag: "at", user_id: "invented_person" }),
-    [{ id: "invented_person", name: `Name${bad}` }]);
-  assert.match(output, /First\nvisible-red-end \nLast/);
-  assert.doesNotMatch(output, /[\u0000-\u0009\u000B-\u001F\u007F-\u009F\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/);
-  assert.doesNotMatch(output, /HIDDEN_OSC/);
+  const input = card(paragraph(`First\n${bad}\nLast`), { tag: "at", user_id: "invented_person" });
+  // Preserve the original untyped fixture: v3 cannot authorize a typed user_id
+  // from it. The explicitly typed twin still exercises the complete name lexer.
+  const legacy = renderCardContent(input, [{ id: "invented_person", name: `Name${bad}` }]);
+  assert.equal(legacy.reason, "unresolved_card_mention");
+  assert.match(legacy.text, /@未知用户/);
+  const typed = complete(input, [{ id: "invented_person", id_type: "user_id", name: `Name${bad}` }]);
+  assert.match(typed, /@Namevisible-red-end/);
+  for (const output of [legacy.text, typed]) {
+    assert.match(output, /First\nvisible-red-end \nLast/);
+    assert.doesNotMatch(output, /[\u0000-\u0009\u000B-\u001F\u007F-\u009F\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/);
+    assert.doesNotMatch(output, /HIDDEN_OSC/);
+  }
 });
 
 test("cyclic cards and wrapper cycles terminate while preserving already-known text", () => {

@@ -38,7 +38,7 @@ test("native cards and old-record views share projection without changing raw ev
   const rendered = renderCardContent(item.body.content, item.mentions);
   assert.deepEqual(renderApiMessageContent(item), rendered);
   assert.equal(normalized.content, rendered.text);
-  assert.equal(normalized.content_rendering.version, 2);
+  assert.equal(normalized.content_rendering.version, 3);
   const stored = record(normalized);
   assert.equal(stored.raw_json, before);
   assert.equal(stored.content_hash, createHash("sha256").update(before).digest("hex"));
@@ -77,7 +77,7 @@ test("same-version native card projection can improve once while preserving fact
   for (const key of ["raw_json", "content_hash", "external_version"]) assert.equal(stored[key], first[key]);
   assert.equal(stored.body, improved.body);
   assert.equal(JSON.parse(stored.canonical_json).sender_name, "Paper author");
-  assert.equal(JSON.parse(stored.canonical_json).content_rendering.version, 2);
+  assert.equal(JSON.parse(stored.canonical_json).content_rendering.version, 3);
 });
 
 test("read-only card projection never substitutes canonical or fallback text for missing raw evidence", () => {

@@ -5,6 +5,7 @@ const MAX_OUTPUT_CHARS = 16_000;
 const MAX_NODES = 2048;
 const MAX_DEPTH = 24;
 const LOCALES = ["zh_cn", "en_us", "ja_jp"];
+const ID_NAMESPACES = ["open_id", "user_id", "union_id", "app_id"];
 const TEXT_TAGS = new Set(["text", "plain_text", "lark_md", "markdown", "md"]);
 const CONTAINER_TAGS = new Set(["div", "note", "action", "column_set", "column"]);
 // These controls can erase or join URL syntax when terminal text is cleaned.
@@ -25,8 +26,9 @@ const EXPLANATIONS = {
 };
 
 /** @typedef {Record<string, any>} JsonObject */
+/** @typedef {{parent: Identity | null, ids: Map<string, string>, name: string | null, conflict: boolean}} Identity */
 /** @typedef {keyof typeof EXPLANATIONS} Reason */
-/** @typedef {{text: string, status: "rendered" | "partial" | "structured_fallback", reason: string | null, version: 2}} CardRenderResult */
+/** @typedef {{text: string, status: "rendered" | "partial" | "structured_fallback", reason: string | null, version: 3, omitted_actions?: number}} CardRenderResult */
 
 /** @param {unknown} value @returns {value is JsonObject} */
 function object(value) {
@@ -96,8 +98,15 @@ function renderCardContent(content, mentions = []) {
   /** @type {Set<Reason>} */
   const reasons = new Set();
   const active = new WeakSet();
-  /** @type {Map<string, string | null>} */
-  const names = new Map();
+  // Consumption domains stay separate. A native attachment alias never turns
+  // into a global user ID, and a mention token never reads a typed-ID table.
+  /** @type {Map<string, Map<string, Identity>>} */
+  const identities = new Map([...ID_NAMESPACES, "literal", "mention_key"].map((kind) => [kind, new Map()]));
+  /** @type {Map<string, {rows: Identity[], missing: boolean}>} */
+  const mentionKeys = new Map();
+  /** @type {Map<string, Identity | null>} */
+  const nativeRefs = new Map();
+  let hasAttachment = false;
   /** Cache terminal name projections across aliases; never reparse them in a parent.
    * @type {Map<string, string>} */
   const formattedNames = new Map();
@@ -106,6 +115,7 @@ function renderCardContent(content, mentions = []) {
   let nodes = 0;
   let output = "";
   let stopped = false;
+  let omittedActions = 0;
   /** @param {Reason} reason */
   const mark = (reason) => { reasons.add(reason); };
 
@@ -128,9 +138,6 @@ function renderCardContent(content, mentions = []) {
     if (value.length > available) { mark("card_input_limit"); return ""; }
     return value;
   }
-
-  /** @param {string} value */
-  function boundedText(value) { return cleanText(boundedRawText(value)); }
 
   /** @param {unknown} value @returns {unknown} */
   function parse(value) {
@@ -180,12 +187,167 @@ function renderCardContent(content, mentions = []) {
     }
   }
 
+  /** Validate and debit every ID before storing, combining, or comparing it.
+   * IDs are matched in original bytes, never cleaned or prefix-converted.
+   * @param {unknown} value @returns {string | null} */
+  function boundedId(value) {
+    return typeof value === "string" && value && boundedRawText(value) === value ? value : null;
+  }
+
+  /** @param {Identity} value @returns {Identity} */
+  function identityRoot(value) {
+    let root = value;
+    while (root.parent) root = root.parent;
+    while (value.parent && value.parent !== root) {
+      const next = value.parent;
+      value.parent = root;
+      value = next;
+    }
+    return root;
+  }
+
+  /** @param {string} kind @param {string} id @returns {Identity} */
+  function identityFor(kind, id) {
+    const table = identities.get(kind);
+    if (!table) throw new Error("unsupported identity namespace");
+    let identity = table.get(id);
+    if (!identity) {
+      identity = { parent: null, ids: new Map([[kind, id]]), name: null, conflict: false };
+      table.set(id, identity);
+    }
+    return identityRoot(identity);
+  }
+
+  /** Only IDs explicitly co-present in one source entry may join identities.
+   * Shared IDs allow compatible additional namespaces; key/name equality does
+   * not join disjoint identities. Contradictions remain permanent.
+   * @param {Identity} left @param {Identity} right @returns {Identity} */
+  function joinIdentity(left, right) {
+    left = identityRoot(left);
+    right = identityRoot(right);
+    if (left === right) return left;
+    right.parent = left;
+    left.conflict ||= right.conflict;
+    for (const [kind, id] of right.ids) {
+      if (left.ids.has(kind) && left.ids.get(kind) !== id) left.conflict = true;
+      else left.ids.set(kind, id);
+    }
+    if (left.name && right.name && left.name !== right.name) left.conflict = true;
+    left.name ||= right.name;
+    return left;
+  }
+
+  /** @param {Identity | null | undefined} identity @returns {Identity | null} */
+  function resolvedIdentity(identity) {
+    if (!identity) return null;
+    const root = identityRoot(identity);
+    return root.conflict || !root.name ? null : root;
+  }
+
+  /** @param {string} key @returns {Identity | null} */
+  function mentionBinding(key) {
+    const binding = mentionKeys.get(key);
+    if (!binding || binding.missing || binding.rows.length === 0) return null;
+    const root = resolvedIdentity(binding.rows[0]);
+    return root && binding.rows.every((row) => identityRoot(row) === root) ? root : null;
+  }
+
+  /** @param {string} alias @param {Identity | null} identity */
+  function bindNative(alias, identity) {
+    if (!nativeRefs.has(alias)) nativeRefs.set(alias, identity);
+    else if (nativeRefs.get(alias) !== identity) nativeRefs.set(alias, null);
+  }
+
+  /** @param {string} id @returns {Identity | null} */
+  function nativeBinding(id) {
+    if (hasAttachment) return resolvedIdentity(nativeRefs.get(id));
+    // Compatibility is exact and only available without attachment evidence.
+    // The same bytes in multiple namespaces are ambiguous even if names match.
+    /** @type {Identity | null} */
+    let match = null;
+    let matches = 0;
+    for (const kind of [...ID_NAMESPACES, "literal"]) {
+      const identity = identities.get(kind)?.get(id);
+      if (identity) { matches += 1; match = resolvedIdentity(identity); }
+    }
+    if (mentionKeys.has(id)) { matches += 1; match = mentionBinding(id); }
+    return matches === 1 ? match : null;
+  }
+
+  /** @param {unknown} value @param {number} depth */
+  function attachment(value, depth) {
+    if (value === undefined) return;
+    hasAttachment = true;
+    enter(value, depth, () => {
+      const decoded = parse(value);
+      if (!object(decoded)) { mark("unsupported_card_structure"); return; }
+      const users = read(decoded, "at_users");
+      if (users === undefined) return;
+      enter(users, depth + 1, () => {
+        if (!object(users)) { mark("unsupported_card_structure"); return; }
+        for (const rawAlias in users) {
+          if (stopped) break;
+          // Even skipped inherited keys consume visits; no prototype entry is
+          // read or allowed to manufacture a native bridge.
+          enter(rawAlias, depth + 2, () => {
+            if (!Object.hasOwn(users, rawAlias)) return;
+            const alias = boundedId(rawAlias);
+            if (!alias) return;
+            const entry = read(users, alias);
+            enter(entry, depth + 3, () => {
+              if (!object(entry)) { bindNative(alias, null); return; }
+              const key = boundedId(read(entry, "mention_key"));
+              const identity = key ? mentionBinding(key) : null;
+              bindNative(alias, identity);
+              const userId = boundedId(read(entry, "user_id"));
+              if (userId) bindNative(userId, identity);
+            });
+          });
+        }
+      });
+    });
+  }
+
+  /** A typed node reads only its declared namespace; native references use the
+   * attachment bridge or the narrowly defined legacy fallback.
+   * @param {JsonObject} payload @returns {Identity | null} */
+  function nodeMention(payload) {
+    const id = read(payload, "id");
+    const declaredType = read(payload, "id_type");
+    /** @type {Identity | null} */
+    let match = null;
+    let typed = false;
+    let valid = true;
+    /** @param {string} kind @param {unknown} value */
+    function consume(kind, value) {
+      typed = true;
+      const exact = boundedId(value);
+      const identity = exact ? resolvedIdentity(identities.get(kind)?.get(exact)) : null;
+      if (!identity || match && match !== identity) valid = false;
+      else match = identity;
+    }
+    if (declaredType !== undefined) {
+      const kind = boundedId(declaredType);
+      if (!kind || !ID_NAMESPACES.includes(kind)) { typed = true; valid = false; }
+      else consume(kind, id);
+    }
+    for (const kind of ID_NAMESPACES) {
+      const flat = read(payload, kind);
+      const nested = read(id, kind);
+      if (flat !== undefined) consume(kind, flat);
+      if (nested !== undefined) consume(kind, nested);
+    }
+    if (typed) return valid ? match : null;
+    const native = boundedId(read(payload, "userID"));
+    return native ? nativeBinding(native) : null;
+  }
+
   /** A name is an independent source value, projected once without resolving
    * any mention-like text inside it. The caller only appends terminal output.
-   * @param {string} id
+   * @param {Identity | null} identity
    */
-  function mention(id) {
-    const name = names.get(id);
+  function mention(identity) {
+    const name = resolvedIdentity(identity)?.name;
     if (name) {
       let formatted = formattedNames.get(name);
       if (formatted === undefined) {
@@ -288,15 +450,16 @@ function renderCardContent(content, mentions = []) {
             if (hiddenEnd > tokenEnd) { tokenEnd = hiddenEnd; crossedControl = true; break; }
             if (hiddenEnd > cursor) cursor = hiddenEnd - 1;
           }
-          const id = crossedControl ? "" : token[1] ?? token[0];
-          const cost = (names.get(id)?.length ?? 5) + 1;
+          const identity = crossedControl ? null : token[1] !== undefined
+            ? nativeBinding(token[1]) : mentionBinding(token[0]);
+          const cost = (identity?.name?.length ?? 5) + 1;
           let projected;
           if (cost > remainingExpansion) {
             mark("card_output_limit");
             projected = "@提及未展开";
           } else {
             remainingExpansion -= cost;
-            projected = mention(id);
+            projected = mention(identity);
           }
           (label ?? parts).push(projected);
           index = tokenEnd;
@@ -443,35 +606,66 @@ function renderCardContent(content, mentions = []) {
     if (!recognized) mark("unsupported_card_structure");
   }
 
-  /** Display the finite native button URL slots without treating callback data
-   * as a link or silently ignoring a malformed platform destination.
-   * @param {JsonObject} payload @param {boolean} label
-   */
-  function buttonLinks(payload, label) {
-    let linked = false;
-    const url = read(payload, "url") ?? read(payload, "href");
-    if (typeof url === "string") {
-      emit(`${label ? " " : ""}（链接：${safeUrl(boundedRawText(url))}）`);
-      linked = true;
-    } else if (url !== undefined) mark("unsupported_card_structure");
-    const multi = read(payload, "multi_url");
-    if (multi !== undefined) {
-      if (!object(multi)) mark("unsupported_card_structure");
-      else {
-        let recognized = false;
-        for (const [slot, platform] of [["url", "默认"], ["pc_url", "桌面"], ["ios_url", "iOS"], ["android_url", "Android"]]) {
-          const destination = read(multi, slot);
-          if (destination === undefined || destination === null || destination === "") continue;
-          recognized = true;
-          if (typeof destination !== "string") { mark("unsupported_card_structure"); continue; }
-          lineBreak();
-          emit(`${platform}链接：${safeUrl(boundedRawText(destination))}`);
-          linked = true;
-        }
-        if (!recognized) mark("unsupported_card_structure");
+  /** Inspect only documented navigation slots; action requests remain opaque.
+   * @param {JsonObject} payload @param {number} depth @param {boolean} actionLinks */
+  function navigationLinks(payload, depth, actionLinks = false) {
+    /** @type {Array<{label: string | null, text: string}>} */
+    const links = [];
+    let usable = 0;
+    /** @param {unknown} value @param {string | null} label */
+    function add(value, label = null) {
+      if (value === undefined || value === null || value === "") return;
+      /** @type {unknown} */
+      let destination = value;
+      if (object(destination)) {
+        const wrapper = destination;
+        destination = undefined;
+        enter(wrapper, depth + 1, () => { destination = read(wrapper, "url"); });
       }
+      if (typeof destination !== "string") { mark("unsupported_card_structure"); return; }
+      const projected = safeUrl(boundedRawText(destination));
+      if (projected !== "[不支持的链接]") usable += 1;
+      links.push({ label, text: projected });
     }
-    if (!label && !linked) mark("unsupported_card_structure");
+    add(read(payload, "url") ?? read(payload, "href"));
+    const multi = read(payload, "multi_url");
+    if (multi !== undefined) enter(multi, depth + 1, () => {
+      if (!object(multi)) { mark("unsupported_card_structure"); return; }
+      let recognized = false;
+      for (const [slot, platform] of [["url", "默认"], ["pc_url", "桌面"], ["ios_url", "iOS"], ["android_url", "Android"]]) {
+        const destination = read(multi, slot);
+        if (destination === undefined || destination === null || destination === "") continue;
+        recognized = true;
+        add(destination, platform);
+      }
+      if (!recognized) mark("unsupported_card_structure");
+    });
+    if (actionLinks) {
+      const actions = read(payload, "actions");
+      if (actions !== undefined) each(actions, depth + 1, (entry, entryDepth) => enter(entry, entryDepth, () => {
+        if (!object(entry)) { mark("unsupported_card_structure"); return; }
+        const actionType = read(entry, "type");
+        if (actionType === "request" || actionType === "action_request") return;
+        if (actionType !== "open_url") { mark("unsupported_card_structure"); return; }
+        const action = read(entry, "action");
+        enter(action, entryDepth + 1, () => {
+          if (!object(action)) { mark("unsupported_card_structure"); return; }
+          const url = read(action, "url");
+          if (url === undefined || url === null || url === "") mark("unsupported_card_structure");
+          else add(url);
+        });
+      }));
+    }
+    return { links, usable };
+  }
+
+  /** @param {ReturnType<typeof navigationLinks>} navigation @param {boolean} label */
+  function emitLinks(navigation, label) {
+    for (const [index, link] of navigation.links.entries()) {
+      if (link.label || index > 0) lineBreak();
+      emit(link.label ? `${link.label}链接：${link.text}` : `${label && index === 0 ? " " : ""}（链接：${link.text}）`);
+    }
+    if (!label && navigation.links.length === 0) mark("unsupported_card_structure");
   }
 
   /** @param {unknown} value @param {number} depth @param {boolean} inLine */
@@ -484,17 +678,21 @@ function renderCardContent(content, mentions = []) {
       if (!object(payload)) { mark("unsupported_card_structure"); return; }
       const tag = read(value, "tag") ?? read(value, "type") ?? read(payload, "tag") ?? read(payload, "type") ?? "";
       if (tag === "at") {
-        const id = read(payload, "userID") ?? read(payload, "user_id");
-        if (typeof id === "string") boundedText(id);
-        emit(typeof id === "string" ? mention(id) : mention(""));
+        emit(mention(nodeMention(payload)));
       } else if (TEXT_TAGS.has(tag)) {
         if (!textSlots(payload, depth)) mark("unsupported_card_structure");
       } else if (tag === "button" || tag === "a" || tag === "link") {
+        const navigation = navigationLinks(payload, depth, tag === "button");
+        if (tag === "button" && navigation.usable === 0) { omittedActions += 1; return; }
         if (!inLine) lineBreak();
         const label = textSlots(payload, depth);
-        buttonLinks(payload, label);
+        emitLinks(navigation, label);
       } else if (CONTAINER_TAGS.has(tag)) {
+        lineBreak();
         container(payload, depth, tag === "column" || tag === "column_set");
+        lineBreak();
+      } else if (tag === "br") {
+        emit("\n");
       } else if (tag === "hr") {
         lineBreak(); emit("---"); lineBreak();
       } else if (tag === "") {
@@ -503,42 +701,74 @@ function renderCardContent(content, mentions = []) {
         if (["elements", "fields", "actions", "columns", "extra"].some((key) => read(payload, key) !== undefined)) {
           container(payload, depth);
         } else if (["url", "href", "multi_url"].some((key) => read(payload, key) !== undefined)) {
-          buttonLinks(payload, textSlots(payload, depth));
+          emitLinks(navigationLinks(payload, depth), textSlots(payload, depth));
         } else if (!textSlots(payload, depth)) mark("unsupported_card_structure");
       } else mark("unsupported_card_structure");
     });
   }
 
   try {
-    // Mention identifiers and names come only from this message's native list.
+    // First establish typed evidence from all rows. Evaluate key bindings only
+    // after shared identity components have absorbed compatible extra IDs.
     if (Array.isArray(mentions)) each(mentions, 0, (entry, depth) => enter(entry, depth, () => {
       if (!object(entry)) return;
-      const name = read(entry, "name");
-      if (typeof name !== "string" || !name.trim()) return;
-      const safeName = boundedRawText(name);
+      const key = boundedId(read(entry, "key"));
+      const rawName = read(entry, "name");
+      const checkedName = typeof rawName === "string" ? boundedRawText(rawName) : "";
+      const name = checkedName.trim() ? checkedName : null;
       const id = read(entry, "id");
-      const keys = [read(entry, "key"), typeof id === "string" ? id : undefined,
-        ...["open_id", "user_id", "union_id"].flatMap((key) => [read(entry, key), read(id, key)])];
-      for (const key of keys) {
-        if (typeof key !== "string" || !key) continue;
-        boundedText(key);
-        if (key.length > MAX_INPUT_CHARS) continue;
-        const previous = names.get(key);
-        names.set(key, names.has(key) && previous !== safeName ? null : safeName);
+      const idType = read(entry, "id_type");
+      /** @type {Identity | null} */
+      let identity = null;
+      let invalid = false;
+      /** @param {string} kind @param {unknown} value */
+      function add(kind, value) {
+        if (value === undefined || value === null || value === "") return;
+        const exact = boundedId(value);
+        if (!exact) { invalid = true; return; }
+        const candidate = identityFor(kind, exact);
+        identity = identity ? joinIdentity(identity, candidate) : candidate;
+      }
+      for (const kind of ID_NAMESPACES) {
+        add(kind, read(entry, kind));
+        add(kind, read(id, kind));
+      }
+      if (typeof id === "string") {
+        if (idType === undefined) add("literal", id);
+        else {
+          const kind = boundedId(idType);
+          if (kind && ID_NAMESPACES.includes(kind)) add(kind, id);
+          else invalid = true;
+        }
+      } else if (idType !== undefined) invalid = true;
+      if (!identity && key && !invalid) identity = identityFor("mention_key", key);
+      if (identity) {
+        const root = identityRoot(identity);
+        if (invalid || root.name && name && root.name !== name) root.conflict = true;
+        root.name ||= name;
+      }
+      if (key) {
+        const binding = mentionKeys.get(key) || { rows: [], missing: false };
+        if (identity) binding.rows.push(identity);
+        if (!name || !identity || invalid) binding.missing = true;
+        mentionKeys.set(key, binding);
       }
     }));
     let card = parse(content);
     let wrapperDepth = 0;
     const wrappers = new WeakSet();
-    while (object(card) && read(card, "json_card") !== undefined) {
+    while (!stopped && object(card) && read(card, "json_card") !== undefined) {
       if (wrappers.has(card)) { mark("card_cycle"); card = null; break; }
       if (wrapperDepth >= MAX_DEPTH) { mark("card_depth_limit"); card = null; break; }
       wrappers.add(card);
+      const wrapper = card;
+      enter(wrapper, wrapperDepth, () => { attachment(read(wrapper, "json_attachment"), wrapperDepth + 1); });
       wrapperDepth += 1;
-      card = parse(read(card, "json_card"));
+      card = parse(read(wrapper, "json_card"));
     }
     if (!object(card)) mark("invalid_card_json");
     else enter(card, wrapperDepth, () => {
+      attachment(read(card, "json_attachment"), wrapperDepth + 1);
       const header = read(card, "header");
       if (header !== undefined) {
         const headerPayload = read(header, "property") ?? header;
@@ -562,13 +792,22 @@ function renderCardContent(content, mentions = []) {
     mark("unsupported_card_structure");
   }
   output = output.trim();
+  const omissions = omittedActions > 0 ? { omitted_actions: omittedActions } : {};
+  if (!output && reasons.size === 0 && omittedActions > 0) {
+    return { text: "[卡片仅含交互操作，文本视图已收起]", status: "rendered", reason: null, version: 3, ...omissions };
+  }
   if (!output && reasons.size === 0) mark("card_no_visible_content");
-  const reason = /** @type {Reason | undefined} */ (Object.keys(EXPLANATIONS).find((key) => reasons.has(/** @type {Reason} */ (key))));
-  if (!reason) return { text: output, status: "rendered", reason: null, version: 2 };
+  const reason = /** @type {Reason | undefined} */ (Object.keys(EXPLANATIONS).find((key) =>
+    key !== "unresolved_card_mention" && reasons.has(/** @type {Reason} */ (key))))
+    || (reasons.has("unresolved_card_mention") ? "unresolved_card_mention" : undefined);
+  if (!reason) return { text: output, status: "rendered", reason: null, version: 3, ...omissions };
+  if (reason === "unresolved_card_mention" && reasons.size === 1) {
+    return { text: output, status: "partial", reason, version: 3, ...omissions };
+  }
   const status = output ? "partial" : "structured_fallback";
   const marker = `[卡片${output ? "部分内容未展开" : "未展开"}：${EXPLANATIONS[reason]}]`;
   return { text: `${output.slice(0, Math.max(0, MAX_OUTPUT_CHARS - marker.length - 1))}${output ? "\n" : ""}${marker}`,
-    status, reason, version: 2 };
+    status, reason, version: 3, ...omissions };
 }
 
 export { renderCardContent };

@@ -1,3 +1,52 @@
+/** Resolve source namespaces before comparing names. Legacy prefixes are only
+ * an inheritance compatibility rule, never permission to perform a lookup.
+ * Explicit raw evidence wins over a missing canonical type; contradictory
+ * explicit evidence cannot inherit a name, even when the ID bytes match. */
+function larkSenderNamespaceSql(canonical: string, raw: string, actor: string, allowLegacy = true) {
+  const pairs = ['open_id', 'user_id', 'union_id', 'app_id'].flatMap((type) => [
+    `SELECT '${type}' AS type, json_extract(raw, '$.sender.${type}') AS value FROM native`,
+    `SELECT '${type}' AS type, json_extract(raw, '$.sender.sender_id.${type}') AS value FROM native`,
+  ]).join(' UNION ALL ');
+  return `(WITH source AS MATERIALIZED (
+    SELECT ${canonical} AS canonical, ${actor} AS actor,
+      CASE WHEN json_valid(${raw}) THEN ${raw} ELSE '{}' END AS raw
+  ), native AS MATERIALIZED (
+    SELECT canonical, actor, CASE WHEN json_type(raw, '$.raw_api') = 'object'
+      THEN json_extract(raw, '$.raw_api') ELSE raw END AS raw FROM source
+  ), evidence AS MATERIALIZED (${pairs}), types AS MATERIALIZED (
+    SELECT *, NULLIF(json_extract(canonical, '$.sender_id_type'), '') AS canonical_type,
+      NULLIF(json_extract(raw, '$.sender.id_type'), '') AS declared_type,
+      CASE WHEN json_type(raw, '$.sender.id') = 'text' THEN NULLIF(json_extract(raw, '$.sender.id'), '') END AS raw_id,
+      (SELECT COUNT(DISTINCT type) FROM evidence WHERE value = native.actor) AS matching_types,
+      (SELECT MIN(type) FROM evidence WHERE value = native.actor) AS matching_type
+    FROM native
+  ), resolved AS MATERIALIZED (
+    SELECT *, COALESCE(declared_type, CASE WHEN matching_types = 1 THEN matching_type END) AS source_type
+    FROM types
+  ) SELECT CASE
+    WHEN COALESCE(actor, '') = '' OR canonical_type = 'conflicting'
+      OR json_type(canonical, '$.sender_id_type') NOT IN ('text', 'null')
+      OR json_type(raw, '$.sender.id_type') NOT IN ('text', 'null')
+      OR raw_id IS NOT NULL AND raw_id <> actor
+      OR declared_type IS NULL AND matching_types > 1
+      OR source_type IS NULL AND EXISTS (
+        SELECT 1 FROM evidence WHERE typeof(value) = 'text' AND value <> '')
+      OR EXISTS (SELECT 1 FROM evidence WHERE typeof(value) = 'text' AND value <> ''
+        GROUP BY type HAVING COUNT(DISTINCT value) > 1)
+      OR source_type IS NOT NULL AND EXISTS (
+        SELECT 1 FROM evidence WHERE type = source_type AND typeof(value) = 'text' AND value <> '' AND value <> actor)
+      OR declared_type IS NOT NULL AND raw_id IS NULL AND NOT EXISTS (
+        SELECT 1 FROM evidence WHERE type = declared_type AND value = actor)
+      OR canonical_type IS NOT NULL AND source_type IS NOT NULL AND canonical_type <> source_type
+      THEN NULL
+    WHEN source_type IS NOT NULL THEN 'typed:' || source_type
+    ${allowLegacy ? `WHEN canonical_type IS NOT NULL THEN 'typed:' || canonical_type
+    WHEN actor GLOB 'ou_*' THEN 'typed:open_id'
+    WHEN actor GLOB 'cli_*' THEN 'typed:app_id'
+    ELSE 'legacy:opaque'` : 'ELSE NULL'}
+    END FROM resolved)`;
+}
+
 /** SQL-side name merge shared by ingestion and enrichment. A missing/empty name
  * is unknown, including failed lookups. Only name_state='cleared' is a clear.
  * Historical chat names may fill unknown fields, but cannot undo an explicit
@@ -12,11 +61,15 @@ function mergeLarkNameProjectionSql(
   incomingActor: string,
   existingContainer: string,
   incomingContainer: string,
+  existingRaw = "'{}'",
+  incomingRaw = "'{}'",
 ) {
   const sameActor = `${existingActor} IS NOT NULL AND ${existingActor} <> ''
     AND ${existingActor} IS ${incomingActor}
     AND json_extract(old, '$.sender_id') IS ${existingActor}
-    AND json_extract(next, '$.sender_id') IS ${incomingActor}`;
+    AND json_extract(next, '$.sender_id') IS ${incomingActor}
+    AND ${larkSenderNamespaceSql(existingJson, existingRaw, existingActor)}
+      = ${larkSenderNamespaceSql(incomingJson, incomingRaw, incomingActor)}`;
   const sameContainer = `${existingContainer} IS NOT NULL AND ${existingContainer} <> ''
     AND ${existingContainer} IS ${incomingContainer}
     AND json_extract(old, '$.chat_id') IS ${existingContainer}
@@ -76,4 +129,4 @@ function mergeLarkNameProjectionSql(
     THEN old ELSE next END FROM n${index})`;
 }
 
-export { mergeLarkNameProjectionSql };
+export { larkSenderNamespaceSql, mergeLarkNameProjectionSql };

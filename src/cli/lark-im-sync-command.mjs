@@ -1,5 +1,8 @@
 // @ts-check
 
+import { ACTIVITY_GRACE_MS, createActivityWriter } from "../diagnostics/lark-im-activity-evidence.mjs";
+import { writeLog } from "./lark-im-worker-command.mjs";
+
 import { resolve } from "node:path";
 import { getSelfProfile } from "../adapters/lark-im/adapter.mjs";
 import { getTransportStats, resetTransportStats } from "../adapters/lark-im/transport.mjs";
@@ -73,6 +76,7 @@ const DEFAULT_RETRY_DELAY_MS = 2000;
  * }} RunResult
  *
  * @typedef {object} LarkImSyncCommandDeps
+ * @property {ReturnType<typeof createActivityWriter>=} activity
  * @property {(dbPath: string) => void=} ensureInitialized
  * @property {(dbPath: string, sourceId: string, candidateStartMs: number, options?: {explicit?: boolean, endMs?: number}) => number=} ensureSourceInitialSyncStart
  * @property {(opts: SyncOptions) => SelfProfile=} getSelfProfile
@@ -311,16 +315,20 @@ function executeLarkImSync(opts, deps = {}) {
   };
 
   if (opts.scope === "all" || opts.scope === "sent") {
+    deps.activity?.update("sync", { step: "sent", durationMs: 5000 });
     summary.sent = runner.syncSent(dbPath, opts, requiredSelfProfile);
   }
   if (opts.scope === "all" || opts.scope === "discover") {
+    deps.activity?.update("sync", { step: "discover", durationMs: 5000 });
     summary.discovery = runner.syncDiscovery(dbPath, opts);
   }
   if (opts.scope === "all" || opts.scope === "received") {
+    deps.activity?.update("sync", { step: "received", durationMs: 5000 });
     summary.received = runner.syncReceived(dbPath, opts, requiredSelfProfile);
   }
 
   if (opts.scope === "details") {
+    deps.activity?.update("sync", { step: "details", durationMs: 5000 });
     summary.details = runner.retryDetails(dbPath, opts, requiredSelfProfile);
   }
 
@@ -347,13 +355,22 @@ function runLarkImSyncCli(argv, io = {}) {
   const stderr = io.stderr || process.stderr;
   const readTransport = io.deps?.getTransportStats || getTransportStats;
   (io.deps?.resetTransportStats || resetTransportStats)();
+  /** @type {ReturnType<typeof createActivityWriter> | undefined} */
+  let activity;
   try {
     const opts = parseArgs(argv);
     if (opts.help) {
       stdout.write(usage());
       return 0;
     }
-    const summary = executeLarkImSync(opts, io.deps || {});
+    const parent = process.env.EXOCORTEX_ACTIVITY_PARENT || "";
+    const timeout = Number(process.env.EXOCORTEX_ACTIVITY_STEP_TIMEOUT_MS);
+    const durationMs = parent && Number.isSafeInteger(timeout) && timeout > 0 ? timeout + ACTIVITY_GRACE_MS : 5000;
+    activity = io.deps?.activity || (!io.deps ? createActivityWriter({ db: opts.db, role: "sync", parentInstance: parent,
+      emit: (event) => writeLog({ logDir: process.env.EXOCORTEX_ACTIVITY_LOG_DIR || "logs/lark-im" }, event, { stdout: { write() {} } }),
+    }) : undefined);
+    activity?.update("sync", { step: opts.scope, durationMs });
+    const summary = executeLarkImSync(opts, { ...io.deps, activity });
     summary.transport = readTransport();
     stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
     return summary.ok ? 0 : 1;
@@ -365,7 +382,7 @@ function runLarkImSyncCli(argv, io = {}) {
       stderr.write(`${JSON.stringify({ type: "lark_transport_summary", transport })}\n`);
     }
     return 1;
-  }
+  } finally { activity?.update("stopped"); }
 }
 
 export {
