@@ -7,6 +7,10 @@ const MAX_DEPTH = 24;
 const LOCALES = ["zh_cn", "en_us", "ja_jp"];
 const TEXT_TAGS = new Set(["text", "plain_text", "lark_md", "markdown", "md"]);
 const CONTAINER_TAGS = new Set(["div", "note", "action", "column_set", "column"]);
+// These controls can erase or join URL syntax when terminal text is cleaned.
+// Tab and line separators keep their whitespace boundary and are excluded.
+const LINK_SYNTAX_CONTROLS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
+const LINK_SCHEME = /\b(?:[a-z][a-z0-9+.-]{1,31}:\/\/|(?:javascript|vbscript|data|file|mailto|tel):)/i;
 const EXPLANATIONS = {
   card_input_limit: "输入超过解析上限",
   card_output_limit: "正文超过展示上限",
@@ -86,8 +90,8 @@ function renderCardContent(content, mentions = []) {
   const active = new WeakSet();
   /** @type {Map<string, string | null>} */
   const names = new Map();
-  /** Cache by name, so aliases do not repeat URL work or duplicate large strings.
-   * @type {Map<string, string>} */
+  /** Cache name strings and standalone projections across aliases.
+   * @type {Map<string, {plain: string, linked?: string}>} */
   const formattedNames = new Map();
   let parseChars = 0;
   let textChars = 0;
@@ -111,8 +115,10 @@ function renderCardContent(content, mentions = []) {
   function boundedRawText(value) {
     const available = Math.max(0, MAX_INPUT_CHARS - textChars);
     textChars += Math.min(value.length, available);
-    if (value.length > available) mark("card_input_limit");
-    return value.slice(0, available);
+    // Never parse a prefix as a complete value: truncating before a URL's @
+    // could turn credentials into an apparently harmless hostname.
+    if (value.length > available) { mark("card_input_limit"); return ""; }
+    return value;
   }
 
   /** @param {string} value */
@@ -155,6 +161,7 @@ function renderCardContent(content, mentions = []) {
    */
   function safeUrl(value) {
     try {
+      if (LINK_SYNTAX_CONTROLS.test(value)) throw new Error("ambiguous control in URL");
       const url = new URL(value);
       if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("unsupported protocol");
       const omitted = Boolean(url.username || url.password || url.search || url.hash);
@@ -165,18 +172,20 @@ function renderCardContent(content, mentions = []) {
     }
   }
 
-  /** @param {string} id */
-  function mention(id) {
+  /** @param {string} id @param {boolean} [projectLinks] */
+  function mention(id, projectLinks = true) {
     const name = names.get(id);
     if (name) {
       let formatted = formattedNames.get(name);
       if (formatted === undefined) {
-        // One extra character lets the caller distinguish a full result from
-        // a projection that must carry the explicit output-limit marker.
-        formatted = `@${safeLinks(name)}`.slice(0, MAX_OUTPUT_CHARS + 1);
+        formatted = { plain: `@${name}` };
         formattedNames.set(name, formatted);
       }
-      return formatted;
+      // Inline names are inserted as opaque text before the single final link
+      // scan. Standalone at nodes need their own cached, final link projection.
+      if (!projectLinks) return formatted.plain;
+      if (formatted.linked === undefined) formatted.linked = safeLinks(`@${name}`).slice(0, MAX_OUTPUT_CHARS + 1);
+      return formatted.linked;
     }
     mark("unresolved_card_mention");
     return "@未知用户";
@@ -187,81 +196,155 @@ function renderCardContent(content, mentions = []) {
    */
   function visibleText(value) {
     let text = boundedRawText(value);
-    let remainingExpansion = Math.max(0, MAX_OUTPUT_CHARS - output.length);
+    // Names must reach the URL lexer whole. This separate finite workspace
+    // budget retains ordinary long-name prefixes without allocating N names
+    // of arbitrary size; only the final, safe projection is output-truncated.
+    let remainingExpansion = Math.max(0, MAX_INPUT_CHARS - text.length);
     text = text.replace(/<at\s+id=["']([^"'<>]*)["']\s*>[^<]*<\/at>|@_user_\d+\b/gi,
       (matched, id) => {
-        if (remainingExpansion === 0) { mark("card_output_limit"); return ""; }
-        const replacement = mention(id ?? matched);
-        const retained = replacement.slice(0, remainingExpansion);
-        remainingExpansion -= retained.length;
-        if (retained.length < replacement.length) mark("card_output_limit");
-        return retained;
+        if (remainingExpansion === 0) { mark("card_output_limit"); return matched; }
+        const replacement = mention(id ?? matched, false);
+        if (replacement.length > remainingExpansion) { mark("card_output_limit"); return matched; }
+        remainingExpansion -= replacement.length;
+        return replacement;
       });
     // Original text is input-bounded; all inserted names together are bounded
-    // by the remaining output budget. Keep the whole original URL syntax for
+    // by the finite expansion budget. Keep the whole original URL syntax for
     // redaction rather than truncating a destination before it is inspected.
-    return safeLinks(cleanText(text));
+    return safeLinks(text);
   }
 
-  /** A single forward scan prevents unmatched brackets from causing regex
-   * backtracking and keeps complete parenthesized URL queries inside the link.
+  /**
+   * URL atoms take priority over Markdown at every source offset, including
+   * inside labels. A consumed atom is projected once and its brackets never
+   * become syntax. Markdown destinations have a separate bounded delimiter
+   * scan; success and failure both advance past all inspected input. Generated
+   * fragments are final output, never fed back through the lexer.
    * @param {string} text
    */
-  function markdownLinks(text) {
-    const parts = [];
-    let copiedUntil = 0;
-    let labelStart = -1;
-    for (let index = 0; index < text.length; index += 1) {
-      if (text[index] === "\n") labelStart = -1;
-      // Keep the whole possible label, including IPv6 brackets in a URL label.
-      // Restarting at its inner '[' would split off the scheme and allow the
-      // remaining query to evade URL projection.
-      else if (text[index] === "[" && labelStart < 0) labelStart = index;
-      else if (text[index] === "]" && labelStart >= 0 && text[index + 1] === "(") {
-        let nesting = 1;
-        let excessive = false;
-        let end = index + 2;
-        for (; end < text.length && text[end] !== "\n"; end += 1) {
-          if (text[end] === "\\" && end + 1 < text.length && text[end + 1] !== "\n") {
-            end += 1;
-            continue;
-          }
-          if (text[end] === "(") nesting += 1;
-          if (nesting > MAX_DEPTH) excessive = true;
-          if (text[end] === ")" && --nesting === 0) break;
-        }
-        const label = text.slice(labelStart + 1, index);
-        const start = labelStart > copiedUntil && text[labelStart - 1] === "!" ? labelStart - 1 : labelStart;
-        parts.push(bareLinks(text.slice(copiedUntil, start)));
-        const safeLabel = bareLinks(label);
-        if (nesting !== 0 || excessive) {
-          mark("unsupported_card_link");
-          parts.push(`${safeLabel}（[不支持的链接]）`);
-        } else {
-          const url = text.slice(index + 2, end).trim().replace(/^<([^>]*)>$/, "$1")
-            .replace(/\s+["'][^"']*["']$/, "").replace(/\\([\\()[\]])/g, "$1");
-          parts.push(`${safeLabel}（链接：${safeUrl(url)}）`);
-        }
-        copiedUntil = nesting === 0 ? end + 1 : end;
-        index = copiedUntil - 1;
-        labelStart = -1;
-      }
+  function safeLinks(text) {
+    // Cleaning can remove @host, erase a scheme, or create one from separated
+    // letters. Its leftover prose might itself be credential/query text. With
+    // no unambiguous original boundary, reject the whole affected text value.
+    // Control-only prose still follows the ordinary terminal cleanup rules.
+    const uncertainLinks = LINK_SYNTAX_CONTROLS.test(text);
+    const originalHasLink = uncertainLinks && LINK_SCHEME.test(text);
+    text = cleanText(text);
+    if (uncertainLinks && (originalHasLink || LINK_SCHEME.test(text))) {
+      mark("unsupported_card_link");
+      return "[不支持的链接]";
     }
-    parts.push(bareLinks(text.slice(copiedUntil)));
+    const parts = [];
+    /** @type {string[] | null} */
+    let label = null;
+    let labelDepth = 0;
+    let labelPrefix = "[";
+    let labelHasUrl = false;
+    let plainStart = 0;
+    let index = 0;
+    // Sticky matching examines at most 32 scheme characters on the original
+    // string. It never slices the remaining input at each candidate position.
+    const scheme = new RegExp(LINK_SCHEME.source, "iy");
+    /** @param {number} end */
+    function flush(end) {
+      if (end > plainStart) (label ?? parts).push(text.slice(plainStart, end));
+      plainStart = end;
+    }
+    function literalLabel() {
+      if (label === null) return;
+      parts.push(labelPrefix, label.join(""));
+      // An atom may own what looks like a closing Markdown delimiter. Do not
+      // recover it by splitting/reinterpreting the URL; declare the ambiguity.
+      if (labelHasUrl) mark("unsupported_card_link");
+      label = null;
+      labelDepth = 0;
+      labelHasUrl = false;
+    }
+    while (index < text.length) {
+      scheme.lastIndex = index;
+      const urlStart = scheme.exec(text);
+      if (urlStart) {
+        let end = scheme.lastIndex;
+        while (end < text.length && !/\s/u.test(text[end])) end += 1;
+        flush(index);
+        const atom = text.slice(index, end);
+        (label ?? parts).push(safeUrl(atom));
+        if (label !== null) {
+          labelHasUrl = true;
+          if (atom.includes("](")) mark("unsupported_card_link");
+        }
+        index = end;
+        plainStart = end;
+        continue;
+      }
+      const char = text[index];
+      if (char === "\n" && label !== null) {
+        flush(index);
+        literalLabel();
+      } else if (char === "[") {
+        if (label === null) {
+          const image = index > plainStart && text[index - 1] === "!";
+          flush(image ? index - 1 : index);
+          label = [];
+          labelPrefix = image ? "![" : "[";
+          labelHasUrl = false;
+          labelDepth = 1;
+          plainStart = index + 1;
+        } else {
+          labelDepth += 1;
+          if (labelDepth > MAX_DEPTH) mark("unsupported_card_link");
+        }
+      } else if (char === "]" && label !== null) {
+        if (labelDepth > 1) {
+          labelDepth -= 1;
+          if (text[index + 1] === "(") mark("unsupported_card_link");
+        } else if (text[index + 1] === "(") {
+          flush(index);
+          let nesting = 1;
+          let excessive = false;
+          let end = index + 2;
+          for (; end < text.length && text[end] !== "\n"; end += 1) {
+            if (text[end] === "\\" && end + 1 < text.length && text[end + 1] !== "\n") { end += 1; continue; }
+            if (text[end] === "(") nesting += 1;
+            if (nesting > MAX_DEPTH) excessive = true;
+            if (text[end] === ")" && --nesting === 0) break;
+          }
+          const caption = label.join("");
+          if (nesting !== 0 || excessive) {
+            mark("unsupported_card_link");
+            parts.push(`${caption}（[不支持的链接]）`);
+          } else {
+            let url = text.slice(index + 2, end).trim();
+            const quote = url.at(-1);
+            if (quote === '\"' || quote === "'") {
+              const opening = url.lastIndexOf(quote, url.length - 2);
+              if (opening > 0 && /\s/u.test(url[opening - 1])) url = url.slice(0, opening).trimEnd();
+            }
+            if (url.startsWith("<") && url.endsWith(">")) url = url.slice(1, -1);
+            url = url.replace(/\\([\\()[\]])/g, "$1");
+            parts.push(`${caption}（链接：${safeUrl(url)}）`);
+          }
+          label = null;
+          labelDepth = 0;
+          labelHasUrl = false;
+          index = nesting === 0 ? end + 1 : end;
+          plainStart = index;
+          continue;
+        } else {
+          flush(index + 1);
+          // A closed bracket with no destination is literal text.
+          parts.push(labelPrefix, label.join(""));
+          label = null;
+          labelDepth = 0;
+          labelHasUrl = false;
+        }
+      }
+      index += 1;
+    }
+    flush(text.length);
+    literalLabel();
     return parts.join("");
   }
-
-  /** @param {string} text */
-  function bareLinks(text) {
-    // Delimit only at whitespace: brackets, angle brackets and full-width
-    // punctuation can all occur in URL queries. Project each original token
-    // once before adding display markers; never rescan generated link text.
-    return text.replace(/\b(?:[a-z][a-z0-9+.-]{1,31}:\/\/|(?:javascript|vbscript|data|file|mailto|tel):)\S+/gi,
-      (url) => safeUrl(url));
-  }
-
-  /** @param {string} text */
-  function safeLinks(text) { return markdownLinks(text); }
 
   /** @param {unknown} value @param {number} depth @param {(item: unknown, depth: number) => void} visit */
   function each(value, depth, visit) {
@@ -333,7 +416,7 @@ function renderCardContent(content, mentions = []) {
     let linked = false;
     const url = read(payload, "url") ?? read(payload, "href");
     if (typeof url === "string") {
-      emit(`${label ? " " : ""}（链接：${safeUrl(boundedText(url))}）`);
+      emit(`${label ? " " : ""}（链接：${safeUrl(boundedRawText(url))}）`);
       linked = true;
     } else if (url !== undefined) mark("unsupported_card_structure");
     const multi = read(payload, "multi_url");
@@ -347,7 +430,7 @@ function renderCardContent(content, mentions = []) {
           recognized = true;
           if (typeof destination !== "string") { mark("unsupported_card_structure"); continue; }
           lineBreak();
-          emit(`${platform}链接：${safeUrl(boundedText(destination))}`);
+          emit(`${platform}链接：${safeUrl(boundedRawText(destination))}`);
           linked = true;
         }
         if (!recognized) mark("unsupported_card_structure");
@@ -397,7 +480,7 @@ function renderCardContent(content, mentions = []) {
       if (!object(entry)) return;
       const name = read(entry, "name");
       if (typeof name !== "string" || !name.trim()) return;
-      const safeName = boundedText(name);
+      const safeName = boundedRawText(name);
       const id = read(entry, "id");
       const keys = [read(entry, "key"), typeof id === "string" ? id : undefined,
         ...["open_id", "user_id", "union_id"].flatMap((key) => [read(entry, key), read(id, key)])];

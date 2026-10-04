@@ -70,7 +70,14 @@ test("linear control scanning preserves lines and strips complete ANSI, OSC and 
     "bel\u001b]52;c;HIDDEN_BEL\u0007visible\n" +
     "dcs\u001bPHIDDEN_DCS\u001b\\visible\n" +
     "space\u0000\tend\u2028last";
-  const result = renderCardContent(plainCard(source));
+  // Preserve the original mixed control/URL fixture. Even a hidden URL can
+  // straddle a removed control terminator, so this whole value is ambiguous.
+  const ambiguous = renderCardContent(plainCard(source));
+  assert.equal(ambiguous.status, "partial");
+  assert.equal(ambiguous.reason, "unsupported_card_link");
+  assert.doesNotMatch(ambiguous.text, /HIDDEN|https?:|[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u202e]/);
+  // Controls without link syntax retain the exact multiline prose contract.
+  const result = renderCardContent(plainCard(source.replace("https://example.invalid/HIDDEN_OSC", "HIDDEN_OSC")));
   assert.equal(result.text, "first\nred text\nbeforeafter\nc1visible\nbelvisible\ndcsvisible\nspace  end\nlast");
   assert.equal(result.status, "rendered");
   assert.doesNotMatch(result.text, /HIDDEN|[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u202e]/);

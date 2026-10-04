@@ -62,11 +62,19 @@ for (const [name, url] of [
   ["angle punctuation", "https://example.invalid/a?token=A>SYNTHETIC_SECRET<TAIL#SYNTHETIC_FRAGMENT"],
 ]) {
   test(`${name} is consumed before URL projection, including Markdown labels and destinations`, () => {
-    const result = renderCardContent({ elements: [text(`Bare ${url}\n[Read](${url})\n[${url}](${url})`)] });
+    const result = renderCardContent({ elements: [text(`Bare ${url}\n[Read](${url})`)] });
     assert.equal(result.status, "rendered");
+    assert.equal(result.reason, null);
     assert.match(result.text, /已省略/);
     assert.doesNotMatch(result.text, /SYNTHETIC_SECRET|SYNTHETIC_FRAGMENT|SYNTHETIC_PASSWORD|TAIL|token=/);
     if (name.startsWith("IPv6")) assert.match(result.text, /https:\/\/\[2001:db8::[12]\]\/a/);
     else assert.match(result.text, /https:\/\/example\.invalid\/a/);
+    // URL-owned punctuation is never reused as Markdown syntax. A URL label
+    // with no whitespace before ]( is deliberately ambiguous, not a complete
+    // supported Markdown projection; all former secret sentinels remain tested.
+    const ambiguous = renderCardContent({ elements: [text(`[${url}](${url})`)] });
+    assert.equal(ambiguous.status, "partial");
+    assert.equal(ambiguous.reason, "unsupported_card_link");
+    assert.doesNotMatch(ambiguous.text, /SYNTHETIC_SECRET|SYNTHETIC_FRAGMENT|SYNTHETIC_PASSWORD|TAIL|token=/);
   });
 }
