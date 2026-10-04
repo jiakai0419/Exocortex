@@ -424,7 +424,7 @@ for (const [label, mutation, field, expected] of [
     insertRow(f);
     const before = readRows(f)[0];
     const output = summary(run(f), 1);
-    assert.equal(output.skipped_conflicts, 1);
+    assert.equal(output.skipped_conflicts, 1, JSON.stringify(output));
     assert.equal(output.updated, 0);
     assert.deepEqual(readRows(f)[0], { ...before, [field]: expected });
     assert.deepEqual(sql(f.db, "SELECT * FROM maintenance_locks;", true), []);

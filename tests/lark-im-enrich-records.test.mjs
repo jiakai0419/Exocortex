@@ -583,7 +583,7 @@ for (const replacement of [false, true]) {
     assert.deepEqual(readRecords(fixture.dbPath), before);
     const locks = maintenanceLocks(fixture.dbPath);
     if (replacement) {
-      assert.equal(locks.length, 1);
+      assert.equal(locks.length, 1, JSON.stringify({ stdout: result.stdout, stderr: result.stderr }));
       assert.equal(locks[0].owner, "synthetic-other-owner");
     } else {
       assert.deepEqual(locks, []);
