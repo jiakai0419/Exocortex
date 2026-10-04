@@ -6,7 +6,7 @@ import test from "node:test";
 
 import { createLarkImAdapter } from "../src/adapters/lark-im/adapter.mjs";
 import { createSyncRunner } from "../src/adapters/lark-im/sync-runner.mjs";
-import { ensureInitialized, quoteSql, readScope, sqliteExec, sqliteQuery } from "../dist/storage/sqlite/ingestion-store.js";
+import { ensureInitialized, quoteSql, readLarkListProgress, readScope, sqliteExec, sqliteQuery } from "../dist/storage/sqlite/ingestion-store.js";
 
 const START = Date.parse("2026-10-01T00:00:00+08:00");
 const SCOPE = "lark.im.received.chat.native_fixture";
@@ -28,7 +28,8 @@ test("native root and replies commit atomically; later page failure retains curs
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const dbPath = join(directory, "synthetic.sqlite");
   ensureInitialized(dbPath);
-  sqliteExec(dbPath, `INSERT INTO sync_scopes(id,source_id,name,config_json) VALUES(
+  sqliteExec(dbPath, `UPDATE sources SET config_json=json_set(config_json,'$.initial_sync_start_ms',${START}) WHERE id='lark.im';
+    INSERT INTO sync_scopes(id,source_id,name,config_json) VALUES(
     ${quoteSql(SCOPE)},'lark.im','native synthetic fixture',${quoteSql(JSON.stringify({ chat_id: "oc_fixture", chat_type: "group" }))});`);
   let failSecondPage = false;
   let calls = 0;
@@ -75,7 +76,8 @@ function syntheticDatabase(t) {
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const dbPath = join(directory, "synthetic.sqlite");
   ensureInitialized(dbPath);
-  sqliteExec(dbPath, `INSERT INTO sync_scopes(id,source_id,name,config_json) VALUES(
+  sqliteExec(dbPath, `UPDATE sources SET config_json=json_set(config_json,'$.initial_sync_start_ms',${START}) WHERE id='lark.im';
+    INSERT INTO sync_scopes(id,source_id,name,config_json) VALUES(
     ${quoteSql(SCOPE)},'lark.im','synthetic incomplete details',${quoteSql(JSON.stringify({ chat_id: "oc_fixture", chat_type: "group" }))});`);
   return dbPath;
 }
@@ -133,35 +135,44 @@ for (const direction of ["received", "sent"]) {
     const metadata = JSON.parse(run.metadata_json);
     assert.equal(metadata.window_complete, false);
     assert.equal(metadata.pages, 2);
-    assert.equal(metadata.missing_detail_count, 1);
-    assert.deepEqual(metadata.missing_detail_reasons, { bot_user_out_of_chat: 1 });
+    assert.equal(metadata.pending_detail_count, 1);
+    assert.equal(metadata.list_complete, true);
+    assert.equal(metadata.details_complete, false);
+    assert.equal(readLarkListProgress(dbPath, readScope(dbPath, scopeId)).cursor.created_at_ms, START + 60_000);
+    const missing = sqliteQuery(dbPath, `SELECT status,last_error_message FROM lark_im_detail_tasks WHERE scope_id=${quoteSql(scopeId)};`)[0];
+    assert.equal(missing.status, "pending");
+    assert.match(missing.last_error_message, /bot_user_out_of_chat/);
+    assert.doesNotMatch(missing.last_error_message, /synthetic-private|om_fixture|oc_fixture/);
     assert.equal(metadata.window_start, undefined, "failed attempts must not emit successful coverage-window keys");
-    assert.doesNotMatch(run.metadata_json, /synthetic-private|om_fixture|oc_fixture/);
+    assert.doesNotMatch(run.metadata_json, /synthetic-private|om_fixture/);
     assert.equal(sqliteQuery(dbPath, "SELECT COUNT(*) AS n FROM sync_locks;")[0].n, 0);
 
+    sqliteExec(dbPath, `UPDATE lark_im_detail_tasks SET retry_at='2000-01-01T00:00:00.000Z';`);
     const repeated = sync();
     assert.equal(repeated.ok, false);
-    assert.equal(repeated.duplicate, 2);
+    assert.equal(repeated.duplicate, 0, "completed list coverage does not rewind to denied roots");
     denied = false;
-    const recovered = sync();
+    sqliteExec(dbPath, `UPDATE lark_im_detail_tasks SET retry_at='2000-01-01T00:00:00.000Z';`);
+    const recovered = runner.retryDetails(dbPath, opts(START + 60_000), PROFILE)[0];
     assert.equal(recovered.ok, true);
     assert.equal(recovered.inserted, 1);
-    assert.equal(recovered.duplicate, 2);
+    assert.equal(recovered.duplicate, 0);
     assert.equal(readScope(dbPath, scopeId).cursor.created_at_ms, START + 60_000);
     assert.deepEqual(sqliteQuery(dbPath, "SELECT status FROM sync_runs ORDER BY id;").map((row) => row.status),
-      ["failed", "failed", "succeeded"]);
+      ["failed", "failed", "failed", "failed", "succeeded"]);
     assert.equal(sqliteQuery(dbPath, "SELECT COUNT(*) AS n FROM records;")[0].n, 3);
     assert.match(sqliteQuery(dbPath, `SELECT body FROM records WHERE external_id=${quoteSql(root.message_id)};`)[0].body, /synthetic 43/);
     assert.equal(paths.filter((path) => path.endsWith(root.message_id)).length, 3);
   });
 }
 
-test("a previously expanded boundary root survives denied details while newer ordinary messages persist", (t) => {
+test("a previously expanded boundary root survives denied edited details while newer ordinary messages persist", (t) => {
   const dbPath = syntheticDatabase(t);
   const root = rawMerge(50, START + 60_000);
   let denied = false;
   const adapter = createLarkImAdapter({ run(args) {
-    if (args[2] === "/open-apis/im/v1/messages") return nativePage(denied ? [root, raw(51, START + 90_000)] : [root]);
+    if (args[2] === "/open-apis/im/v1/messages") return nativePage(denied
+      ? [{ ...root, update_time: String(START + 120_000) }, raw(51, START + 90_000)] : [root]);
     if (denied) throw new Error("lark-cli failed: kind=restricted_mode");
     return nativePage([root, raw(52, START)]);
   } });
@@ -175,7 +186,32 @@ test("a previously expanded boundary root survives denied details while newer or
   assert.equal(failed.inserted, 1);
   assert.deepEqual(sqliteQuery(dbPath, `SELECT raw_json,canonical_json,body,updated_at FROM records WHERE external_id=${quoteSql(root.message_id)};`)[0], saved);
   assert.deepEqual(sqliteQuery(dbPath, `SELECT cursor_json,cursor_updated_at,last_success_run_id FROM sync_scopes WHERE id=${quoteSql(SCOPE)};`)[0], before);
+  assert.equal(readLarkListProgress(dbPath, readScope(dbPath, SCOPE)).cursor.created_at_ms, START + 120_000);
   assert.equal(readScope(dbPath, SCOPE).enabled, 1);
+});
+
+test("an unchanged completed boundary root reuses its receipt without reopening detail debt", (t) => {
+  const dbPath = syntheticDatabase(t);
+  const root = rawMerge(55, START + 60_000);
+  let replay = false;
+  let detailCalls = 0;
+  const adapter = createLarkImAdapter({ run(args) {
+    if (args[2] === "/open-apis/im/v1/messages") return nativePage(replay ? [root, raw(56, START + 90_000)] : [root]);
+    detailCalls += 1;
+    if (replay) throw new Error("lark-cli failed: kind=restricted_mode");
+    return nativePage([root, raw(57, START)]);
+  } });
+  const runner = createSyncRunner({ ...adapter, buildPeopleContext: context });
+  assert.equal(runner.syncReceivedScope(dbPath, opts(START + 60_000), readScope(dbPath, SCOPE), PROFILE).ok, true);
+  const saved = sqliteQuery(dbPath, `SELECT raw_json,body FROM records WHERE external_id=${quoteSql(root.message_id)};`)[0];
+  replay = true;
+  const result = runner.syncReceivedScope(dbPath, opts(START + 120_000), readScope(dbPath, SCOPE), PROFILE);
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.inserted, 1);
+  assert.equal(detailCalls, 1, "unchanged source fingerprint has durable completed detail evidence");
+  assert.deepEqual(sqliteQuery(dbPath, `SELECT raw_json,body FROM records WHERE external_id=${quoteSql(root.message_id)};`)[0], saved);
+  assert.equal(readScope(dbPath, SCOPE).cursor.created_at_ms, START + 120_000);
+  assert.equal(sqliteQuery(dbPath, "SELECT COUNT(*) AS n FROM lark_im_detail_tasks WHERE status='pending';")[0].n, 0);
 });
 
 test("native window deadline retries a complete minute prefix and next run resumes without losing boundary messages", (t) => {
@@ -232,7 +268,7 @@ test("native one-minute budget saturation leaves cursor and records unchanged", 
   assert.equal(sqliteQuery(dbPath, "SELECT status FROM sync_runs;")[0].status, "failed");
 });
 
-test("a later list failure after detail denial commits neither ordinary records nor cursor", (t) => {
+test("a later list failure commits neither ordinary records, missing-root tasks nor cursor", (t) => {
   const dbPath = syntheticDatabase(t);
   const root = rawMerge(70, START);
   const adapter = createLarkImAdapter({ run(args) {
@@ -248,5 +284,7 @@ test("a later list failure after detail denial commits neither ordinary records 
   assert.equal(readScope(dbPath, SCOPE).enabled, 1);
   assert.equal(readScope(dbPath, SCOPE).cursor, null);
   assert.equal(sqliteQuery(dbPath, "SELECT COUNT(*) AS n FROM records;")[0].n, 0);
+  assert.equal(sqliteQuery(dbPath, "SELECT COUNT(*) AS n FROM lark_im_detail_tasks;")[0].n, 0);
+  assert.equal(readLarkListProgress(dbPath, readScope(dbPath, SCOPE)), null);
   assert.equal(sqliteQuery(dbPath, "SELECT status FROM sync_runs;")[0].status, "failed");
 });

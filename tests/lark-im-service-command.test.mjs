@@ -577,3 +577,20 @@ test("wait-ok does not accept a completed cycle followed by unfinished history",
   assert.equal(evaluation.ready, false);
   assert.match(evaluation.reason, /unfinished_cycle=true/);
 });
+
+test("wait-ok requires pending detail debt to reach zero despite raw healthy status", () => {
+  const startedAt = Date.parse("2026-06-20T00:00:00.000Z");
+  const summary = {
+    last_cycle: { cycle: 1, ok: true, at: "2026-06-20T00:00:01.000Z" },
+    in_progress: false,
+    unfinished_cycle: false,
+  };
+  for (const pendingCount of [2, 1, 0]) {
+    const evaluation = evaluateWaitOkState(startedAt, {
+      health: "ok", details: { pending_count: pendingCount },
+    }, summary);
+    assert.equal(evaluation.newOkCycle, true);
+    assert.equal(evaluation.healthReady, pendingCount === 0);
+    assert.equal(evaluation.ready, pendingCount === 0);
+  }
+});

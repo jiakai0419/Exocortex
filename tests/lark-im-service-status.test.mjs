@@ -668,3 +668,104 @@ test("failed sync subprocess cannot establish activity with otherwise valid JSON
   assert.equal(report.overview.activity.status, "unknown");
   assert.equal(report.overview.health.status, "problem");
 });
+
+test("service evaluates a foreground lease acquired during a slow sync query against the later clock", (t) => {
+  const startedAt = Date.parse("2026-06-20T12:00:00.000Z");
+  let clockMs = startedAt;
+  t.mock.method(Date, "now", () => clockMs);
+  const report = buildServiceStatusReport(
+    { label: "com.example.worker", target: "gui/501/com.example.worker", logDir: "logs/test" },
+    {
+      clock: () => clockMs,
+      runCommand: (cmd) => {
+        if (cmd === "launchctl") return spawnResult({ status: 113, stderr: 'Could not find service "com.example.worker" in domain for user gui: 501' });
+        clockMs += 1000;
+        return spawnResult({ stdout: JSON.stringify(syncStatusFixture({ health: "syncing", locks: [{
+          locked_at: new Date(startedAt + 500).toISOString(), expires_at: new Date(startedAt + 10000).toISOString(),
+        }] })) });
+      },
+      readRecentWorkerEvents: () => ({ path: "worker.jsonl", exists: false, events: [] }),
+      readLiveProbeCache: () => null,
+      liveProbeContext: () => null,
+      sqliteJson: () => [],
+    },
+  );
+  assert.equal(report.overview.service.status, "stopped");
+  assert.equal(report.overview.activity.status, "syncing");
+  assert.equal(report.stability.window_started_at, new Date(clockMs - report.stability.window_ms).toISOString());
+});
+
+test("service expires a lease that crosses its normal or hard deadline during a slow sync query", (t) => {
+  const startedAt = Date.parse("2026-06-20T12:00:00.000Z");
+  let clockMs = startedAt;
+  t.mock.method(Date, "now", () => clockMs);
+  for (const lease of [
+    { locked_at: new Date(startedAt - 1000).toISOString(), expires_at: new Date(startedAt + 500).toISOString() },
+    { locked_at: new Date(startedAt - 3600000 + 500).toISOString(), expires_at: new Date(startedAt + 10000).toISOString() },
+  ]) {
+    clockMs = startedAt;
+    const report = buildServiceStatusReport(
+      { label: "com.example.worker", target: "gui/501/com.example.worker", logDir: "logs/test" },
+      {
+        clock: () => clockMs,
+        runCommand: (cmd) => {
+          if (cmd === "launchctl") return spawnResult({ stdout: "state = running\n" });
+          clockMs += 1000;
+          return spawnResult({ stdout: JSON.stringify(syncStatusFixture({ health: "syncing", locks: [lease] })) });
+        },
+        readRecentWorkerEvents: () => ({ path: "worker.jsonl", exists: false, events: [] }),
+        readLiveProbeCache: () => null,
+        liveProbeContext: () => null,
+        sqliteJson: () => [],
+      },
+    );
+    assert.equal(report.overview.activity.status, "unknown");
+    assert.equal(report.overview.health.status, "problem");
+  }
+});
+
+test("service reads its evaluation clock after optional evidence queries, while numeric nowMs stays fixed", () => {
+  const startedAt = Date.parse("2026-06-20T12:00:00.000Z");
+  for (const fixedClock of [false, true]) {
+    let clockMs = startedAt;
+    const report = buildServiceStatusReport(
+      { label: "com.example.worker", target: "gui/501/com.example.worker", logDir: "logs/test" },
+      {
+        ...(fixedClock ? { nowMs: startedAt } : {}),
+        clock: () => clockMs,
+        runCommand: (cmd) => cmd === "launchctl" ? spawnResult({ stdout: "state = running\n" }) : spawnResult({ stdout: JSON.stringify(syncStatusFixture({ health: "syncing", locks: [{
+          locked_at: new Date(startedAt - 1000).toISOString(), expires_at: new Date(startedAt + 500).toISOString(),
+        }] })) }),
+        readRecentWorkerEvents: () => ({ path: "worker.jsonl", exists: false, events: [] }),
+        readLiveProbeCache: () => null,
+        liveProbeContext: () => null,
+        sqliteJson: () => { clockMs += 1000; return []; },
+      },
+    );
+    assert.equal(report.overview.activity.status, fixedClock ? "syncing" : "unknown");
+    assert.equal(report.stability.window_started_at, new Date((fixedClock ? startedAt : clockMs) - report.stability.window_ms).toISOString());
+  }
+});
+
+test("pending message details prevent service health from claiming completion even during active sync", () => {
+  const nowMs = Date.parse("2026-06-20T12:00:00.000Z");
+  for (const health of ["ok", "ok_with_history", "syncing", "catching_up"]) {
+    const overview = buildServiceOverview({
+      launchd: { loaded: true, state: "running" },
+      syncStatus: syncStatusFixture({
+        health, health_detail: "all known enabled scopes have cursors", details: { pending_count: 2 },
+        locks: [{ locked_at: "2026-06-20T11:59:00.000Z", expires_at: "2026-06-20T12:01:00.000Z" }],
+      }),
+      workerSummary: workerSummaryFixture(),
+      nowMs,
+    });
+    assert.equal(overview.health.status, "catching_up");
+    assert.equal(overview.health.detail, "2 message details await retry");
+    assert.equal(overview.activity.status, "syncing");
+  }
+  const complete = buildServiceOverview({
+    launchd: { loaded: true, state: "running" }, syncStatus: syncStatusFixture({ details: { pending_count: 0 } }),
+    workerSummary: workerSummaryFixture(), nowMs,
+  });
+  assert.equal(complete.health.status, "ok");
+});

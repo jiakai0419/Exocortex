@@ -28,7 +28,7 @@ const DEFAULT_RETRIES = 4;
 const DEFAULT_RETRY_DELAY_MS = 2000;
 
 /**
- * @typedef {"all" | "sent" | "discover" | "received"} SyncScopeOption
+ * @typedef {"all" | "sent" | "discover" | "received" | "details"} SyncScopeOption
  * @typedef {"cursor" | "hot" | "reconcile"} DiscoveryMode
  * @typedef {"all" | "hot" | "catchup"} ReceivedMode
  *
@@ -55,6 +55,8 @@ const DEFAULT_RETRY_DELAY_MS = 2000;
  * @property {number} lockTtlSeconds
  * @property {number} retries
  * @property {number} retryDelayMs
+ * @property {number} detailLimit
+ * @property {string=} detailScope
  * @property {number} startMs
  * @property {number} endMs
  * @property {number} stableHorizonMs
@@ -91,7 +93,7 @@ function usage() {
 
 Options:
   --db <path>                 SQLite database path. Default: ${DEFAULT_DB}
-  --scope <scope>             all | sent | discover | received. Default: all
+  --scope <scope>             all | sent | discover | received | details. Default: all
   --start <iso>               Confirm the persistent start for scopes without cursors; requires an ISO timezone.
                               On a new source, default: today 00:00 local time. Later conflicting values fail.
   --end <iso>                 Upper bound for this run. Default: now.
@@ -115,6 +117,8 @@ Options:
   --lock-ttl-seconds <n>      Scope lock TTL. Default: 600
   --retries <n>               Retries for transient lark-cli failures. Default: ${DEFAULT_RETRIES}
   --retry-delay-ms <n>        Delay between transient retries. Default: ${DEFAULT_RETRY_DELAY_MS}
+  --detail-limit <n>         Due detail roots per details-only run, max 20. Default: 5
+  --detail-scope <id>        Restrict details-only retries to one stored scope.
   --help                      Show this help.
 `;
 }
@@ -197,6 +201,7 @@ function defaultOptions() {
     lockTtlSeconds: 600,
     retries: DEFAULT_RETRIES,
     retryDelayMs: DEFAULT_RETRY_DELAY_MS,
+    detailLimit: 5,
     startMs: 0,
     endMs: 0,
     stableHorizonMs: DEFAULT_STABLE_HORIZON_SECONDS * 1000,
@@ -242,6 +247,8 @@ function parseArgs(argv) {
       opts.stableHorizonSeconds = parseNonNegativeInt(next, "stable-horizon-seconds");
     else if (arg === "--lock-ttl-seconds")
       opts.lockTtlSeconds = parsePositiveInt(next, "lock-ttl-seconds");
+    else if (arg === "--detail-limit") opts.detailLimit = Math.min(20, parsePositiveInt(next, "detail-limit"));
+    else if (arg === "--detail-scope") opts.detailScope = next;
     else if (arg === "--retries") opts.retries = parsePositiveInt(next, "retries");
     else if (arg === "--retry-delay-ms")
       opts.retryDelayMs = parsePositiveInt(next, "retry-delay-ms");
@@ -249,8 +256,8 @@ function parseArgs(argv) {
     i += 1;
   }
 
-  if (!["all", "sent", "discover", "received"].includes(opts.scope)) {
-    throw new Error("--scope must be one of: all, sent, discover, received");
+  if (!["all", "sent", "discover", "received", "details"].includes(opts.scope)) {
+    throw new Error("--scope must be one of: all, sent, discover, received, details");
   }
   if (!["cursor", "hot", "reconcile"].includes(opts.discoveryMode)) {
     throw new Error("--discovery-mode must be cursor, hot, or reconcile");
@@ -281,7 +288,7 @@ function executeLarkImSync(opts, deps = {}) {
   opts = { ...opts, startMs: baseline, start: new Date(baseline).toISOString() };
   if (opts.endMs < baseline) throw new Error("--end must be after the persisted initial sync baseline");
 
-  const needsSelfProfile = opts.scope === "all" || opts.scope === "sent" || opts.scope === "received";
+  const needsSelfProfile = opts.scope === "all" || opts.scope === "sent" || opts.scope === "received" || opts.scope === "details";
   const selfProfile = /** @type {SelfProfile | null} */ (needsSelfProfile ? loadSelfProfile(opts) : null);
   if (needsSelfProfile && !selfProfile?.open_id) {
     throw new Error("could not resolve current Lark user open_id");
@@ -313,10 +320,15 @@ function executeLarkImSync(opts, deps = {}) {
     summary.received = runner.syncReceived(dbPath, opts, requiredSelfProfile);
   }
 
+  if (opts.scope === "details") {
+    summary.details = runner.retryDetails(dbPath, opts, requiredSelfProfile);
+  }
+
   const failures = [
     summary.sent,
     summary.discovery,
     ...summary.received,
+    ...(summary.details || []),
   ].filter((item) => item && item.ok === false);
   if (failures.length > 0) {
     summary.ok = false;

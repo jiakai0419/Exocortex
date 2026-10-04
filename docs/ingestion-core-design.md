@@ -151,6 +151,8 @@ worker 必须只从本地持久化状态恢复：
 ```text
 sync_scopes.cursor_json
 sync_scopes.config_json
+lark_im_list_progress
+lark_im_detail_tasks
 sync_runs
 sync_locks
 records
@@ -169,7 +171,7 @@ sync_runs 标记成功
 sync_scopes.cursor_json 更新
 ```
 
-这些动作必须在同一事务里提交。进程在事务前或事务中崩溃时，下次重启只能重新读取旧窗口；允许重复读取，不允许跳过未确认数据。
+这些动作必须在同一事务里提交。普通来源在中断后重读旧窗口；Lark IM 正常同步另存连续列表水位与逐根详情待办。列表完整时可原子保存普通记录、待办和列表水位，但欠账未清零时完整 Cursor 不前进。重启恢复两类持久化进度，详情修复后才闭合完整覆盖；允许重复读取，不允许跳过未确认数据。
 
 ### 失败和中断不能制造前进
 
@@ -706,18 +708,15 @@ Cursor 注意事项：
 }
 ```
 
-通用推进规则：
+当前 Lark 正常同步使用分钟对齐的时间水位；包含式边界会重复读取，再以本地毫秒裁剪与幂等写入消除重复。完整 Cursor 表示该水位之前列表和详情均已处理，不是本轮看见的最大消息 ID。
 
-- 同一时间戳内使用 `message_id` 作为 tie-breaker。
-- 只有分页完整处理后，才推进到本轮最大 `{created_at_ms, message_id}`。
-- 下轮读取严格大于 Cursor 的消息。
-- 写入和 Cursor 推进必须在同一事务提交。
-
-各路径差异：
-
-- `sent_by_me` 使用 `+messages-search`。该接口样本中不是按 `create_time asc` 返回，因此必须完整读取有上界窗口，再本地排序和过滤。
-- `received.chat.<chat_scope_id>` 使用 `+chat-messages-list --order asc`。该接口样本中按 `create_time` 单调递增，适合 per-chat cursor。
-- 两条路径的 `--start` 边界样本中都是包含式，因此 adapter 必须本地过滤严格大于 Cursor 的记录，而不是假设远端支持严格大于。
+- `sent_by_me` 使用原生 `POST /open-apis/im/v1/messages/search`，完整分页后以原生 `GET /open-apis/im/v1/messages/mget` 校验每个 ID 的根消息。返回顺序不能充当水位证据。
+- received 使用原生 `GET /open-apis/im/v1/messages`，请求 `sort_type=ByCreateTimeAsc` 与 `only_thread_root_messages=false`，完整分页包含主题回复。
+- 秒级查询边界向外取整，本地按原始毫秒起止裁剪。页数饱和可二分；共享 180 秒列表预算耗尽后只补试一个最小分钟前缀。普通 timeout 不触发二分。
+- 完整列表中的普通记录、合并根待办及 `lark_im_list_progress` 在一个带锁、硬租约、完整游标、列表代际和稳定会话身份检查的事务提交。发现排名、名称等可变元数据不属于身份 fence。
+- `lark_im_detail_tasks` 是持久化的逐根补齐队列，保留原始根、指纹、版本、重试时间、尝试次数及完成收据。独立详情请求有 30 秒、50 页、1000 项、64 层上限，不得导致列表缩窗。权威新版本可以完成旧待办；过时结果必须通过指纹 CAS 拒绝。
+- 详情欠账不阻止后续普通消息列表覆盖，但完整 Cursor 与完整覆盖证据保持原值。欠账清零时原子闭合到连续列表水位。仅列表成功的 run 使用 `list_window_*` 与不完整标记，不得作为完整覆盖区间。
+- `--scope details` 有界处理到期待办，尊重逐根指数退避；详情失败不吞掉后续健康根。聚合诊断、覆盖报告及 Service readiness 均显式考虑待办。命令、限制与恢复流程见 [operations.md](operations.md#原始消息与有界回填)。
 
 ### Unsupported received chat scopes
 
@@ -732,7 +731,7 @@ Cursor 注意事项：
 - `bot_user_out_of_chat`：lark-cli 返回 `230002` / `Bot/User can NOT be out of the chat.`。
 - `restricted_mode`：飞书返回保密模式/不允许复制转发一类错误。
 
-识别后，scope 写入 `config_json.unsupported_reason`、`unsupported_at`、`unsupported_error`，并设置 `enabled = 0`。如果后续需要恢复，应通过显式 recheck/re-enable 流程处理，而不是由 hot discovery 自动打开。
+只有当前 received 会话列表请求本身返回这些错误时，scope 写入 `config_json.unsupported_reason`、`unsupported_at`、`unsupported_error`，并设置 `enabled = 0`。如果后续需要恢复，应通过显式 recheck/re-enable 流程处理，而不是由 hot discovery 自动打开。单条合并转发详情返回这些错误只更新该根待办的失败与退避，不能据此禁用整个会话。
 
 ## 设计原则
 

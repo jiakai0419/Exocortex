@@ -1,13 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { plain } from "../dist/terminal/index.js";
 import {
   parseArgs,
   runSyncStatusCli,
 } from "../src/cli/sync-status-command.mjs";
-import { buildStatus } from "../src/diagnostics/sync-status-report.mjs";
+import { buildStatus, sanitizeStatusReportForPublicOutput } from "../src/diagnostics/sync-status-report.mjs";
 import { renderSyncStatusText as renderText } from "../src/terminal/sync-status-view.mjs";
+import { ensureInitialized, quoteSql } from "../dist/storage/sqlite/ingestion-store.js";
 
 function memoryWriter() {
   let text = "";
@@ -186,6 +191,7 @@ test("buildStatus assembles rows without performing recovery", () => {
     },
     sqliteJson: (dbPath, _sql, label) => {
       calls.push([label, dbPath]);
+      if (label === "read detail progress schema") return [];
       if (label === "read record totals") {
         return [{ count: 3, latest_ms: Date.parse("2026-06-20T00:00:00.000Z") }];
       }
@@ -260,6 +266,87 @@ test("buildStatus assembles rows without performing recovery", () => {
   assert.equal(status.runs.recent[0].error_code, 9499);
   assert.equal(calls.some(([label]) => label === "recover"), false);
   assert.equal(status.recovery.performed, false);
+  assert.equal(status.details.evidence, "legacy_unavailable");
+  assert.equal(status.details.pending_count, null);
+});
+
+function detailFixture(t) {
+  const directory = mkdtempSync(join(tmpdir(), "exocortex-detail-status-synthetic-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const db = join(directory, "synthetic.sqlite");
+  ensureInitialized(db);
+  const sql = (input) => {
+    const result = spawnSync("sqlite3", [db], { input: `.bail on\n${input}`, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+  };
+  const scope = "lark.im.received.chat.generated-status-scope";
+  const hidden = "GENERATED_PRIVATE_DETAIL_STATE";
+  const cursor = JSON.stringify({ kind: "time_message_cursor/v1", created_at_ms: 1_920_000_000_000 });
+  sql(`INSERT INTO sync_scopes(id,source_id,name) VALUES (${quoteSql(scope)},'lark.im','generated active scope');
+    INSERT INTO sync_scopes(id,source_id,name,enabled) VALUES (${quoteSql(scope + '-disabled')},'lark.im','generated disabled scope',0);
+    INSERT INTO sync_runs(source_id,scope_id,status) VALUES ('lark.im','lark.im.sent_by_me','succeeded');
+    UPDATE sync_scopes SET last_success_run_id=last_insert_rowid(),cursor_json=${quoteSql(cursor)} WHERE id='lark.im.sent_by_me';
+    INSERT INTO sync_runs(source_id,scope_id,status) VALUES ('lark.im',${quoteSql(scope)},'succeeded');
+    UPDATE sync_scopes SET last_success_run_id=last_insert_rowid(),cursor_json=${quoteSql(cursor)} WHERE id=${quoteSql(scope)};
+    UPDATE sync_scopes SET cursor_json='{"has_more":false}' WHERE id='lark.im.unmuted_chat_discovery';
+    INSERT INTO lark_im_list_progress(scope_id,cursor_json,coverage_start_ms,generation,scope_config_json,updated_at)
+      VALUES ('lark.im.sent_by_me',${quoteSql(cursor)},1919999940000,1,'{}','2001-01-01T00:00:00.000Z');
+    INSERT INTO lark_im_detail_tasks(scope_id,message_id,raw_root_json,fingerprint,occurred_at_ms,status,retry_at,created_at,updated_at,last_error_message)
+      VALUES ('lark.im.sent_by_me','generated-root',${quoteSql(JSON.stringify({ hidden }))},'generated-hash',1919999940000,'pending','2001-01-01T00:00:00.000Z','2001-01-01T00:00:00.000Z','2001-01-01T00:00:00.000Z',${quoteSql(hidden)}),
+      (${quoteSql(scope)},'generated-complete','{}','generated-complete-hash',1919999940000,'complete','2001-01-01T00:00:00.000Z','2001-01-01T00:00:00.000Z','2001-01-01T00:00:00.000Z',NULL),
+      (${quoteSql(scope + '-disabled')},'generated-disabled','{}','generated-disabled-hash',1919999940000,'pending','2001-01-01T00:00:00.000Z','2001-01-01T00:00:00.000Z','2001-01-01T00:00:00.000Z',NULL);`);
+  return { db, sql, hidden, scope };
+}
+
+test("status reports separate list progress and due detail debt without leaking payloads or writing", (t) => {
+  const { db, hidden, scope } = detailFixture(t);
+  const before = readFileSync(db);
+  const status = buildStatus(db);
+  assert.equal(status.health, "catching_up");
+  assert.deepEqual(status.details, { evidence: "available", pending_count: 1, due_count: 1, scopes_pending: 1,
+    oldest_pending_ms: 1_919_999_940_000, next_retry_at: "2001-01-01T00:00:00.000Z" });
+  assert.deepEqual(status.list_progress, { evidence: "available", scopes: 1,
+    oldest_cursor_ms: 1_920_000_000_000, invalid_cursor_scopes: 0 });
+  const output = JSON.stringify(status) + plain(renderText(status));
+  for (const value of [db, hidden, scope, "generated-root", "generated-hash"]) assert.equal(output.includes(value), false);
+  assert.match(output, /1 pending, 1 due for retry/);
+  assert.match(output, /List progress/);
+  assert.deepEqual(readFileSync(db), before);
+});
+
+test("legacy status stays explicit and partial or unreadable new detail schemas fail closed", (t) => {
+  const { db, sql } = detailFixture(t);
+  sql("DROP TABLE lark_im_detail_tasks;");
+  assert.throws(() => buildStatus(db), /schema is incomplete/);
+  sql("CREATE TABLE lark_im_detail_tasks(unrelated TEXT);");
+  assert.throws(() => buildStatus(db), /read pending detail totals failed/);
+  sql("DROP TABLE lark_im_detail_tasks; DROP TABLE lark_im_list_progress;");
+  assert.throws(() => buildStatus(db), /schema is incomplete/);
+  sql("DELETE FROM schema_migrations WHERE version='009';");
+  const before = readFileSync(db);
+  const status = buildStatus(db);
+  assert.equal(status.health, "ok");
+  assert.equal(status.details.evidence, "legacy_unavailable");
+  assert.equal(status.details.pending_count, null);
+  assert.equal(status.list_progress.scopes, null);
+  assert.match(plain(renderText(status)), /unavailable \(legacy database\)/);
+  assert.deepEqual(readFileSync(db), before);
+});
+
+test("public status sanitization cannot retain stale okay health when detail debt is present", () => {
+  const status = sanitizeStatusReportForPublicOutput(statusFixture({ health: "ok",
+    details: { evidence: "available", pending_count: 3, due_count: 1, scopes_pending: 1, raw_root_json: "PRIVATE" } }));
+  assert.equal(status.health, "catching_up");
+  assert.match(status.health_detail, /3 message details await retry/);
+  assert.equal(status.details.raw_root_json, undefined);
+  assert.equal(sanitizeStatusReportForPublicOutput(statusFixture({
+    details: { evidence: "available", pending_count: null },
+  })).health, "needs_attention");
+  const invalidList = sanitizeStatusReportForPublicOutput(statusFixture({
+    list_progress: { evidence: "available", scopes: 1, invalid_cursor_scopes: 1 },
+  }));
+  assert.equal(invalidList.health, "needs_attention");
+  assert.match(invalidList.health_detail, /list progress evidence is unavailable/);
 });
 
 test("parseArgs validates format and missing values", () => {

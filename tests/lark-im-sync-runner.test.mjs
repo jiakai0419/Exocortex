@@ -6,10 +6,14 @@ import test from "node:test";
 
 import { createSyncRunner } from "../src/adapters/lark-im/sync-runner.mjs";
 import { PaginationLimitError } from "../dist/core/sync.js";
+import { normalizeApiMessage } from "../src/adapters/lark-im/raw-message.mjs";
 import {
   acquireLock,
+  commitLarkListRun,
   createRun,
   ensureInitialized,
+  ensureSourceInitialSyncStart,
+  quoteSql,
   readScope,
   releaseLock,
   sqliteExec,
@@ -74,6 +78,7 @@ function peopleContext(selfProfile) {
 function createTestRunner(deps) {
   return createSyncRunner({
     isMaintenanceLocked: () => false,
+    readLarkListProgress: () => null,
     ...deps,
   });
 }
@@ -101,14 +106,14 @@ test("createSyncRunner lets sent sync run against injected adapter and store dep
     },
     releaseLock: (_dbPath, scopeId) => calls.push(["release", scopeId]),
     failRun: () => calls.push(["fail"]),
-    fetchSentMessages: (selfOpenId, startMs, endMs) => {
+    fetchSentMessageList: (selfOpenId, startMs, endMs) => {
       calls.push(["fetch-sent", selfOpenId, startMs, endMs]);
-      return { messages: [message("om_sent", BASE_MS, { content: "sent body" })], pages: 1 };
+      return { messages: [message("om_sent", BASE_MS, { content: "sent body" })], detailRoots: [], pages: 1 };
     },
     buildPeopleContext: (_messages, _opts, profile) => peopleContext(profile),
-    succeedMessageRun: (_dbPath, scope, runId, records, scanned, cursor, metadata) => {
+    commitLarkListRun: (_dbPath, scope, runId, records, _detailRoots, scanned, cursor, metadata) => {
       written = { scope, runId, records, scanned, cursor, metadata };
-      return { inserted: records.length, updated: 0, duplicate: 0 };
+      return { inserted: records.length, updated: 0, duplicate: 0, pending_details: 0 };
     },
   });
 
@@ -123,6 +128,9 @@ test("createSyncRunner lets sent sync run against injected adapter and store dep
     inserted: 1,
     updated: 0,
     duplicate: 0,
+    list_complete: true,
+    details_complete: true,
+    pending_details: 0,
   });
   assert.equal(written.runId, 42);
   assert.deepEqual(written.records.map((record) => [record.external_id, record.direction, record.body]), [
@@ -149,18 +157,18 @@ test("syncSent checkpoints one complete prefix after bisecting an oversized wind
     createRun: () => 43,
     releaseLock: () => {},
     failRun: () => {},
-    fetchSentMessages: (_selfId, startMs, endMs) => {
+    fetchSentMessageList: (_selfId, startMs, endMs) => {
       assert.equal(startMs, BASE_MS);
       fetchEnds.push(endMs);
       if (endMs - startMs > 2 * 60_000) {
         throw new PaginationLimitError("page budget exhausted", 1);
       }
-      return { messages: [message("om_prefix", endMs)], pages: 1 };
+      return { messages: [message("om_prefix", endMs)], detailRoots: [], pages: 1 };
     },
     buildPeopleContext: (_messages, _opts, profile) => peopleContext(profile),
-    succeedMessageRun: (_dbPath, _scope, _runId, _records, _scanned, cursor, metadata) => {
+    commitLarkListRun: (_dbPath, _scope, _runId, _records, _detailRoots, _scanned, cursor, metadata) => {
       checkpoint = { cursor, metadata };
-      return { inserted: 1, updated: 0, duplicate: 0 };
+      return { inserted: 1, updated: 0, duplicate: 0, pending_details: 0 };
     },
   });
 
@@ -173,8 +181,8 @@ test("syncSent checkpoints one complete prefix after bisecting an oversized wind
   assert.equal(result.ok, true);
   assert.deepEqual(fetchEnds, [BASE_MS + 8 * 60_000, BASE_MS + 4 * 60_000, BASE_MS + 2 * 60_000]);
   assert.equal(checkpoint.cursor.created_at_ms, BASE_MS + 2 * 60_000);
-  assert.equal(checkpoint.metadata.window_bisections, 2);
-  assert.equal(Date.parse(checkpoint.metadata.window_end), BASE_MS + 2 * 60_000);
+  assert.equal(checkpoint.metadata.list_window_bisections, 2);
+  assert.equal(Date.parse(checkpoint.metadata.list_window_end), BASE_MS + 2 * 60_000);
 });
 
 test("createSyncRunner classifies unsupported received scopes through injected deps", () => {
@@ -193,7 +201,7 @@ test("createSyncRunner classifies unsupported received scopes through injected d
     createRun: () => 77,
     releaseLock: (_dbPath, scopeId) => calls.push(["release", scopeId]),
     failRun: () => calls.push(["fail"]),
-    fetchChatMessages: () => {
+    fetchChatMessageList: () => {
       throw new Error("restricted private body oc_secret");
     },
     isRestrictedModeError: () => true,
@@ -273,7 +281,7 @@ test("syncSent failure fails the run, releases the lock, and does not checkpoint
       calls.push("run");
       return 501;
     },
-    fetchSentMessages: () => {
+    fetchSentMessageList: () => {
       calls.push("fetch");
       throw new Error("temporary lark failure");
     },
@@ -282,9 +290,9 @@ test("syncSent failure fails the run, releases the lock, and does not checkpoint
       failed = { scope: failedScope, runId, message: error.message };
     },
     releaseLock: (_dbPath, scopeId) => calls.push(`release:${scopeId}`),
-    succeedMessageRun: () => {
+    commitLarkListRun: () => {
       checkpointed = true;
-      return { inserted: 0, updated: 0, duplicate: 0 };
+      return { inserted: 0, updated: 0, duplicate: 0, pending_details: 0 };
     },
   });
 
@@ -331,12 +339,12 @@ test("syncScope re-reads the cursor after locking before it creates or runs work
     },
     releaseLock: () => {},
     failRun: () => {},
-    fetchSentMessages: (_selfId, startMs, endMs) => {
+    fetchSentMessageList: (_selfId, startMs, endMs) => {
       fetchCalls.push([startMs, endMs]);
-      return { messages: [message("om_new", BASE_MS + 2 * 60_000)], pages: 1 };
+      return { messages: [message("om_new", BASE_MS + 2 * 60_000)], detailRoots: [], pages: 1 };
     },
     buildPeopleContext: (_messages, _opts, profile) => peopleContext(profile),
-    succeedMessageRun: () => ({ inserted: 1, updated: 0, duplicate: 0 }),
+    commitLarkListRun: () => ({ inserted: 1, updated: 0, duplicate: 0, pending_details: 0 }),
   });
 
   const result = runner.syncSent(
@@ -377,7 +385,7 @@ test("syncScope releases after failRun errors and preserves both failure details
     readScope: () => scope,
     acquireLock: () => true,
     createRun: () => 503,
-    fetchSentMessages: () => {
+    fetchSentMessageList: () => {
       throw new Error("fetch failed");
     },
     failRun: () => {
@@ -401,9 +409,9 @@ test("release failure after a successful commit is reported without failing the 
     readScope: () => scope,
     acquireLock: () => true,
     createRun: () => 504,
-    fetchSentMessages: () => ({ messages: [], pages: 1 }),
+    fetchSentMessageList: () => ({ messages: [], detailRoots: [], pages: 1 }),
     buildPeopleContext: (_messages, _opts, profile) => peopleContext(profile),
-    succeedMessageRun: () => ({ inserted: 0, updated: 0, duplicate: 0 }),
+    commitLarkListRun: () => ({ inserted: 0, updated: 0, duplicate: 0, pending_details: 0 }),
     failRun: () => {
       failCalls += 1;
     },
@@ -435,7 +443,7 @@ test("syncSent skips locked scopes before creating a run or calling the adapter"
       return false;
     },
     createRun: () => calls.push("run"),
-    fetchSentMessages: () => calls.push("fetch"),
+    fetchSentMessageList: () => calls.push("fetch"),
     failRun: () => calls.push("fail"),
     releaseLock: () => calls.push("release"),
   });
@@ -466,7 +474,7 @@ test("syncSent skips maintenance lock without creating a failed run", () => {
     },
     acquireLock: () => calls.push("lock"),
     createRun: () => calls.push("run"),
-    fetchSentMessages: () => calls.push("fetch"),
+    fetchSentMessageList: () => calls.push("fetch"),
     failRun: () => calls.push("fail"),
     releaseLock: () => calls.push("release"),
   });
@@ -500,7 +508,7 @@ test("syncSent reports maintenance lock when acquireLock is blocked by a race", 
       return false;
     },
     createRun: () => calls.push("run"),
-    fetchSentMessages: () => calls.push("fetch"),
+    fetchSentMessageList: () => calls.push("fetch"),
     failRun: () => calls.push("fail"),
     releaseLock: () => calls.push("release"),
   });
@@ -527,7 +535,7 @@ test("syncSent skips disabled scopes before locking or calling the adapter", () 
     }),
     acquireLock: () => calls.push("lock"),
     createRun: () => calls.push("run"),
-    fetchSentMessages: () => calls.push("fetch"),
+    fetchSentMessageList: () => calls.push("fetch"),
     failRun: () => calls.push("fail"),
     releaseLock: () => calls.push("release"),
   });
@@ -679,7 +687,7 @@ test("syncReceived honors receivedScopesPerRun batch limits", () => {
     createRun: (_dbPath, scope) => Number(scope.id.at(-1).charCodeAt(0)),
     releaseLock: () => {},
     failRun: () => {},
-    fetchChatMessages: (chatId) => {
+    fetchChatMessageList: (chatId) => {
       chatIds.push(chatId);
       return {
         messages: [
@@ -690,14 +698,16 @@ test("syncReceived honors receivedScopesPerRun batch limits", () => {
             content: `from ${chatId}`,
           }),
         ],
+        detailRoots: [],
         pages: 1,
       };
     },
     buildPeopleContext: (_messages, _opts, selfProfile) => peopleContext(selfProfile),
-    succeedMessageRun: (_dbPath, _scope, _runId, records) => ({
+    commitLarkListRun: (_dbPath, _scope, _runId, records) => ({
       inserted: records.length,
       updated: 0,
       duplicate: 0,
+      pending_details: 0,
     }),
   });
 
@@ -750,16 +760,16 @@ test("syncReceived stops after exhausted transient transport failures and keeps 
           calls.push(["run", scope.id]);
           return scope.id.at(-1).charCodeAt(0);
         },
-        fetchChatMessages: (chatId) => {
+        fetchChatMessageList: (chatId) => {
           calls.push(["fetch", chatId]);
           if (chatId === "oc_b") throw new Error(errorMessage);
-          return { messages: [], pages: 1 };
+          return { messages: [], detailRoots: [], pages: 1 };
         },
         buildPeopleContext: (_messages, _opts, profile) => peopleContext(profile),
-        succeedMessageRun: (_dbPath, scope, _runId, _records, _scanned, cursor) => {
+        commitLarkListRun: (_dbPath, scope, _runId, _records, _detailRoots, _scanned, cursor) => {
           calls.push(["checkpoint", scope.id]);
           scopes.get(scope.id).cursor = cursor;
-          return { inserted: 0, updated: 0, duplicate: 0 };
+          return { inserted: 0, updated: 0, duplicate: 0, pending_details: 0 };
         },
         failRun: (_dbPath, scope, _runId, error) => {
           assert.equal(error.message, errorMessage);
@@ -989,4 +999,74 @@ test("hard-expired lock fencing rolls back unsupported scope mutations", (t) => 
     ),
     [{ enabled: 1, reason: null }],
   );
+});
+
+function detailSchedulingFixture(t, count) {
+  const dir = mkdtempSync(join(tmpdir(), "exocortex-detail-scheduling-synthetic-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const dbPath = join(dir, "synthetic.sqlite");
+  ensureInitialized(dbPath);
+  ensureSourceInitialSyncStart(dbPath, "lark.im", BASE_MS, { explicit: true });
+  const candidates = Array.from({ length: count }, (_, index) => {
+    const suffix = String(index).padStart(2, "0");
+    const id = `lark.im.received.chat.generated_detail_schedule_${suffix}`;
+    const root = { message_id: `om_generated_detail_schedule_${suffix}`, msg_type: "merge_forward",
+      chat_id: `oc_generated_detail_schedule_${suffix}`, create_time: String(BASE_MS + 1_000),
+      update_time: String(BASE_MS + 1_000), sender: { id: "ou_generated_detail_schedule", sender_type: "user" },
+      body: { content: "{}" } };
+    sqliteExec(dbPath, `INSERT INTO sync_scopes(id,source_id,name,config_json) VALUES(
+      ${quoteSql(id)},'lark.im',${quoteSql(`generated detail scheduling ${suffix}`)},${quoteSql(JSON.stringify({ chat_id: root.chat_id }))});`);
+    const scope = readScope(dbPath, id);
+    const runId = createRun(dbPath, scope);
+    commitLarkListRun(dbPath, scope, runId, [], [root], 1,
+      { kind: "time_message_cursor/v1", created_at_ms: BASE_MS + 60_000, message_id: "" },
+      { initial_sync_start_ms: BASE_MS, list_window_start_ms: BASE_MS, list_window_end_ms: BASE_MS + 60_000 });
+    return { id, root };
+  });
+  sqliteExec(dbPath, "UPDATE lark_im_detail_tasks SET retry_at='2000-01-01T00:00:00.000Z';");
+  return { dbPath, candidates };
+}
+
+test("details limit one refills an oldest locked scope with a healthy due scope", (t) => {
+  const { dbPath, candidates: [locked, healthy] } = detailSchedulingFixture(t, 2);
+  assert.equal(acquireLock(dbPath, locked.id, 60), true);
+  const lockBefore = sqliteQuery(dbPath, "SELECT * FROM sync_locks;");
+  const requests = [];
+  const runner = createSyncRunner({
+    fetchMessageDetails: (root) => {
+      requests.push(root.message_id);
+      assert.equal(root.message_id, healthy.root.message_id);
+      const child = { ...root, message_id: "om_generated_detail_schedule_child", msg_type: "text",
+        upper_message_id: root.message_id, body: { content: '{"text":"Invented scheduling child"}' } };
+      return normalizeApiMessage(root, { mergeItems: [root, child] });
+    },
+  });
+  const results = runner.retryDetails(dbPath, syncOptions({ detailLimit: 1 }),
+    { open_id: "ou_generated_detail_schedule_self", name: "Generated Self" });
+  assert.deepEqual(requests, [healthy.root.message_id]);
+  assert.equal(results.find((item) => item.scope_id === locked.id).reason, "scope_locked");
+  assert.equal(results.find((item) => item.scope_id === healthy.id).detail_attempts, 1);
+  assert.equal(results.find((item) => item.scope_id === healthy.id).ok, true);
+  assert.equal(results.at(-1).pending_details, 1, "locked debt remains explicit");
+  assert.deepEqual(sqliteQuery(dbPath, "SELECT * FROM sync_locks;"), lockBefore);
+  assert.equal(readScope(dbPath, locked.id).cursor, null);
+  assert.equal(readScope(dbPath, healthy.id).cursor.created_at_ms, BASE_MS + 60_000);
+  assert.deepEqual(sqliteQuery(dbPath, "SELECT status FROM lark_im_detail_tasks ORDER BY scope_id;")
+    .map((row) => row.status), ["pending", "complete"]);
+});
+
+test("details limit one inspects at most twenty-one locked scope candidates", (t) => {
+  const { dbPath } = detailSchedulingFixture(t, 22);
+  const inspected = [];
+  const runner = createSyncRunner({
+    acquireLock: (_path, id) => { inspected.push(id); return false; },
+    fetchMessageDetails: () => { throw new Error("locked candidates must not fetch details"); },
+  });
+  const results = runner.retryDetails(dbPath, syncOptions({ detailLimit: 1 }),
+    { open_id: "ou_generated_detail_schedule_self", name: "Generated Self" });
+  assert.equal(inspected.length, 21);
+  assert.equal(new Set(inspected).size, 21);
+  assert.equal(results.filter((item) => item.reason === "scope_locked").length, 21);
+  assert.equal(results.at(-1).pending_details, 22);
+  assert.equal(sqliteQuery(dbPath, "SELECT COUNT(*) AS n FROM records;")[0].n, 0);
 });

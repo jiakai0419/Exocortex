@@ -63,6 +63,18 @@ function nonNegativeNumber(value) {
 }
 
 /** @param {unknown} value */
+function publicCount(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+/** Preserve absent evidence as unknown, not an empty backlog.
+ * @param {JsonObject | undefined} value @param {string[]} counts */
+function progressEvidence(value, counts) {
+  if (value?.evidence === "available" && counts.every((key) => publicCount(value[key]) !== null)) return "available";
+  return value?.evidence === "legacy_unavailable" || value === undefined ? "legacy_unavailable" : "unavailable";
+}
+
+/** @param {unknown} value */
 function publicCursor(value) {
   if (!value || typeof value !== "object") return null;
   const cursor = /** @type {JsonObject} */ (value);
@@ -79,8 +91,13 @@ function publicCursor(value) {
  * @param {string} health
  * @param {JsonObject} scopes
  * @param {JsonObject | null} discoveryCursor
+ * @param {JsonObject} details
+ * @param {JsonObject} listProgress
  */
-function publicHealthDetail(health, scopes, discoveryCursor) {
+function publicHealthDetail(health, scopes, discoveryCursor, details, listProgress) {
+  if (details.evidence === "unavailable") return "message detail evidence is unavailable";
+  if (listProgress.evidence === "unavailable" || Number(listProgress.invalid_cursor_scopes || 0) > 0) return "message list progress evidence is unavailable";
+  if (Number(details.pending_count || 0) > 0) return `${details.pending_count} message details await retry; list progress does not prove full content`;
   if (health === "not_ready") return "initial discovery or successful message-scope evidence is missing";
   if (health === "needs_attention") return "sync history contains failures but no successful run";
   if (health === "syncing") return "worker is currently syncing";
@@ -110,9 +127,27 @@ function sanitizeStatusReportForPublicOutput(report) {
       exit_status: Number(report.exit_status || 1),
     };
   }
-  const health = ["syncing", "catching_up", "not_ready", "needs_attention", "ok", "ok_with_history"].includes(report?.health)
+  let health = ["syncing", "catching_up", "not_ready", "needs_attention", "ok", "ok_with_history"].includes(report?.health)
     ? report.health
     : "unknown";
+  const detailEvidence = progressEvidence(report?.details, ["pending_count", "due_count", "scopes_pending"]);
+  const details = {
+    evidence: detailEvidence,
+    pending_count: detailEvidence === "available" ? publicCount(report.details.pending_count) : null,
+    due_count: detailEvidence === "available" ? publicCount(report.details.due_count) : null,
+    scopes_pending: detailEvidence === "available" ? publicCount(report.details.scopes_pending) : null,
+    oldest_pending_ms: detailEvidence === "available" ? publicCount(report.details.oldest_pending_ms) : null,
+    next_retry_at: detailEvidence === "available" ? publicTimestamp(report.details.next_retry_at) : null,
+  };
+  const listEvidence = progressEvidence(report?.list_progress, ["scopes", "invalid_cursor_scopes"]);
+  const listProgress = {
+    evidence: listEvidence,
+    scopes: listEvidence === "available" ? publicCount(report.list_progress.scopes) : null,
+    oldest_cursor_ms: listEvidence === "available" ? publicCount(report.list_progress.oldest_cursor_ms) : null,
+    invalid_cursor_scopes: listEvidence === "available" ? publicCount(report.list_progress.invalid_cursor_scopes) : null,
+  };
+  if (detailEvidence === "unavailable" || listEvidence === "unavailable" || Number(listProgress.invalid_cursor_scopes || 0) > 0) health = "needs_attention";
+  else if (Number(details.pending_count || 0) > 0) health = "catching_up";
   const scopes = {
     total: nonNegativeNumber(report?.scopes?.total),
     enabled: nonNegativeNumber(report?.scopes?.enabled),
@@ -143,6 +178,8 @@ function sanitizeStatusReportForPublicOutput(report) {
         })),
     },
     scopes,
+    details,
+    list_progress: listProgress,
     discovery: {
       cursor: discoveryCursor,
       cursor_updated_at: publicTimestamp(report?.discovery?.cursor_updated_at),
@@ -186,7 +223,7 @@ function sanitizeStatusReportForPublicOutput(report) {
       active_expired_locks: 0,
     },
     health,
-    health_detail: publicHealthDetail(health, scopes, discoveryCursor),
+    health_detail: publicHealthDetail(health, scopes, discoveryCursor, details, listProgress),
   };
 }
 
@@ -210,6 +247,43 @@ function readScopeStatus(dbPath, scopeId, label, query) {
   );
 }
 
+/** Read only aggregates. A partial schema or read failure must fail the check.
+ * @param {string} dbPath
+ * @param {(dbPath: string, sql: string, label: string) => Row[]} query
+ */
+function readDetailProgress(dbPath, query) {
+  const tables = query(dbPath,
+    "SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('lark_im_list_progress', 'lark_im_detail_tasks', 'schema_migrations');",
+    "read detail progress schema");
+  const names = new Set(tables.map((row) => row.name));
+  const present = Number(names.has("lark_im_list_progress")) + Number(names.has("lark_im_detail_tasks"));
+  const migrated = names.has("schema_migrations") && query(dbPath,
+    "SELECT version FROM schema_migrations WHERE version = '009';", "read detail progress migration").length > 0;
+  if (present === 0 && !migrated) return {
+    details: { evidence: "legacy_unavailable" }, list_progress: { evidence: "legacy_unavailable" },
+  };
+  if (present !== 2) throw new Error("message detail progress schema is incomplete");
+  const enabledScope = "s.source_id = 'lark.im' AND s.enabled = 1 AND (s.id = 'lark.im.sent_by_me' OR s.id LIKE 'lark.im.received.chat.%')";
+  const details = query(dbPath, `SELECT COUNT(*) AS pending_count,
+      COUNT(DISTINCT t.scope_id) AS scopes_pending,
+      COALESCE(SUM(CASE WHEN julianday(t.retry_at) <= julianday('now') THEN 1 ELSE 0 END), 0) AS due_count,
+      MIN(t.occurred_at_ms) AS oldest_pending_ms, MIN(t.retry_at) AS next_retry_at
+    FROM lark_im_detail_tasks t JOIN sync_scopes s ON s.id = t.scope_id
+    WHERE ${enabledScope} AND t.status = 'pending';`, "read pending detail totals");
+  const listProgress = query(dbPath, `WITH progress AS (
+      SELECT CASE WHEN json_valid(p.cursor_json) THEN p.cursor_json ELSE '{}' END AS cursor_json
+      FROM lark_im_list_progress p JOIN sync_scopes s ON s.id = p.scope_id WHERE ${enabledScope}
+    ), cursors AS (
+      SELECT CASE WHEN json_extract(cursor_json, '$.kind') = 'time_message_cursor/v1'
+        AND json_type(cursor_json, '$.created_at_ms') = 'integer'
+        AND json_extract(cursor_json, '$.created_at_ms') BETWEEN 0 AND 9007199254740991
+        THEN json_extract(cursor_json, '$.created_at_ms') END AS cursor_ms FROM progress
+    ) SELECT COUNT(*) AS scopes, MIN(cursor_ms) AS oldest_cursor_ms,
+      COUNT(*) - COUNT(cursor_ms) AS invalid_cursor_scopes FROM cursors;`, "read list progress totals");
+  if (details.length !== 1 || listProgress.length !== 1) throw new Error("message detail progress evidence is unavailable");
+  return { details: { evidence: "available", ...details[0] }, list_progress: { evidence: "available", ...listProgress[0] } };
+}
+
 /**
  * @param {string} dbPath
  * @param {SyncStatusReportDeps} [deps]
@@ -224,6 +298,7 @@ function buildStatus(dbPath, deps = {}) {
     ),
     { count: 0, latest_ms: null },
   );
+  const detailProgress = readDetailProgress(dbPath, query);
   const byDirection = query(
     dbPath,
     "SELECT COALESCE(direction, 'unknown') AS direction, COUNT(*) AS count, MAX(occurred_at_ms) AS latest_ms FROM records GROUP BY direction ORDER BY direction;",
@@ -301,6 +376,7 @@ function buildStatus(dbPath, deps = {}) {
   const hotDiscoveryCursor = parseMaybeJson(hotDiscoveryRow.cursor_json);
   const reconcileCursor = parseMaybeJson(reconcileRow.cursor_json);
   return sanitizeStatusReportForPublicOutput({
+    ...detailProgress,
     records: {
       total: Number(totals.count || 0),
       latest_ms: totals.latest_ms ?? null,
@@ -354,7 +430,7 @@ function buildStatus(dbPath, deps = {}) {
       }),
     },
     locks,
-    health: summarizeHealth({ discoveryCursor, scopeCounts, locks, runCounts }),
+    health: summarizeHealth({ discoveryCursor, scopeCounts, locks, runCounts, details: detailProgress.details }),
   });
 }
 

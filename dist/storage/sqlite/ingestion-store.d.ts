@@ -115,5 +115,33 @@ declare function countWriteEffects(dbPath: string, sourceId: string, records: St
 declare function succeedRecordRun(dbPath: string, scope: SyncScope, runId: number, records: StoredRecord[], scannedCount: number, cursor: JsonObject | null, metadata: JsonObject): WriteEffects;
 /** Save validated records from an incomplete window without claiming coverage. */
 declare function failRecordRun(dbPath: string, scope: SyncScope, runId: number, records: StoredRecord[], scannedCount: number, error: Error, metadata: JsonObject): WriteEffects;
+type LarkDetailOutcome = {
+    message_id: string;
+    fingerprint: string;
+    record?: StoredRecord;
+    error?: Error;
+    retry_at?: string;
+};
+type LarkProgressEffects = WriteEffects & {
+    pending_details: number;
+    full_cursor_promoted: boolean;
+    list_cursor: JsonObject;
+};
+declare function readLarkListProgress(dbPath: string, scope: SyncScope): {
+    cursor: any;
+    anchor_cursor: any;
+} | null;
+/** Only due debt is returned; completed descriptors are durable replay receipts. */
+declare function readPendingLarkDetails(dbPath: string, scope: SyncScope, { limit, now }?: {
+    limit?: number;
+    now?: Date | string;
+}): {
+    raw_root: any;
+    raw: any;
+}[];
+/** Call only after the complete list window has passed pagination validation. */
+declare function commitLarkListRun(dbPath: string, scope: SyncScope, runId: number, records: StoredRecord[], rawMergeRoots: JsonObject[], scannedCount: number, listCursor: JsonObject, metadata: JsonObject): LarkProgressEffects;
+/** A complete detail response replaces content; failed attempts only reschedule debt. */
+declare function finishLarkDetailRun(dbPath: string, scope: SyncScope, runId: number, outcomes: LarkDetailOutcome[], metadata?: JsonObject): LarkProgressEffects;
 declare const succeedMessageRun: typeof succeedRecordRun;
-export { DEFAULT_HARD_LEASE_SECONDS, acquireLock, acquireMaintenanceLock, countWriteEffects, commitBoundedReplayRecords, normalizeBoundedReplayRecords, createRun, ensureInitialized, ensureSourceInitialSyncStart, existingRecordMap, failRun, failRecordRun, isMaintenanceLocked, normalizeExternalVersion, normalizeStoredRecords, ownerPid, ownerStartedAtMs, defaultOwnerState, recoverStaleSyncState, quoteSql, readScope, releaseLock, releaseMaintenanceLock, secureDatabasePaths, sqlJson, sqliteExec, sqliteQuery, succeedMessageRun, succeedRecordRun, upsertRecordsSql, validateInitialSyncStartMs, };
+export { DEFAULT_HARD_LEASE_SECONDS, acquireLock, acquireMaintenanceLock, countWriteEffects, commitBoundedReplayRecords, commitLarkListRun, finishLarkDetailRun, readLarkListProgress, readPendingLarkDetails, normalizeBoundedReplayRecords, createRun, ensureInitialized, ensureSourceInitialSyncStart, existingRecordMap, failRun, failRecordRun, isMaintenanceLocked, normalizeExternalVersion, normalizeStoredRecords, ownerPid, ownerStartedAtMs, defaultOwnerState, recoverStaleSyncState, quoteSql, readScope, releaseLock, releaseMaintenanceLock, secureDatabasePaths, sqlJson, sqliteExec, sqliteQuery, succeedMessageRun, succeedRecordRun, upsertRecordsSql, validateInitialSyncStartMs, };

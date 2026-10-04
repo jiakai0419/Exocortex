@@ -268,10 +268,10 @@ function installChat(dbPath, name, cursor = null) {
   return scopeId;
 }
 
-function fakeRunner(fetchChatMessages) {
+function fakeRunner(fetchChatMessageList) {
   return createSyncRunner({
-    fetchChatMessages,
-    fetchSentMessages: () => { throw new Error("unexpected synthetic sent fetch"); },
+    fetchChatMessageList,
+    fetchSentMessageList: () => { throw new Error("unexpected synthetic sent fetch"); },
     fetchChatDiscoveryPage: () => { throw new Error("unexpected synthetic discovery fetch"); },
     buildPeopleContext: (_messages, _opts, self) => ({
       self, contacts: new Map(), chat_members: new Map(), apps: new Map(), app_fallbacks: new Map(),
@@ -308,7 +308,7 @@ test("a failed first launch keeps its baseline across midnight, a restart, and n
         msg_type: "text",
         sender: { id: "ou_synthetic_other", id_type: "open_id", sender_type: "user" },
         chat_id: chatId, chat_type: "group", content: "synthetic previous-day message",
-      }], pages: 1 };
+      }], detailRoots: [], pages: 1 };
     }),
   });
 
@@ -332,7 +332,7 @@ test("a failed first launch keeps its baseline across midnight, a restart, and n
     getSelfProfile: () => profile,
     syncRunner: fakeRunner((_chatId, startMs) => {
       resumedStarts.push(startMs);
-      return { messages: [], pages: 1 };
+      return { messages: [], detailRoots: [], pages: 1 };
     }),
   });
   assert.equal(resumed.ok, true);

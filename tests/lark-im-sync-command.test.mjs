@@ -321,3 +321,28 @@ test("discovery-only commands persist the source baseline without fetching a pro
   assert.equal(summary.ok, true);
   assert.deepEqual(calls, ["init", "baseline", "discover"]);
 });
+
+test("details-only CLI has a capped positive batch limit and never dispatches list scopes", () => {
+  assert.equal(parseArgs(["--scope", "details"]).detailLimit, 5);
+  assert.equal(parseArgs(["--scope", "details", "--detail-limit", "200"]).detailLimit, 20);
+  assert.throws(() => parseArgs(["--scope", "details", "--detail-limit", "0"]), /positive integer/);
+  const opts = parseArgs(["--scope", "details", "--detail-limit", "2", "--detail-scope", "invented-scope"]);
+  const called = [];
+  const summary = executeLarkImSync(opts, {
+    resolvePath: (value) => value,
+    ensureInitialized: () => {},
+    ensureSourceInitialSyncStart: (_db, _source, value) => value,
+    getSelfProfile: () => ({ open_id: "invented-self", name: "Invented Self" }),
+    syncRunner: {
+      retryDetails: (_db, receivedOptions) => {
+        called.push([receivedOptions.detailLimit, receivedOptions.detailScope]);
+        return [{ ok: false, reason: "details_pending", pending_details: 1, detail_attempts: 0 }];
+      },
+    },
+  });
+  assert.deepEqual(called, [[2, "invented-scope"]]);
+  assert.equal(summary.ok, false, "no due attempt must not claim unresolved debt is complete");
+  assert.equal(summary.sent, null);
+  assert.equal(summary.discovery, null);
+  assert.deepEqual(summary.received, []);
+});

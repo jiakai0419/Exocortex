@@ -169,7 +169,7 @@ function chatType(raw, canonical, config) {
 }
 
 function chatName(raw, canonical, config) {
-  return canonical.chat_name_state === "cleared" ? "" : canonical.chat_name || raw?.chat_name || raw?.chat?.name || config.chat_name || "";
+  return canonical.chat_name || raw?.chat_name || raw?.chat?.name || config.chat_name || "";
 }
 
 function chatPartner(raw, canonical) {
@@ -586,8 +586,7 @@ function main() {
     const next = { ...row.canonical };
     const cid = chatId(row.raw, row, row.canonical, row.config);
     const ctype = chatType(row.raw, row.canonical, row.config);
-    const cname = row.canonical.chat_name_state === "cleared" ? null
-      : chatName(row.raw, row.canonical, row.config) || knownChatNames.get(cid) || "";
+    const cname = chatName(row.raw, row.canonical, row.config) || knownChatNames.get(cid) || "";
     const sid = senderId(row.raw, row, row.canonical);
     const isAppSender = senderType(row.raw, row.canonical) === "app" || String(sid || "").startsWith("cli_");
     const existingSenderName = senderName(row.raw, row.canonical);
@@ -637,6 +636,12 @@ function main() {
     next.chat_id = next.chat_id || cid || null;
     next.chat_type = next.chat_type || ctype || null;
     next.chat_name = next.chat_name || cname || null;
+    if (!row.canonical.chat_name) {
+      // All chat-name inputs here come from persisted snapshots. Mark them so
+      // the shared merge can distinguish enrichment from a fresh source name.
+      delete next.chat_name_state;
+      if (cname) next.chat_name_source = "local_history";
+    }
     if (partnerId || next.chat_partner) {
       next.chat_partner = {
         ...(next.chat_partner && typeof next.chat_partner === "object" ? next.chat_partner : {}),

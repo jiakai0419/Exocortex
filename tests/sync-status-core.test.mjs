@@ -79,3 +79,13 @@ test("empty, failed-only and missing discovery evidence never report ready", () 
   assert.equal(summarizeHealth(state({ scopeCounts: { message_enabled: 0 } })), "not_ready");
   assert.equal(summarizeHealth(state({ scopeCounts: { message_enabled: 2, message_without_success: 1 } })), "not_ready");
 });
+
+test("detail debt remains catching up despite complete cursors, past success or a running scan", () => {
+  const details = { evidence: "available", pending_count: 2 };
+  assert.equal(summarizeHealth(state({ details })), "catching_up");
+  assert.equal(summarizeHealth(state({ details, locks: [{ scope_id: "synthetic-live-scan" }] })), "catching_up");
+  assert.match(healthDetail(state({ details })), /2 message details await retry; list progress does not prove full content/);
+  assert.equal(summarizeHealth(state({ details: { evidence: "available", pending_count: 0 } })), "ok");
+  assert.equal(summarizeHealth(state({ details: { evidence: "legacy_unavailable", pending_count: null } })), "ok");
+  assert.equal(summarizeHealth(state({ details: { evidence: "unavailable", pending_count: null } })), "needs_attention");
+});

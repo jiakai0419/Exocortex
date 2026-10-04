@@ -104,10 +104,11 @@ test("locked scopes are refilled within a finite scan while actual API attempts 
     readScope: (_db, id) => scopes.get(id),
     isMaintenanceLocked: () => maintenance,
     acquireLock: () => { locks += 1; return !blockAll && locks > 2; },
+    readLarkListProgress: () => null,
     createRun: () => locks, releaseLock: () => {}, failRun: () => {},
-    fetchChatMessages: () => { fetched += 1; return { messages: [], pages: 1 }; },
+    fetchChatMessageList: () => { fetched += 1; return { messages: [], detailRoots: [], pages: 1 }; },
     buildPeopleContext: () => ({}),
-    succeedMessageRun: () => ({ inserted: 0, updated: 0, duplicate: 0 }),
+    commitLarkListRun: () => ({ inserted: 0, updated: 0, duplicate: 0, pending_details: 0 }),
   });
   const opts = { startMs: NOW - 600_000, endMs: NOW, receivedMode: "catchup", receivedScopesPerRun: 2,
     endExplicit: true, stableHorizonSeconds: 30, lockTtlSeconds: 600, maxPages: 10, pageSize: 50 };
@@ -132,10 +133,11 @@ test("locked initialized candidates refill their own lane without crowding out t
     nowIso: () => iso(NOW), sqliteQuery: () => rows,
     readScope: (_db, id) => scopes.get(id), isMaintenanceLocked: () => false,
     acquireLock: (_db, id) => id !== rows[0].id && id !== rows[1].id,
+    readLarkListProgress: () => null,
     createRun: (_db, scope) => { started.push(scope); return started.length; },
     releaseLock: () => {}, failRun: () => {},
-    fetchChatMessages: () => ({ messages: [], pages: 1 }), buildPeopleContext: () => ({}),
-    succeedMessageRun: () => ({ inserted: 0, updated: 0, duplicate: 0 }),
+    fetchChatMessageList: () => ({ messages: [], detailRoots: [], pages: 1 }), buildPeopleContext: () => ({}),
+    commitLarkListRun: () => ({ inserted: 0, updated: 0, duplicate: 0, pending_details: 0 }),
   });
   runner.syncReceived("fixture", { startMs: NOW - 600_000, endMs: NOW, receivedMode: "catchup",
     receivedScopesPerRun: 4, endExplicit: true, stableHorizonSeconds: 30, lockTtlSeconds: 600,

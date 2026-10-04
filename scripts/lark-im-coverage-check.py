@@ -98,6 +98,20 @@ def successful_interval(run):
         return None, 'not_succeeded'
     if run['skipped'] == 1:
         return None, 'skipped'
+    if run['window_complete'] == 0 or run['details_complete'] == 0 or run['list_complete'] == 0:
+        return None, 'incomplete_window'
+    if run['coverage_mode'] == 'list_checkpoint_and_details':
+        if (run['list_complete_type'] != 'true' or run['details_complete_type'] != 'true'
+                or run['pending_detail_count_type'] != 'integer' or run['pending_detail_count'] != 0):
+            return None, 'invalid_detail_closure'
+        if (integer_ms(run['window_start_ms']) != iso_ms(run['window_start'])
+                or integer_ms(run['window_end_ms']) != iso_ms(run['window_end'])):
+            return None, 'invalid_detail_closure'
+    elif run['coverage_mode'] is not None:
+        return None, 'unsupported_coverage_mode'
+    elif (run['list_complete_type'] is not None or run['details_complete_type'] is not None
+          or run['list_window_start_type'] is not None or run['list_window_end_type'] is not None):
+        return None, 'list_only_window'
     start = iso_ms(run['window_start'])
     end = iso_ms(run['window_end'])
     if start is None or end is None or end < start:
@@ -113,6 +127,60 @@ def successful_interval(run):
     if after < start:
         return None, 'invalid_cursor_after'
     return (start, min(end, after)), None
+
+
+def detail_progress(con, target_ms):
+    """Separate list checkpoints from unresolved detail debt in this snapshot.
+
+    Legacy databases have no detail ledger. A partially present/new unreadable
+    schema is an inspection failure, never an empty backlog.
+    """
+    tables = {row['name'] for row in con.execute("""
+        SELECT name FROM sqlite_schema WHERE type='table'
+          AND name IN ('lark_im_list_progress','lark_im_detail_tasks','schema_migrations')
+    """)}
+    migrated = ('schema_migrations' in tables and con.execute(
+        "SELECT 1 FROM schema_migrations WHERE version='009'").fetchone() is not None)
+    tables.discard('schema_migrations')
+    if not tables and not migrated:
+        return ({'evidence': 'legacy_unavailable', 'pending_count': None,
+                 'due_count': None, 'scopes_pending': None,
+                 'pending_at_or_before_target': None, 'oldest_pending_ms': None,
+                 'next_retry_at': None},
+                {'evidence': 'legacy_unavailable', 'scopes': None,
+                 'at_target': None, 'invalid_cursor_scopes': None, 'oldest_cursor_ms': None})
+    if len(tables) != 2:
+        raise ValueError('incomplete message detail progress schema')
+    enabled = """s.source_id='lark.im' AND s.enabled=1
+        AND (s.id='lark.im.sent_by_me' OR s.id LIKE 'lark.im.received.chat.%')"""
+    pending = list(con.execute(f"""
+        SELECT t.occurred_at_ms,t.retry_at FROM lark_im_detail_tasks t
+        JOIN sync_scopes s ON s.id=t.scope_id WHERE {enabled} AND t.status='pending'
+    """))
+    times = [integer_ms(row['occurred_at_ms']) for row in pending]
+    retries = [iso_ms(row['retry_at']) for row in pending]
+    if any(value is None for value in times + retries):
+        raise ValueError('invalid pending message detail evidence')
+    pending_scopes = con.execute(f"""
+        SELECT COUNT(DISTINCT t.scope_id) FROM lark_im_detail_tasks t
+        JOIN sync_scopes s ON s.id=t.scope_id WHERE {enabled} AND t.status='pending'
+    """).fetchone()[0]
+    now_ms = int(datetime.datetime.now(UTC).timestamp() * 1000)
+    cursors = [cursor_ms(row['cursor_json']) for row in con.execute(f"""
+        SELECT p.cursor_json FROM lark_im_list_progress p
+        JOIN sync_scopes s ON s.id=p.scope_id WHERE {enabled}
+    """)]
+    valid_cursors = [value for value in cursors if value is not None]
+    return ({'evidence': 'available', 'pending_count': len(pending),
+             'due_count': sum(value <= now_ms for value in retries),
+             'scopes_pending': pending_scopes,
+             'pending_at_or_before_target': sum(value <= target_ms for value in times),
+             'oldest_pending_ms': min(times) if times else None,
+             'next_retry_at': utc_text(min(retries)) if retries else None},
+            {'evidence': 'available', 'scopes': len(cursors),
+             'at_target': sum(value >= target_ms for value in valid_cursors),
+             'invalid_cursor_scopes': len(cursors) - len(valid_cursors),
+             'oldest_cursor_ms': min(valid_cursors) if valid_cursors else None})
 
 
 def interval_coverage(intervals, start, target):
@@ -175,6 +243,7 @@ def inspect_connection(con, target_ms):
     range_status = ('baseline_unavailable' if start_ms is None else
                     'target_not_after_baseline' if target_ms <= start_ms else 'ok')
     range_valid = range_status == 'ok'
+    detail_state, list_progress = detail_progress(con, target_ms)
 
     scopes = [dict(row) for row in con.execute("""
         SELECT id, enabled, cursor_json,
@@ -224,12 +293,39 @@ def inspect_connection(con, target_ms):
           json_extract(CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END,
                        '$.window_end') AS window_end,
           json_extract(CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END,
+                       '$.window_start_ms') AS window_start_ms,
+          json_extract(CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END,
+                       '$.window_end_ms') AS window_end_ms,
+          json_extract(CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END,
+                       '$.window_complete') AS window_complete,
+          json_extract(CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END,
+                       '$.coverage_mode') AS coverage_mode,
+          json_extract(CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END,
+                       '$.list_complete') AS list_complete,
+          json_extract(CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END,
+                       '$.details_complete') AS details_complete,
+          json_extract(CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END,
+                       '$.pending_detail_count') AS pending_detail_count,
+          json_type(CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END,
+                       '$.list_complete') AS list_complete_type,
+          json_type(CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END,
+                       '$.details_complete') AS details_complete_type,
+          json_type(CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END,
+                       '$.pending_detail_count') AS pending_detail_count_type,
+          json_type(CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END,
+                       '$.list_window_start_ms') AS list_window_start_type,
+          json_type(CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END,
+                       '$.list_window_end_ms') AS list_window_end_type,
+          json_extract(CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END,
                        '$.skipped') AS skipped
         FROM sync_runs r JOIN sync_scopes s ON s.id=r.scope_id AND s.source_id=r.source_id
         WHERE r.source_id='lark.im' AND s.enabled=1
           AND (s.id='lark.im.sent_by_me' OR s.id LIKE 'lark.im.received.chat.%')
     """):
         interval, reason = successful_interval(run)
+        if (reason is None and run['coverage_mode'] == 'list_checkpoint_and_details'
+                and detail_state['evidence'] != 'available'):
+            interval, reason = None, 'detail_evidence_unavailable'
         if reason == 'not_succeeded':
             evidence_counts['non_succeeded_runs_ignored'] += 1
         elif reason == 'skipped':
@@ -250,7 +346,8 @@ def inspect_connection(con, target_ms):
                                                 for value in received_cursors) and sent_at_target)
     coverage_complete = (baseline_status == 'ok' and range_valid and sent is not None
                          and complete_scopes == len(enabled))
-    strict_complete = bool(endpoints_at_target and coverage_complete)
+    details_clear = detail_state['pending_at_or_before_target'] in (None, 0)
+    strict_complete = bool(endpoints_at_target and coverage_complete and details_clear)
     progress = {
         'target_ms': target_ms,
         'initial_discovery_done': int(discovery_done),
@@ -305,10 +402,12 @@ def inspect_connection(con, target_ms):
         **evidence_counts,
         'invalid_successful_run_reasons': invalid_reasons,
         'successful_windows_cover_fixed_range': bool(coverage_complete),
+        'details_at_or_before_target_resolved': (details_clear if detail_state['evidence'] == 'available' else None),
         'initial_baseline_complete': strict_complete,
     }
     out = {
         'checked_at': datetime.datetime.now(UTC).isoformat(), 'progress': progress, 'coverage': coverage,
+        'details': detail_state, 'list_progress': list_progress,
         'discovery': discovery,
         'scope_classes': [{'enabled': enabled_flag, 'reason': reason, 'count': count}
                           for (enabled_flag, reason), count in sorted(classes.items())],

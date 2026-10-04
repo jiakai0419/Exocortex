@@ -629,3 +629,43 @@ test("fresh contact lookup replaces a cleared sender with current provenance", (
   assert.equal(canonical.sender_name_source, "contact");
   assert.equal(canonical.sender_name_confidence, "high");
 });
+
+for (const state of ["cleared", "known"]) {
+  test(`failed enrichment cannot replace a ${state} chat name from cached scope metadata`, (t) => {
+    const fixture = enrichmentFixture(t, { denyLookups: true, record: {
+      first_seen_scope_id: LAB.receivedScope,
+      sender: { id: LAB.app.id, sender_type: "app" },
+      canonical: {
+        chat_name: state === "known" ? "Current Pendulum Studio" : null,
+        ...(state === "cleared" ? { chat_name_state: "cleared" } : {}),
+        chat_name_source: "synthetic_authority",
+        sender_name: LAB.app.name, sender_name_source: "application_api", sender_name_confidence: "high",
+      },
+    } });
+    const before = readRecords(fixture.dbPath);
+    assert.equal(before[0].raw_json.includes('"chat_name"'), false);
+    const result = runEnrichment(fixture, ["--probe-apps"]);
+    assert.equal(result.status, 0, result.stderr);
+    const summary = JSON.parse(result.stdout);
+    assert.equal(summary.app_lookup_permission_denied, 1);
+    assert.equal(summary.updated, 0);
+    assert.deepEqual(readRecords(fixture.dbPath), before);
+  });
+}
+
+test("historical room enrichment fills unknown names once with explicit provenance", (t) => {
+  const fixture = enrichmentFixture(t);
+  const before = readRecords(fixture.dbPath)[0];
+  const result = runEnrichment(fixture);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).updated, 1);
+  const after = readRecords(fixture.dbPath)[0];
+  const canonical = JSON.parse(after.canonical_json);
+  assert.equal(canonical.chat_name, LAB.room.name);
+  assert.equal(canonical.chat_name_source, "local_history");
+  for (const field of ["raw_json", "content_hash", "external_version", "body"]) assert.equal(after[field], before[field]);
+  const repeated = runEnrichment(fixture);
+  assert.equal(repeated.status, 0, repeated.stderr);
+  assert.equal(JSON.parse(repeated.stdout).updated, 0);
+  assert.deepEqual(readRecords(fixture.dbPath)[0], after);
+});

@@ -319,6 +319,8 @@ function recordFromMessage(message, scopeId, direction, context = {}, scopeConfi
     message?.chat_partner && typeof message.chat_partner === "object" ? message.chat_partner : null;
   const chatType = message?.chat_type || message?.chat?.chat_type || scopeConfig.chat_type || null;
   const partnerId = chatPartner?.open_id || chatPartner?.id || chatPartner?.user_id || null;
+  const directChatName = message?.chat_name || message?.chat?.name || "";
+  const chatName = directChatName || scopeConfig.chat_name || null;
   const senderDirectName = sender.name || sender.display_name || "";
   /** @type {NameDetails | null} */
   const senderNameDetails = senderDirectName
@@ -346,7 +348,9 @@ function recordFromMessage(message, scopeId, direction, context = {}, scopeConfi
     sender_type: senderType(message),
     chat_id: containerId,
     chat_type: chatType,
-    chat_name: message?.chat_name || message?.chat?.name || scopeConfig.chat_name || null,
+    chat_name: chatName,
+    // Scope configuration is cached discovery metadata, not a new naming event.
+    ...(chatName ? { chat_name_source: directChatName ? "message" : "scope_config" } : {}),
     chat_partner: chatPartner
       ? {
           open_id: partnerId,

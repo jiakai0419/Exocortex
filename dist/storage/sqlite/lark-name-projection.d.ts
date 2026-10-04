@@ -1,5 +1,7 @@
 /** SQL-side name merge shared by ingestion and enrichment. A missing/empty name
  * is unknown, including failed lookups. Only name_state='cleared' is a clear.
+ * Historical chat names may fill unknown fields, but cannot undo an explicit
+ * clear or replace a known name. A fresh message name may do either.
  * Keep name provenance together, and never carry it across different identities.
  * Ingestion evaluates this inside its write transaction; enrichment evaluates
  * a snapshot and commits only if that exact snapshot still matches. */

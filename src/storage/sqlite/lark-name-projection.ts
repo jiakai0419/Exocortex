@@ -1,5 +1,7 @@
 /** SQL-side name merge shared by ingestion and enrichment. A missing/empty name
  * is unknown, including failed lookups. Only name_state='cleared' is a clear.
+ * Historical chat names may fill unknown fields, but cannot undo an explicit
+ * clear or replace a known name. A fresh message name may do either.
  * Keep name provenance together, and never carry it across different identities.
  * Ingestion evaluates this inside its write transaction; enrichment evaluates
  * a snapshot and commits only if that exact snapshot still matches. */
@@ -29,7 +31,8 @@ function mergeLarkNameProjectionSql(
     {
       identity: sameContainer,
       name: '$.chat_name', state: '$.chat_name_state',
-      fields: ['$.chat_name', '$.chat_name_state'],
+      historical: `json_extract(next, '$.chat_name_source') IN ('scope_config', 'local_history')`,
+      fields: ['$.chat_name', '$.chat_name_state', '$.chat_name_source'],
     },
     {
       identity: `${sameContainer}
@@ -46,7 +49,7 @@ function mergeLarkNameProjectionSql(
     index += 1;
     stages.push(`n${index} AS MATERIALIZED (SELECT old, next,
       (${group.identity})
-      AND COALESCE(json_extract(next, '${group.name}'), '') = ''
+      AND (COALESCE(json_extract(next, '${group.name}'), '') = '' OR ${group.historical || '0'})
       AND COALESCE(json_extract(next, '${group.state}'), '') <> 'cleared'
       AND (COALESCE(json_extract(old, '${group.name}'), '') <> ''
         OR json_extract(old, '${group.state}') = 'cleared') AS keep

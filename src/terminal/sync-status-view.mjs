@@ -74,6 +74,12 @@ function renderSyncStatusText(input) {
         `${status.scopes.received_enabled} enabled, ${status.scopes.received_without_cursor} without cursor`,
       ],
       ["Unsupported scopes", `${status.scopes.received_unsupported || 0} total`],
+      ["List progress", status.list_progress.evidence === "available"
+        ? `${status.list_progress.scopes} scopes, oldest frontier ${localTime(status.list_progress.oldest_cursor_ms)}`
+        : status.list_progress.evidence === "legacy_unavailable" ? "unavailable (legacy database)" : "unavailable"],
+      ["Message details", status.details.evidence === "available"
+        ? `${status.details.pending_count} pending, ${status.details.due_count} due for retry`
+        : status.details.evidence === "legacy_unavailable" ? "unavailable (legacy database)" : "unavailable"],
       ["Runs", JSON.stringify(status.runs.by_status)],
       ["Locks", status.locks.length],
     ]),

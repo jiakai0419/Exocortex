@@ -46,6 +46,7 @@ const DEFAULT_DB = "data/exocortex.sqlite";
  * @property {(path: string) => JsonObject | null=} liveProbeContext
  * @property {(dbPath: string, sql: string, label: string) => JsonObject[]=} sqliteJson
  * @property {number=} nowMs
+ * @property {() => number=} clock
  * @property {number=} freshnessMaxAgeMs
  * @property {number=} stabilityWindowMs
  *
@@ -307,6 +308,7 @@ function isCatchingUp(syncStatus) {
   if (!syncStatus) return false;
   return (
     String(syncStatus.health || "").toLowerCase() === "catching_up" ||
+    Number(syncStatus.details?.pending_count || 0) > 0 ||
     Number(syncStatus.scopes?.received_without_cursor || 0) > 0 ||
     syncStatus.discovery?.cursor?.has_more === true
   );
@@ -328,6 +330,9 @@ function summarizeServiceHealth({ service, syncStatus, syncErrorText = "", worke
     return { status: "problem", detail: "last worker cycle failed" };
   }
   if (isCatchingUp(syncStatus)) {
+    if (Number(syncStatus.details?.pending_count || 0) > 0) {
+      return { status: "catching_up", detail: `${Number(syncStatus.details.pending_count)} message details await retry` };
+    }
     return { status: "catching_up", detail: rawHealth === "catching_up" ? syncStatus.health_detail || "sync is still catching up" : "known scopes still need catch-up" };
   }
   if (rawHealth === "syncing") {
@@ -459,7 +464,7 @@ function buildServiceStatusReport(opts, deps = {}) {
   const readWorkerLog = deps.readRecentWorkerEvents || readRecentWorkerEvents;
   const summarize = deps.summarizeWorkerEvents || summarizeWorkerEvents;
   const readFreshnessCache = deps.readLiveProbeCache || readLiveProbeCache;
-  const nowMs = deps.nowMs ?? Date.now();
+  const now = () => deps.nowMs ?? (deps.clock || Date.now)();
   const launchd = run("launchctl", ["print", opts.target], { allowFailure: true });
   const inspection = classifyLaunchdPrint(launchd);
   const loaded = inspection === "unknown" ? null : inspection === "loaded";
@@ -467,24 +472,30 @@ function buildServiceStatusReport(opts, deps = {}) {
   const sync = run(process.execPath, ["scripts/sync-status.mjs", "--db", opts.db || DEFAULT_DB, "--format", "json"], { allowFailure: true });
   const syncStatus = sync.status === 0 && !sync.error && !sync.signal ? parseJsonOutput(sync) : null;
   const workerLog = readWorkerLog(opts.logDir);
+  const liveProbeCachePath = resolve(opts.logDir, "live-probe.json");
+  const liveProbe = readFreshnessCache(liveProbeCachePath);
+  const expectedContext = (deps.liveProbeContext || liveProbeContext)(opts.db || DEFAULT_DB);
+  let failureKinds = [];
+  try {
+    failureKinds = collectRecentFailureKinds(
+      opts.db || DEFAULT_DB,
+      now(),
+      deps.stabilityWindowMs || DEFAULT_STABILITY_WINDOW_MS,
+      deps,
+    ).by_kind;
+  } catch {
+    // Failure aggregation is optional; unavailable evidence stays empty.
+  }
+  // Synchronous diagnostic reads can outlast a lease or observe one acquired
+  // after collection began. Evaluate all temporal evidence after those reads.
+  const nowMs = now();
   const workerSummary = summarize(workerLog.events, nowMs);
   const workerStability = summarizeWorkerStability(
     workerLog.events,
     nowMs,
     deps.stabilityWindowMs || DEFAULT_STABILITY_WINDOW_MS,
   );
-  try {
-    workerStability.failures.by_kind = collectRecentFailureKinds(
-      opts.db || DEFAULT_DB,
-      nowMs,
-      deps.stabilityWindowMs || DEFAULT_STABILITY_WINDOW_MS,
-      deps,
-    ).by_kind;
-  } catch {
-    workerStability.failures.by_kind = [];
-  }
-  const liveProbeCachePath = resolve(opts.logDir, "live-probe.json");
-  const liveProbe = readFreshnessCache(liveProbeCachePath);
+  workerStability.failures.by_kind = failureKinds;
   const serviceState = loaded === null ? "unknown" : loaded ? launchdState.state || "loaded" : "not loaded";
   const launchdReport = {
     loaded,
@@ -507,7 +518,7 @@ function buildServiceStatusReport(opts, deps = {}) {
       syncErrorText,
       workerSummary,
       liveProbe,
-      expectedContext: (deps.liveProbeContext || liveProbeContext)(opts.db || DEFAULT_DB),
+      expectedContext,
       nowMs,
       freshnessMaxAgeMs: deps.freshnessMaxAgeMs,
     }),

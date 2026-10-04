@@ -13,6 +13,7 @@
  * @property {ScopeCounts} scopeCounts
  * @property {Row[]} locks
  * @property {Row[]} runCounts
+ * @property {{evidence?: string, pending_count?: number | null}=} details
  *
  * @typedef {"syncing" | "catching_up" | "not_ready" | "needs_attention" | "ok_with_history" | "ok"} HealthState
  */
@@ -34,11 +35,13 @@ function countBy(rows, keyName, valueName) {
  * @param {HealthStateInput} input
  * @returns {HealthState}
  */
-function summarizeHealth({ discoveryCursor, scopeCounts, locks, runCounts }) {
+function summarizeHealth({ discoveryCursor, scopeCounts, locks, runCounts, details }) {
   const running = Number(countBy(runCounts, "status", "count").running || 0);
   const failed = Number(countBy(runCounts, "status", "count").failed || 0);
   const succeeded = Number(countBy(runCounts, "status", "count").succeeded || 0);
   const receivedWithoutCursor = Number(scopeCounts.received_without_cursor || 0);
+  if (details?.evidence === "unavailable") return "needs_attention";
+  if (Number(details?.pending_count || 0) > 0) return "catching_up";
   if (locks.length > 0 || running > 0) return "syncing";
   if (succeeded === 0 && failed > 0) return "needs_attention";
   if (succeeded === 0 || Number(scopeCounts.message_enabled || 0) === 0) return "not_ready";
@@ -49,8 +52,10 @@ function summarizeHealth({ discoveryCursor, scopeCounts, locks, runCounts }) {
 }
 
 /** @param {HealthStateInput} input */
-function healthDetail({ discoveryCursor, scopeCounts, locks, runCounts }) {
-  const health = summarizeHealth({ discoveryCursor, scopeCounts, locks, runCounts });
+function healthDetail({ discoveryCursor, scopeCounts, locks, runCounts, details }) {
+  const health = summarizeHealth({ discoveryCursor, scopeCounts, locks, runCounts, details });
+  if (details?.evidence === "unavailable") return "message detail evidence is unavailable";
+  if (Number(details?.pending_count || 0) > 0) return `${details?.pending_count} message details await retry; list progress does not prove full content`;
   if (health === "not_ready") return "initial discovery or successful message-scope evidence is missing";
   if (health === "needs_attention") return "sync history contains failures but no successful run";
   const running = Number(countBy(runCounts, "status", "count").running || 0);

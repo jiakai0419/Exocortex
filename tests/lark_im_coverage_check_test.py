@@ -172,6 +172,23 @@ class CoverageTests(unittest.TestCase):
         self.con.commit()
         return check.inspect_database(self.path, target)
 
+    def detail_schema(self):
+        migration = SCRIPT.parent.parent / 'migrations/009_lark_im_detail_progress.sql'
+        self.con.executescript(migration.read_text())
+
+    def detail_task(self, occurred=MID, status='pending', scope=RECEIVED, retry='2001-01-01T00:00:00.000Z'):
+        self.con.execute('''INSERT INTO lark_im_detail_tasks(scope_id,message_id,raw_root_json,
+            fingerprint,occurred_at_ms,status,retry_at,created_at,updated_at,last_error_message)
+            VALUES(?,?,?,?,?,?,?,?,?,?)''',
+                         (scope, private_marker('message'), json.dumps({'body': private_marker('root')}),
+                          private_marker('fingerprint'), occurred, status, retry, iso(START), iso(START),
+                          private_marker('detail_error')))
+
+    def list_progress(self, scope=RECEIVED, frontier=END):
+        self.con.execute('''INSERT INTO lark_im_list_progress(scope_id,anchor_cursor_json,cursor_json,
+            coverage_start_ms,generation,scope_config_json,updated_at) VALUES(?,?,?,?,?,?,?)''',
+                         (scope, None, cursor(frontier), START, 1, '{}', iso(END)))
+
     def assert_complete(self, out, expected):
         self.assertEqual(out['coverage']['initial_baseline_complete'], expected)
         self.assertEqual(out['progress']['initial_baseline_at_target'], int(expected))
@@ -190,6 +207,115 @@ class CoverageTests(unittest.TestCase):
         self.assert_complete(out, True)
         self.assertEqual(out['coverage']['eligible_successful_runs'], 3)
         self.assertEqual(out['coverage']['missing_scope_milliseconds'], 0)
+
+    def test_detail_evidence_is_explicitly_unavailable_on_legacy_database(self):
+        self.run_window(RECEIVED, START, END)
+        self.con.commit()
+        before = file_state(self.path)
+        out = self.inspect()
+        self.assert_complete(out, True)
+        self.assertEqual(out['details']['evidence'], 'legacy_unavailable')
+        self.assertIsNone(out['details']['pending_count'])
+        self.assertIsNone(out['list_progress']['scopes'])
+        self.assertIsNone(out['coverage']['details_at_or_before_target_resolved'])
+        self.assertEqual(file_state(self.path), before)
+
+    def test_list_frontier_and_partial_run_never_substitute_for_full_coverage(self):
+        self.detail_schema()
+        self.list_progress()
+        self.detail_task()
+        self.run_window(RECEIVED, START, END, status='failed',
+                        metadata={'window_start': None, 'window_end': None,
+                                  'list_window_start_ms': START, 'list_window_end_ms': END,
+                                  'list_complete': True, 'details_complete': False})
+        out = self.inspect()
+        self.assert_complete(out, False)
+        self.assertEqual(out['list_progress']['at_target'], 1)
+        self.assertEqual(out['details']['pending_count'], 1)
+        self.assertEqual(out['details']['due_count'], 1)
+        self.assertEqual(out['coverage']['eligible_successful_runs'], 1)
+        self.assertEqual(out['coverage']['scopes_without_eligible_successful_runs'], 1)
+
+    def test_partial_markers_override_accidental_successful_full_window_fields(self):
+        for payload in ({'details_complete': False}, {'window_complete': False},
+                        {'list_complete': False}, {'list_window_start_ms': START},
+                        {'list_window_end_ms': END}, {'list_complete': True}):
+            with self.subTest(payload=payload):
+                self.con.execute('DELETE FROM sync_runs WHERE scope_id=?', (RECEIVED,))
+                self.run_window(RECEIVED, START, END, metadata=payload)
+                self.assert_complete(self.inspect(), False)
+
+    def test_composed_detail_closure_requires_complete_flags_zero_debt_and_matching_bounds(self):
+        self.detail_schema()
+        valid = {'coverage_mode': 'list_checkpoint_and_details', 'list_complete': True,
+                 'details_complete': True, 'pending_detail_count': 0,
+                 'window_start_ms': START, 'window_end_ms': END}
+        self.run_window(RECEIVED, START, END, metadata=valid)
+        self.assert_complete(self.inspect(), True)
+        for change in ({'details_complete': None}, {'list_complete': 1},
+                       {'pending_detail_count': '0'}, {'pending_detail_count': 1},
+                       {'window_start_ms': START + 1}, {'window_end_ms': END - 1},
+                       {'coverage_mode': 'unrecognized-generated-proof'}):
+            with self.subTest(change=change):
+                self.con.execute('DELETE FROM sync_runs WHERE scope_id=?', (RECEIVED,))
+                self.run_window(RECEIVED, START, END, metadata={**valid, **change})
+                self.assert_complete(self.inspect(), False)
+
+    def test_current_pending_revision_overrides_old_full_coverage_including_target_boundary(self):
+        self.detail_schema()
+        self.run_window(RECEIVED, START, END)
+        self.list_progress(frontier=END + DAY_MS)
+        self.detail_task(occurred=END)
+        out = self.inspect()
+        self.assertTrue(out['coverage']['successful_windows_cover_fixed_range'])
+        self.assertEqual(out['progress']['cursor_endpoints_at_target'], 1)
+        self.assert_complete(out, False)
+        self.assertFalse(out['coverage']['details_at_or_before_target_resolved'])
+        self.con.execute("UPDATE lark_im_detail_tasks SET status='complete'")
+        self.assert_complete(self.inspect(), True)
+
+    def test_details_after_target_and_disabled_scopes_do_not_poison_prior_fixed_range(self):
+        self.detail_schema()
+        self.run_window(RECEIVED, START, END)
+        self.detail_task(occurred=END + 1, retry='2099-01-01T00:00:00.000Z')
+        disabled = RECEIVED + '-disabled-detail'
+        self.scope(disabled, enabled=0)
+        self.detail_task(occurred=START, scope=disabled)
+        out = self.inspect()
+        self.assert_complete(out, True)
+        self.assertEqual(out['details']['pending_count'], 1)
+        self.assertEqual(out['details']['due_count'], 0)
+        self.assertEqual(out['details']['pending_at_or_before_target'], 0)
+
+    def test_partial_or_unreadable_new_detail_schema_fails_closed(self):
+        self.run_window(RECEIVED, START, END)
+        self.detail_schema()
+        self.con.execute('DROP TABLE lark_im_detail_tasks')
+        result, out = self.cli()
+        self.assertEqual(result, 2)
+        self.assertEqual(out['error'], 'readonly_inspection_failed')
+        self.con.execute('CREATE TABLE lark_im_detail_tasks(unrelated TEXT)')
+        result, out = self.cli()
+        self.assertEqual(result, 2)
+        self.assertFalse(out['coverage']['initial_baseline_complete'])
+        self.con.executescript('''DROP TABLE lark_im_detail_tasks; DROP TABLE lark_im_list_progress;
+            CREATE TABLE schema_migrations(version TEXT PRIMARY KEY);
+            INSERT INTO schema_migrations VALUES('009');''')
+        result, out = self.cli()
+        self.assertEqual(result, 2)
+        self.assertEqual(out['error'], 'readonly_inspection_failed')
+
+    def test_detail_aggregates_exclude_private_task_fields_and_preserve_database(self):
+        self.detail_schema()
+        self.run_window(RECEIVED, START, END)
+        self.list_progress()
+        self.detail_task()
+        self.con.commit()
+        before = file_state(self.path)
+        rendered = json.dumps(self.inspect())
+        self.assertEqual(file_state(self.path), before)
+        for field in ('message', 'root', 'fingerprint', 'detail_error', 'scope'):
+            self.assertNotIn(private_marker(field), rendered)
 
     def test_late_start_after_midnight_is_not_complete(self):
         late = (START // DAY_MS + 1) * DAY_MS

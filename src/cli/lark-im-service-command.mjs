@@ -535,7 +535,8 @@ function evaluateWaitOkState(startedAt, syncStatus, workerSummary) {
   const lastCycle = workerSummary.last_cycle;
   const lastCycleAt = lastCycle?.at ? Date.parse(String(lastCycle.at)) : NaN;
   const newOkCycle = lastCycle?.ok === true && Number.isFinite(lastCycleAt) && lastCycleAt >= startedAt;
-  const healthReady = syncStatus ? isReadyHealth(syncStatus.health) : false;
+  const healthReady = syncStatus ? isReadyHealth(syncStatus.health) &&
+    !(Number(syncStatus.details?.pending_count || 0) > 0) : false;
   const ready = Boolean(lastCycle && newOkCycle && !workerSummary.in_progress && !workerSummary.unfinished_cycle && healthReady);
   const reason = [
     `cycle=${workerSummary.last_cycle?.cycle || "none"}`,

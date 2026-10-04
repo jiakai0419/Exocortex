@@ -3,8 +3,9 @@
 import {
   buildPeopleContext,
   fetchChatDiscoveryPage,
-  fetchChatMessages,
-  fetchSentMessages,
+  fetchChatMessageList,
+  fetchSentMessageList,
+  fetchMessageDetails,
   isBotUserOutOfChatError,
   isRestrictedModeError,
 } from "./adapter.mjs";
@@ -12,7 +13,10 @@ import {
   acquireLock,
   createRun,
   failRun,
-  failRecordRun,
+  commitLarkListRun,
+  readLarkListProgress,
+  readPendingLarkDetails,
+  finishLarkDetailRun,
   isMaintenanceLocked,
   quoteSql,
   readScope,
@@ -20,10 +24,8 @@ import {
   sqlJson,
   sqliteExec,
   sqliteQuery,
-  succeedMessageRun,
 } from "../../../dist/storage/sqlite/ingestion-store.js";
 import {
-  MessageDetailsIncompleteError,
   CHAT_DISCOVERY_SCOPE_ID,
   CHAT_HOT_DISCOVERY_SCOPE_ID,
   CHAT_RECONCILE_SCOPE_ID,
@@ -36,6 +38,8 @@ import {
   localIsoFromMs,
   messageWindow,
   prepareRecords,
+  recordFromMessage,
+  senderId,
   shortHash,
 } from "./core.mjs";
 
@@ -65,6 +69,11 @@ const RUN_FENCE_HARD_LEASE_SECONDS = 20 * 60;
  * @property {number} lockTtlSeconds
  * @property {number} retries
  * @property {number} retryDelayMs
+ * @property {number=} detailLimit
+ * @property {string=} detailScope
+ * @property {number=} detailBudgetMs
+ * @property {number=} detailMaxPages
+ * @property {number=} detailMaxItems
  *
  * @typedef {JsonObject & {
  *   id: string,
@@ -110,6 +119,7 @@ const RUN_FENCE_HARD_LEASE_SECONDS = 20 * 60;
  * @property {(dbPath: string, scope: ScopeRow, runId: number, error: unknown, reason: string) => void} succeedUnsupportedRun
  * @property {(dbPath: string, opts: SyncOptions, scope: ScopeRow, selfProfile: SelfProfile) => RunResult} syncReceivedScope
  * @property {(dbPath: string, opts: SyncOptions, selfProfile: SelfProfile) => RunResult[]} syncReceived
+ * @property {(dbPath: string, opts: SyncOptions, selfProfile: SelfProfile) => RunResult[]} retryDetails
  */
 
 /** @type {SyncRunnerDeps} */
@@ -118,22 +128,26 @@ const defaultDeps = {
   buildPeopleContext,
   createRun,
   failRun,
-  failRecordRun,
+  commitLarkListRun,
+  readLarkListProgress,
+  readPendingLarkDetails,
+  finishLarkDetailRun,
   fetchChatDiscoveryPage,
-  fetchChatMessages,
-  fetchSentMessages,
+  fetchChatMessageList,
+  fetchSentMessageList,
+  fetchMessageDetails,
   isMaintenanceLocked,
   isBotUserOutOfChatError,
   isRestrictedModeError,
   makeSnapshotId: (prefix = "snapshot") => `${prefix}_${Date.now()}_${shortHash(`${process.pid}:${Math.random()}`)}`,
   nowIso: () => new Date().toISOString(),
+  nowMs: () => performance.now(),
   quoteSql,
   readScope,
   releaseLock,
   sqlJson,
   sqliteExec,
   sqliteQuery,
-  succeedMessageRun,
 };
 
 /**
@@ -373,92 +387,158 @@ VALUES (CASE WHEN EXISTS (SELECT 1 FROM __lark_run_fence_guard) THEN 1 ELSE 0 EN
 `;
 }
 
-/** Persist validated records without promoting an incomplete window to coverage.
- * Missing roots stay absent (or keep prior complete data); the unchanged cursor
- * makes normal scheduling retry them. Metadata describes only aggregate reasons.
- * @param {string} dbPath @param {ScopeRow} scope @param {number} runId
- * @param {MessageDetailsIncompleteError} error @param {SyncOptions} opts
- * @param {SelfProfile} selfProfile @param {number} startMs
- * @param {"sent" | "received"} direction @param {SyncRunnerDeps} deps
+/** Retry one scope's durable debt without any list fetch or list-cursor rewind.
+ * The list transaction has already committed before this separate run starts.
+ * @param {string} dbPath @param {SyncOptions} opts @param {ScopeRow} scope
+ * @param {SelfProfile} selfProfile @param {SyncRunnerDeps} deps
+ * @param {number} [limit] @param {number} [deadline]
  * @returns {RunResult}
  */
-function failIncompleteMessageWindow(dbPath, scope, runId, error, opts, selfProfile, startMs, direction, deps) {
-  const context = deps.buildPeopleContext(error.messages, opts, selfProfile, scope.config);
-  const records = direction === "sent"
-    ? prepareRecords(error.messages, scope.id, "sent", scope.cursor, opts.startMs, error.windowEndMs,
-      null, context, scope.config)
-    : prepareChatWindowRecords(error.messages, scope.id, scope.cursor, opts.startMs, error.windowEndMs,
-      selfProfile.open_id, context, scope.config || {});
-  /** @type {Record<string, number>} */
-  const reasons = {};
-  for (const missing of error.missingDetails) reasons[missing.reason] = (reasons[missing.reason] || 0) + 1;
-  const scanned = error.messages.length + error.missingDetails.length;
-  const effects = deps.failRecordRun(dbPath, scope, runId, records, scanned, error, {
-    adapter: direction === "sent" ? "lark.im.sent_by_me" : "lark.im.received_per_chat",
-    pages: error.pages,
-    window_complete: false,
-    attempted_window_start: localIsoFromMs(startMs),
-    attempted_window_end: localIsoFromMs(error.windowEndMs),
-    window_bisections: error.windowBisections,
-    missing_detail_count: error.missingDetails.length,
-    missing_detail_reasons: reasons,
-    stored_candidate_count: records.length,
-  });
-  return { ok: false, incomplete: true, error: error.message, scanned, records: records.length, ...effects };
+function retryScopeDetails(dbPath, opts, scope, selfProfile, deps, limit = 1,
+  deadline = deps.nowMs() + Math.min(30_000, opts.detailBudgetMs ?? 30_000)) {
+  if (deps.nowMs() >= deadline) return { ok: false, skipped: true, reason: "detail_budget_exhausted", detail_attempts: 0 };
+  const due = deps.readPendingLarkDetails(dbPath, scope, { limit, now: deps.nowIso() });
+  if (!due.length) return { ok: false, skipped: true, reason: "details_not_due", detail_attempts: 0 };
+  return syncScope(dbPath, scope.id, opts, (lockedScope, runId) => {
+    const tasks = deps.readPendingLarkDetails(dbPath, lockedScope, { limit, now: deps.nowIso() });
+    const outcomes = [];
+    for (const task of tasks) {
+      const remaining = Math.floor(deadline - deps.nowMs());
+      if (remaining <= 0) break;
+      try {
+        const message = deps.fetchMessageDetails(task.raw_root, {
+          retries: opts.retries, retryDelayMs: opts.retryDelayMs,
+          detailBudgetMs: Math.min(30_000, remaining),
+          detailMaxPages: opts.detailMaxPages, detailMaxItems: opts.detailMaxItems,
+        });
+        const direction = senderId(message) === selfProfile.open_id ? "sent" : "received";
+        const record = recordFromMessage(message, lockedScope.id, direction,
+          { self: selfProfile }, lockedScope.config || {});
+        outcomes.push({ message_id: task.message_id, fingerprint: task.fingerprint, record });
+      } catch (error) {
+        const reason = error && typeof error === "object" && "detailReason" in error
+          ? String(error.detailReason) : "invalid_or_unavailable_details";
+        const safeReason = /^[a-z_]{1,80}$/.test(reason) ? reason : "invalid_or_unavailable_details";
+        const failure = new Error(`message detail retry failed: kind=${safeReason}`);
+        failure.name = "MessageDetailError";
+        outcomes.push({ message_id: task.message_id, fingerprint: task.fingerprint, error: failure });
+      }
+    }
+    if (!outcomes.length) throw new Error("detail retry budget exhausted before a task could be attempted");
+    const effects = deps.finishLarkDetailRun(dbPath, lockedScope, runId, outcomes, {
+      adapter: "lark.im.details", detail_attempts: outcomes.length,
+    });
+    return { ok: effects.pending_details === 0, details_complete: effects.pending_details === 0,
+      incomplete: effects.pending_details > 0, detail_attempts: outcomes.length,
+      ...(effects.pending_details > 0 ? { error: "message details remain pending and retryable" } : {}),
+      records: outcomes.filter((outcome) => "record" in outcome).length, ...effects };
+  }, deps);
 }
 
-/**
- * @param {string} dbPath
- * @param {SyncOptions} opts
- * @param {SelfProfile} selfProfile
- * @param {SyncRunnerDeps} [deps]
- * @returns {RunResult}
+/** List coverage and complete content have separate durable checkpoints.
+ * A detail failure can never enter the list-window bisection path.
+ * @param {string} dbPath @param {SyncOptions} opts @param {string} scopeId
+ * @param {SelfProfile} selfProfile @param {"sent" | "received"} direction
+ * @param {SyncRunnerDeps} deps @returns {RunResult}
  */
-function syncSent(dbPath, opts, selfProfile, deps = defaultDeps) {
-  return syncScope(dbPath, SENT_SCOPE_ID, opts, (scope, runId) => {
-    const { startMs, endMs: targetEndMs } = messageWindow(scope, opts);
+function syncListedScope(dbPath, opts, scopeId, selfProfile, direction, deps) {
+  const listed = syncScope(dbPath, scopeId, opts, (scope, runId) => {
+    const progress = deps.readLarkListProgress(dbPath, scope);
+    const listScope = { ...scope, cursor: progress?.cursor ?? scope.cursor };
+    const { startMs, endMs: targetEndMs } = messageWindow(listScope, opts);
     let fetched;
     try {
-      fetched = fetchMessageWindowWithBisection(
-        (windowStartMs, windowEndMs) =>
-          deps.fetchSentMessages(selfProfile.open_id, windowStartMs, windowEndMs, opts),
-        startMs,
-        targetEndMs,
-      );
+      if (direction === "received" && !scope.config?.chat_id) throw new Error("received scope is missing chat identity");
+      fetched = fetchMessageWindowWithBisection((start, end) => direction === "sent"
+        ? deps.fetchSentMessageList(selfProfile.open_id, start, end, opts)
+        : deps.fetchChatMessageList(scope.config?.chat_id, start, end, opts), startMs, targetEndMs);
     } catch (error) {
-      if (error instanceof MessageDetailsIncompleteError) {
-        return failIncompleteMessageWindow(dbPath, scope, runId, error, opts, selfProfile, startMs, "sent", deps);
+      const unsupported = direction === "received"
+        ? deps.isRestrictedModeError(error) ? "restricted_mode"
+          : deps.isBotUserOutOfChatError(error) ? "bot_user_out_of_chat" : null
+        : null;
+      if (unsupported) {
+        succeedUnsupportedRun(dbPath, scope, runId, error, unsupported, deps);
+        return { ok: true, skipped: true, reason: unsupported, scanned: 0, records: 0,
+          inserted: 0, updated: 0, duplicate: 0 };
       }
       throw error;
     }
-    const completedEndMs = Number(fetched.window_end_ms);
-    const peopleContext = deps.buildPeopleContext(fetched.messages, opts, selfProfile, scope.config);
-    const records = prepareRecords(
-      fetched.messages,
-      scope.id,
-      "sent",
-      scope.cursor,
-      opts.startMs,
-      completedEndMs,
-      null,
-      /** @type {any} */ (peopleContext),
-      scope.config,
-    );
-    const cursor = cursorAfter(completedEndMs);
-    const effects = deps.succeedMessageRun(dbPath, scope, runId, records, fetched.messages.length, cursor, {
-      adapter: "lark.im.sent_by_me",
-      pages: fetched.pages,
-      window_start: localIsoFromMs(startMs),
-      window_end: localIsoFromMs(completedEndMs),
-      requested_window_end: localIsoFromMs(opts.endMs),
-      bounded_window_target: localIsoFromMs(targetEndMs),
-      window_bisections: fetched.window_bisections,
+    const endMs = Number(fetched.window_end_ms);
+    const context = deps.buildPeopleContext(fetched.messages, opts, selfProfile, scope.config || {});
+    const records = direction === "sent"
+      ? prepareRecords(fetched.messages, scope.id, "sent", listScope.cursor, opts.startMs, endMs,
+        null, context, scope.config || {})
+      : prepareChatWindowRecords(fetched.messages, scope.id, listScope.cursor, opts.startMs, endMs,
+        selfProfile.open_id, context, scope.config || {});
+    const roots = fetched.detailRoots || [];
+    const scanned = fetched.messages.length + roots.length;
+    const effects = deps.commitLarkListRun(dbPath, scope, runId, records, roots, scanned, cursorAfter(endMs), {
+      adapter: direction === "sent" ? "lark.im.sent_by_me" : "lark.im.received_per_chat",
+      pages: fetched.pages, initial_sync_start_ms: opts.startMs,
+      list_window_start_ms: startMs, list_window_end_ms: endMs,
+      list_window_start: localIsoFromMs(startMs), list_window_end: localIsoFromMs(endMs),
+      list_window_bisections: fetched.window_bisections,
+      requested_window_end: localIsoFromMs(opts.endMs), bounded_window_target: localIsoFromMs(targetEndMs),
       stable_horizon_seconds: opts.endExplicit ? 0 : opts.stableHorizonSeconds,
-      fetched_count: fetched.messages.length,
-      stored_candidate_count: records.length,
+      fetched_count: scanned, stored_candidate_count: records.length,
     });
-    return { ok: true, scanned: fetched.messages.length, records: records.length, ...effects };
+    const pending = Number(effects.pending_details || 0);
+    return { ok: pending === 0, list_complete: true, details_complete: pending === 0,
+      ...(pending > 0 ? { incomplete: true, error: "list saved; message details remain pending and retryable" } : {}),
+      scanned, records: records.length, ...effects };
   }, deps);
+  if (!listed.list_complete || !listed.pending_details) return listed;
+  // One automatic attempt per successful scope listing. Failures are persisted
+  // with backoff; an explicit details-only invocation can process a larger batch.
+  const retry = retryScopeDetails(dbPath, opts, deps.readScope(dbPath, scopeId), selfProfile, deps);
+  const pending = retry.pending_details ?? listed.pending_details;
+  return { ...listed, ok: pending === 0, details_complete: pending === 0, incomplete: pending > 0,
+    error: pending > 0 ? "list saved; message details remain pending and retryable" : undefined,
+    pending_details: pending, detail_retry: retry,
+    inserted: Number(listed.inserted || 0) + Number(retry.inserted || 0),
+    updated: Number(listed.updated || 0) + Number(retry.updated || 0),
+    duplicate: Number(listed.duplicate || 0) + Number(retry.duplicate || 0),
+    records: Number(listed.records || 0) + Number(retry.records || 0) };
+}
+
+/** @param {string} dbPath @param {SyncOptions} opts @param {SelfProfile} selfProfile
+ * @param {SyncRunnerDeps} [deps] @returns {RunResult} */
+function syncSent(dbPath, opts, selfProfile, deps = defaultDeps) {
+  return syncListedScope(dbPath, opts, SENT_SCOPE_ID, selfProfile, "sent", deps);
+}
+
+/** Explicit bounded entry point; honors durable retry_at rather than bypassing backoff.
+ * @param {string} dbPath @param {SyncOptions} opts @param {SelfProfile} selfProfile
+ * @param {SyncRunnerDeps} [deps] @returns {RunResult[]} */
+function retryDetails(dbPath, opts, selfProfile, deps = defaultDeps) {
+  const limit = Math.min(20, opts.detailLimit ?? 5);
+  const now = deps.nowIso();
+  const scanLimit = Math.max(limit * 3, limit + 20);
+  const scopeFilter = opts.detailScope ? `AND s.id = ${deps.quoteSql(opts.detailScope)}` : "";
+  const scopes = deps.sqliteQuery(dbPath, `SELECT s.id, MIN(d.retry_at) AS due_at
+    FROM sync_scopes s JOIN lark_im_detail_tasks d ON d.scope_id=s.id
+    WHERE s.source_id='lark.im' AND s.enabled=1 AND d.status='pending'
+      AND d.retry_at <= ${deps.quoteSql(now)} ${scopeFilter}
+    GROUP BY s.id ORDER BY due_at, s.id LIMIT ${scanLimit};`, "list due detail scopes");
+  const deadline = deps.nowMs() + Math.min(30_000, opts.detailBudgetMs ?? 30_000);
+  const results = [];
+  let remaining = limit;
+  for (const row of scopes) {
+    if (remaining <= 0 || deps.nowMs() >= deadline) break;
+    const result = retryScopeDetails(dbPath, opts, deps.readScope(dbPath, row.id), selfProfile, deps, remaining, deadline);
+    results.push(result);
+    remaining -= Number(result.detail_attempts || 0);
+    if (result.skipped && result.reason === "maintenance_lock") break;
+  }
+  const outstanding = deps.sqliteQuery(dbPath, `SELECT COUNT(*) AS count
+    FROM sync_scopes s JOIN lark_im_detail_tasks d ON d.scope_id=s.id
+    WHERE s.source_id='lark.im' AND s.enabled=1 AND d.status='pending' ${scopeFilter};`, "count remaining detail debt")[0];
+  if (Number(outstanding?.count || 0) > 0) {
+    results.push({ ok: false, incomplete: true, reason: "details_pending",
+      pending_details: Number(outstanding.count), detail_attempts: 0 });
+  }
+  return results;
 }
 
 /**
@@ -934,61 +1014,7 @@ COMMIT;
  * @returns {RunResult}
  */
 function syncReceivedScope(dbPath, opts, scope, selfProfile, deps = defaultDeps) {
-  return syncScope(dbPath, scope.id, opts, (lockedScope, runId) => {
-    const chatIdValue = lockedScope.config?.chat_id;
-    if (!chatIdValue) throw new Error(`received scope missing config.chat_id: ${lockedScope.id}`);
-    const { startMs, endMs: targetEndMs } = messageWindow(lockedScope, opts);
-    let fetched;
-    try {
-      fetched = fetchMessageWindowWithBisection(
-        (windowStartMs, windowEndMs) =>
-          deps.fetchChatMessages(chatIdValue, windowStartMs, windowEndMs, opts),
-        startMs,
-        targetEndMs,
-      );
-    } catch (error) {
-      if (error instanceof MessageDetailsIncompleteError) {
-        return failIncompleteMessageWindow(dbPath, lockedScope, runId, error, opts, selfProfile, startMs, "received", deps);
-      }
-      if (deps.isRestrictedModeError(error)) {
-        succeedUnsupportedRun(dbPath, lockedScope, runId, error, "restricted_mode", deps);
-        return { ok: true, skipped: true, reason: "restricted_mode", scanned: 0, records: 0, inserted: 0, updated: 0, duplicate: 0 };
-      }
-      if (deps.isBotUserOutOfChatError(error)) {
-        succeedUnsupportedRun(dbPath, lockedScope, runId, error, "bot_user_out_of_chat", deps);
-        return { ok: true, skipped: true, reason: "bot_user_out_of_chat", scanned: 0, records: 0, inserted: 0, updated: 0, duplicate: 0 };
-      }
-      throw error;
-    }
-    const completedEndMs = Number(fetched.window_end_ms);
-    const scopeConfig = lockedScope.config || {};
-    const peopleContext = deps.buildPeopleContext(fetched.messages, opts, selfProfile, scopeConfig);
-    const records = prepareChatWindowRecords(
-      fetched.messages,
-      lockedScope.id,
-      lockedScope.cursor,
-      opts.startMs,
-      completedEndMs,
-      selfProfile.open_id,
-      /** @type {any} */ (peopleContext),
-      scopeConfig,
-    );
-    const cursor = cursorAfter(completedEndMs);
-    const effects = deps.succeedMessageRun(dbPath, lockedScope, runId, records, fetched.messages.length, cursor, {
-      adapter: "lark.im.received_per_chat",
-      pages: fetched.pages,
-      window_start: localIsoFromMs(startMs),
-      window_end: localIsoFromMs(completedEndMs),
-      requested_window_end: localIsoFromMs(opts.endMs),
-      bounded_window_target: localIsoFromMs(targetEndMs),
-      window_bisections: fetched.window_bisections,
-      stable_horizon_seconds: opts.endExplicit ? 0 : opts.stableHorizonSeconds,
-      fetched_count: fetched.messages.length,
-      stored_candidate_count: records.length,
-      chat_scope_id: lockedScope.id,
-    });
-    return { ok: true, scanned: fetched.messages.length, records: records.length, ...effects };
-  }, deps);
+  return syncListedScope(dbPath, opts, scope.id, selfProfile, "received", deps);
 }
 
 /**
@@ -1063,6 +1089,7 @@ function createSyncRunner(deps = {}) {
     syncReceivedScope: (dbPath, opts, scope, selfProfile) =>
       syncReceivedScope(dbPath, opts, scope, selfProfile, resolvedDeps),
     syncReceived: (dbPath, opts, selfProfile) => syncReceived(dbPath, opts, selfProfile, resolvedDeps),
+    retryDetails: (dbPath, opts, selfProfile) => retryDetails(dbPath, opts, selfProfile, resolvedDeps),
   };
 }
 
@@ -1082,4 +1109,5 @@ export {
   syncReceivedScope,
   syncScope,
   syncSent,
+  retryDetails,
 };
