@@ -22,7 +22,7 @@ node bin/exocortex.mjs check --help
 node bin/exocortex.mjs --help --all --format json
 ```
 
-[命令目录](docs/commands.md) 给出全部选项、默认值与副作用；[Operations](docs/operations.md) 给出检查、重启和验收配方；[CLI migration](docs/cli-migration.md) 记录旧路径去向与待完成的真实 worker 切换。
+[命令目录](docs/commands.md) 给出全部选项、默认值与副作用；[Operations](docs/operations.md) 给出检查、重启和验收配方；[CLI migration](docs/cli-migration.md) 记录旧路径去向、真实 worker 切换取证与部署验收边界。
 
 ## Checks and explicit changes
 

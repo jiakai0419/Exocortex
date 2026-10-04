@@ -17,7 +17,7 @@ function optionValue(spec, value) {
     return value;
 }
 /** Primitive parsing is shared; domain window, identity and effect rules are not a DSL. */
-export function parseOptions(argv, specs, { context = createCommandContext(), allowAll = false, resolvePaths = true, allowDuplicates = false } = {}) {
+export function parseOptions(argv, specs, { context = createCommandContext(), allowAll = false, resolvePaths = true } = {}) {
     /** @type {Record<string, any>} */
     const options = {};
     const provided = new Set();
@@ -42,7 +42,7 @@ export function parseOptions(argv, specs, { context = createCommandContext(), al
         const spec = specs.find((entry) => entry.flag === flag);
         if (!spec)
             throw new CliUsageError("Unknown option or unexpected command argument");
-        if (provided.has(flag) && !spec.repeat && !allowDuplicates)
+        if (provided.has(flag) && !spec.repeat)
             throw new CliUsageError(`${flag} may be specified only once`);
         provided.add(flag);
         if (spec.type === "boolean") {

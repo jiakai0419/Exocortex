@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseArgs as parseWorkerRaw, runCycle, runStep } from "../src/runtime/worker/worker.mjs";
-import { validateWorkerOptions, resolveWorkerPaths, parseWorkerProgramArguments } from "../src/runtime/worker/options.mjs";
+import { main, parseArgs as parseWorkerRaw, runCycle, runStep } from "../src/runtime/worker/worker.mjs";
+import { WORKER_OPTION_SPECS, validateWorkerOptions, resolveWorkerPaths, parseWorkerProgramArguments } from "../src/runtime/worker/options.mjs";
 import { createCommandContext } from "../src/cli/context.mjs";
 import { parseRouteOptions } from "../src/cli/registry.mjs";
 const context = createCommandContext({ root: "/synthetic-project", cwd: "/synthetic-project" });
@@ -30,6 +30,47 @@ const sharedKeys = [
 function shared(options) {
   return Object.fromEntries(sharedKeys.map((key) => [key, options[key]]));
 }
+
+const duplicateValues = {
+  db: ["first.sqlite", "last.sqlite"], logDir: ["first-logs", "last-logs"],
+  chatTypes: ["group", "p2p"], adaptiveFairMin: ["5", "8"],
+  adaptiveFairMax: ["80", "90"], adaptiveTargetCycleSeconds: ["120", "180"],
+};
+for (const spec of WORKER_OPTION_SPECS) {
+  test(`worker and persistent service arguments reject repeated ${spec.flag}`, () => {
+    const values = duplicateValues[spec.key] || ["2", "3"];
+    const argv = spec.type === "boolean" ? [spec.flag, spec.flag] : [spec.flag, values[0], spec.flag, values[1]];
+    assert.throws(() => parseWorkerRaw(argv), /only once/);
+    assert.throws(() => parseWorkerProgramArguments(argv), /only once/);
+    assert.throws(() => parseRouteOptions("service.install", argv), /only once/);
+  });
+}
+
+test("worker rejects repeated paths and lifetime flags before starting a cycle", () => {
+  let calls = 0;
+  for (const argv of [["--db", "first.sqlite", "--db", "last.sqlite"],
+    ["--log-dir", "first", "--log-dir", "last"], ["--once", "--once"],
+    ["--max-cycles", "2", "--max-cycles", "3"], ["--once", "--once", "--help"]]) {
+    assert.throws(() => main(argv, { runWorker() { calls++; return true; } }), /only once/);
+  }
+  assert.equal(calls, 0);
+});
+
+test("worker validates each value without echoing unknown arguments", () => {
+  assert.throws(() => parseWorkerRaw(["--interval-seconds", "bad", "--interval-seconds", "3"]), /positive integer/);
+  assert.throws(() => parseWorkerRaw(["--db", "", "--db", "valid.sqlite"]), /non-empty path/);
+  assert.throws(() => parseWorkerRaw(["--private-synthetic-unknown"]), (error) => {
+    assert.match(error.message, /Unknown option/);
+    assert.doesNotMatch(error.message, /private-synthetic-unknown/);
+    return true;
+  });
+});
+
+test("distinct foreground lifetime options keep their last-occurring choice", () => {
+  assert.equal(parseWorkerRaw(["--once", "--max-cycles", "3"]).maxCycles, 3);
+  assert.equal(parseWorkerRaw(["--max-cycles", "3", "--once"]).maxCycles, 1);
+});
+
 function plistArguments(options) {
   const xml = plistXml(options, {
     root: "/synthetic-project", logDir: options.logDir, nodePath: "/synthetic-bin/node",

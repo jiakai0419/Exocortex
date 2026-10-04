@@ -290,7 +290,7 @@ node bin/exocortex.mjs check --wait --timeout-seconds 180
 node bin/exocortex.mjs status --detail
 ```
 
-检查失败时保留分项证据；不要把启动请求接受当作验收。需要回退时恢复此次切换前的代码和配置，**不覆盖回灌旧数据库**，避免丢失运行期间的新记录和游标进度。唯一旧 worker 桥的删除条件见 [迁移清单](cli-migration.md#worker-切换门槛-w)。
+检查失败时保留分项证据；不要把启动请求接受当作验收。需要回退时恢复此次切换前的代码和配置，**不覆盖回灌旧数据库**，避免丢失运行期间的新记录和游标进度。worker 入口切换的固定取证与后续部署门槛记录在 [迁移清单](cli-migration.md#worker-切换门槛-w)，源树删除不等于运行环境已完成退役。
 
 ### 检查、重启、等待分别执行
 

@@ -16,7 +16,7 @@ npm run verify
 | npm 任务 | 用途与效果 |
 | --- | --- |
 | `npm run build` | 按 tsconfig.build 生成当前 dist，生成物随源码提交 |
-| `npm run typecheck` | noEmit 类型检查，覆盖 bin、tools、src 与明确登记的过渡桥 |
+| `npm run typecheck` | noEmit 类型检查，覆盖 bin、tools、src |
 | `npm run check` | 先 build，再运行源码语法发现 |
 | `npm test` | 先 build，再完整运行 tests/*.test.mjs，最多四个文件并行 |
 | `npm run build:check` | `tools/verify.mjs --generated-only`：临时干净构建、集合/字节比较，不修复当前 dist |

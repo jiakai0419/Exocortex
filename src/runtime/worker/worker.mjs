@@ -90,20 +90,20 @@ const STEP_OPERATIONS = {
  * @property {Record<string, number>=} cooldownsByOperation
  */
 
-function usage(bridge = false) {
-  return `Usage: node ${bridge ? "scripts/lark-im-worker.mjs" : "src/runtime/worker/main.mjs"} [options]\n\nInternal worker options:\n${WORKER_OPTION_SPECS.map((spec) =>
+function usage() {
+  return `Usage: node src/runtime/worker/main.mjs [options]\n\nInternal worker options:\n${WORKER_OPTION_SPECS.map((spec) =>
     `  ${spec.flag}${spec.type === "boolean" ? "" : " <value>"}  ${spec.description} Default: ${spec.default}`).join("\n")}\n  --once  Run one cycle and exit.\n  --max-cycles <n>  Stop after N cycles.\n  --help  Show this help.\n`;
 }
 
-/** @param {string[]} argv @param {{legacy?:boolean}} [context] @returns {WorkerOptions} */
-function parseArgs(argv, { legacy = false } = {}) {
+/** @param {string[]} argv @returns {WorkerOptions} */
+function parseArgs(argv) {
   const lifetime = [
     { flag: "--once", key: "once", type: "boolean" },
     { flag: "--max-cycles", key: "maxCycles", type: "integer" },
   ];
-  const parsed = parseOptions(argv, [...WORKER_OPTION_SPECS, ...lifetime], { resolvePaths: false, allowDuplicates: legacy });
+  const parsed = parseOptions(argv, [...WORKER_OPTION_SPECS, ...lifetime], { resolvePaths: false });
   const opts = /** @type {WorkerOptions} */ ({ ...parsed.options, maxCycles: null });
-  // Keep the registered bridge's established last lifetime flag behavior.
+  // Distinct foreground lifetime options keep their last-occurring choice.
   for (let i = 0; i < argv.length; i += 1) {
     if (argv[i] === "--once") opts.maxCycles = 1;
     else if (argv[i] === "--max-cycles") opts.maxCycles = parsed.options.maxCycles;
@@ -303,12 +303,12 @@ function runWorker(opts, deps = {}) {
   } finally { activity?.update("stopped", { cycle }); }
 }
 
-/** Internal execution policy; the registered legacy bridge alone keeps cwd defaults. */
+/** Internal execution policy: root defaults and explicit cwd-relative paths. */
 function main(argv = process.argv.slice(2), context = {}) {
-  let opts = parseArgs(argv, { legacy: context.legacyPaths === true });
-  if (opts.help) { (context.stdout || process.stdout).write(usage(context.legacyPaths)); return 0; }
+  let opts = parseArgs(argv);
+  if (opts.help) { (context.stdout || process.stdout).write(usage()); return 0; }
   const provided = new Set(argv.filter((arg) => arg.startsWith("--")));
-  opts = resolveWorkerPaths(opts, { root: context.legacyPaths ? (context.cwd || process.cwd()) : (context.root || PROJECT_ROOT),
+  opts = resolveWorkerPaths(opts, { root: context.root || PROJECT_ROOT,
     cwd: context.cwd || process.cwd(), provided });
   return (context.runWorker || runWorker)(opts) ? 0 : 2;
 }

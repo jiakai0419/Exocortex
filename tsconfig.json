@@ -17,7 +17,6 @@
     "bin/**/*.mjs",
     "tools/**/*.mjs",
     "src/**/*.ts",
-    "src/**/*.mjs",
-    "scripts/lark-im-worker.mjs"
+    "src/**/*.mjs"
   ]
 }

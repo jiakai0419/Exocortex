@@ -9,10 +9,10 @@
 设计取证基线 `9e817b0` 的 `scripts/` 有 **27 个路径**：20 个顶层入口及 7 个 shim。CLI v2 实施基线 `96ba78e` 又包含 `check-generated.mjs` 与 `lib/lark-im-enrichment.mjs`，实际待处理 **29 个路径**。后两项单列迁移，不能把原 27 项的历史口径改成 29。
 
 - **A**：原 26 项在同一完整候选中迁移仓内 imports、spawns、npm/CI、测试、现行文档与已识别本地调用者，再删除旧路径。保留领域反例与输出能力，最终检查由候选验收记录证明。
-- **W**：原第 27 项 worker 还需真实安装配置、进程和新周期证据。唯一短期桥为 `scripts/lark-im-worker.mjs`；当前未执行 W，不能声称已经达到零旧路径。
+- **W**：原第 27 项 worker 的真实入口、进程和新周期切换证据已取得；本提交删除 `scripts/lark-im-worker.mjs`。源树退役、提交发布、运行环境切换和全量数据就绪分别取证，不能相互替代，详见下文。
 - **X**：只为有实际证据的外部消费者登记限期例外。当前仓内清点没有登记 X，不凭“可能有人使用”保留壳。
 
-终态是 6 个顶层命令、16 个执行路由，以及 7 个可执行文件：一个公共 bin、四个开发/研究工具、内部 worker 与唯一 Python coverage 工具。W 桥在过渡期另计，普通模块和 dist 不计作可执行入口。
+本提交为 6 个顶层命令、16 个执行路由，以及 7 个可执行文件：一个公共 bin、四个开发/研究工具、内部 worker 与唯一 Python coverage 工具。原 27 项旧路径在此源树中全部移除，实施基线后增的两项仍单列；普通模块和 dist 不计作可执行入口。源树路径数量不证明运行环境已部署本提交。
 
 ## 原 27 项逐条去向
 
@@ -34,7 +34,7 @@
 | 12 | `lark-im-replay.mjs` | `maintenance replay`；显式 DB、1–3 scope、固定时窗、严格版本及独立审计保留 | A |
 | 13 | `lark-im-service.mjs` | 生命周期到 `service`；观察到 `status`；等待到 `check --wait` | A |
 | 14 | `lark-im-sync.mjs` | 公共 `sync` 与 worker 子进程共用 bin；算法与导出直接来自领域模块 | A |
-| 15 | `lark-im-worker.mjs` | 内部 `src/runtime/worker/main.mjs`；过渡桥保持旧 argv/JSONL/退出语义 | W |
+| 15 | `lark-im-worker.mjs` | 内部 `src/runtime/worker/main.mjs`；本提交移除旧桥，部署按 W 门槛验收 | W |
 | 16 | `lib/doctor-core.mjs` | 直接 import `src/diagnostics/doctor-core.mjs` 中仍适用的领域规则；聚合归 check | A |
 | 17 | `lib/ingestion-store.mjs` | 直接 import `dist/storage/sqlite/ingestion-store.js`，保持 TS/dist 边界 | A |
 | 18 | `lib/lark-im-adapter.mjs` | 直接 import `src/adapters/lark-im/adapter.mjs` | A |
@@ -67,9 +67,9 @@
 | 阅读消费者与共享 card fixture | 原 JSON 数组和私有原始字段保持；阅读无网络、无业务写入，按钮不执行 |
 | 运维与现行文档 | 命令按意图迁移；check/restart/wait 分步，预览/apply 默认变化明确 |
 | 历史设计与回归记录 | 顶部标明历史时点并链接现行文档；旧路径仅作为历史，不机械改写旧证据 |
-| 已安装 LaunchAgent | 源码证明旧安装器曾固化 worker 路径；实际安装值尚未由本轮读取，进入 W |
+| 已安装 LaunchAgent | 已识别安装配置已迁至内部 main，完整参数与其他 plist 字段保留；真实新实例与完整周期证据已取得，后续提交仍须独立审查及运行验收 |
 
-清点覆盖仓库源文件、生成物、配置、测试和文档中的路径引用。未读取私人自动化目录或生产配置，不能据此声称所有外部调用均不存在。发现具体用户控制的本地调用后应加入同批迁移；真正外部绑定才登记 X。
+仓内清点覆盖源文件、生成物、配置、测试和文档中的路径引用；授权切换另外核验了已识别 LaunchAgent。该有限范围不能证明所有未知外部调用均不存在。发现具体用户控制的本地调用后应加入同批迁移；真正外部绑定才登记 X。
 
 ## 行为差异
 
@@ -85,14 +85,14 @@
 | compact 直接写 | 默认预览，`--apply` 才执行实际回收 |
 | lag 的较大默认样本 | live 默认 chat-pages=5、hot-chats=5、messages-per-chat=3；原需 20×5 的自动化显式传参 |
 | live 与缓存写入容易混淆 | `check --live` 默认不写；`--write-live-cache` 只在 live 模式可用，TTL 不充当采样时窗 |
-| 脚本间默认路径依赖 cwd | 默认 DB/log/backup 按安装 root；显式相对路径按 cwd；worker 旧桥在 W 前保留旧默认以兼容 |
+| 脚本间默认路径依赖 cwd | 默认 DB/log/backup 按安装 root；显式相对路径按 cwd；内部 worker 使用同一规则 |
 | coverage Python 的错误与未完成均为 2 | 公共 check 结构化区分：条件不满足/证据不足为 2，参数/依赖/读取失败为 1 |
 | details 欠账与执行失败混用退出 1 | 公共 sync 明确部分完成/欠账为 2，执行失败为 1，worker 同步消费新分类 |
 | probe 默认写报告或隐含 events | metadata 不启动 events；sample/events 显式、有界；仅 `--output` 写私有报告 |
 
 `messages` 保留原数组 JSON 与 raw/body/canonical/display 字段。维护预览不放宽数据范围：replay 仍要求显式 DB 和 1–3 个不同 scope，records 默认 limit 1000、scopes 默认 50，sender-only 默认 50/上限 100 且总远端预算 30 秒。`--probe-apps` 只对 records 有效。`--unsafe-details` 仅在 check live 或 records enrichment 模式成立，整份输出按 private 处理。
 
-过渡 worker 桥保留旧的重复参数规则：每个有效参数按最后一次取值，`--once` 与 `--max-cycles` 按最后出现的生命周期选项决定；路径仍按旧 cwd 规则解析。每次出现的值都要通过验证，后面的值不能掩盖前面的非法输入。只有旧桥启用此兼容规则；新内部入口、公共命令和持久服务配置仍拒绝重复参数。
+已退役桥曾保留重复参数最后取值及 cwd 默认路径规则；这些专用兼容分支已在本提交删除。内部入口、公共命令和持久服务配置继续拒绝重复参数，显式可重复的选项仍按其声明处理。内部 worker 的 `--once` 与 `--max-cycles` 各出现一次时，仍按最后出现的生命周期选项决定；两者均不进入长期服务配置。
 
 ## 审查范围必须注明基线
 
@@ -102,13 +102,17 @@ blob 口径为区间内每个提交新增或修改文件的新侧 Git 对象去�
 
 ## Worker 切换门槛 W
 
-当前 W **未完成**，仅有隔离候选中的生成器与合成契约证据，不能替代真实运行取证。授权切换时必须：
+以下记录 **2026-10-04 部署 `a0e6bbf` 时的固定取证**，不证明任何后续提交已发布或部署。该次授权切换中：旧实例及写者退出，一致备份与启动前 raw/body/canonical/hash/version/游标严格等价审计通过，完整显式 worker 参数及其他 plist 字段保留，已识别 LaunchAgent 指向内部 main。新实例的 OS、活动事件和数据库身份一致，并已完成调用后开始的完整成功周期。
+
+该周期证据不等于全局检查通过：验收时 `check --wait` 仍退出 2（`final_local_not_ready`），仍有普通发送者姓名经有界预览未解析、未形成更新，未执行写入；固定部署目标的覆盖仍有尾部未到，未发现起点缺口或内部空洞。这些是该次验收时点的未完成项；后台自然推进不构成后续通过证明。`a0e6bbf` 仍含旧桥，本提交将其移除。提交的独立审查、发布及运行环境切换结果应由对应版本的发布记录证明。
+
+后续切换仍须遵循以下门槛：
 
 1. 保存原代码、完整安装配置和独立一致性备份；确认目标数据库与全部 WorkerConfig。
 2. 停止旧 worker 并确认旧实例及子进程退出；launchd 停止不证明独立前台同步结束。结合进程身份与写入 fence 确认没有活跃写者，不能仅凭 lease 推断存活或死亡。无法停止或身份未知就停止切换，不强杀未知任务。
 3. 安装新配置，核验所有已识别 plist 指向 `src/runtime/worker/main.mjs`，参数完整且路径正确。
 4. 启动新实例，使用 `check --wait` 验证调用后新完整周期，再分别做本地、固定目标覆盖和可选远端验收。
-5. 确认已识别调用均迁移后删除唯一 worker 桥。若分发布，最多跨一个迁移发布；尚有桥就仍是“迁移未完成”。
+5. 确认已识别调用均迁移后，在隔离候选删除最后的桥并完成独立审查与发布。若分发布，最多跨一个迁移发布；仅隔离删除、运行环境仍有桥时不能宣称入口退役已发布完成。
 
 失败时恢复代码与配置，不用旧备份覆盖回灌当前数据库。源文件路径数量达标不能代替新周期、覆盖或隐私验收。
 

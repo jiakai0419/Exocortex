@@ -79,7 +79,7 @@ test("sync captures its dynamic time once and registry resolves default versus e
   assert.equal(Date.parse(observed.summary.window.end), instant, "window default uses the invocation clock captured before dispatch");
 });
 
-test("internal worker uses root defaults while its registered bridge retains cwd defaults", () => {
+test("internal worker uses root defaults and explicit cwd-relative paths", () => {
   function observe(argv, extra = {}) {
     let observed;
     assert.equal(main(argv, { root: "/synthetic-install", cwd: "/synthetic-invocation",
@@ -92,9 +92,6 @@ test("internal worker uses root defaults while its registered bridge retains cwd
   const explicit = observe(["--db", "explicit.sqlite", "--log-dir", "explicit-logs", "--once"]);
   assert.equal(explicit.db, "/synthetic-invocation/explicit.sqlite");
   assert.equal(explicit.logDir, "/synthetic-invocation/explicit-logs");
-  const bridge = observe(["--once"], { legacyPaths: true });
-  assert.equal(bridge.db, "/synthetic-invocation/data/exocortex.sqlite");
-  assert.equal(bridge.logDir, "/synthetic-invocation/logs/lark-im");
 });
 
 test("persistent worker arguments contain db plus exactly 13 common and 4 adaptive fields", () => {

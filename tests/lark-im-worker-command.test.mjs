@@ -435,15 +435,19 @@ test("runWorker applies adaptive batches and preserves independent cooldown stat
   assert.doesNotMatch(JSON.stringify(schedulers), /scope_id|chat_id|user_id|stderr/);
 });
 
-test("lark im worker direct CLI help and argument errors keep exit codes stable", () => {
-  const help = spawnSync(process.execPath, ["scripts/lark-im-worker.mjs", "--help"], {
+test("retired worker bridge is absent from the candidate", () => {
+  assert.equal(existsSync(new URL("../scripts/lark-im-worker.mjs", import.meta.url)), false);
+});
+
+test("internal worker direct CLI help and argument errors keep exit codes stable", () => {
+  const help = spawnSync(process.execPath, ["src/runtime/worker/main.mjs", "--help"], {
     encoding: "utf8",
   });
   assert.equal(help.status, 0);
-  assert.match(help.stdout, /Usage: node scripts\/lark-im-worker\.mjs/);
+  assert.match(help.stdout, /Usage: node src\/runtime\/worker\/main\.mjs/);
   assert.equal(help.stderr, "");
 
-  const error = spawnSync(process.execPath, ["scripts/lark-im-worker.mjs", "--unknown", "1"], {
+  const error = spawnSync(process.execPath, ["src/runtime/worker/main.mjs", "--unknown", "1"], {
     encoding: "utf8",
   });
   assert.equal(error.status, 1);
