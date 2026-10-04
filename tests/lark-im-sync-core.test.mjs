@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { normalizeApiMessage } from "../src/adapters/lark-im/raw-message.mjs";
 
 import {
   bodyFromMessage,
@@ -130,6 +131,61 @@ test("chat window records keep self non-text messages as sent while storing rece
     ],
   );
 });
+
+test("chat direction classification preserves native source and name projections across cursor boundaries", () => {
+  const base = Date.parse("2026-08-01T00:00:00Z");
+  const scopeId = "lark.im.received.chat.synthetic_projection";
+  const source = (suffix, sender, createMs = base) => ({
+    message_id: `om_synthetic_projection_${suffix}`, chat_id: "oc_synthetic_projection",
+    create_time: String(createMs), update_time: String(createMs + 1000), msg_type: "text",
+    sender, body: { content: JSON.stringify({ text: `invented ${suffix}` }) },
+  });
+  const self = { id: "ou_synthetic_self", id_type: "open_id", sender_type: "user" };
+  const other = { id: "ou_synthetic_other", id_type: "open_id", sender_type: "user" };
+  const sources = [source("c", self), source("b", other), source("a", self),
+    source("future", self, base + 2000), source("older", other, base - 1000)];
+  const messages = sources.map((raw) => normalizeApiMessage(raw));
+  const context = { self: { open_id: self.id, name: "Synthetic Self" },
+    contacts: new Map([[other.id, "Synthetic Other"]]) };
+  const cursor = { created_at_ms: base, message_id: "om_synthetic_projection_a" };
+  const records = prepareChatWindowRecords(messages, scopeId, cursor, base - 1000, base + 1000,
+    self.id, context, {});
+  assert.deepEqual(records.map((record) => [record.external_id, record.direction, record.body]), [
+    ["om_synthetic_projection_b", "received", "invented b"],
+    ["om_synthetic_projection_c", "sent", "invented c"],
+  ]);
+  for (const record of records) {
+    const message = messages.find((item) => item.message_id === record.external_id);
+    assert.deepEqual(record, recordFromMessage(message, scopeId, record.direction, context, {}));
+    assert.deepEqual(JSON.parse(record.raw_json), sources.find((item) => item.message_id === record.external_id));
+    assert.equal(JSON.parse(record.canonical_json).sender_name,
+      record.direction === "sent" ? "Synthetic Self" : "Synthetic Other");
+  }
+});
+
+for (const order of [["self", "other"], ["other", "self"], ["self", "other", "self_later"]]) {
+  test(`conflicting equal-version chat duplicates retain the established direction tie order: ${order.join(",")}`, (t) => {
+    const base = Date.parse("2026-08-01T00:00:00Z");
+    const dbPath = tempDb(t);
+    const scope = readScope(dbPath, "lark.im.sent_by_me");
+    const messages = order.map((name) => message("om_synthetic_direction_duplicate", base, {
+      senderId: name === "other" ? "ou_synthetic_other" : "ou_synthetic_self",
+      senderName: name === "other" ? "Synthetic Other" : "Synthetic Self",
+      content: `invented ${name}`, update_time: String(base + 1000),
+    }));
+    const records = prepareChatWindowRecords(messages, scope.id, null, base, base,
+      "ou_synthetic_self", {}, {});
+    assert.deepEqual(records.map((record) => record.direction),
+      ["received", ...order.filter((name) => name !== "other").map(() => "sent")]);
+    const expected = messages.findLast((item) => item.sender.id === "ou_synthetic_self");
+    const runId = createRun(dbPath, scope);
+    succeedMessageRun(dbPath, scope, runId, records, messages.length, cursorAfter(base));
+    const stored = sqliteQuery(dbPath, "SELECT actor_id, direction, body, raw_json, content_hash FROM records;")[0];
+    const expectedRecord = recordFromMessage(expected, scope.id, "sent");
+    assert.deepEqual(stored, { actor_id: "ou_synthetic_self", direction: "sent", body: expected.content,
+      raw_json: expectedRecord.raw_json, content_hash: expectedRecord.content_hash });
+  });
+}
 
 test("messageWindow uses a stable horizon for implicit now, but honors explicit --end", () => {
   const implicit = parseArgs([

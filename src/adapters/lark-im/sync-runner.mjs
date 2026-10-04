@@ -544,31 +544,17 @@ function prepareChatWindowRecords(
   scopeConfig,
 ) {
   const selfHash = hash(selfOpenId);
-  const isSelfRecord = (record) => hash(record.actor_id || "") === selfHash;
-  return [
-    ...prepareRecords(
-      messages,
-      scopeId,
-      "received",
-      cursor,
-      startMs,
-      endMs,
-      (record) => !isSelfRecord(record),
-      /** @type {any} */ (peopleContext),
-      scopeConfig,
-    ),
-    ...prepareRecords(
-      messages,
-      scopeId,
-      "sent",
-      cursor,
-      startMs,
-      endMs,
-      isSelfRecord,
-      /** @type {any} */ (peopleContext),
-      scopeConfig,
-    ),
-  ].sort((a, b) => a.occurred_at_ms - b.occurred_at_ms || a.external_id.localeCompare(b.external_id));
+  // Direction is a record projection; raw payload, canonical names and hash
+  // are independent of it. Normalize each message only once before classifying.
+  const records = prepareRecords(messages, scopeId, "received", cursor, startMs, endMs,
+    null, /** @type {any} */ (peopleContext), scopeConfig);
+  for (const record of records) {
+    if (hash(record.actor_id || "") === selfHash) record.direction = "sent";
+  }
+  // Preserve the old received-then-sent tie order: same-version duplicate
+  // writes select the last candidate, even if a source repeats an identity.
+  return records.sort((a, b) => a.occurred_at_ms - b.occurred_at_ms || a.external_id.localeCompare(b.external_id)
+    || Number(a.direction === "sent") - Number(b.direction === "sent"));
 }
 
 /** @param {unknown} value @param {string} label */

@@ -241,11 +241,12 @@ test("scope dry-run cannot create a missing database or parent directory", (t) =
 test("failed scope commit rolls back and releases its own lock", (t) => {
   const f = fixture(t);
   sqlite(f.dbPath, `CREATE TRIGGER reject_enrichment BEFORE UPDATE ON sync_scopes
-    BEGIN SELECT RAISE(ABORT, 'synthetic write failure'); END;`);
+    BEGIN SELECT RAISE(ABORT, 'SYNTHETIC_PRIVATE_SQL_BODY /invented/private-fixture.sqlite'); END;`);
   const before = scopes(f.dbPath);
   const result = run(f);
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /synthetic write failure/);
+  assert.match(result.stderr, /scope enrichment failed/);
+  assert.doesNotMatch(result.stderr + result.stdout, /SYNTHETIC_PRIVATE_SQL_BODY|private-fixture|CREATE TRIGGER|RAISE/);
   assert.deepEqual(scopes(f.dbPath), before);
   assert.deepEqual(locks(f.dbPath), []);
 });
@@ -287,7 +288,8 @@ process.exit(result.status ?? 1);
     chmodSync(path, 0o755);
     const result = run(f, [], { PATH: `${f.dir}:${process.env.PATH}` });
     assert.equal(result.status, 1);
-    assert.match(result.stderr, /CHECK constraint failed/);
+    assert.match(result.stderr, /scope enrichment failed/);
+    assert.doesNotMatch(result.stderr, /CHECK constraint|INSERT INTO|maintenance_locks|other-owner/);
     assert.deepEqual(scopes(f.dbPath), before);
     const remaining = locks(f.dbPath);
     if (replacement) {
@@ -298,3 +300,22 @@ process.exit(result.status ?? 1);
     }
   });
 }
+
+test("failed readonly query cannot expose SQLite stderr, literals or paths", (t) => {
+  const f = fixture(t);
+  const before = scopes(f.dbPath);
+  const beforeBytes = readFileSync(f.dbPath);
+  const path = join(f.dir, "sqlite3");
+  writeFileSync(path, `#!/usr/bin/env node
+process.stderr.write("SYNTHETIC_PRIVATE_READ_BODY /invented/private-fixture.sqlite SELECT secret FROM invented;");
+process.exit(1);
+`);
+  chmodSync(path, 0o700);
+  const result = run(f, ["--dry-run"], { PATH: `${f.dir}:${process.env.PATH}` });
+  assert.equal(result.status, 1);
+  assert.equal(result.stderr, "scope enrichment failed\n");
+  assert.doesNotMatch(result.stdout + result.stderr, /SYNTHETIC_PRIVATE|private-fixture|SELECT secret/);
+  assert.deepEqual(readFileSync(f.dbPath), beforeBytes);
+  assert.deepEqual(scopes(f.dbPath), before);
+  assert.deepEqual(locks(f.dbPath), []);
+});

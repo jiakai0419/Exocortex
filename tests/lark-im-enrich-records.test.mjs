@@ -508,11 +508,12 @@ test("dry-run on a missing path creates neither database nor parent directory", 
 test("a failed commit rolls back all enrichment and releases its maintenance lock", (t) => {
   const fixture = enrichmentFixture(t);
   sqliteExec(fixture.dbPath, `CREATE TRIGGER reject_enrichment BEFORE UPDATE ON records
-    BEGIN SELECT RAISE(ABORT, 'synthetic write failure'); END;`, "install rejection trigger");
+    BEGIN SELECT RAISE(ABORT, 'SYNTHETIC_PRIVATE_SQL_BODY /invented/private-fixture.sqlite'); END;`, "install rejection trigger");
   const before = readRecords(fixture.dbPath);
   const result = runEnrichment(fixture);
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /synthetic write failure/);
+  assert.match(result.stderr, /record enrichment failed/);
+  assert.doesNotMatch(result.stderr + result.stdout, /SYNTHETIC_PRIVATE_SQL_BODY|private-fixture|CREATE TRIGGER|RAISE/);
   assert.deepEqual(readRecords(fixture.dbPath), before);
   assert.deepEqual(maintenanceLocks(fixture.dbPath), []);
 });
@@ -564,7 +565,8 @@ for (const replacement of [false, true]) {
     installCommitInterleavingSqlite(fixture.dir, fixture.dbPath, mutation);
     const result = runEnrichment(fixture, [], { PATH: `${fixture.dir}:${SAFE_PATH}` });
     assert.equal(result.status, 1);
-    assert.match(result.stderr, /CHECK constraint failed/);
+    assert.match(result.stderr, /record enrichment failed/);
+    assert.doesNotMatch(result.stderr, /CHECK constraint|INSERT INTO|maintenance_locks|other-owner/);
     assert.deepEqual(readRecords(fixture.dbPath), before);
     const locks = maintenanceLocks(fixture.dbPath);
     if (replacement) {
@@ -993,3 +995,23 @@ test("ordinary sender remote alias member echo remains unknown after an empty co
   assert.deepEqual(enrichmentCalls(fixture.callsPath).map(args => args.slice(0, 2)),
     [["contact", "+get-user"], ["contact", "+search-user"], ["im", "chat.members"]]);
 });
+
+for (const [scenario, stderr] of [
+  ["private remote body", "SYNTHETIC_PRIVATE_REMOTE_BODY https://synthetic.invalid/?token=INVENTED_SECRET"],
+  ["forged lock message", "maintenance lock unavailable: 998877665544 active sync lock(s); retry shortly"],
+]) {
+  test(`failed self lookup with ${scenario} emits a public category without database changes`, (t) => {
+    const fixture = enrichmentFixture(t);
+    writeFileSync(fixture.fakeLarkCli, `#!/usr/bin/env node
+process.stderr.write(${JSON.stringify(stderr)});
+process.exit(1);
+`);
+    const before = readRecords(fixture.dbPath);
+    const result = runEnrichment(fixture);
+    assert.equal(result.status, 1);
+    assert.equal(result.stderr, "record enrichment failed\n");
+    assert.doesNotMatch(result.stdout + result.stderr, /SYNTHETIC_PRIVATE|INVENTED_SECRET|synthetic\.invalid|998877665544/);
+    assert.deepEqual(readRecords(fixture.dbPath), before);
+    assert.deepEqual(maintenanceLocks(fixture.dbPath), []);
+  });
+}

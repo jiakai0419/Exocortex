@@ -1,13 +1,11 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
-import {
-  acquireMaintenanceLock,
-  releaseMaintenanceLock,
-} from "../dist/storage/sqlite/ingestion-store.js";
+import { quoteSql } from "../dist/storage/sqlite/ingestion-store.js";
+import { readOnlySqliteJson as sqliteJson } from "../src/storage/sqlite/readonly-query.mjs";
+import { commitEnrichmentUpdates, publicEnrichmentError } from "./lib/lark-im-enrichment.mjs";
 
 import { larkSenderNameIsUnknownSql, larkSenderNamespaceSql, mergeLarkNameProjectionSql } from "../dist/storage/sqlite/lark-name-projection.js";
 import { createNameResolver } from "../src/adapters/lark-im/name-resolver.mjs";
@@ -80,33 +78,6 @@ function parseArgs(argv) {
   return opts;
 }
 
-function quoteSql(value) {
-  if (value === null || value === undefined) return "NULL";
-  return `'${String(value).replaceAll("'", "''")}'`;
-}
-
-function sqliteJson(dbPath, sql, label) {
-  const result = spawnSync("sqlite3", ["-readonly", "-json", dbPath], {
-    input: `.bail on\n.timeout 5000\nPRAGMA query_only = ON;\n${sql}`,
-    encoding: "utf8",
-    maxBuffer: 50 * 1024 * 1024,
-  });
-  if (result.status !== 0 || result.error) throw new Error(`${label} failed: ${String(result.stderr || result.error?.message || "SQLite unavailable").trim()}`);
-  const trimmed = result.stdout.trim();
-  return trimmed ? JSON.parse(trimmed) : [];
-}
-
-function sqliteExec(dbPath, sql, label) {
-  const result = spawnSync("sqlite3", ["-json", dbPath], {
-    input: `.bail on\n.timeout 5000\nPRAGMA foreign_keys = ON;\n${sql}`,
-    encoding: "utf8",
-    maxBuffer: 50 * 1024 * 1024,
-  });
-  if (result.status !== 0 || result.error) throw new Error(`${label} failed: ${String(result.stderr || result.error?.message || "SQLite unavailable").trim()}`);
-  const trimmed = result.stdout.trim();
-  return trimmed ? JSON.parse(trimmed) : [];
-}
-
 function parseMaybeJson(value) {
   if (!value) return null;
   try {
@@ -124,17 +95,6 @@ function runLark(args, options = {}) {
   if (result.status !== 0) throw new Error(result.stderr.trim() || `${bin} ${args.join(" ")} failed`);
   const trimmed = result.stdout.trim();
   return trimmed ? JSON.parse(trimmed) : null;
-}
-
-function acquireWriteMaintenanceLock(dbPath, reason) {
-  const owner = `pid:${process.pid}:lark-im-enrich-records:${randomUUID()}`;
-  // Network lookups have finished; this lease covers only the local commit.
-  const result = acquireMaintenanceLock(dbPath, { owner, ttlSeconds: 60, reason });
-  if (result.acquired) return owner;
-  if (result.reason === "sync_locks_active") {
-    throw new Error(`maintenance lock unavailable: ${result.active_sync_locks || 0} active sync lock(s); retry shortly`);
-  }
-  throw new Error(`maintenance lock unavailable: held by ${result.lock_owner || "another maintenance command"}`);
 }
 
 function firstArray(...values) {
@@ -487,27 +447,9 @@ function prepareUpdates(dbPath, rows, proposals, senderOnly = false) {
 }
 
 function commitUpdates(dbPath, updates, dryRun) {
-  if (updates.length === 0 || dryRun) return { updated: 0, skippedConflicts: 0 };
-  const lockOwner = acquireWriteMaintenanceLock(dbPath, 'lark-im-enrich-records');
-  try {
-    const effects = sqliteExec(dbPath, `
-      BEGIN IMMEDIATE;
-      CREATE TEMP TABLE __enrichment_fence (allowed INTEGER NOT NULL CHECK (allowed = 1));
-      INSERT INTO __enrichment_fence (allowed)
-      SELECT CASE WHEN EXISTS (
-        SELECT 1 FROM maintenance_locks
-        WHERE name = 'global' AND owner = ${quoteSql(lockOwner)}
-          AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-      ) AND NOT EXISTS (SELECT 1 FROM sync_locks) THEN 1 ELSE 0 END;
-      CREATE TEMP TABLE __enrichment_effects (updated INTEGER NOT NULL);
-      ${updates.join('\n')}
-      SELECT COALESCE(SUM(updated), 0) AS updated FROM __enrichment_effects;
-      COMMIT;`, 'update records');
-    const updated = Number(effects[0]?.updated || 0);
-    return { updated, skippedConflicts: updates.length - updated };
-  } finally {
-    releaseMaintenanceLock(dbPath, lockOwner);
-  }
+  return commitEnrichmentUpdates(dbPath, updates, {
+    dryRun, reason: "lark-im-enrich-records", label: "update records",
+  });
 }
 
 function nativeRow(raw) {
@@ -613,8 +555,7 @@ function runSenderOnly(dbPath, opts) {
   if (unresolved > 0 || hasMore || skippedConflicts > 0) process.exitCode = 1;
 }
 
-function main() {
-  const opts = parseArgs(process.argv.slice(2));
+function main(opts) {
   const dbPath = resolve(opts.db);
   if (!existsSync(dbPath)) throw new Error(`database not found: ${dbPath}`);
   if (opts.senderOnly) return runSenderOnly(dbPath, opts);
@@ -858,7 +799,12 @@ function main() {
 }
 
 try {
-  main();
+  const opts = parseArgs(process.argv.slice(2));
+  try {
+    main(opts);
+  } catch (error) {
+    throw publicEnrichmentError(error, "record enrichment failed");
+  }
 } catch (error) {
   process.stderr.write(`${error.message}\n`);
   process.exit(1);
