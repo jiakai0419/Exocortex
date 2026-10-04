@@ -11,6 +11,6 @@ export async function runStatusCommand(options, context, deps = {}) {
   if (options.logs) report.logs = readPrivateLogs(options, deps);
   const code = collected.report.sync.status ? 0 : 1;
   if (options.format === "json") context.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
-  else context.stdout.write(renderStatusText(report));
+  else context.stdout.write(renderStatusText(report, { columns: context.stdout.columns, stream: context.stdout }));
   return code;
 }

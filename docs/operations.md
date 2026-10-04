@@ -141,31 +141,22 @@ node bin/exocortex.mjs check --db /absolute/path/to/exocortex.sqlite \
 
 `check` 直接调用共享报告，不通过已退役的诊断子 CLI 拼接结果。执行失败、信号、坏 JSON 或有效但未满足的证据不能被健康字段覆盖。公共结果使用有限原因、状态和计数，不透出原始 stderr；本地与远端分项保留各自观察时间。
 
-### Recent cycles (up to 24h)
+### Status 的整屏层级与历史口径
 
-`status` 展示请求窗口内保留的 worker 日志证据，不把它当作服务运行时长或完整监控覆盖。
+公共 `status` 按当前判断、同步进度、需处理项、近期历史排列；`--detail` 使用同样的标题和键值布局，并补充 Diagnostics，不直接拼接 JSON。字段契约与从零合成整屏见 [Status screen design](status-screen-design.md)。
 
-```text
-Statistics range             例如 Today 03:11–07:26 · 4h15m；同日省略重复日期，跨日保留两端。
-Cycles                       窗口内实际读到的成功/失败/总 cycle 数。
-Last success                 窗口内最近一次成功 cycle，以及距本次统计时刻多久。
-Longest between successes    窗口内相邻两次已观察到的成功 cycle 之间的最长间隔。
-Failures                     窗口内失败 cycle、失败 step 和可分类失败原因。
-```
+- **Health & current work**：Local health 仅指本地同步检查；不是质量检查或远端完整性保证。Background 单列服务运行及所选数据库关联。Current work 只使用已验证 Activity，并翻译当前任务名；Unconfirmed 旁解释缺失或冲突证据。
+- **Coverage**：分别显示保存的消息、收到的会话、消息列表最落后水位、详情欠账和会话名单完成情况。收到的会话数不与包含 sent 的消息源分母混用；列表进度不等于完整内容覆盖。Restricted chats 保留原因、数量、错误码。缓存远端样本过期不等于后台失败。
+- **Attention**：给出对应诊断入口；所有建议命令都须沿用本次 status 的 `--db` 和 `--log-dir` 值，界面只说明这一要求，不输出私有路径。没有或过期的远端样本单列为 Optional sample，不作为必须处理的问题；旧成功、未收尾历史和租约都不直接建议 repair 或 restart。`check --live` 取得本次样本，只有显式增加 `--write-live-cache` 才更新供后续 status 使用的缓存。
+- **Recent history**：worker 日志的轮次/任务和所选数据库的失败运行独立统计。日志未验证绑定所选数据库，轮次号也会因重启重置，因此不以轮次号当全局身份。
 
-最长间隔不包含窗口左边界到首成功，也不包含末成功到现在；后者已由 `Last success` 单列。少于两次成功时显示证据不足，JSON 为 `null`，不能显示零或整段窗口。JSON 保留精确毫秒，最长间隔的终端显示四舍五入到秒；距最近成功沿用已过去整秒。窗口起点和统计时刻都是包含边界，窗口外或未来的成功不参与相邻间隔。
+默认显示日志请求回看长度、窗口内事件首末时间及部分/截断状态。detail 给出请求窗口的精确端点、最长成功间隔、最新已完成任务和有步骤却未见收尾的历史。只有旧事件时明确“窗口内无事件”，旧结果仍带日期；未来或无效时间不能写成刚刚成功。成功间隔只计算窗口内相邻成功完成，不包括窗口边界，不代表停机时长。少于两个成功时不可用。
 
-整段输出声明一次本地 IANA 时区；夏令时切换或重复本地小时按需保留端点偏移以消歧。正常短窗口不再重复附加不足 24h 的长说明，截断保留简短 log truncated 提示，JSON 精确范围及 coverage 语义不变。详见 [状态展示契约](status-unsupported-presentation.md)。
+日志只读当前 `worker.jsonl` 最多 8 MiB、20,000 个非空行，不读轮转历史。达到回看左边界也不证明连续运行或无遗漏。数据库失败统计只计算保留的 `sync_runs` 中 `status=failed` 且开始时间位于其独立闭区间内的行，按安全类别聚合；查询失败显示不可用，不能说零失败。查询先冻结截止时间，活动仍在全部读取结束后验证有效期。JSON 中既有 `stability.failures.by_kind` 保留兼容语义，新 `failure_runs` 给出来源、时间基础和精确窗口。
 
-统计范围的起点来自保留的有效 worker 事件，可能早于首成功；它不是服务启动时间。当前只读 `worker.jsonl` 的有界尾部（最多 8 MiB、20,000 个非空行），不读轮转历史；截取、损坏行或轮转都可能遗漏事件。即使保留记录达到窗口起点，也只证明读到了那个时间范围，不能证明连续运行或无遗漏。没有有效事件时范围未知，不凭空展示完整 24 小时。
+detail 保留初始名单发现、活跃会话刷新成功时间、名单复核完成时间、消息源分母、详情最老欠账/下次重试、保留运行计数、预约异常和时间证据。名单完成只代表名单：hot/reconcile 读取未静音的群聊和私聊，不能据此断言这些会话的消息覆盖完整。正常预约不作为当前活动正判；过期预约不证明进程已死。
 
-### 简洁的发现与占用状态
-
-`Received scopes` 保留已启用会话总数与尚无消息游标的会话数。`Chat list review`（会话列表盘点，对应 reconcile）展示名单盘点状态及快照的 `completed_at`；没有完成时间证据时明确未知，不能用后来更新游标的时间替代。`Active chat refresh`（活跃会话刷新，对应 hot discovery）显示最近一次成功刷新时间，不把它叫作任务开始时间或最新消息时间。分页等技术字段仍保留在详细诊断中，不增加重复会话计数。
-
-这两种发现当前默认都通过 `im +chat-list --as user --exclude-muted --types group,p2p --sort active_time --page-size 100` 读取未静音群聊和私聊名单，并不是无限范围的全部会话。reconcile 默认每个 cycle 续读一页，直到 `has_more=false`，最后一页成功后在事务中记录完成时间；完成后至少间隔配置的复核周期（默认 24 小时）再开始。hot discovery 每个 cycle 从首页刷新，代码默认最多五页；显式 `--hot-discovery-pages-per-cycle 1` 可限为一页；这不是代码默认值。它展示拉取成功后、提交前采集并随成功事务保存的刷新时间。两者都只是会话名单，不表示这些会话的消息已扫描完整。
-
-整体 `Health` 只在 Overview 显示一次。正常租约不另列 `Locks`，也不作为 Activity 正判。过期、超过硬期限、未来开始时间或无效时间区间等已有时间戳证据会显示原因与诊断检查建议；过期不能证明进程已死亡，租约存在也不能证明进程存活或存在等待。没有阻塞证据时不声称正在等待，不猜等待时长。详细诊断仍保留原有数量、时间等信息，不默认增加原始持有者标识。
+整屏声明一次本地 IANA 时区；跨日和跨年保留两端日期，DST 切换/重复小时按需显示偏移。不到一分钟的区间保留秒，避免正区间看起来长度为零。无色和窄屏保留全部字段含义，详情 JSON 的原字段和精确时间仍可用。
 
 ### Transient Lark Failures
 
@@ -459,7 +450,7 @@ node bin/exocortex.mjs check --live
 
 ### Unsupported Chat Scopes
 
-Service 以正常键值行显示 `Unsupported scopes`：单原因与总数同行，多原因缩进展示各自数量；保留非空错误码，不再单列空的 Lark CLI 列或重复表格。公共 JSON 原样保留原因分组。
+公共 status 在 Coverage 中显示 `Restricted chats`：单原因与总数同行，多原因逐行保留数量与非空错误码；公共 JSON 仍保留原有 unsupported 原因分组。
 
 Received chat scope 的列表读取可能进入 unsupported 状态。它表示同步器识别到当前 lark-cli 身份不能读取会话列表，后续会暂停这个 scope，但本地已同步的 records 会保留。单条合并转发的详情失败不证明整个会话不可读取，不会禁用 scope。
 
@@ -478,12 +469,13 @@ Received chat scope 的列表读取可能进入 unsupported 状态。它表示�
 node bin/exocortex.mjs status
 ```
 
-`status` 会同时展示三层信息：
+`status` 按四个区域展示信息；`--detail` 另补 Diagnostics：
 
 ```text
-LaunchAgent -> 后台服务是否被 macOS 托管、PID、退出码
-Sync        -> 本地同步状态、records、scopes、discovery/reconcile
-Worker      -> 最近完整 cycle、最近 step、当前活动及有限失败摘要
+Health & current work -> 本地同步健康、后台服务与已验证的当前工作
+Coverage              -> 消息、会话进度、内容欠账、名单状态与远端样本
+Attention             -> 需处理项、可选采样及沿用同一目标的诊断提示
+Recent history        -> 日志中的完成轮次、已完成任务及有限失败摘要
 ```
 
 ### Data Quality
@@ -534,8 +526,8 @@ node bin/exocortex.mjs status --detail
 - 固定终点的 coverage-check 确认成功窗口连续覆盖，单次成功 cycle 不足以证明完整。
 - `check --live` 获得非空、窗口明确、无 missing 的样本；全空、不可用和错误均不能算远端通过。
 - 如需 service 展示样本，显式写缓存并在五分钟内检查 SAMPLED 及范围，当前认证主体仍未知。
-- `status --detail` 中 `Discovery`、`Hot discovery`、`Reconcile` 分别能看出 initial、hot 和周期复核状态。
-- `status` 中 `Worker` 区域能看出最近 cycle 在持续推进。
+- `status --detail` 中 `Conversation list`、`Active chat refresh`、`Chat list review` 分别能看出 initial、hot 和周期复核状态。
+- `status` 的 `Recent history` 显示日志中最近完成的轮次；当前是否同步须查看 `Health & current work`，不能用历史推进替代当前阶段证据。
 - 最近消息能正常展示发送人、群名和消息内容。
 - 后台服务是 active。
 

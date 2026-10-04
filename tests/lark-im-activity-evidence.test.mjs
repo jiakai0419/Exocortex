@@ -328,7 +328,7 @@ test("review regression: an unrelated orphan cannot suppress verified independen
     uid: () => 999, stdout: { write: (text) => { output += text; } },
     buildServiceStatusReport: (opts) => buildServiceStatusReport(opts, fixture.deps),
   }), 0);
-  assert.match(plain(output), /Activity: SYNCING · independent foreground sync observed/);
+  assert.match(plain(output), /Current work\s+Syncing · verified foreground command/);
 });
 
 test("all activity consumers reject missing required fields and malformed types without old-phase fallback", async (t) => {
@@ -356,7 +356,7 @@ test("all activity consumers reject missing required fields and malformed types 
     uid: () => 999, stdout: { write: (text) => { output += text; } },
     buildServiceStatusReport: (opts) => buildServiceStatusReport(opts, fixture.deps),
   });
-  assert.match(plain(output), /Activity: UNKNOWN · current phase evidence is incomplete/);
+  assert.match(plain(output), /Current work\s+Unconfirmed · current activity records are incomplete/);
 });
 
 test("explicit unknown identity is valid schema, blocks its old phase, and does not poison later real evidence", (t) => {
@@ -438,7 +438,7 @@ test("4531143 regression: a suspended parent with matching start cannot turn its
     uid: () => 999, stdout: { write: (text) => { output += text; } },
     buildServiceStatusReport: (opts) => buildServiceStatusReport(opts, fixture.deps),
   });
-  assert.match(plain(output), /Activity: UNKNOWN/); assert.doesNotMatch(plain(output), /foreground sync observed/);
+  assert.match(plain(output), /Current work\s+Unconfirmed/); assert.doesNotMatch(plain(output), /foreground sync observed/);
 });
 
 test("parent identity and liveness stay separate across 81 log/report/CLI combinations", async (t) => {
@@ -470,7 +470,7 @@ test("parent identity and liveness stay separate across 81 log/report/CLI combin
             uid: () => 999, stdout: { write: (text) => { output += text; } },
             buildServiceStatusReport: (opts) => buildServiceStatusReport(opts, fixture.deps),
           });
-          assert.match(plain(output), new RegExp(`Activity: ${expected.toUpperCase()}`), label);
+          assert.match(plain(output), new RegExp(`Current work\\s+${expected === "unknown" ? "Unconfirmed" : expected === "syncing" ? "Syncing" : expected === "waiting" ? "Waiting" : "Stopped"}`), label);
           checked++;
         }
       }

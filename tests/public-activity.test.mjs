@@ -67,7 +67,7 @@ test("public activity never reads internal details or copies identities, unknown
   const raw = activity([phase()]);
   const value = publicActivity({ ...raw, detail: privateMarker, pid: 7111, instance_id: privateMarker, database_key: key, path: privateMarker });
   assert.equal(value.state, "syncing"); assert.doesNotMatch(JSON.stringify(value), new RegExp(`${privateMarker}|7111|${key}`));
-  assert.deepEqual(Object.keys(value).sort(), ["status", "state", "evidence", "source", "phase", "reason", "observed_at", "updated_at", "valid_until"].sort());
+  assert.deepEqual(Object.keys(value).sort(), ["status", "state", "evidence", "source", "phase", "reason", "observed_at", "updated_at", "valid_until", "step"].sort());
   for (const field of ["reason", "source", "phase", "evidence", "state"]) {
     const invalid = publicActivity({ ...raw, [field]: privateMarker, detail: "foreground sync observed" });
     assert.equal(invalid.state, "unknown", field); assert.equal(invalid.reason, "activity_evidence_unavailable", field);

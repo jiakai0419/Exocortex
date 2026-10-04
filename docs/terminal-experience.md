@@ -85,6 +85,10 @@ JSON 消费者原有字段不变，`display.card` 是可选增量；原始内容
 
 ## 服务状态
 
-Activity 使用当前阶段、实例与时间证据，分别显示 SYNCING / WAITING / STOPPED / UNKNOWN；锁和历史活动不能冒充当前同步。[Activity 证据](activity-evidence.md) 定义判定及前台、重启和未知边界。
+公共 `status` 的整屏契约见 [Status screen design](status-screen-design.md)。默认按 Health & current work、Coverage、Attention、Recent history 分组，`--detail` 保持结构并增加 Diagnostics。正常 80 列无色合成屏约 31 行；窄屏折行并堆叠标签，不裁掉诊断事实。颜色只加强层级，不承载唯一含义。
 
-Unsupported scopes 并入正常键值布局，多原因缩进且保留有效错误码。Recent cycles 展示最多 24 小时的实际日志范围，精简同日日期，统一时区并处理跨日、跨年和 DST；JSON 保持精确时间与 coverage。格式见 [状态展示契约](status-unsupported-presentation.md)。
+Current work 只取已验证的阶段、实例、数据库和时间证据；缺失或冲突显示 Unconfirmed 加具体原因。JSON 中的 syncing/waiting/stopped/unknown 与既有兼容字段不变。完成任务、未收尾轮次、正常锁都不能冒充当前活动。[Activity 证据](activity-evidence.md) 保留判定边界。
+
+Coverage 分开会话名单、收到的会话、所有消息源、列表水位与内容欠账；名单完成或有游标不等于全量远端覆盖。Restricted chats 按数量、原因及有效错误码展示；未知原因不复制原始错误。远端采样单独说明缓存、样本范围和身份限制。
+
+Recent history 明示 worker 日志未验证属于所选数据库，日志窗口内的周期/任务和数据库内按开始时间统计的失败运行各有时间口径。无事件、无日志、截断、不可查询不会统称为没有失败；完整窗口、最长成功间隔、旧任务和未收尾历史在 detail 中可查。所有时间统一到声明的本地时区，跨日和 DST 保留必要端点信息。

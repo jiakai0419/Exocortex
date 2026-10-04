@@ -33,6 +33,8 @@ test("no retained events do not invent a full-window success gap or observation 
   assert.equal(result.last_success, null);
   assert.equal(result.observed_events, 0);
   assert.deepEqual(result.observation, {
+    current_window_first_event_at: null,
+    current_window_last_event_at: null,
     first_event_at: null,
     last_event_at: null,
     range_started_at: null,

@@ -81,6 +81,7 @@ test("status restores safe stability, lease warnings, sampled window and worker 
     observation: { first_event_at: iso(at - 10000), last_event_at: iso(at - 1000), range_started_at: iso(at - 10000), range_ended_at: iso(at), window_start_reached: false, tail_truncated: true, raw: marker },
     cycles: { total: 3, ok: 2, failed: 1 }, last_success: { cycle: 3, at: iso(at - 1000), age_ms: 1000 }, longest_between_successes_ms: 4000,
     failures: { failed_cycles: 1, failed_steps: 2, by_kind: [{ kind: "permission_denied", count: 1 }, { kind: marker, count: 1 }], by_step: [{ name: "sent", count: 1 }, { name: marker, count: 1 }] }, raw: marker };
+  r.failure_runs = { evidence: "available", source: "retained_sync_runs", database_binding: "selected_database", time_basis: "started_at", window_ms: 86400000, window_started_at: iso(at - 86400000), window_ended_at: iso(at), failed_runs: 2, by_kind: [{ kind: "permission_denied", count: 1 }, { kind: marker, count: 1 }] };
   r.overview.leases = { evidence: "available", observed_at: iso(at), total: 2, occupied_count: 1, abnormal_count: 1,
     reasons: [{ reason: "expired", count: 1 }, { reason: marker, count: 99 }], owner: marker, scope_id: marker };
   r.overview.freshness = { status: "sampled", scope: "recent_hot_messages", sample_count: 3, window: { start: iso(at - 60000), end: iso(at - 1000), raw: marker }, checked_at: iso(at), expires_at: iso(at + 60000), raw: marker };
@@ -95,18 +96,18 @@ test("status restores safe stability, lease warnings, sampled window and worker 
     assert.deepEqual(p.freshness.window, { start: iso(at - 60000), end: iso(at - 1000) }); assert.equal(p.freshness.scope, "recent_hot_messages");
     assert.equal(p.worker.last_step.name, "sent"); assert.equal(p.worker.last_failure.name, "unknown"); assert.doesNotMatch(f.output(), new RegExp(marker));
   }
-  const f = fixture(); assert.equal(await runStatusCommand(options({ format: "text" }), f.context, deps(r)), 0);
-  assert.match(f.output(), /Statistics range:.*log truncated/); assert.match(f.output(), /Cycles: 2 ok, 1 failed, 3 total/);
-  assert.match(f.output(), /Longest between successes: 4s/); assert.match(f.output(), /permission_denied x1/); assert.match(f.output(), /expired x1/);
-  assert.match(f.output(), /Sample: recent_hot_messages, 3 messages/); assert.match(f.output(), /Window:/); assert.match(f.output(), /Last step: cycle #3 sent/);
+  const f = fixture(); assert.equal(await runStatusCommand(options({ format: "text", detail: true }), f.context, deps(r)), 0);
+  assert.match(f.output(), /log\s+truncated/); assert.match(f.output(), /Completed rounds\s+2 succeeded · 1 failed · 3 total/);
+  assert.match(f.output(), /Success spacing\s+Longest observed interval 4s/); assert.match(f.output(), /Permission denied · 1/); assert.match(f.output(), /expired x1/);
+  assert.match(f.output(), /Sample matched · 3 recent active-chat messages/); assert.match(f.output(), /Sample window/); assert.match(f.output(), /Latest task\s+Sent messages · Succeeded/);
   assert.doesNotMatch(f.output(), new RegExp(marker));
 });
 test("unrecognized status enum and timestamp evidence cannot disclose private values or imply a zero interval", async () => {
   const r = report(); r.stability = { longest_between_successes_ms: 0, cycles: { ok: 1 }, observation: { range_started_at: marker }, failures: { by_step: [{ name: marker, count: 1 }] } };
   r.overview.freshness = { status: "unknown", reason: marker, scope: marker, window: { start: marker, end: marker } };
   r.overview.leases = { evidence: "unavailable", reasons: [{ reason: marker, count: 1 }] };
-  const f = fixture(); await runStatusCommand(options({ format: "text" }), f.context, deps(r));
-  assert.match(f.output(), /Longest between successes: unavailable \(need 2 successes\)/); assert.doesNotMatch(f.output(), /Leases:/); assert.doesNotMatch(f.output(), new RegExp(marker));
+  const f = fixture(); await runStatusCommand(options({ format: "text", detail: true }), f.context, deps(r));
+  assert.match(f.output(), /Success spacing\s+Unavailable; need two successful rounds/); assert.doesNotMatch(f.output(), /Leases:/); assert.doesNotMatch(f.output(), new RegExp(marker));
 });
 
 test("default text preserves existing service health instead of upgrading a failed cycle with local ready", async () => {
@@ -116,23 +117,23 @@ test("default text preserves existing service health instead of upgrading a fail
   const overview = buildServiceOverview({ launchd: { loaded: true, state: "running", pid: 1234 }, syncStatus: local, workerSummary, nowMs: at });
   assert.equal(overview.health.status, "problem");
   const r = report({ probe: { status: "running", pid: 1234 }, overview, sync: { status: local }, worker: { summary: workerSummary, log: { events: [] } } });
-  const f = fixture(); assert.equal(await runStatusCommand(options({ format: "text" }), f.context, deps(r)), 0);
-  assert.match(f.output(), /Health: PROBLEM/); assert.doesNotMatch(f.output(), /Health: OK/);
+  const f = fixture(); assert.equal(await runStatusCommand(options({ format: "text", detail: true }), f.context, deps(r)), 0);
+  assert.match(f.output(), /Local health\s+NEEDS ATTENTION/); assert.doesNotMatch(f.output(), /Local health\s+OK/);
 });
 for (const [unsupported, reasons] of [[0, []], [4, [{ reason: "restricted_mode", error_code: 231203, count: 4 }]],
   [5, [{ reason: "restricted_mode", error_code: 231203, count: 3 }, { reason: "bot_user_out_of_chat", error_code: 230002, count: 2 }]]]) {
-  test(`default status retains compact Sync rows for ${reasons.length} unsupported reasons`, async () => {
+  test(`detailed status retains unified Coverage rows for ${reasons.length} unsupported reasons`, async () => {
     const r = report(); r.sync.status = sync({ records: { total: 8, by_direction: [{ direction: "sent", count: 3 }, { direction: "received", count: 5 }] },
       scopes: { received_enabled: 7, received_without_cursor: 1, received_unsupported: unsupported, unsupported_reasons: reasons },
       hot_discovery: { ran: true, cursor_updated_at: new Date(at - 3000).toISOString(), raw: marker },
       reconcile: { complete: true, cursor: { completed_at: new Date(at - 6000).toISOString(), raw: marker } } });
     r.overview.leases = { evidence: "available", total: 1, occupied_count: 1, abnormal_count: 0, reasons: [] };
-    const f = fixture(); assert.equal(await runStatusCommand(options({ format: "text" }), f.context, deps(r)), 0); const output = plain(f.output());
-    assert.match(output, /Records\s+8 total, 3 sent, 5 received/); assert.match(output, /Received scopes\s+7 enabled, 1 without cursor/);
-    assert.match(output, /Active chat refresh\s+last success/); assert.match(output, /Chat list review\s+complete; completed/);
+    const f = fixture(); assert.equal(await runStatusCommand(options({ format: "text", detail: true }), f.context, deps(r)), 0); const output = plain(f.output());
+    assert.match(output, /Stored messages\s+8 total · 3 sent · 5 received/); assert.match(output, /Received chats\s+7 enabled · 1 awaiting a full-content cursor/);
+    assert.match(output, /Active chat refresh\s+Last success/); assert.match(output, /Chat list review\s+Complete ·/);
     assert.doesNotMatch(output, /Leases:|Warning|PRIVATE_STATUS_SENTINEL/);
-    if (reasons.length === 0) assert.match(output, /Unsupported scopes\s+0/);
-    else if (reasons.length === 1) assert.match(output, /Unsupported scopes\s+4 · restricted_mode \(access restricted\) · code 231203/);
-    else { assert.match(output, /Unsupported scopes\s+5/); assert.match(output, /\n\s+3 · restricted_mode \(access restricted\) · code 231203/); assert.match(output, /\n\s+2 · bot_user_out_of_chat \(bot or user outside chat\) · code 230002/); }
+    if (reasons.length === 0) assert.match(output, /Restricted chats\s+0/);
+    else if (reasons.length === 1) assert.match(output, /Restricted chats\s+4 · access restricted · code 231203/);
+    else { assert.match(output, /Restricted chats\s+5/); assert.match(output, /Restriction\s+3 · access restricted · code 231203/); assert.match(output, /Restriction\s+2 · bot or user is outside the conversation · code\s+230002/); }
   });
 }

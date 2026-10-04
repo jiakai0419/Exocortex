@@ -15,6 +15,9 @@ const count = (/** @type {unknown} */ value) => Number.isSafeInteger(value) && N
 
 const WORKER_STEPS = ["sent", "discover-hot", "received-hot", "discover-catchup", "discover-reconcile", "received-fair", "retention", "received-catchup"];
 const LEASE_REASONS = ["invalid_timestamp", "invalid_interval", "future_start", "hard_limit_exceeded", "expired"];
+const HEALTH_REASONS = ["service_state_unavailable", "service_stopped", "sync_status_unavailable", "detail_evidence_unavailable",
+  "list_progress_unavailable", "initial_sync_unverified", "no_successful_runs", "unfinished_runs_unverified", "last_cycle_failed",
+  "details_pending", "scopes_pending", "discovery_pending", "catchup_pending", "local_ready", "activity_observed", "health_unavailable"];
 const FRESHNESS_REASONS = ["no_cached_probe", "legacy_evidence", "context_mismatch", "invalid_timestamp", "expired", "no_usable_sample", "inconclusive"];
 
 /** Group only finite public categories; raw step names and errors stay private.
@@ -35,7 +38,15 @@ function publicCounts(rows, key, classify) {
 function publicStability(value) {
   const stability = value || {};
   return { window_ms: count(stability.window_ms), window_started_at: publicTimestamp(stability.window_started_at),
+    window_ended_at: publicTimestamp(stability.window_ended_at),
+    source: choice(stability.source, ["current_worker_log"]), database_binding: "unverified",
+    evidence: choice(stability.evidence, ["available", "unavailable"]),
+    log_evidence: { exists: typeof stability.log_evidence?.exists === "boolean" ? stability.log_evidence.exists : null,
+      integrity: typeof stability.log_evidence?.integrity === "boolean" ? stability.log_evidence.integrity : null,
+      truncated: typeof stability.log_evidence?.truncated === "boolean" ? stability.log_evidence.truncated : null },
     observation: { first_event_at: publicTimestamp(stability.observation?.first_event_at), last_event_at: publicTimestamp(stability.observation?.last_event_at),
+      current_window_first_event_at: publicTimestamp(stability.observation?.current_window_first_event_at),
+      current_window_last_event_at: publicTimestamp(stability.observation?.current_window_last_event_at),
       range_started_at: publicTimestamp(stability.observation?.range_started_at), range_ended_at: publicTimestamp(stability.observation?.range_ended_at),
       window_start_reached: typeof stability.observation?.window_start_reached === "boolean" ? stability.observation.window_start_reached : null,
       tail_truncated: typeof stability.observation?.tail_truncated === "boolean" ? stability.observation.tail_truncated : null },
@@ -47,6 +58,18 @@ function publicStability(value) {
       by_step: publicCounts(stability.failures?.by_step, "name", (value) => choice(value, WORKER_STEPS)) } };
 }
 
+/** This is independent retained database history, not worker-log coverage.
+ * @param {JsonObject | undefined} value */
+function publicFailureRuns(value) {
+  const failures = value || {};
+  const available = failures.evidence === "available" && count(failures.failed_runs) !== null;
+  return { source: choice(failures.source, ["retained_sync_runs"]), database_binding: choice(failures.database_binding, ["selected_database"]),
+    time_basis: choice(failures.time_basis, ["started_at"]), evidence: available ? "available" : "unavailable",
+    window_ms: count(failures.window_ms), window_started_at: publicTimestamp(failures.window_started_at),
+    window_ended_at: publicTimestamp(failures.window_ended_at), failed_runs: available ? count(failures.failed_runs) : null,
+    by_kind: available ? publicCounts(failures.by_kind, "kind", publicFailureKind) : [] };
+}
+
 /** @param {JsonObject | undefined} value */
 function publicLeases(value) {
   const leases = value || {};
@@ -55,11 +78,19 @@ function publicLeases(value) {
     reasons: publicCounts((Array.isArray(leases.reasons) ? leases.reasons : []).filter((row) => LEASE_REASONS.includes(row?.reason)), "reason", String) };
 }
 
-/** @param {JsonObject | undefined} value */
-function publicWorker(value) {
+/** @param {JsonObject | undefined} value @param {number} observedAt */
+function publicWorker(value, observedAt) {
   const summary = value || {};
-  const event = (/** @type {JsonObject | null | undefined} */ item) => item ? { cycle: count(item.cycle), ok: item.ok === true, at: publicTimestamp(item.at), age_ms: count(item.age_ms) } : null;
-  return { has_events: summary.has_events === true,
+  const validTimestamp = (/** @type {unknown} */ value) => {
+    const at = typeof value === "string" ? Date.parse(value) : NaN;
+    return Number.isFinite(at) && at <= observedAt;
+  };
+  const event = (/** @type {JsonObject | null | undefined} */ item) => item ? {
+    cycle: count(item.cycle), ok: item.ok === true, at: publicTimestamp(item.at), age_ms: count(item.age_ms),
+    timestamp_valid: validTimestamp(item.at), result_valid: item.result_valid !== false,
+  } : null;
+  return { source: "current_worker_log", database_binding: "unverified", has_events: summary.has_events === true,
+    last_event_timestamp_valid: validTimestamp(summary.last_event_at),
     last_event_type: choice(summary.last_event_type, ["lark_im_worker_cycle", "lark_im_worker_step", "lark_im_worker_scheduler"]),
     last_event_at: publicTimestamp(summary.last_event_at), last_event_age_ms: count(summary.last_event_age_ms),
     last_cycle: event(summary.last_cycle), last_step: summary.last_step ? { ...event(summary.last_step), name: choice(summary.last_step.name, WORKER_STEPS) } : null,
@@ -75,7 +106,10 @@ function publicSyncSummary(sync) {
   if (!sync?.records || !sync?.scopes) return null;
   return { records: { total: count(sync.records.total), by_direction: sync.records.by_direction.map((/** @type {JsonObject} */ row) => ({ direction: row.direction, count: count(row.count) })) },
     scopes: { received_enabled: count(sync.scopes.received_enabled), received_without_cursor: count(sync.scopes.received_without_cursor),
+      message_enabled: count(sync.scopes.message_enabled), message_without_success: count(sync.scopes.message_without_success),
       received_unsupported: count(sync.scopes.received_unsupported), unsupported_reasons: sync.scopes.unsupported_reasons },
+    discovery: { complete: sync.discovery.complete, cursor: sync.discovery.cursor, cursor_updated_at: sync.discovery.cursor_updated_at },
+    details: sync.details, list_progress: sync.list_progress, runs: { by_status: sync.runs.by_status },
     hot_discovery: { ran: sync.hot_discovery.ran, cursor_updated_at: sync.hot_discovery.cursor_updated_at },
     reconcile: { complete: sync.reconcile.complete, cursor: sync.reconcile.cursor ? { has_more: sync.reconcile.cursor.has_more === true,
       completed_at: publicTimestamp(sync.reconcile.cursor.completed_at) } : null } };
@@ -146,7 +180,8 @@ function collectStatusEvidence(options, context, deps = {}) {
   const installed = (deps.readInstalledServiceConfig || readInstalledServiceConfig)(serviceDeps);
   const report = (deps.buildServiceStatusReport || buildServiceStatusReport)({ label: LABEL, target: target(serviceDeps), db: options.db, logDir: options.logDir },
     { clock: context.now, ...deps.reportDeps, serviceDeps, ...(deps.buildStatus ? { buildStatus: deps.buildStatus } : {}) });
-  const observedAt = context.now();
+  const reportObservedAt = Date.parse(String(report.observed_at || ""));
+  const observedAt = Number.isFinite(reportObservedAt) ? reportObservedAt : context.now();
   const binding = serviceTargetEvidence(report, observedAt);
   return { report, installed, binding, observedAt, service: { ...report.probe, target_match: binding.target_match }, workerSummary: waitWorkerSummary(report, binding) };
 }
@@ -160,15 +195,16 @@ function publicStatusReport(collected, options) {
   return { schema_version: 1, privacy: options.logs ? "private" : "public-safe", observed_at: new Date(observedAt).toISOString(),
     service: { status: choice(service.status, ["running", "loaded", "absent", "unknown"]), target_match: service.target_match,
       configuration: choice(installed.status, ["installed", "missing", "unknown"]), pid: count(service.pid), last_exit_code: Number.isSafeInteger(service.last_exit_code) ? service.last_exit_code : null },
-    health: { status: choice(overview.health.status, ["ok", "catching_up", "problem"]), local: choice(sync?.health, ["ok", "ok_with_history", "catching_up", "syncing", "not_ready", "needs_attention", "unknown"]) },
+    health: { status: choice(overview.health.status, ["ok", "catching_up", "problem"]),
+      reason: HEALTH_REASONS.includes(overview.health.reason) ? overview.health.reason : "health_unavailable", local: choice(sync?.health, ["ok", "ok_with_history", "catching_up", "syncing", "not_ready", "needs_attention", "unknown"]) },
     activity: publicActivity(overview.activity),
     freshness: { status: choice(overview.freshness.status, ["sampled", "unknown", "behind"]), auth_identity: "unknown",
       scope: choice(overview.freshness.scope, ["recent_hot_messages"]), reason: choice(overview.freshness.reason, FRESHNESS_REASONS),
       window: { start: publicTimestamp(overview.freshness.window?.start), end: publicTimestamp(overview.freshness.window?.end) },
       sample_count: count(overview.freshness.sample_count), checked_at: publicTimestamp(overview.freshness.checked_at), expires_at: publicTimestamp(overview.freshness.expires_at) },
     sync: publicSyncSummary(sync),
-    stability: publicStability(report.stability), leases: publicLeases(overview.leases),
-    worker: publicWorker(report.worker.summary),
+    stability: publicStability(report.stability), failure_runs: publicFailureRuns(report.failure_runs), leases: publicLeases(overview.leases),
+    worker: publicWorker(report.worker.summary, observedAt),
     ...(options.detail ? { detail: sync } : {}) };
 }
 

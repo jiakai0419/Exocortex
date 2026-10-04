@@ -3,6 +3,7 @@ import { publicTimestamp } from "./public-safe.mjs";
 
 /** Finite explanations selected by the activity decision tree, never parsed
  * from an internal detail string or a remote/process error. */
+const STEPS = new Set(["sent", "discover-hot", "received-hot", "discover-catchup", "discover-reconcile", "received-fair", "retention", "all", "discover", "received", "details"]);
 const REASONS = Object.freeze({
   activity_evidence_unavailable: "activity evidence unavailable",
   sync_status_unavailable: "sync status unavailable",
@@ -54,6 +55,7 @@ function publicActivity(activity) {
   }
   return { status: state === "waiting" || state === "stopped" ? "idle" : state,
     state, evidence, source, phase, reason,
+    step: state === "syncing" && ["step", "sync"].includes(phase) && STEPS.has(activity?.step) ? activity?.step : null,
     observed_at: publicTimestamp(activity?.observed_at), updated_at: publicTimestamp(activity?.updated_at),
     valid_until: publicTimestamp(activity?.valid_until) };
 }
