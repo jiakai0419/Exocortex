@@ -19,7 +19,7 @@ function sqlite(dbPath, sql, readonly = false) {
   return result.stdout.trim() ? JSON.parse(result.stdout) : [];
 }
 
-function installFakeLarkCli(dir, dbPath, { beforeLookupSql = "", fail = false, empty = false } = {}) {
+function installFakeLarkCli(dir, dbPath, { beforeLookupSql = "", fail = false, empty = false, response = null } = {}) {
   const path = join(dir, "fake-lark-cli.mjs");
   writeFileSync(path, `#!/usr/bin/env node
 import { spawnSync } from "node:child_process";
@@ -47,7 +47,7 @@ if (${JSON.stringify(fail)}) {
   process.stderr.write("synthetic lookup failure");
   process.exit(1);
 }
-process.stdout.write(JSON.stringify(${JSON.stringify(empty)} ? {} : { data: { name: "Resolved " + params.chat_id } }));
+process.stdout.write(JSON.stringify(${JSON.stringify(response)} ?? (${JSON.stringify(empty)} ? {} : { data: { name: "Resolved " + params.chat_id } })));
 `);
   chmodSync(path, 0o755);
   return path;
@@ -226,6 +226,60 @@ for (const mode of ["fail", "empty"]) {
     assert.equal(statSync(f.dir).mode & 0o777, 0o755);
     assert.equal(statSync(f.dbPath).mode & 0o777, 0o644);
     assert.deepEqual(locks(f.dbPath), []);
+  });
+}
+
+for (const [response, name] of [
+  [{ name: "Primary", i18n_names: { zh_cn: "Chinese" } }, "Primary"],
+  [{ data: { i18n_names: { zh_cn: "Synthetic Chinese", en_us: "Synthetic English" } } }, "Synthetic Chinese"],
+  [{ data: { i18n_names: { en_us: "Synthetic English" } } }, "Synthetic English"],
+]) {
+  test(`scope naming keeps the established envelope and language fallback: ${name}`, (t) => {
+    const f = fixture(t, { response });
+    const result = run(f);
+    assert.equal(result.status, 0, result.stderr);
+    const summary = JSON.parse(result.stdout);
+    assert.deepEqual([summary.planned, summary.updated, summary.failed, summary.skipped_conflicts], [1, 1, 0, 0]);
+    assert.equal(JSON.parse(scopes(f.dbPath)[0].config_json).chat_name, name);
+    assert.doesNotMatch(result.stdout + result.stderr, /Primary|Synthetic Chinese|Synthetic English/);
+  });
+}
+
+for (const mode of ["success", "timeout", "permission"]) {
+  test(`scope ${mode} lookup uses one bounded shared subprocess and keeps public output safe`, (t) => {
+    const f = fixture(t);
+    const audit = join(f.dir, "transport-audit.jsonl");
+    const preload = join(f.dir, "transport-observer.cjs");
+    writeFileSync(preload, `
+const cp = require("node:child_process");
+const fs = require("node:fs");
+const original = cp.spawnSync;
+cp.spawnSync = function(command, args, options) {
+  if (command === ${JSON.stringify(f.fakeLarkCli)}) {
+    fs.appendFileSync(${JSON.stringify(audit)}, JSON.stringify({timeout:options?.timeout, maxBuffer:options?.maxBuffer, killSignal:options?.killSignal, args}) + "\\n");
+    if (${JSON.stringify(mode)} !== "success") return { status:${mode === "timeout" ? "null" : "1"}, stdout:"", stderr:"permission denied SYNTHETIC_PRIVATE_REMOTE /invented/private-fixture",
+      ${mode === "timeout" ? 'error:Object.assign(new Error("SYNTHETIC_PRIVATE_TIMEOUT"), {code:"ETIMEDOUT"}),' : ""}
+    };
+  }
+  return original.apply(this, arguments);
+};
+require("node:module").syncBuiltinESMExports();
+`);
+    const before = readFileSync(f.dbPath);
+    const result = run(f, [], { NODE_OPTIONS: `--require=${preload}` });
+    assert.equal(result.status, 0, result.stderr);
+    const calls = readFileSync(audit, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    assert.equal(calls.length, 1);
+    assert.ok(calls[0].timeout > 0 && calls[0].timeout <= 5000);
+    assert.equal(calls[0].killSignal, "SIGKILL");
+    assert.equal(calls[0].maxBuffer, 20 * 1024 * 1024);
+    assert.deepEqual(calls[0].args, ["im", "chats", "get", "--as", "user", "--params",
+      '{"chat_id":"oc_shape_a"}', "--format", "json"]);
+    const summary = JSON.parse(result.stdout);
+    assert.deepEqual([summary.planned, summary.updated, summary.failed], mode === "success" ? [1, 1, 0] : [0, 0, 1]);
+    assert.doesNotMatch(result.stdout + result.stderr, /SYNTHETIC_PRIVATE|private-fixture|oc_shape|permission denied|lark-cli/);
+    assert.deepEqual(locks(f.dbPath), []);
+    if (mode !== "success") assert.deepEqual(readFileSync(f.dbPath), before);
   });
 }
 

@@ -391,7 +391,7 @@ node scripts/doctor.mjs
 node scripts/lark-im-service.mjs status
 ```
 
-`git status` 只提示工作区是否干净，不作为失败。`check`、`build:check` 和 `test` 可能生成 `dist`，因此必须先成功 stop，再执行本地检查。stop 无法确认时不构建；构建或检查失败后不启动部分生成的代码，服务保持停止，报告后续步骤 skipped。检查通过后才 start、`wait-ok`、`doctor` 和最终 `status`。这会产生明确维护停机窗口；独立前台同步应按 Safe Runtime Maintenance 另外结束，launchd stop 不代表不存在独立前台进程。
+`git status` 只提示工作区是否干净，不作为失败。`check` 与 `test` 会构建当前 `dist`；`build:check` 仅在临时目录构建并比较。维护流程必须先成功 stop，再执行本地检查。stop 无法确认时不构建；构建或检查失败后不启动部分生成的代码，服务保持停止，报告后续步骤 skipped。检查通过后才 start、`wait-ok`、`doctor` 和最终 `status`。这会产生明确维护停机窗口；独立前台同步应按 Safe Runtime Maintenance 另外结束，launchd stop 不代表不存在独立前台进程。
 
 需要真实远端对照时加：
 

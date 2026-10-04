@@ -22,6 +22,7 @@ import { displayNameFromUser, personName, senderAliasesByOpenId, senderOpenId } 
  * @typedef {object} AdapterOptions
  * @property {number=} retries
  * @property {number=} retryDelayMs
+ * @property {boolean=} forceRefresh Bypass application-name cache for an explicit probe.
  *
  * @typedef {object} SelfProfile
  * @property {string} open_id
@@ -100,14 +101,20 @@ function botAppId(bot) {
   return objectBot.app_id || objectBot.application_id || objectBot.bot_app_id || objectBot.cli_id || "";
 }
 
+// Optional enrichment yields to ingestion. This is an application budget,
+// not an API rate limit; explicit enrichment keeps the same request bound.
+const NAME_LOOKUP_RETRY_BUDGET_MS = 5000;
+
 /**
- * @param {{run: LarkRunner, now?: () => number}} deps
+ * @param {{run: LarkRunner, now?: () => number, onLookup?: (event: JsonObject) => void}} deps
  * @returns {NameResolver}
  */
-function createNameResolver({ run, now = Date.now }) {
-  // Optional enrichment must yield to message ingestion. This retry budget is
-  // an application priority policy, not an official API rate limit.
-  const nameLookupRetryBudgetMs = 5000;
+function createNameResolver({ run, now = Date.now, onLookup }) {
+  // An explicit observer receives private lookup evidence for its own report.
+  // Nothing is logged here; observer failures cannot affect name resolution.
+  const reportLookup = (/** @type {JsonObject} */ event) => {
+    try { onLookup?.(event); } catch { /* Diagnostics are optional. */ }
+  };
   // Resolver-local, positive-only cache: never persist profile data or retain
   // failed lookups. Reads refresh LRU order, not the five-minute rename TTL.
   const cacheTtlMs = 5 * 60 * 1000;
@@ -175,7 +182,7 @@ function createNameResolver({ run, now = Date.now }) {
             redactedFlags: ["--user-ids"],
             retries: opts.retries,
             retryDelayMs: opts.retryDelayMs,
-            retryBudgetMs: nameLookupRetryBudgetMs,
+            retryBudgetMs: NAME_LOOKUP_RETRY_BUDGET_MS,
           },
         );
         const users = firstArray(json?.users, json?.data?.users);
@@ -248,7 +255,7 @@ function createNameResolver({ run, now = Date.now }) {
             redactedFlags: ["--params"],
             retries: opts.retries,
             retryDelayMs: opts.retryDelayMs,
-            retryBudgetMs: nameLookupRetryBudgetMs,
+            retryBudgetMs: NAME_LOOKUP_RETRY_BUDGET_MS,
           },
         );
         const items = firstArray(json?.items, json?.data?.items);
@@ -284,9 +291,11 @@ function createNameResolver({ run, now = Date.now }) {
   function resolveApplicationNames(appIds, opts) {
     const names = new Map();
     for (const appId of uniqueAppIds(appIds)) {
+      if (opts.forceRefresh) nameCache.delete(`app:${appId}`);
       const cached = cachedName(`app:${appId}`);
       if (cached) {
         names.set(appId, cached);
+        reportLookup({ kind: "application", app_id: appId, status: "resolved", name: cached, cached: true });
         continue;
       }
       try {
@@ -305,7 +314,7 @@ function createNameResolver({ run, now = Date.now }) {
           {
             retries: opts.retries,
             retryDelayMs: opts.retryDelayMs,
-            retryBudgetMs: nameLookupRetryBudgetMs,
+            retryBudgetMs: NAME_LOOKUP_RETRY_BUDGET_MS,
           },
         );
         const app = json?.data?.app || json?.app;
@@ -313,8 +322,12 @@ function createNameResolver({ run, now = Date.now }) {
         if (name) {
           names.set(appId, name);
           cacheName(`app:${appId}`, name);
+          reportLookup({ kind: "application", app_id: appId, status: "resolved", name, cached: false });
+        } else {
+          reportLookup({ kind: "application", app_id: appId, status: "missing_name", cached: false });
         }
-      } catch {
+      } catch (error) {
+        reportLookup({ kind: "application", app_id: appId, status: "failed", error, cached: false });
         // App-name enrichment is best-effort. If permission is missing, leave it unresolved.
       }
     }
@@ -348,7 +361,7 @@ function createNameResolver({ run, now = Date.now }) {
             redactedFlags: ["--params"],
             retries: opts.retries,
             retryDelayMs: opts.retryDelayMs,
-            retryBudgetMs: nameLookupRetryBudgetMs,
+            retryBudgetMs: NAME_LOOKUP_RETRY_BUDGET_MS,
           },
         );
         const bots = firstArray(json?.items, json?.data?.items).filter((bot) => botName(bot));
@@ -367,14 +380,20 @@ function createNameResolver({ run, now = Date.now }) {
 
         const remainingIds = pendingIds.filter((id) => !directMatches.has(id));
         const remainingBots = bots.filter((bot) => !directMatches.has(botAppId(bot)));
-        if (remainingIds.length === 1 && remainingBots.length === 1) {
+        const uniqueFallback = remainingIds.length === 1 && remainingBots.length === 1;
+        if (uniqueFallback) {
           names.set(`${chatIdValue}:${remainingIds[0]}`, {
             name: botName(remainingBots[0]),
             source: "chat_bot_unique",
             confidence: "medium",
           });
         }
-      } catch {
+        const ambiguous = remainingIds.length > 0 && remainingBots.length > 0 && !uniqueFallback;
+        reportLookup({ kind: "chat_bots", chat_id: chatIdValue,
+          status: ambiguous ? "ambiguous" : directMatches.size > 0 || uniqueFallback ? "resolved" : "unresolved",
+          pending_app_ids: remainingIds.length, bot_candidates: remainingBots.length });
+      } catch (error) {
+        reportLookup({ kind: "chat_bots", chat_id: chatIdValue, status: "failed", error });
         // Fallback display-name enrichment must never block message sync.
       }
     }
@@ -452,6 +471,7 @@ function createNameResolver({ run, now = Date.now }) {
 }
 
 export {
+  NAME_LOOKUP_RETRY_BUDGET_MS,
   createNameResolver,
   displayNameFromUser,
   firstArray,

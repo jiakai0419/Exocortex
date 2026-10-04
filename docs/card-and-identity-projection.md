@@ -46,6 +46,9 @@ sender 持久投影新增 `canonical.sender_id_type`。姓名 SQL 合并只有 e
 
 查询复用 resolver/transport，保留 30-ID 联系人批次但本模式唯一用户目标为 1；整轮远端预算 30 秒，每请求 timeout/retryBudget 不超过剩余预算与 5 秒的较小值，`retries=0`。群成员 fallback 整轮最多 3 个候选 chat、5 页（每页 100）；限额、截止或仍有 `has_more` 时明确 unresolved。contact 名只能用于同账号目标 actor 的选中记录，member 名只用于对应 chat。网络在维护锁外；短事务按原快照 CAS 并使用共享 merge，仅补充必要的 canonical.sender_id_type 身份元数据，并更新 sender_name/source/confidence 与 updated_at，保留 raw/hash/version/body/chat/partner 等其他字段。`first_seen_scope_id` 不能充当完整会话归属。`--dry-run` 是显式远端补全预览，不是离线模式。以上选择与数量参数已由集成任务确认冻结，不得按一次样本临时放宽。
 
+联系人、群成员、应用名和机器人回退四类查询与匹配规则仅在 `name-resolver.mjs` 实现。常规同步及 record enrich 调用相同规则；脚本只将私有 `onLookup` 事件映射到既有计数和显式 `--unsafe-details` 字段，回调失败不改变姓名结果。`--probe-apps` 使用明确的 `forceRefresh` 绕过并驱逐应用正向缓存；强制查询失败保持 unknown，允许下次重试，绝不制造 clear。默认五分钟 TTL、1000 项容量及 positive-only 缓存规则保持。
+
+两种补全都使用共享 transport。姓名与单个会话元数据查询使用同一个五秒请求预算常量，补全不自动重试；sender-only 仍额外限制整轮预算和扫描范围。scope enrich 通过 adapter 的单会话元数据读取复用响应校验和名称提取，保留原有 20MiB 子进程输出上限及独立的 scope 快照比较事务；record enrich 保留默认 50MiB 上限。私有详情继续包含明确请求的 ID、解析名称和诊断字段，失败 message 使用共享的安全描述；默认输出不透传远端 stderr。
 
 ## 正文、动作与诊断
 

@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 
-import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { quoteSql, sqlJson } from "../dist/storage/sqlite/ingestion-store.js";
 import { readOnlySqliteJson as sqliteJson } from "../src/storage/sqlite/readonly-query.mjs";
 import { commitEnrichmentUpdates, publicEnrichmentError } from "./lib/lark-im-enrichment.mjs";
+import { fetchChatMetadata } from "../src/adapters/lark-im/adapter.mjs";
 
 const DEFAULT_DB = "data/exocortex.sqlite";
 
@@ -49,15 +49,6 @@ function parsePositiveInt(value, name) {
   return parsed;
 }
 
-function runLark(args) {
-  const result = spawnSync(process.env.LARK_CLI || "lark-cli", args, {
-    encoding: "utf8",
-    maxBuffer: 20 * 1024 * 1024,
-  });
-  if (result.status !== 0) throw new Error(result.stderr.trim() || `lark-cli exit ${result.status}`);
-  return JSON.parse(result.stdout);
-}
-
 function loadScopes(dbPath, limit) {
   return sqliteJson(
     dbPath,
@@ -73,11 +64,6 @@ function loadScopes(dbPath, limit) {
   ).map((row) => ({ ...row, config: JSON.parse(row.config_json || "{}") }));
 }
 
-function chatNameFromResponse(json) {
-  const data = json?.data || json;
-  return data?.name || data?.i18n_names?.zh_cn || data?.i18n_names?.en_us || null;
-}
-
 function main(opts) {
   const dbPath = resolve(opts.db);
   if (!existsSync(dbPath)) throw new Error(`database not found: ${dbPath}`);
@@ -87,18 +73,7 @@ function main(opts) {
   for (const scope of scopes) {
     if (!scope.config.chat_id) continue;
     try {
-      const json = runLark([
-        "im",
-        "chats",
-        "get",
-        "--as",
-        "user",
-        "--params",
-        JSON.stringify({ chat_id: scope.config.chat_id }),
-        "--format",
-        "json",
-      ]);
-      const chatName = chatNameFromResponse(json);
+      const { chat_name: chatName } = fetchChatMetadata(scope.config.chat_id);
       if (!chatName) continue;
       const nextConfig = { ...scope.config, chat_name: chatName };
       updates.push(`UPDATE sync_scopes

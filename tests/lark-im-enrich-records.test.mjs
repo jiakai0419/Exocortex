@@ -90,7 +90,8 @@ function quoteSql(value) {
 }
 
 function installFakeLarkCli(dir, { dbPath = null, beforeSelfSql = "", assertNoMaintenanceLock = false,
-  denyLookups = false, contactUsers = null, paginateContacts = false, memberItems = null, callLogPath = null } = {}) {
+  denyLookups = false, contactUsers = null, paginateContacts = false, memberItems = null, callLogPath = null,
+  applicationResponse = null, applicationError = "", botResponse = null, botError = "" } = {}) {
   const path = join(dir, "fake-lark-cli.mjs");
   writeFileSync(
     path,
@@ -122,6 +123,18 @@ if (args.join(" ") === "contact +get-user --as user --format json") {
 if (${JSON.stringify(denyLookups)}) {
   process.stderr.write('synthetic permission denied');
   process.exit(1);
+}
+if (args[0] === 'api' && args[2]?.startsWith('/open-apis/application/v6/applications/')) {
+  const error = ${JSON.stringify(applicationError)};
+  if (error) { process.stderr.write(error); process.exit(1); }
+  const response = ${JSON.stringify(applicationResponse)};
+  if (response !== null) { process.stdout.write(JSON.stringify(response)); process.exit(0); }
+}
+if (args[0] === 'im' && args[1] === 'chat.members' && args[2] === 'bots') {
+  const error = ${JSON.stringify(botError)};
+  if (error) { process.stderr.write(error); process.exit(1); }
+  const response = ${JSON.stringify(botResponse)};
+  if (response !== null) { process.stdout.write(JSON.stringify(response)); process.exit(0); }
 }
 if (args[0] === 'contact' && args[1] === '+search-user' && ${JSON.stringify(contactUsers)} !== null) {
   let users = ${JSON.stringify(contactUsers)};
@@ -1015,3 +1028,92 @@ process.exit(1);
     assert.deepEqual(maintenanceLocks(fixture.dbPath), []);
   });
 }
+
+
+test("probe-apps makes an actual request for a known app and keeps source facts unchanged", (t) => {
+  const fixture = enrichmentFixture(t, { applicationResponse: { app: { app_name: "Renamed Synthetic Counter" } }, record: {
+    sender: { id: LAB.app.id, sender_type: "app" },
+    canonical: { chat_name: LAB.room.name, sender_name: LAB.app.name,
+      sender_name_source: "application_api", sender_name_confidence: "high" },
+  } });
+  const before = readRecords(fixture.dbPath)[0];
+  const ordinary = runEnrichment(fixture);
+  assert.equal(ordinary.status, 0, ordinary.stderr);
+  assert.equal(JSON.parse(ordinary.stdout).app_ids_requested, 0);
+  const result = runEnrichment(fixture, ["--probe-apps", "--unsafe-details"]);
+  assert.equal(result.status, 0, result.stderr);
+  const summary = JSON.parse(result.stdout);
+  assert.equal(summary.app_probe.requested, 1);
+  assert.equal(summary.app_probe.resolved, 1);
+  assert.equal(summary.app_fallback_chats_requested, 0);
+  assert.equal(summary.app_probe.results[0].name, "Renamed Synthetic Counter");
+  const after = readRecords(fixture.dbPath)[0];
+  assert.equal(JSON.parse(after.canonical_json).sender_name, "Renamed Synthetic Counter");
+  for (const key of Object.keys(before).filter((key) => !["canonical_json", "updated_at"].includes(key))) {
+    assert.equal(after[key], before[key], key);
+  }
+});
+
+for (const [label, bots, expectedSource] of [
+  ["direct", [{ app_id: LAB.app.id, bot_name: "Synthetic Direct Bot" }], "chat_bot_app_id"],
+  ["unique", [{ bot_name: "Synthetic Unique Bot" }], "chat_bot_unique"],
+]) {
+  test(`record enrichment consumes shared ${label} bot fallback evidence and keeps public output safe`, (t) => {
+    const fixture = enrichmentFixture(t, { applicationResponse: {}, botResponse: { data: { items: bots } }, record: {
+      sender: { id: LAB.app.id, sender_type: "app" }, canonical: { chat_name: LAB.room.name },
+    } });
+    const before = readRecords(fixture.dbPath)[0];
+    const result = runEnrichment(fixture);
+    assert.equal(result.status, 0, result.stderr);
+    const summary = JSON.parse(result.stdout);
+    assert.equal(summary.app_lookup_failures, 1);
+    assert.equal(summary.app_lookup_other_failures, 1);
+    assert.equal(summary.app_fallback_chats_requested, 1);
+    assert.equal(summary.app_fallback_names, 1);
+    for (const value of [LAB.app.id, LAB.room.id, bots[0].bot_name]) assert.equal(result.stdout.includes(value), false);
+    const after = readRecords(fixture.dbPath)[0];
+    const canonical = JSON.parse(after.canonical_json);
+    assert.equal(canonical.sender_name, bots[0].bot_name);
+    assert.equal(canonical.sender_name_source, expectedSource);
+    for (const field of ["raw_json", "content_hash", "external_version", "body"]) assert.equal(after[field], before[field]);
+  });
+}
+
+test("shared transport preserves permission and ambiguity counts with opt-in app diagnostics", (t) => {
+  const fixture = enrichmentFixture(t, {
+    applicationError: JSON.stringify({ error: { code: 210508, message: "Permission denied invented private diagnostic" } }),
+    botResponse: { items: [{ bot_name: "Synthetic First Bot" }, { bot_name: "Synthetic Second Bot" }] },
+    record: { sender: { id: LAB.app.id, sender_type: "app" },
+      canonical: { chat_name: LAB.room.name, sender_name: LAB.app.name,
+        sender_name_source: "application_api", sender_name_confidence: "high" } },
+  });
+  const before = readRecords(fixture.dbPath);
+  const result = runEnrichment(fixture, ["--probe-apps", "--unsafe-details"]);
+  assert.equal(result.status, 0, result.stderr);
+  const summary = JSON.parse(result.stdout);
+  assert.equal(summary.app_lookup_permission_denied, 1);
+  assert.equal(summary.app_fallback_ambiguous, 1);
+  assert.equal(summary.app_fallback_failures, 0);
+  assert.equal(summary.app_probe.results[0].app_id, LAB.app.id);
+  assert.equal(summary.app_probe.results[0].code, 210508);
+  assert.equal(summary.app_probe.results[0].status, "permission_denied");
+  assert.equal(summary.unsafe_details.app_fallback_errors[0].pending_app_ids, 1);
+  assert.equal(summary.unsafe_details.app_fallback_errors[0].bot_candidates, 2);
+  assert.doesNotMatch(result.stdout, /invented private diagnostic/);
+  assert.deepEqual(readRecords(fixture.dbPath), before);
+});
+
+test("a failed shared bot lookup remains counted and does not erase an existing app name", (t) => {
+  const fixture = enrichmentFixture(t, { applicationResponse: {}, botError: "synthetic service unavailable private text", record: {
+    sender: { id: LAB.app.id, sender_type: "app" }, canonical: { chat_name: LAB.room.name, sender_name: LAB.app.name,
+      sender_name_source: "application_api", sender_name_confidence: "high" },
+  } });
+  const before = readRecords(fixture.dbPath);
+  const result = runEnrichment(fixture, ["--probe-apps"]);
+  assert.equal(result.status, 0, result.stderr);
+  const summary = JSON.parse(result.stdout);
+  assert.equal(summary.app_lookup_failures, 1);
+  assert.equal(summary.app_fallback_failures, 1);
+  assert.doesNotMatch(result.stdout, /private text|synthetic service unavailable/);
+  assert.deepEqual(readRecords(fixture.dbPath), before);
+});

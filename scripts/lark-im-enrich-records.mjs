@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { quoteSql } from "../dist/storage/sqlite/ingestion-store.js";
@@ -8,9 +7,9 @@ import { readOnlySqliteJson as sqliteJson } from "../src/storage/sqlite/readonly
 import { commitEnrichmentUpdates, publicEnrichmentError } from "./lib/lark-im-enrichment.mjs";
 
 import { larkSenderNameIsUnknownSql, larkSenderNamespaceSql, mergeLarkNameProjectionSql } from "../dist/storage/sqlite/lark-name-projection.js";
-import { createNameResolver } from "../src/adapters/lark-im/name-resolver.mjs";
+import { createNameResolver, NAME_LOOKUP_RETRY_BUDGET_MS, uniqueAppIds } from "../src/adapters/lark-im/name-resolver.mjs";
 import { displayNameFromUser, personName, senderAliasesByOpenId, senderIdentity, senderNameFromSource, senderOpenId } from "../src/adapters/lark-im/sender-identity.mjs";
-import { createLarkCliRunner, createTransportState } from "../src/adapters/lark-im/transport.mjs";
+import { classifyLarkFailure, createLarkCliRunner, createTransportState } from "../src/adapters/lark-im/transport.mjs";
 
 const DEFAULT_DB = "data/exocortex.sqlite";
 
@@ -87,18 +86,9 @@ function parseMaybeJson(value) {
   }
 }
 
+const executeLark = createLarkCliRunner({ timeoutMs: NAME_LOOKUP_RETRY_BUDGET_MS, state: createTransportState() });
 function runLark(args, options = {}) {
-  const bin = process.env.LARK_CLI || "lark-cli";
-  const budget = Number(options.retryBudgetMs) || 5000;
-  const result = spawnSync(bin, args, { encoding: "utf8", maxBuffer: 50 * 1024 * 1024,
-    timeout: Math.max(1, Math.min(5000, budget)), killSignal: "SIGKILL" });
-  if (result.status !== 0) throw new Error(result.stderr.trim() || `${bin} ${args.join(" ")} failed`);
-  const trimmed = result.stdout.trim();
-  return trimmed ? JSON.parse(trimmed) : null;
-}
-
-function firstArray(...values) {
-  return values.find((value) => Array.isArray(value)) || [];
+  return executeLark(args, { retries: 0, retryDelayMs: 0, retryBudgetMs: NAME_LOOKUP_RETRY_BUDGET_MS, ...options });
 }
 
 function getSelfProfile() {
@@ -155,176 +145,40 @@ function chatPartner(raw, canonical) {
   return canonical.chat_partner || (raw?.chat_partner && typeof raw.chat_partner === "object" ? raw.chat_partner : null);
 }
 
-function uniqueNonEmpty(values) {
-  return [...new Set(values.filter((value) => typeof value === "string" && value.length > 0))];
-}
-
-function uniqueOpenIds(values) {
-  return uniqueNonEmpty(values).filter((value) => value.startsWith("ou_"));
-}
-
-function uniqueAppIds(values) {
-  return uniqueNonEmpty(values).filter((value) => value.startsWith("cli_"));
-}
-
-function parseLarkError(error) {
-  const message = String(error?.message || error || "");
-  const jsonStart = message.indexOf("{");
-  if (jsonStart >= 0) {
-    try {
-      const parsed = JSON.parse(message.slice(jsonStart));
-      const detail = parsed?.error && typeof parsed.error === "object" ? parsed.error : parsed;
-      return {
-        code: Number(detail?.code ?? parsed?.code) || null,
-        type: detail?.type || parsed?.type || null,
-        subtype: detail?.subtype || parsed?.subtype || null,
-        message: detail?.message || detail?.msg || parsed?.msg || message,
-      };
-    } catch {
-      // Fall through to text parsing below.
+// The resolver owns request/response and matching rules. This workflow only
+// adapts its private evidence to the existing safe and opt-in detailed report.
+function recordLookupDiagnostic(diagnostics, event) {
+  if (event.kind === "application") {
+    if (event.status === "resolved") {
+      diagnostics.app_lookup_successes += 1;
+      diagnostics.app_lookup_results.push({ app_id: event.app_id, status: "resolved", name: event.name });
+      return;
+    }
+    diagnostics.app_lookup_failures += 1;
+    if (event.status === "missing_name") {
+      diagnostics.app_lookup_other_failures += 1;
+      diagnostics.app_lookup_results.push({ app_id: event.app_id, status: "missing_name" });
+      return;
+    }
+    const info = classifyLarkFailure(event.error);
+    const status = info.kind === "permission_denied" ? "permission_denied" : "failed";
+    if (status === "permission_denied") diagnostics.app_lookup_permission_denied += 1;
+    else diagnostics.app_lookup_other_failures += 1;
+    const result = { app_id: event.app_id, status, code: info.code, message: info.message };
+    diagnostics.app_lookup_results.push(result);
+    diagnostics.app_lookup_errors.push(result);
+  } else if (event.kind === "chat_bots") {
+    diagnostics.app_fallback_chats_requested += 1;
+    if (event.status === "ambiguous") {
+      diagnostics.app_fallback_ambiguous += 1;
+      diagnostics.app_fallback_errors.push({ chat_id: event.chat_id, pending_app_ids: event.pending_app_ids,
+        bot_candidates: event.bot_candidates, status: "ambiguous" });
+    } else if (event.status === "failed") {
+      diagnostics.app_fallback_failures += 1;
+      diagnostics.app_fallback_errors.push({ chat_id: event.chat_id, status: "failed",
+        message: classifyLarkFailure(event.error).message });
     }
   }
-  const code = message.match(/\b(\d{5,})\b/)?.[1] || null;
-  return {
-    code: code ? Number(code) : null,
-    type: null,
-    subtype: null,
-    message,
-  };
-}
-
-function isPermissionDeniedLarkError(info) {
-  return (
-    info?.code === 210508 ||
-    /insufficient permission|permission denied|permission level|no permission|unauthorized/i.test(
-      String(info?.message || ""),
-    )
-  );
-}
-
-function botName(bot) {
-  if (!bot || typeof bot !== "object") return "";
-  return bot.bot_name || bot.name || bot.display_name || "";
-}
-
-function botAppId(bot) {
-  if (!bot || typeof bot !== "object") return "";
-  return bot.app_id || bot.application_id || bot.bot_app_id || bot.cli_id || "";
-}
-
-function resolveApplicationNames(appIds, diagnostics = null) {
-  const ids = uniqueAppIds(appIds);
-  const names = new Map();
-  if (diagnostics) diagnostics.app_ids_requested = ids.length;
-  for (const appId of ids) {
-    try {
-      const json = runLark([
-        "api",
-        "GET",
-        `/open-apis/application/v6/applications/${appId}`,
-        "--as",
-        "bot",
-        "--params",
-        JSON.stringify({ lang: "zh_cn" }),
-        "--format",
-        "json",
-      ]);
-      const app = json?.data?.app || json?.app;
-      const name = app?.app_name || firstArray(app?.i18n).find((item) => item?.i18n_key === "zh_cn")?.name || "";
-      if (name) {
-        names.set(appId, name);
-        if (diagnostics) {
-          diagnostics.app_lookup_successes += 1;
-          diagnostics.app_lookup_results.push({ app_id: appId, status: "resolved", name });
-        }
-      } else if (diagnostics) {
-        diagnostics.app_lookup_failures += 1;
-        diagnostics.app_lookup_other_failures += 1;
-        diagnostics.app_lookup_results.push({ app_id: appId, status: "missing_name" });
-      }
-    } catch (error) {
-      if (diagnostics) {
-        const info = parseLarkError(error);
-        const status = isPermissionDeniedLarkError(info) ? "permission_denied" : "failed";
-        diagnostics.app_lookup_failures += 1;
-        if (status === "permission_denied") diagnostics.app_lookup_permission_denied += 1;
-        else diagnostics.app_lookup_other_failures += 1;
-        const result = {
-          app_id: appId,
-          status,
-          code: info.code,
-          message: String(info.message || "").slice(0, 300),
-        };
-        diagnostics.app_lookup_results.push(result);
-        diagnostics.app_lookup_errors.push(result);
-      }
-    }
-  }
-  return names;
-}
-
-function resolveChatBotAppFallbackNames(appIdsByChat, officialApps, diagnostics = null) {
-  const names = new Map();
-  for (const [cid, ids] of appIdsByChat.entries()) {
-    const pendingIds = uniqueAppIds([...ids]).filter((id) => !officialApps.has(id));
-    if (pendingIds.length === 0) continue;
-    if (diagnostics) diagnostics.app_fallback_chats_requested += 1;
-    try {
-      const json = runLark([
-        "im",
-        "chat.members",
-        "bots",
-        "--as",
-        "user",
-        "--params",
-        JSON.stringify({ chat_id: cid }),
-        "--format",
-        "json",
-      ]);
-      const bots = firstArray(json?.items, json?.data?.items).filter((bot) => botName(bot));
-      const directMatches = new Set();
-      for (const bot of bots) {
-        const appId = botAppId(bot);
-        if (pendingIds.includes(appId)) {
-          directMatches.add(appId);
-          names.set(`${cid}:${appId}`, {
-            name: botName(bot),
-            source: "chat_bot_app_id",
-            confidence: "high",
-          });
-        }
-      }
-
-      const remainingIds = pendingIds.filter((id) => !directMatches.has(id));
-      const remainingBots = bots.filter((bot) => !directMatches.has(botAppId(bot)));
-      if (remainingIds.length === 1 && remainingBots.length === 1) {
-        names.set(`${cid}:${remainingIds[0]}`, {
-          name: botName(remainingBots[0]),
-          source: "chat_bot_unique",
-          confidence: "medium",
-        });
-      } else if (remainingIds.length > 0 && remainingBots.length > 0 && diagnostics) {
-        diagnostics.app_fallback_ambiguous += 1;
-        diagnostics.app_fallback_errors.push({
-          chat_id: cid,
-          pending_app_ids: remainingIds.length,
-          bot_candidates: remainingBots.length,
-          status: "ambiguous",
-        });
-      }
-    } catch (error) {
-      if (diagnostics) {
-        diagnostics.app_fallback_failures += 1;
-        diagnostics.app_fallback_errors.push({
-          chat_id: cid,
-          status: "failed",
-          message: String(error.message || error).slice(0, 300),
-        });
-      }
-    }
-  }
-  if (diagnostics) diagnostics.app_fallback_names = names.size;
-  return names;
 }
 
 function isInvalidRenderedContent(value) {
@@ -489,7 +343,7 @@ function runSenderOnly(dbPath, opts) {
   const remote = { calls: 0, member_pages: 0, member_chats: 0, failures: 0,
     budget_exhausted: false, page_limit_reached: false, chat_limit_reached: false };
   const deadline = Date.now() + 30_000;
-  const transport = createLarkCliRunner({ timeoutMs: 5000, state: createTransportState() });
+  const transport = createLarkCliRunner({ timeoutMs: NAME_LOOKUP_RETRY_BUDGET_MS, state: createTransportState() });
   const memberChats = new Set();
   const run = (args, options = {}) => {
     const remaining = Math.floor(deadline - Date.now());
@@ -506,8 +360,8 @@ function runSenderOnly(dbPath, opts) {
     }
     remote.calls += 1;
     try {
-      return transport(args, { ...options, retries: 0, timeoutMs: Math.min(5000, remaining),
-        retryBudgetMs: Math.min(5000, remaining) });
+      return transport(args, { ...options, retries: 0, timeoutMs: Math.min(NAME_LOOKUP_RETRY_BUDGET_MS, remaining),
+        retryBudgetMs: Math.min(NAME_LOOKUP_RETRY_BUDGET_MS, remaining) });
     } catch (error) {
       remote.failures += 1;
       if (Date.now() >= deadline) remote.budget_exhausted = true;
@@ -629,7 +483,7 @@ function main(opts) {
   };
   // Request construction, response validation and seed priority have one
   // implementation shared with ingestion and the bounded sender-only mode.
-  const resolver = createNameResolver({ run(args, options) {
+  const resolver = createNameResolver({ onLookup: (event) => recordLookupDiagnostic(diagnostics, event), run(args, options) {
     const contact = args[0] === "contact" && args[1] === "+search-user";
     if (contact) diagnostics.contact_ids_requested += args[args.indexOf("--user-ids") + 1].split(",").length;
     try { return runLark(args, options); } catch (error) {
@@ -648,8 +502,10 @@ function main(opts) {
     const names = resolver.resolveChatMemberNames(cid, [...ids].filter((id) => !contactNames.has(id)), lookupOpts, aliases);
     for (const [id, name] of names.entries()) memberNames.set(`${cid}:${id}`, name);
   }
-  const appNames = resolveApplicationNames(appIds, diagnostics);
-  const appFallbackNames = resolveChatBotAppFallbackNames(appIdsByChat, appNames, diagnostics);
+  diagnostics.app_ids_requested = uniqueAppIds(appIds).length;
+  const appNames = resolver.resolveApplicationNames(appIds, { ...lookupOpts, forceRefresh: opts.probeApps });
+  const appFallbackNames = resolver.resolveChatBotAppFallbackNames(appIdsByChat, appNames, lookupOpts);
+  diagnostics.app_fallback_names = appFallbackNames.size;
   const appProbeResultsById = new Map(diagnostics.app_lookup_results.map((result) => [result.app_id, result]));
 
   const proposals = [];

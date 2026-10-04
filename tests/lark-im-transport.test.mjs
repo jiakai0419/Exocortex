@@ -52,6 +52,19 @@ test("JSON parsing never quotes malformed response content", () => {
   throwsSafe(() => parseJson("private Bearer token"), /non-JSON output$/);
 });
 
+test("operation-specific subprocess buffers may tighten but never increase the shared limit", () => {
+  for (const [maxBufferBytes, expected] of [
+    [undefined, 50 * 1024 * 1024], [20 * 1024 * 1024, 20 * 1024 * 1024],
+    [100 * 1024 * 1024, 50 * 1024 * 1024], [0, 50 * 1024 * 1024],
+    [NaN, 50 * 1024 * 1024], [1.5, 50 * 1024 * 1024],
+  ]) {
+    const h = harness([ok()]);
+    h.run(CONTACT, { maxBufferBytes });
+    assert.equal(h.calls[0].options.maxBuffer, expected);
+    assert.equal(h.calls[0].options.timeout, 120000);
+  }
+});
+
 test("legacy display helper hides every repeated sensitive flag", () => {
   assert.equal(redactCommand(["im", "--id", "secret1", "--id", "secret2"], ["--id"]),
     "lark-cli im --id <redacted> --id <redacted>");
@@ -132,7 +145,8 @@ test("existing permanent and transient classifications remain public-safe", () =
     ["HTTP 503 Service Unavailable", "service_unavailable", true],
     ["Restricted Mode: copying is disabled", "restricted_mode", false],
     ['{"error":{"code":230002,"message":"private"}}', "bot_user_out_of_chat", false],
-    ['{"error":{"code":2200,"message":"private permission denied"}}', "unknown", false],
+    ['{"error":{"code":2200,"message":"private permission denied"}}', "permission_denied", false],
+    ['{"error":{"code":2200,"message":"private ambiguous failure"}}', "unknown", false],
   ];
   for (const [input, kind, transient] of cases) {
     const result = classifyLarkFailure(input);
@@ -143,6 +157,29 @@ test("existing permanent and transient classifications remain public-safe", () =
   const result = classifyLarkFailure("lark-cli failed: kind=rate_limited code=99991400 retry_after_ms=5000 operation=contact_search");
   assert.equal(result.retry_after_ms, 5000);
   assert.equal(result.code, 99991400);
+});
+
+test("shared permission evidence preserves enrichment counts without exposing remote text", () => {
+  const inputs = [
+    '{"error":{"type":"api","code":210508,"message":"SYNTHETIC_PRIVATE_REMOTE"}}',
+    "lark-cli failed: kind=unknown code=210508 operation=application_info",
+    ...["insufficient permission", "permission denied", "permission level", "no permission", "unauthorized"]
+      .map((reason) => `${reason}: SYNTHETIC_PRIVATE_REMOTE /invented/private-fixture`),
+  ];
+  for (const input of inputs) {
+    const failure = classifyLarkFailure(input);
+    assert.equal(failure.kind, "permission_denied");
+    assert.equal(failure.transient, false);
+    assert.equal(failure.message, "permission denied");
+    const h = harness([fail(input)]);
+    throwsSafe(() => h.run(CONTACT, { retries: 3 }), /kind=permission_denied/);
+    assert.equal(h.calls.length, 1);
+    assert.deepEqual(h.sleeps, []);
+  }
+  // Known transport outages keep their request retry meaning even when the
+  // remote explanation also mentions permission; prose is only a fallback.
+  assert.equal(classifyLarkFailure('{"error":{"type":"api","code":2200,"message":"Internal Error: permission denied"}}').kind, "internal_error");
+  assert.equal(classifyLarkFailure("HTTP 503 temporary permission level issue").kind, "service_unavailable");
 });
 
 test("non-rate transient retries preserve exponential backoff and successful telemetry", () => {
@@ -298,7 +335,7 @@ test("invalid retry configuration falls back to bounded defaults", () => {
 
 test("permission failures never retry or leak args, stderr, stdout, or executable path", () => {
   const h = harness([fail("private permission denied", { stdout: "private output" })], { bin: "/home/private/bin" });
-  throwsSafe(() => h.run([...CONTACT, "--token", "Bearer secret", "--params", '{"private":1}'], { retries: 10 }), /kind=unknown operation=contact_search/);
+  throwsSafe(() => h.run([...CONTACT, "--token", "Bearer secret", "--params", '{"private":1}'], { retries: 10 }), /kind=permission_denied operation=contact_search/);
   assert.equal(h.calls.length, 1);
   assert.deepEqual(h.sleeps, []);
   assert.equal(h.stats().exhausted, 0);

@@ -14,6 +14,7 @@ import { PaginationLimitError } from "../../../dist/core/sync.js";
 import { normalizeApiMessage } from "./raw-message.mjs";
 import {
   createNameResolver,
+  NAME_LOOKUP_RETRY_BUDGET_MS,
   displayNameFromUser,
   firstArray,
   uniqueAppIds,
@@ -38,6 +39,7 @@ import {
  * @property {number=} retryDelayMs
  * @property {number=} timeoutMs
  * @property {number=} retryBudgetMs
+ * @property {number=} maxBufferBytes
  *
  * @typedef {(args: string[], options?: AdapterRunOptions) => JsonObject | null} LarkRunner
  *
@@ -112,6 +114,7 @@ import {
  * @property {(chatIdValue: string, startMs: number, endMs: number, opts: FetchOptions) => MessageListResult} fetchChatMessageList
  * @property {(rawRoot: JsonObject, opts?: DetailOptions) => JsonObject} fetchMessageDetails
  * @property {(opts: FetchOptions, pageToken: string) => ChatDiscoveryPage} fetchChatDiscoveryPage
+ * @property {(chatIdValue: string) => ChatDiscoveryItem} fetchChatMetadata
  */
 
 /**
@@ -266,8 +269,20 @@ function normalizeChat(value, index) {
   return {
     chat_id: chat.chat_id,
     chat_type: chat.chat_mode || chat.chat_type || null,
-    chat_name: chat.name || chat.i18n_names?.zh_cn || chat.i18n_names?.en_us || null,
+    chat_name: chatDisplayName(chat),
   };
+}
+
+/** Display-only chat metadata has a finite language fallback. Missing names
+ * remain unknown and cannot be mistaken for an authoritative clear.
+ * @param {JsonObject} chat
+ * @returns {string | null}
+ */
+function chatDisplayName(chat) {
+  for (const name of [chat.name, chat.i18n_names?.zh_cn, chat.i18n_names?.en_us]) {
+    if (typeof name === "string" && name.trim()) return name.trim();
+  }
+  return null;
 }
 
 /** @param {unknown} error */
@@ -692,9 +707,36 @@ function createLarkImAdapter({ run = runLark, clock = Date.now } = {}) {
     };
   }
 
+  /** One optional naming lookup. It shares transport error/cooldown handling,
+   * while its five-second deadline never borrows a message-window budget.
+   * @type {LarkImAdapter["fetchChatMetadata"]}
+   */
+  function fetchChatMetadata(chatIdValue) {
+    if (typeof chatIdValue !== "string" || !chatIdValue.trim()) {
+      throw new Error("chat metadata requires a chat identity");
+    }
+    const json = run(["im", "chats", "get", "--as", "user", "--params",
+      JSON.stringify({ chat_id: chatIdValue }), "--format", "json"], {
+      redactedFlags: ["--params"], retries: 0,
+      timeoutMs: NAME_LOOKUP_RETRY_BUDGET_MS, retryBudgetMs: NAME_LOOKUP_RETRY_BUDGET_MS,
+      maxBufferBytes: 20 * 1024 * 1024,
+    });
+    if (!json || typeof json !== "object" || Array.isArray(json) || json.error != null ||
+        json.ok === false || json.code !== undefined && json.code !== 0) {
+      throw new Error("chat metadata returned an invalid or unsuccessful response");
+    }
+    const data = json.data ?? json;
+    if (!data || typeof data !== "object" || Array.isArray(data) ||
+        data.chat_id !== undefined && data.chat_id !== chatIdValue) {
+      throw new Error("chat metadata returned invalid identity metadata");
+    }
+    return normalizeChat({ ...data, chat_id: chatIdValue }, 0);
+  }
+
   return {
     buildPeopleContext,
     fetchChatDiscoveryPage,
+    fetchChatMetadata,
     fetchChatMessages,
     fetchSentMessages,
     fetchChatMessageList,
@@ -715,6 +757,8 @@ const buildPeopleContext = (messages, opts, selfProfile, scopeConfig) =>
   defaultAdapter.buildPeopleContext(messages, opts, selfProfile, scopeConfig);
 /** @type {LarkImAdapter["fetchChatDiscoveryPage"]} */
 const fetchChatDiscoveryPage = (opts, pageToken) => defaultAdapter.fetchChatDiscoveryPage(opts, pageToken);
+/** @type {LarkImAdapter["fetchChatMetadata"]} */
+const fetchChatMetadata = (chatIdValue) => defaultAdapter.fetchChatMetadata(chatIdValue);
 /** @type {LarkImAdapter["fetchChatMessages"]} */
 const fetchChatMessages = (chatIdValue, startMs, endMs, opts) =>
   defaultAdapter.fetchChatMessages(chatIdValue, startMs, endMs, opts);
@@ -742,6 +786,7 @@ export {
   createLarkImAdapter,
   displayNameFromUser,
   fetchChatDiscoveryPage,
+  fetchChatMetadata,
   fetchChatMessages,
   fetchSentMessages,
   fetchChatMessageList,

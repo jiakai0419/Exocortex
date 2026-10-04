@@ -15,6 +15,7 @@ import { spawnSync } from "node:child_process";
  * @property {number=} retryDelayMs
  * @property {number=} timeoutMs
  * @property {number=} retryBudgetMs Total time for attempts and waits, including an inherited cooldown.
+ * @property {number=} maxBufferBytes Optional smaller subprocess output limit; cannot exceed the default.
  * @typedef {import("node:child_process").SpawnSyncReturns<string>} SpawnResult
  * @typedef {object} TransportDeps
  * @property {string=} bin
@@ -29,6 +30,7 @@ import { spawnSync } from "node:child_process";
 const DEFAULT_LARK_CLI_TIMEOUT_MS = 120_000;
 const DEFAULT_LARK_RETRY_BUDGET_MS = 180_000;
 const MAX_LARK_RETRIES = 10;
+const MAX_LARK_BUFFER_BYTES = 50 * 1024 * 1024;
 const FALLBACK_RATE_LIMIT_DELAY_MS = 30_000;
 /** @type {readonly TransportOperation[]} */
 const TRANSPORT_OPERATIONS = Object.freeze([
@@ -255,6 +257,8 @@ function classifyLarkFailure(stderr) {
     // Older public descriptors may only have recognized the numeric denial.
     if (publicKind === "unknown" && classification.code === 231203) classification.kind = "restricted_mode";
     if (publicKind === "unknown" && classification.code === 230002) classification.kind = "bot_user_out_of_chat";
+    if (publicKind === "unknown" && classification.code === 210508) classification.kind = "permission_denied";
+    if (classification.kind !== publicKind) classification.message = classification.kind.replaceAll("_", " ");
     return classification;
   }
   const status = [error?.http_status, error?.http_status_code, error?.status, error?.status_code,
@@ -269,9 +273,11 @@ function classifyLarkFailure(stderr) {
   }
   if (code === 231203 || /Restricted Mode|don't allow copying or forwarding messages/i.test(text)) return result("restricted_mode", false);
   if (code === 230002 || /Bot\/User can NOT be out of the chat/i.test(text)) return result("bot_user_out_of_chat", false, "bot or user is not in the chat");
+  if (code === 210508) return result("permission_denied", false);
   if (/\b(?:ECONNRESET|ECONNREFUSED|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH)\b|socket hang up|connection reset|unexpected EOF/i.test(text)) return result("network_error", true);
   if (error?.type === "api" && (code === 2200 || code === 1663) && /Internal Error/i.test(message)) return result("internal_error", true);
   if (/\b(?:502|503|504)\b|Bad Gateway|Service Unavailable|Gateway Timeout|temporarily unavailable/i.test(text)) return result("service_unavailable", true);
+  if (/insufficient permission|permission denied|permission level|no permission|unauthorized/i.test(text)) return result("permission_denied", false);
   return result("unknown", false);
 }
 
@@ -315,7 +321,7 @@ function retryDelayForAttempt(attempt, baseDelayMs) {
 }
 
 /** @param {number | undefined} value @param {number} fallback */
-function positiveMs(value, fallback) {
+function positiveInteger(value, fallback) {
   return Number.isSafeInteger(value) && Number(value) > 0 ? Number(value) : fallback;
 }
 
@@ -331,8 +337,9 @@ function createLarkCliRunner({
     counters.calls += 1;
     const retries = Number.isFinite(options.retries) ? Math.min(MAX_LARK_RETRIES, Math.max(0, Math.floor(Number(options.retries)))) : 0;
     const retryDelayMs = Number.isFinite(options.retryDelayMs) && Number(options.retryDelayMs) >= 0 ? Number(options.retryDelayMs) : 1000;
-    const requestedTimeoutMs = positiveMs(options.timeoutMs, positiveMs(defaultTimeoutMs, DEFAULT_LARK_CLI_TIMEOUT_MS));
-    const budgetMs = positiveMs(options.retryBudgetMs, DEFAULT_LARK_RETRY_BUDGET_MS);
+    const requestedTimeoutMs = positiveInteger(options.timeoutMs, positiveInteger(defaultTimeoutMs, DEFAULT_LARK_CLI_TIMEOUT_MS));
+    const budgetMs = positiveInteger(options.retryBudgetMs, DEFAULT_LARK_RETRY_BUDGET_MS);
+    const maxBuffer = Math.min(MAX_LARK_BUFFER_BYTES, positiveInteger(options.maxBufferBytes, MAX_LARK_BUFFER_BYTES));
     let lastNow = clock();
     if (!Number.isFinite(lastNow)) lastNow = Date.now();
     const deadline = lastNow + budgetMs;
@@ -366,7 +373,7 @@ function createLarkCliRunner({
       if (attempt > 0) counters.retries += 1;
       let result;
       try {
-        result = spawn(bin, args, { encoding: "utf8", maxBuffer: 50 * 1024 * 1024, timeout: lastTimeoutMs, killSignal: "SIGKILL" });
+        result = spawn(bin, args, { encoding: "utf8", maxBuffer, timeout: lastTimeoutMs, killSignal: "SIGKILL" });
       } catch {
         // Do not leak paths, arguments or payloads from an executor exception.
         throw new Error(`lark-cli failed: kind=spawn_error operation=${operation}`);

@@ -32,6 +32,47 @@ test("lark im adapter shim re-exports the src implementation", () => {
   assert.equal(shimCreateLarkImAdapter, createLarkImAdapter);
 });
 
+test("single-chat metadata uses the shared bounded naming lookup and discovery name precedence", () => {
+  const chatId = "oc_synthetic_metadata";
+  const cases = [
+    [{ name: " Primary ", i18n_names: { zh_cn: "Chinese", en_us: "English" } }, "Primary"],
+    [{ name: " ", i18n_names: { zh_cn: " Chinese ", en_us: "English" } }, "Chinese"],
+    [{ name: {}, i18n_names: { zh_cn: [], en_us: "English" } }, "English"],
+    [{}, null],
+  ];
+  for (const [metadata, expectedName] of cases) {
+    for (const wrapped of [false, true]) {
+      const calls = [];
+      const adapter = createLarkImAdapter({ run(args, options) {
+        calls.push({ args, options });
+        if (args[1] === "+chat-list") return { chats: [{ ...metadata, chat_id: chatId }], has_more: false };
+        return wrapped ? { data: metadata } : metadata;
+      } });
+      assert.deepEqual(adapter.fetchChatMetadata(chatId), { chat_id: chatId, chat_type: null, chat_name: expectedName });
+      assert.deepEqual(calls[0].args, ["im", "chats", "get", "--as", "user", "--params",
+        JSON.stringify({ chat_id: chatId }), "--format", "json"]);
+      assert.deepEqual(calls[0].options, { redactedFlags: ["--params"], retries: 0, timeoutMs: 5000, retryBudgetMs: 5000,
+        maxBufferBytes: 20 * 1024 * 1024 });
+      assert.equal(adapter.fetchChatDiscoveryPage(adapterOpts(), "").chats[0].chat_name, expectedName);
+    }
+  }
+});
+
+test("single-chat metadata rejects unsuccessful or mismatched identity responses without quoting content", () => {
+  for (const response of [null, [], { data: [] }, { code: 210508, data: { name: "SYNTHETIC_PRIVATE_REMOTE" } },
+    { ok: false, name: "SYNTHETIC_PRIVATE_REMOTE" }, { error: { message: "SYNTHETIC_PRIVATE_REMOTE" } },
+    { data: { chat_id: "oc_synthetic_other", name: "SYNTHETIC_PRIVATE_REMOTE" } }]) {
+    const adapter = createLarkImAdapter({ run: () => response });
+    assert.throws(() => adapter.fetchChatMetadata("oc_synthetic_metadata"), (error) => {
+      assert.match(error.message, /chat metadata/);
+      assert.doesNotMatch(error.message, /SYNTHETIC_PRIVATE|oc_synthetic/);
+      return true;
+    });
+  }
+  const adapter = createLarkImAdapter({ run: () => assert.fail("invalid chat identity must not invoke transport") });
+  assert.throws(() => adapter.fetchChatMetadata(" "), /requires a chat identity/);
+});
+
 test("fetchSentMessages builds native user search commands and closes each page with raw mget", () => {
   const calls = [];
   const adapter = createLarkImAdapter({
