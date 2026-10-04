@@ -1,6 +1,7 @@
 // @ts-check
 
 import { readOnlySqliteJson } from "../storage/sqlite/readonly-query.mjs";
+import { summarizeLockEvidence } from "./lark-im-lock-evidence.mjs";
 
 import { spawnSync } from "node:child_process";
 import {
@@ -8,7 +9,7 @@ import {
   existsSync,
   openSync,
   readSync,
-  statSync,
+  fstatSync,
 } from "node:fs";
 import { resolve } from "node:path";
 import { summarizeWorkerEvents } from "../../dist/runtime/worker/lark-im-worker-core.js";
@@ -31,6 +32,7 @@ const DEFAULT_DB = "data/exocortex.sqlite";
  * @property {string} path
  * @property {boolean} exists
  * @property {JsonObject[]} events
+ * @property {boolean=} truncated
  *
  * @typedef {object} ServiceStatusOptions
  * @property {string} label
@@ -56,6 +58,7 @@ const DEFAULT_DB = "data/exocortex.sqlite";
  * @typedef {"sampled" | "unknown" | "behind"} ServiceFreshnessStatus
  *
  * @typedef {object} ServiceOverview
+ * @property {ReturnType<typeof summarizeLockEvidence>} leases
  * @property {{status: ServiceRuntimeStatus, detail: string}} service
  * @property {{status: ServiceHealthStatus, detail: string}} health
  * @property {{status: ServiceActivityStatus, detail: string}} activity
@@ -139,42 +142,55 @@ function parseJsonOutput(result) {
  * @param {number} [maxBytes]
  */
 function readFileTail(path, maxBytes = 512 * 1024) {
-  const stat = statSync(path);
-  const length = Math.min(stat.size, maxBytes);
-  const start = Math.max(0, stat.size - length);
-  const buffer = Buffer.alloc(length);
+  return readFileTailEvidence(path, maxBytes).text;
+}
+
+/** Read one opened file even if its path is rotated during the read.
+ * @param {string} path @param {number} maxBytes */
+function readFileTailEvidence(path, maxBytes) {
   const fd = openSync(path, "r");
   try {
-    readSync(fd, buffer, 0, length, start);
+    const size = fstatSync(fd).size;
+    const length = Math.min(size, maxBytes);
+    const start = Math.max(0, size - length);
+    const buffer = Buffer.alloc(length);
+    const bytesRead = readSync(fd, buffer, 0, length, start);
+    const text = buffer.subarray(0, bytesRead).toString("utf8");
+    const newline = text.indexOf("\n");
+    return { text: start > 0 ? newline < 0 ? "" : text.slice(newline + 1) : text,
+      truncated: start > 0 || bytesRead < length };
   } finally {
     closeSync(fd);
   }
-  const text = buffer.toString("utf8");
-  return start > 0 ? text.slice(text.indexOf("\n") + 1) : text;
 }
 
 /**
+ * Only current worker.jsonl is read; rotated files are not history evidence.
  * @param {string} logDir
+ * @param {{maxBytes?: number, maxEvents?: number}} [limits]
  * @returns {WorkerLogTail}
  */
-function readRecentWorkerEvents(logDir) {
+function readRecentWorkerEvents(logDir, limits = {}) {
   const path = resolve(logDir, "worker.jsonl");
-  if (!existsSync(path)) return { path, exists: false, events: [] };
-  const lines = readFileTail(path, DEFAULT_WORKER_LOG_TAIL_BYTES)
-    .trim()
-    .split("\n")
-    .filter(Boolean)
-    .slice(-DEFAULT_WORKER_LOG_MAX_EVENTS);
+  if (!existsSync(path)) return { path, exists: false, events: [], truncated: false };
+  const maxBytes = limits.maxBytes ?? DEFAULT_WORKER_LOG_TAIL_BYTES;
+  const maxEvents = limits.maxEvents ?? DEFAULT_WORKER_LOG_MAX_EVENTS;
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || !Number.isSafeInteger(maxEvents) || maxEvents < 1) {
+    throw new Error("worker log read limits must be positive integers");
+  }
+  const tail = readFileTailEvidence(path, maxBytes);
+  const allLines = tail.text.trim().split("\n").filter(Boolean);
+  const lines = allLines.slice(-maxEvents);
   /** @type {JsonObject[]} */
   const events = [];
   for (const line of lines) {
     try {
       events.push(JSON.parse(line));
     } catch {
-      // Ignore partial or non-JSON log lines at the edge of the tail window.
+      // Ignore partial or non-JSON lines; retained events do not prove continuity.
     }
   }
-  return { path, exists: true, events };
+  return { path, exists: true, events, truncated: tail.truncated || allLines.length > maxEvents };
 }
 
 /**
@@ -190,15 +206,18 @@ function eventTimeMs(event) {
  * @param {unknown[]} events
  * @param {number} [nowMs]
  * @param {number} [windowMs]
+ * @param {{truncated?: boolean}} [logEvidence]
  */
-function summarizeWorkerStability(events, nowMs = Date.now(), windowMs = DEFAULT_STABILITY_WINDOW_MS) {
+function summarizeWorkerStability(events, nowMs = Date.now(), windowMs = DEFAULT_STABILITY_WINDOW_MS, logEvidence = {}) {
   const windowStartMs = nowMs - windowMs;
-  const normalized = (events || [])
+  const retained = (events || [])
     .filter((event) => event && typeof event === "object")
     .map((event) => /** @type {JsonObject} */ (event))
+    .filter((event) => ["lark_im_worker_cycle", "lark_im_worker_step", "lark_im_worker_scheduler"].includes(event.type))
     .map((event) => ({ event, at_ms: eventTimeMs(event) }))
-    .filter((item) => item.at_ms !== null && item.at_ms >= windowStartMs && item.at_ms <= nowMs)
+    .filter((item) => item.at_ms !== null && item.at_ms <= nowMs)
     .sort((a, b) => Number(a.at_ms) - Number(b.at_ms));
+  const normalized = retained.filter((item) => Number(item.at_ms) >= windowStartMs);
   const cycles = normalized.filter((item) => item.event.type === "lark_im_worker_cycle");
   const successCycles = cycles.filter((item) => item.event.ok === true);
   const failedCycles = cycles.filter((item) => item.event.ok === false);
@@ -213,18 +232,26 @@ function summarizeWorkerStability(events, nowMs = Date.now(), windowMs = DEFAULT
   }
   const successTimes = successCycles.map((item) => Number(item.at_ms));
   const lastSuccess = successCycles.at(-1);
-  let longestBetweenSuccessesMs = windowMs;
-  if (successTimes.length > 0) {
-    longestBetweenSuccessesMs = Math.max(0, successTimes[0] - windowStartMs);
-    for (let i = 1; i < successTimes.length; i += 1) {
-      longestBetweenSuccessesMs = Math.max(longestBetweenSuccessesMs, successTimes[i] - successTimes[i - 1]);
-    }
-    longestBetweenSuccessesMs = Math.max(longestBetweenSuccessesMs, nowMs - successTimes[successTimes.length - 1]);
+  /** @type {number | null} */
+  let longestBetweenSuccessesMs = null;
+  for (let i = 1; i < successTimes.length; i += 1) {
+    longestBetweenSuccessesMs = Math.max(longestBetweenSuccessesMs ?? 0, successTimes[i] - successTimes[i - 1]);
   }
+  const firstRetained = retained[0];
+  const lastRetained = retained.at(-1);
+  const firstMs = firstRetained ? Number(firstRetained.at_ms) : null;
 
   return {
     window_ms: windowMs,
     window_started_at: new Date(windowStartMs).toISOString(),
+    observation: {
+      first_event_at: firstMs === null ? null : new Date(firstMs).toISOString(),
+      last_event_at: lastRetained ? new Date(Number(lastRetained.at_ms)).toISOString() : null,
+      range_started_at: firstMs === null ? null : new Date(Math.max(windowStartMs, firstMs)).toISOString(),
+      range_ended_at: firstMs === null ? null : new Date(nowMs).toISOString(),
+      window_start_reached: firstMs !== null && firstMs <= windowStartMs,
+      tail_truncated: typeof logEvidence.truncated === "boolean" ? logEvidence.truncated : null,
+    },
     observed_events: normalized.length,
     cycles: {
       total: cycles.length,
@@ -449,6 +476,7 @@ function buildServiceOverview({
   const activity = summarizeServiceActivity({ service, syncStatus, workerSummary, nowMs });
   return {
     service,
+    leases: summarizeLockEvidence(syncStatus?.locks, nowMs),
     health: summarizeServiceHealth({ service, syncStatus, syncErrorText, workerSummary, activity }),
     activity,
     freshness: summarizeServiceFreshness(liveProbe, nowMs, freshnessMaxAgeMs, expectedContext),
@@ -494,6 +522,7 @@ function buildServiceStatusReport(opts, deps = {}) {
     workerLog.events,
     nowMs,
     deps.stabilityWindowMs || DEFAULT_STABILITY_WINDOW_MS,
+    workerLog,
   );
   workerStability.failures.by_kind = failureKinds;
   const serviceState = loaded === null ? "unknown" : loaded ? launchdState.state || "loaded" : "not loaded";

@@ -312,6 +312,46 @@ test("public status sanitization cannot retain stale okay health when detail deb
   assert.match(invalidList.health_detail, /list progress evidence is unavailable/);
 });
 
+
+test("public discovery completion preserves the snapshot finish time without exposing cursor identities", () => {
+  const completed = "2026-08-05T13:24:00+08:00";
+  const updated = "2026-08-06T05:24:00.000Z";
+  const marker = "GENERATED_PRIVATE_DISCOVERY_MARKER";
+  const status = sanitizeStatusReportForPublicOutput(statusFixture({
+    discovery: { complete: true, cursor_updated_at: updated, cursor: {
+      has_more: false, pages_scanned: 80, completed_at: completed,
+      snapshot_id: marker, page_token: marker, chat_id: marker,
+    } },
+    reconcile: { complete: true, cursor_updated_at: updated, cursor: {
+      has_more: false, pages_scanned: 80, completed_at: completed,
+      snapshot_id: marker, page_token: marker, chat_id: marker,
+    } },
+  }));
+  for (const section of [status.discovery, status.reconcile]) {
+    assert.deepEqual(section.cursor, { has_more: false, pages_scanned: 80,
+      completed_at: "2026-08-05T05:24:00.000Z" });
+    assert.equal(section.cursor_updated_at, updated);
+    assert.notEqual(section.cursor.completed_at, section.cursor_updated_at);
+  }
+  assert.doesNotMatch(JSON.stringify(status), new RegExp(marker));
+});
+
+test("public discovery completion keeps legacy absence and rejects invalid timestamp evidence", () => {
+  const legacy = sanitizeStatusReportForPublicOutput(statusFixture({
+    reconcile: { complete: true, cursor_updated_at: "2026-08-06T05:24:00.000Z",
+      cursor: { has_more: false, pages_scanned: 80 } },
+  }));
+  assert.equal(Object.hasOwn(legacy.reconcile.cursor, "completed_at"), false);
+  for (const completed of [null, undefined, "", "GENERATED_PRIVATE_BAD_COMPLETION", 1e30, "999999999999999999999"]) {
+    const status = sanitizeStatusReportForPublicOutput(statusFixture({
+      reconcile: { complete: true, cursor_updated_at: "2026-08-06T05:24:00.000Z",
+        cursor: { has_more: false, pages_scanned: 80, completed_at: completed } },
+    }));
+    assert.equal(status.reconcile.cursor.completed_at, null);
+    assert.doesNotMatch(JSON.stringify(status), /GENERATED_PRIVATE_BAD_COMPLETION/);
+  }
+});
+
 test("status validates migration evidence in the report snapshot after legacy preflight", (t) => {
   const { db, sql } = detailFixture(t);
   sql("DROP TABLE lark_im_detail_tasks; DROP TABLE lark_im_list_progress; DELETE FROM schema_migrations WHERE version='009';");

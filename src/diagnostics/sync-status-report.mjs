@@ -84,6 +84,14 @@ function publicCursor(value) {
   if (Number.isFinite(Number(cursor.pages_scanned))) {
     projected.pages_scanned = nonNegativeNumber(cursor.pages_scanned);
   }
+  if (Object.hasOwn(cursor, "completed_at")) {
+    projected.completed_at = null;
+    try {
+      projected.completed_at = publicTimestamp(cursor.completed_at);
+    } catch {
+      // An out-of-range timestamp is unknown completion evidence.
+    }
+  }
   return Object.keys(projected).length > 0 ? projected : null;
 }
 

@@ -209,7 +209,7 @@ test("service status report parses launchd, sync status, and worker log summary"
   ]);
 });
 
-test("worker stability measures the longest time between successful cycles including window edges", () => {
+test("worker stability measures only adjacent observed successful cycles", () => {
   const nowMs = Date.parse("2026-06-20T10:50:00.000Z");
   const windowMs = 60 * 60 * 1000;
   const successTimes = ["10:00", "10:01", "10:02", "10:43", "10:44"];
@@ -236,7 +236,7 @@ test("worker stability measures the longest time between successful cycles inclu
   assert.deepEqual(stability.failures.by_step, [{ name: "received-catchup", count: 1 }]);
 });
 
-test("worker stability reports the whole window when no successful cycle exists", () => {
+test("worker stability reports no interval when no successful cycle exists", () => {
   const stability = summarizeWorkerStability(
     [
       {
@@ -254,7 +254,7 @@ test("worker stability reports the whole window when no successful cycle exists"
   assert.equal(stability.cycles.ok, 0);
   assert.equal(stability.cycles.failed, 1);
   assert.equal(stability.last_success, null);
-  assert.equal(stability.longest_between_successes_ms, 60 * 60 * 1000);
+  assert.equal(stability.longest_between_successes_ms, null);
 });
 
 test("service status report preserves not-loaded and sync-unavailable states", () => {

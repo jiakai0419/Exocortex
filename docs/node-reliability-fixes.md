@@ -42,6 +42,12 @@ All database facts used by the status report—detail debt, list progress, recor
 
 A report describes one database snapshot. A writer may commit after the snapshot begins, so a coherent earlier report remains possible; it cannot combine earlier zero debt with a newer incomplete list frontier or failed run. Synthetic WAL tests keep a real reader transaction open while a separate process commits through the real synchronization adapter and store, then verify both the complete earlier report and the incomplete subsequent report. The earlier `b528dc6` candidate is retained in Git history as the negative comparison; this correction is an appended commit.
 
+### Status timing and concise explanations
+
+The longest success interval now measures only adjacent observed successful cycles inside the requested window. Neither window edges nor time since the last success contributes to it; fewer than two successes yields `null`. The last-success age remains separate. Observation metadata describes the retained current-log range, clipped to the requested window, with explicit tail truncation and unknown-range cases. It never claims service startup or continuous coverage. Exact milliseconds remain available in JSON; only the gap's terminal display rounds to a second.
+
+The existing service layout remains: full discovery shows its recorded completion time instead of leading with page counts, while active discovery and received-scope counts retain their distinct meanings. Normal lease occupancy stays in Activity; only timestamp-supported lease anomalies produce a warning. No waiting or process-liveness claim is inferred from a lock alone. Technical cursor and lease fields remain in detailed diagnostics, and no new discovery-count storage mechanism is introduced.
+
 ### Shared name merging
 
 The Lark-specific SQL merge is shared by ingestion and enrichment. Null/empty lookup results mean unknown; explicit `*_name_state: "cleared"` is authoritative. Known names and provenance remain together only when record and canonical identities agree, including the container for scoped sender names. Unknown cannot resurrect a cleared name; a fresh resolved value may replace a clear. Cached chat names explicitly carry `scope_config` / `local_history` provenance and can only fill unknown fields; they cannot overwrite a known name or authoritative clear. A fresh message name remains eligible for a same-version improvement. Other record types keep their existing replacement semantics.
@@ -56,6 +62,7 @@ All identities, message bodies, clocks, subprocess outcomes, and databases in ne
 | --- | --- | --- | --- |
 | Detail isolation and progress | A denied root disabled the conversation; the initial fix then pinned list progress at a shrinking prefix | Both directions, repeated shrinking, fresh runner instances, late ordinary records, default page limits, independent repair, continued healthy detail tasks, preserved old expansions | `lark-im-detail-progress.test.mjs`, `lark-im-native-sync.test.mjs` |
 | Durable list/debt transactions | A restart must retain both progress and unresolved root descriptors | List failure commits nothing; baseline/gaps, lock/lease/cursor/generation/identity/fingerprint fences; mutable discovery metadata allowed; receipts, version conflicts, rollback and final closure | `lark-detail-store.test.mjs`, `lark-im-detail-adapter.test.mjs` |
+| Status timing and presentation | Window edges inflated a success-to-success interval; technical counts duplicated existing status | Synthetic dominant-edge intervals, zero/one success, exact time bounds, partial/rotated logs, safe completion timestamps, normal versus abnormal lease display | `lark-im-service-stability.test.mjs`, service view and lease evidence tests |
 | Consistent status snapshot | Separate read-only connections combined old zero debt with a new incomplete list and failed run | Real concurrent WAL writer; consistent before/after reports; Service and wait-ok; schema preflight race; malformed/missing evidence fails closed | `sync-status-snapshot.test.mjs`, `sync-status-command.test.mjs`, `diagnostics-readonly.test.mjs` |
 | Coverage and diagnostics | List-only evidence or historical health could hide pending details | Partial flags and malformed composed intervals rejected; target-relative debt; legacy versus damaged schema; public aggregate output | `lark_im_coverage_check_test.py`, `sync-status-command.test.mjs`, `sync-status-core.test.mjs` |
 | Window timeout | Shared deadline repeatedly retried one large window without progress | One minimum-prefix retry; boundary messages reread; non-minute start; ordinary timeout/rate limit unchanged; minimum saturation and incomplete pagination never advance | `lark-im-core-pagination.test.mjs`, `lark-im-native-sync.test.mjs` |
@@ -76,10 +83,10 @@ Final checks use Node.js 22 and SQLite CLI 3.51.0. The initial candidate passed 
 | --- | --- |
 | `npm run build` | PASS |
 | `npm run typecheck` | PASS |
-| `npm run check` | PASS; 69 JavaScript files |
-| `npm test` | PASS; 608 tests, 0 failures, 0 skipped; includes synthetic Python coverage tests |
+| `npm run check` | PASS; 70 JavaScript files |
+| `npm test` | PASS; 642 tests, 0 failures, 0 skipped; includes synthetic Python coverage tests |
 | `git diff --check` | PASS |
 | `npm run build:check` | PASS; generated files match committed source |
-| Production service/account/data and deployment acceptance | NOT RUN; outside local implementation authorization |
+| Production service/account/data and deployment acceptance | NOT RUN; deferred until independent final review |
 
-No real launchd operation, account request, synchronization, deployment, or production data repair was performed. All fixtures are invented; none are real or sanitized operational data. Existing disabled scopes are not automatically re-enabled. Permanently unavailable details continue to block *full-content* completion while list scanning proceeds. A saturated minimum list minute still fails safely. An unexpired lease is activity evidence, not proof that its owner process is alive. Final runtime acceptance and publication require separate authorization. The original and follow-up candidates are retained for independent review.
+No real launchd operation, account request, synchronization, deployment, or production data repair was performed. All fixtures are invented; none are real or sanitized operational data. Existing disabled scopes are not automatically re-enabled. Permanently unavailable details continue to block *full-content* completion while list scanning proceeds. A saturated minimum list minute still fails safely. An unexpired lease is activity evidence, not proof that its owner process is alive. Runtime acceptance and publication remain deferred until independent final review. The original and follow-up candidates are retained for independent review.

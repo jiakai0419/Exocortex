@@ -56,6 +56,19 @@ function localIso(value) {
   return new Date(String(value)).toLocaleString();
 }
 
+/** Local wall time with the UTC offset at that instant, including DST changes.
+ * @param {unknown} value
+ */
+function localTimestamp(value) {
+  if (!value) return "unknown";
+  const date = new Date(String(value));
+  if (!Number.isFinite(date.getTime())) return "unknown";
+  const pad = (part) => String(part).padStart(2, "0");
+  const offsetMinutes = -date.getTimezoneOffset();
+  const offset = `${offsetMinutes >= 0 ? "+" : "-"}${pad(Math.floor(Math.abs(offsetMinutes) / 60))}:${pad(Math.abs(offsetMinutes) % 60)}`;
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())} UTC${offset}`;
+}
+
 /** @param {JsonObject} summary */
 function formatWorkerEvent(summary) {
   if (!summary.has_events) return "no worker events yet";
@@ -115,6 +128,52 @@ function formatStabilityLastSuccess(stability) {
     ? ""
     : `#${stability.last_success.cycle} `;
   return `${cycle}${ageText(stability.last_success.age_ms)}`.trim();
+}
+
+/** @param {JsonObject | null | undefined} stability */
+function formatStabilityInterval(stability) {
+  if (!stability) return "unknown";
+  if (Number(stability.cycles?.ok || 0) < 2) return "unavailable (need 2 successes)";
+  const interval = stability.longest_between_successes_ms;
+  // Round measured intervals independently of ages, which still round down.
+  return typeof interval === "number" && Number.isFinite(interval) && interval >= 0 ? durationText(Math.round(interval / 1000) * 1000).replaceAll(" ", "") : "unknown";
+}
+
+/** @param {JsonObject | null | undefined} stability */
+function formatStatisticsRange(stability) {
+  const observed = stability?.observation;
+  const from = localTimestamp(observed?.range_started_at);
+  const to = localTimestamp(observed?.range_ended_at);
+  if (from === "unknown" || to === "unknown") return "unavailable (no current-window log evidence)";
+  const partial = observed?.window_start_reached === true ? "" : `less than ${windowText(stability?.window_ms || 24 * 60 * 60 * 1000)} observed; `;
+  return `${from} → ${to} (${partial}${observed?.tail_truncated ? "retained log tail only" : "retained log only"})`;
+}
+
+/** @param {JsonObject | null | undefined} reconcile */
+function formatReconcile(reconcile) {
+  if (reconcile?.complete) {
+    const completedAt = localTimestamp(reconcile.cursor?.completed_at);
+    return `complete; ${completedAt === "unknown" ? "completion time unavailable" : `completed ${completedAt}`}`;
+  }
+  return reconcile?.cursor?.has_more ? "in progress" : "not started";
+}
+
+/** @param {JsonObject | null | undefined} leases */
+function formatLeaseIssues(leases) {
+  const labels = {
+    invalid_timestamp: "invalid timestamps",
+    invalid_interval: "invalid lease interval",
+    future_start: "future start time",
+    hard_limit_exceeded: "hard lease limit exceeded",
+    expired: "expired",
+  };
+  const reasons = Array.isArray(leases?.reasons) ? leases.reasons : [];
+  const parts = Object.entries(labels).flatMap(([reason, label]) => {
+    const count = reasons.filter((item) => item?.reason === reason && Number.isSafeInteger(item.count) && item.count > 0)
+      .reduce((sum, item) => sum + item.count, 0);
+    return count > 0 ? [`${label} x${count}`] : [];
+  });
+  return parts.join(", ") || "lease state needs inspection";
 }
 
 /** @param {JsonObject | null | undefined} stability */
@@ -187,9 +246,10 @@ function renderServiceStatusText(report) {
     "",
     section(stabilitySectionTitle(stability)),
     kv([
+      ["Statistics range", formatStatisticsRange(stability)],
       ["Cycles", formatStabilityCycles(stability)],
       ["Last success", formatStabilityLastSuccess(stability)],
-      ["Longest between successes", durationText(stability?.longest_between_successes_ms)],
+      ["Longest between successes", formatStabilityInterval(stability)],
       ["Failures", formatStabilityFailures(stability)],
     ]),
     "",
@@ -208,17 +268,11 @@ function renderServiceStatusText(report) {
     );
     lines.push("");
     lines.push(section("Sync"));
-    const reconcileState = syncStatus.reconcile?.complete
-      ? "complete"
-      : syncStatus.reconcile?.cursor?.has_more
-        ? "in progress"
-        : "not started";
     const hotDiscoveryState = syncStatus.hot_discovery?.ran
       ? `last run ${localIso(syncStatus.hot_discovery.cursor_updated_at)}`
       : "not started";
     lines.push(
       kv([
-        ["Health", formatOverviewItem(overview.health)],
         [
           "Records",
           `${syncStatus.records?.total || 0} total, ${byDirection.sent?.count || 0} sent, ${
@@ -233,8 +287,10 @@ function renderServiceStatusText(report) {
         ],
         ["Unsupported scopes", `${syncStatus.scopes?.received_unsupported || 0} total`],
         ["Hot discovery", hotDiscoveryState],
-        ["Reconcile", `${reconcileState}, ${syncStatus.reconcile?.cursor?.pages_scanned || 0} pages`],
-        ["Locks", syncStatus.locks?.length || 0],
+        ["Reconcile", formatReconcile(syncStatus.reconcile)],
+        overview.leases?.evidence === "available" && Number(overview.leases.abnormal_count || 0) > 0
+          ? ["Warning", `${formatLeaseIssues(overview.leases)}; check sync diagnostics and system clock`]
+          : null,
       ]),
     );
     if (syncStatus.scopes?.unsupported_reasons?.length > 0) {
@@ -282,10 +338,15 @@ export {
   formatStabilityCycles,
   formatStabilityFailures,
   formatStabilityLastSuccess,
+  formatStabilityInterval,
+  formatStatisticsRange,
+  formatReconcile,
+  formatLeaseIssues,
   formatWorkerCycle,
   formatWorkerEvent,
   formatWorkerFailure,
   formatWorkerStep,
   localIso,
+  localTimestamp,
   renderServiceStatusText,
 };
