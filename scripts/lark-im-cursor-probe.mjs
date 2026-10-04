@@ -465,12 +465,15 @@ function probeReceivedChats(opts, selfOpenId) {
       redactedFlags: ["--chat-id"],
     });
     const firstPage = pageSummary(first, "messages");
-    const filteredFirstPage = selfOpenId
-      ? {
-          ...firstPage,
-          messages: firstPage.messages.filter((message) => message.sender_id_hash !== hashId(selfOpenId)),
-        }
-      : firstPage;
+    const receivedMessages = selfOpenId
+      ? firstPage.messages.filter((message) => message.sender_id_hash !== hashId(selfOpenId))
+      : firstPage.messages;
+    const filteredFirstPage = {
+      ...firstPage,
+      count: receivedMessages.length,
+      messages: receivedMessages,
+      order: orderAnalysis(receivedMessages),
+    };
 
     let secondPage = null;
     const firstEnvelope = getEnvelope(first.json, "messages");
