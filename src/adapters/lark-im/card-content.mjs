@@ -98,6 +98,9 @@ function renderCardContent(content, mentions = []) {
   /** @type {Set<Reason>} */
   const reasons = new Set();
   const active = new WeakSet();
+  // Reuse only nonempty-map evidence within this render. Empty maps are cheap
+  // to recheck and must not become stale permission to borrow default text.
+  const nonemptyLocaleMaps = new WeakSet();
   // Consumption domains stay separate. A native attachment alias never turns
   // into a global user ID, and a mention token never reads a typed-ID table.
   /** @type {Map<string, Map<string, Identity>>} */
@@ -148,13 +151,19 @@ function renderCardContent(content, mentions = []) {
     try { return JSON.parse(value); } catch { mark("invalid_card_json"); return null; }
   }
 
+  /** Node visits and locale-map inspection share one work allowance. */
+  function consumeNodes(count = 1) {
+    if (stopped) return false;
+    nodes += count;
+    if (nodes > MAX_NODES) { mark("card_node_limit"); stopped = true; return false; }
+    return true;
+  }
+
   /** All known schema recursion shares these limits, including inline arrays.
    * @param {unknown} value @param {number} depth @param {() => void} visit
    */
   function enter(value, depth, visit) {
-    if (stopped) return;
-    nodes += 1;
-    if (nodes > MAX_NODES) { mark("card_node_limit"); stopped = true; return; }
+    if (!consumeNodes()) return;
     if (depth > MAX_DEPTH) { mark("card_depth_limit"); return; }
     if (value !== null && typeof value === "object") {
       if (active.has(value)) { mark("card_cycle"); return; }
@@ -560,14 +569,24 @@ function renderCardContent(content, mentions = []) {
   /** Prefer one complete language projection. Null means a verified empty outer
    * dictionary; undefined retains invalid-language diagnostics. @param {unknown} value */
   function locale(value) {
+    if (!consumeNodes()) return undefined;
     if (!object(value)) { mark("unsupported_card_structure"); return undefined; }
     for (const language of LOCALES) {
       const translated = read(value, language);
       if (typeof translated === "string" || Array.isArray(translated) || object(translated)) return translated;
       if (translated !== undefined) mark("unsupported_card_structure");
     }
-    const prototype = Object.getPrototypeOf(value);
-    if ((prototype === Object.prototype || prototype === null) && Reflect.ownKeys(value).length === 0) return null;
+    if (!nonemptyLocaleMaps.has(value)) {
+      const prototype = Object.getPrototypeOf(value);
+      if (prototype === Object.prototype || prototype === null) {
+        // Native ownKeys is eager. Debit its complete result once, never read
+        // unknown values, and stop before any later map if it exceeds budget.
+        const keys = Reflect.ownKeys(value);
+        if (!consumeNodes(keys.length)) return undefined;
+        if (keys.length === 0) return null;
+        nonemptyLocaleMaps.add(value);
+      }
+    }
     mark("unsupported_card_structure");
     return undefined;
   }
