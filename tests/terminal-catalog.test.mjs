@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readdirSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import test from "node:test";
 
 import { COMMANDS, GROUPS, filteredCommands } from "../scripts/help.mjs";
@@ -22,6 +22,20 @@ test("coverage help names Python and an explicit endpoint without adding a daily
   assert.match(entries[0].command, /^python3 -B .* --target /);
   assert.match(entries[0].summary, /without writing/);
   assert.notEqual(entries[0].core, true);
+});
+
+test("development verification composes only local checks and is discoverable outside daily help", () => {
+  const scripts = JSON.parse(readFileSync("package.json", "utf8")).scripts;
+  const steps = scripts.verify.split(" && ");
+  const required = new Set(["npm run build", "npm run typecheck", "npm run check", "npm test", "npm run build:check"]);
+  assert.equal(steps.length, required.size);
+  assert.deepEqual(new Set(steps), required);
+  for (const name of ["build", "typecheck", "check", "test", "build:check"]) {
+    assert.doesNotMatch(scripts[name], /maintenance|lark-im-service|launchctl/);
+  }
+  const [entry] = filteredCommands({ all: false, group: "development", command: "npm run verify" });
+  assert.equal(entry?.command, "npm run verify");
+  assert.notEqual(entry.core, true);
 });
 
 test("terminal catalog entries have valid groups and examples", () => {

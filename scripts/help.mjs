@@ -215,6 +215,13 @@ const COMMANDS = [
   },
   {
     group: "development",
+    command: "npm run verify",
+    file: "package.json",
+    summary: "Build and validate an isolated development checkout without service lifecycle operations.",
+    examples: ["npm run verify"],
+  },
+  {
+    group: "development",
     command: "npm run build:check",
     file: "scripts/check-generated.mjs",
     summary: "Compare dist with a clean temporary build, including missing and obsolete output files.",

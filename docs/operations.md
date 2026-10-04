@@ -27,11 +27,10 @@
 
 ```bash
 npm ci
-npm run build
-npm run typecheck
-npm test
-npm run check
+npm run verify
 ```
+
+`verify` 是开发配方：顺序运行 build、typecheck、check、test 和 build:check，不调用 service 或 maintenance 命令。构建仍写当前 `dist`，只应在隔离开发 checkout 执行。下文 `maintenance-check` 保留兼容的默认停服/检查/启动流程，不能把它当作这个开发配方的别名。
 
 自动测试使用合成数据与临时目录。真实同步前由本人安装并授权官方 lark-cli，确认账号、读取范围、数据库路径和带时区的首次起点；凭据与个人运行数据不进入仓库。初始化与同步是显式写操作，默认诊断不会创建 schema。替换运行代码前，应停止旧 worker 并确认子进程退出，保存独立一致性备份与原代码/配置；参见 [Safe Runtime Maintenance](#safe-runtime-maintenance)。后台周期、本地状态、固定窗口覆盖和远端采样分别验收，单个绿灯不能证明全量完整。
 

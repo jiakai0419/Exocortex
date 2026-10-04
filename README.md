@@ -10,11 +10,10 @@
 
 ```sh
 npm ci
-npm run build
-npm run typecheck
-npm run check
-npm test
+npm run verify
 ```
+
+`verify` 顺序执行 build、typecheck、syntax、全量测试和干净构建对照，不启停服务。它仍会生成 `dist`，应在隔离开发 checkout 运行；运行目录维护使用 [Operations](docs/operations.md) 的显式停服流程。
 
 生成的 `dist` 随源码提交；`npm run build:check` 在干净临时目录构建，比较完整文件集合与内容，发现缺失、过时和孤立产物，且不改当前 `dist`。修改源码后先运行 `npm run build`，移除不再生成的文件，再执行检查。自动化测试使用假请求和新建的临时数据库，不需要真实账号、凭据或聊天数据。
 
