@@ -269,7 +269,7 @@ function renderServiceStatusText(report) {
     lines.push("");
     lines.push(section("Sync"));
     const hotDiscoveryState = syncStatus.hot_discovery?.ran
-      ? `last run ${localIso(syncStatus.hot_discovery.cursor_updated_at)}`
+      ? `last success ${localIso(syncStatus.hot_discovery.cursor_updated_at)}`
       : "not started";
     lines.push(
       kv([
@@ -286,8 +286,8 @@ function renderServiceStatusText(report) {
           } without cursor`,
         ],
         ["Unsupported scopes", `${syncStatus.scopes?.received_unsupported || 0} total`],
-        ["Hot discovery", hotDiscoveryState],
-        ["Reconcile", formatReconcile(syncStatus.reconcile)],
+        ["Active chat refresh", hotDiscoveryState],
+        ["Chat list review", formatReconcile(syncStatus.reconcile)],
         overview.leases?.evidence === "available" && Number(overview.leases.abnormal_count || 0) > 0
           ? ["Warning", `${formatLeaseIssues(overview.leases)}; check sync diagnostics and system clock`]
           : null,

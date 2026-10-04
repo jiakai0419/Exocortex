@@ -109,8 +109,8 @@ test("service view keeps minimal business rows and hides normal lock/page counts
   assert.match(output, /Last success\s+#3 53s ago/);
   assert.match(output, /Longest between successes\s+1m50s/);
   assert.match(output, /Received scopes\s+7 enabled, 0 without cursor/);
-  assert.match(output, /Hot discovery\s+last run /);
-  assert.match(output, /Reconcile\s+complete; completed .* UTC[+-]\d\d:\d\d/);
+  assert.match(output, /Active chat refresh\s+last success /);
+  assert.match(output, /Chat list review\s+complete; completed .* UTC[+-]\d\d:\d\d/);
   assert.doesNotMatch(output, /\bLocks\b|Warning|17 pages|Observed log|PRIVATE-SYNTHETIC/);
   const abnormal = plain(renderServiceStatusText(reportFixture(true)));
   assert.match(abnormal, /Warning\s+expired x2; check sync diagnostics and system clock/);
