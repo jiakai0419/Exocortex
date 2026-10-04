@@ -4,6 +4,7 @@ type SyncScope = {
     source_id: string;
     name?: string;
     enabled?: number;
+    source_enabled?: number;
     config_json?: string;
     cursor_json?: string | null;
     config?: JsonObject;
@@ -91,6 +92,15 @@ declare function acquireMaintenanceLock(dbPath: string, options?: MaintenanceLoc
 declare function releaseMaintenanceLock(dbPath: string, owner?: string): void;
 declare function acquireLock(dbPath: string, scopeId: string, ttlSeconds: number, owner?: string): boolean;
 declare function releaseLock(dbPath: string, scopeId: string, owner?: string): void;
+/** Build a guard to execute inside the same write transaction as every effect.
+ * Ordinary completion requires enabled source/scope; failRun may only close an
+ * owned run after disable. extraPredicate is trusted source-specific SQL. */
+declare function runFenceGuardSql(scope: SyncScope, runId: number, finishedAtIso: string, options?: {
+    guardTable?: string;
+    assert?: boolean;
+    requireEnabled?: boolean;
+    extraPredicate?: string;
+}): string;
 declare function createRun(dbPath: string, scope: SyncScope, metadata?: JsonObject, owner?: string): number;
 declare function failRun(dbPath: string, scope: SyncScope, runId: number, error: Error): boolean;
 declare function existingRecordMap(dbPath: string, sourceId: string, records: StoredRecord[]): Map<any, any>;
@@ -144,4 +154,4 @@ declare function commitLarkListRun(dbPath: string, scope: SyncScope, runId: numb
 /** A complete detail response replaces content; failed attempts only reschedule debt. */
 declare function finishLarkDetailRun(dbPath: string, scope: SyncScope, runId: number, outcomes: LarkDetailOutcome[], metadata?: JsonObject): LarkProgressEffects;
 declare const succeedMessageRun: typeof succeedRecordRun;
-export { DEFAULT_HARD_LEASE_SECONDS, acquireLock, acquireMaintenanceLock, countWriteEffects, commitBoundedReplayRecords, commitLarkListRun, finishLarkDetailRun, readLarkListProgress, readPendingLarkDetails, normalizeBoundedReplayRecords, createRun, ensureInitialized, ensureSourceInitialSyncStart, existingRecordMap, failRun, failRecordRun, isMaintenanceLocked, normalizeExternalVersion, normalizeStoredRecords, ownerPid, ownerStartedAtMs, defaultOwnerState, recoverStaleSyncState, quoteSql, readScope, releaseLock, releaseMaintenanceLock, secureDatabasePaths, sqlJson, sqliteExec, sqliteQuery, succeedMessageRun, succeedRecordRun, upsertRecordsSql, validateInitialSyncStartMs, };
+export { DEFAULT_HARD_LEASE_SECONDS, acquireLock, acquireMaintenanceLock, countWriteEffects, commitBoundedReplayRecords, commitLarkListRun, finishLarkDetailRun, readLarkListProgress, readPendingLarkDetails, normalizeBoundedReplayRecords, createRun, ensureInitialized, ensureSourceInitialSyncStart, existingRecordMap, failRun, failRecordRun, isMaintenanceLocked, normalizeExternalVersion, normalizeStoredRecords, ownerPid, ownerStartedAtMs, defaultOwnerState, recoverStaleSyncState, runFenceGuardSql, quoteSql, readScope, releaseLock, releaseMaintenanceLock, secureDatabasePaths, sqlJson, sqliteExec, sqliteQuery, succeedMessageRun, succeedRecordRun, upsertRecordsSql, validateInitialSyncStartMs, };

@@ -19,6 +19,7 @@ type SyncScope = {
   source_id: string;
   name?: string;
   enabled?: number;
+  source_enabled?: number;
   config_json?: string;
   cursor_json?: string | null;
   config?: JsonObject;
@@ -95,7 +96,7 @@ type InitialSyncStartOptions = {
 
 const PRIVATE_DIRECTORY_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
-const DEFAULT_HARD_LEASE_SECONDS = 60 * 60;
+const DEFAULT_HARD_LEASE_SECONDS = 20 * 60;
 const DEFAULT_IMPLICIT_RUN_LOCK_SECONDS = 10 * 60;
 const PROCESS_STARTED_AT_MS = Math.max(0, Math.floor(Date.now() - process.uptime() * 1000));
 const PROCESS_START_MATCH_TOLERANCE_MS = 5_000;
@@ -397,9 +398,9 @@ function ensureInitialized(dbPath: string) {
 function readScope(dbPath: string, scopeId: string): SyncScope {
   const rows = sqliteQuery(
     dbPath,
-    `SELECT id, source_id, name, enabled, config_json, cursor_json
-     FROM sync_scopes
-     WHERE id = ${quoteSql(scopeId)}
+    `SELECT s.id, s.source_id, s.name, s.enabled, s.config_json, s.cursor_json, src.enabled AS source_enabled
+     FROM sync_scopes s JOIN sources src ON src.id = s.source_id
+     WHERE s.id = ${quoteSql(scopeId)}
      LIMIT 1;`,
     `read scope ${scopeId}`,
   );
@@ -474,6 +475,7 @@ function ensureSourceInitialSyncStart(
   );
   const row = rows[0];
   if (!row) throw new Error(`source not found: ${sourceId}`);
+  if (row.enabled !== 1) throw new Error("cannot sync a disabled source");
   const config: unknown = JSON.parse(row.config_json);
   if (!config || typeof config !== "object" || Array.isArray(config)) {
     throw new Error("source config must be a JSON object for initial sync baseline");
@@ -581,7 +583,9 @@ DELETE FROM maintenance_locks
 WHERE expires_at <= ${quoteSql(now.toISOString())};
 INSERT INTO sync_locks (scope_id, locked_by, locked_at, expires_at)
 SELECT ${quoteSql(scopeId)}, ${quoteSql(owner)}, ${quoteSql(now.toISOString())}, ${quoteSql(expires.toISOString())}
-WHERE NOT EXISTS (
+WHERE EXISTS (SELECT 1 FROM sync_scopes s JOIN sources src ON src.id = s.source_id
+  WHERE s.id = ${quoteSql(scopeId)} AND s.enabled = 1 AND src.enabled = 1)
+AND NOT EXISTS (
   SELECT 1
   FROM maintenance_locks
   WHERE name = 'global'
@@ -653,6 +657,41 @@ function checkedRunId(runId: number) {
   return runId;
 }
 
+/** Build a guard to execute inside the same write transaction as every effect.
+ * Ordinary completion requires enabled source/scope; failRun may only close an
+ * owned run after disable. extraPredicate is trusted source-specific SQL. */
+function runFenceGuardSql(scope: SyncScope, runId: number, finishedAtIso: string, options: {
+  guardTable?: string; assert?: boolean; requireEnabled?: boolean; extraPredicate?: string;
+} = {}) {
+  const id = checkedRunId(runId);
+  if (!Number.isFinite(Date.parse(finishedAtIso))) throw new Error("invalid run finish time");
+  const table = options.guardTable || "__run_fence_guard";
+  if (!/^__[a-z_]+$/.test(table)) throw new Error("invalid run fence table");
+  return `
+    CREATE TEMP TABLE ${table} (
+      allowed INTEGER PRIMARY KEY CHECK (allowed = 1), lock_owner TEXT NOT NULL,
+      lock_acquired_at TEXT NOT NULL, implicit INTEGER NOT NULL
+    );
+    INSERT INTO ${table}
+    SELECT 1, l.locked_by, l.locked_at,
+      COALESCE(json_extract(r.metadata_json, '$.${RUN_FENCE_METADATA_KEY}.implicit'), 0)
+    FROM sync_runs r
+    JOIN sync_scopes s ON s.id = r.scope_id AND s.source_id = r.source_id
+    JOIN sources src ON src.id = s.source_id
+    JOIN sync_locks l ON l.scope_id = r.scope_id
+    WHERE r.id = ${id} AND r.status = 'running'
+      AND r.scope_id = ${quoteSql(scope.id)} AND r.source_id = ${quoteSql(scope.source_id)}
+      AND l.locked_by = json_extract(r.metadata_json, '$.${RUN_FENCE_METADATA_KEY}.owner')
+      AND l.locked_at = json_extract(r.metadata_json, '$.${RUN_FENCE_METADATA_KEY}.locked_at')
+      AND julianday(l.locked_at) > julianday('now') - ${DEFAULT_HARD_LEASE_SECONDS} / 86400.0
+      AND s.cursor_json IS r.cursor_before_json
+      ${options.requireEnabled === false ? "" : "AND s.enabled = 1 AND src.enabled = 1"}
+      AND (${options.extraPredicate || "1"});
+    ${options.assert ? `CREATE TEMP TABLE ${table}_assert (allowed INTEGER NOT NULL CHECK (allowed = 1));
+    INSERT INTO ${table}_assert SELECT CASE WHEN EXISTS (SELECT 1 FROM ${table}) THEN 1 ELSE 0 END;` : ""}
+  `;
+}
+
 function createRun(
   dbPath: string,
   scope: SyncScope,
@@ -669,7 +708,6 @@ function createRun(
   validateRecordCursor(expectedCursor, "scope cursor");
   const now = new Date();
   const expires = new Date(now.getTime() + DEFAULT_IMPLICIT_RUN_LOCK_SECONDS * 1000);
-  const hardLeaseCutoff = new Date(now.getTime() - DEFAULT_HARD_LEASE_SECONDS * 1000).toISOString();
   const rows = sqliteQuery(
     dbPath,
     `BEGIN IMMEDIATE;
@@ -684,6 +722,9 @@ function createRun(
        ${quoteSql(expires.toISOString())}
      FROM __create_run_state
      WHERE had_lock = 0
+       AND EXISTS (SELECT 1 FROM sync_scopes s JOIN sources src ON src.id=s.source_id
+         WHERE s.id=${quoteSql(scope.id)} AND s.source_id=${quoteSql(scope.source_id)}
+           AND s.enabled=1 AND src.enabled=1 AND s.cursor_json IS ${quoteSql(expectedCursorJson)})
        AND NOT EXISTS (
          SELECT 1
          FROM maintenance_locks
@@ -706,12 +747,13 @@ function createRun(
        )
      FROM sync_scopes s
      JOIN sync_locks l ON l.scope_id = s.id
-     WHERE s.id = ${quoteSql(scope.id)}
+     JOIN sources src ON src.id = s.source_id
+     WHERE s.enabled = 1 AND src.enabled = 1
+       AND s.id = ${quoteSql(scope.id)}
        AND s.source_id = ${quoteSql(scope.source_id)}
        AND s.cursor_json IS ${quoteSql(expectedCursorJson)}
        AND l.locked_by = ${quoteSql(owner)}
-       AND julianday(l.locked_at) IS NOT NULL
-       AND l.locked_at > ${quoteSql(hardLeaseCutoff)}
+       AND julianday(l.locked_at) > julianday('now') - ${DEFAULT_HARD_LEASE_SECONDS} / 86400.0
      RETURNING id;
      COMMIT;`,
     `create run ${scope.id}`,
@@ -726,37 +768,11 @@ function failRun(dbPath: string, scope: SyncScope, runId: number, error: Error) 
   const id = checkedRunId(runId);
   const finishedAt = new Date();
   const now = finishedAt.toISOString();
-  const hardLeaseCutoff = new Date(
-    finishedAt.getTime() - DEFAULT_HARD_LEASE_SECONDS * 1000,
-  ).toISOString();
   const rows = sqliteQuery(
     dbPath,
     `
     BEGIN IMMEDIATE;
-    CREATE TEMP TABLE __run_fence_guard (
-      allowed INTEGER PRIMARY KEY,
-      lock_owner TEXT NOT NULL,
-      lock_acquired_at TEXT NOT NULL,
-      implicit INTEGER NOT NULL
-    );
-    INSERT INTO __run_fence_guard (allowed, lock_owner, lock_acquired_at, implicit)
-    SELECT
-      1,
-      l.locked_by,
-      l.locked_at,
-      COALESCE(json_extract(r.metadata_json, '$.${RUN_FENCE_METADATA_KEY}.implicit'), 0)
-    FROM sync_runs r
-    JOIN sync_scopes s ON s.id = r.scope_id AND s.source_id = r.source_id
-    JOIN sync_locks l ON l.scope_id = r.scope_id
-    WHERE r.id = ${id}
-      AND r.status = 'running'
-      AND r.scope_id = ${quoteSql(scope.id)}
-      AND r.source_id = ${quoteSql(scope.source_id)}
-      AND l.locked_by = json_extract(r.metadata_json, '$.${RUN_FENCE_METADATA_KEY}.owner')
-      AND l.locked_at = json_extract(r.metadata_json, '$.${RUN_FENCE_METADATA_KEY}.locked_at')
-      AND julianday(l.locked_at) IS NOT NULL
-      AND l.locked_at > ${quoteSql(hardLeaseCutoff)}
-      AND s.cursor_json IS r.cursor_before_json;
+    ${runFenceGuardSql(scope, id, now, { requireEnabled: false })}
     UPDATE sync_runs
     SET status = 'failed',
         finished_at = ${quoteSql(now)},
@@ -1214,38 +1230,11 @@ function finishRecordRun(
   delete safeMetadata[RUN_FENCE_METADATA_KEY];
   const finishedAt = new Date();
   const now = finishedAt.toISOString();
-  const hardLeaseCutoff = new Date(
-    finishedAt.getTime() - DEFAULT_HARD_LEASE_SECONDS * 1000,
-  ).toISOString();
   const rows = sqliteQuery(
     dbPath,
     `
     BEGIN IMMEDIATE;
-    CREATE TEMP TABLE __run_fence_guard (
-      allowed INTEGER PRIMARY KEY,
-      lock_owner TEXT NOT NULL,
-      lock_acquired_at TEXT NOT NULL,
-      implicit INTEGER NOT NULL
-    );
-    INSERT INTO __run_fence_guard (allowed, lock_owner, lock_acquired_at, implicit)
-    SELECT
-      1,
-      l.locked_by,
-      l.locked_at,
-      COALESCE(json_extract(r.metadata_json, '$.${RUN_FENCE_METADATA_KEY}.implicit'), 0)
-    FROM sync_runs r
-    JOIN sync_scopes s ON s.id = r.scope_id AND s.source_id = r.source_id
-    JOIN sync_locks l ON l.scope_id = r.scope_id
-    WHERE r.id = ${id}
-      AND r.status = 'running'
-      AND r.scope_id = ${quoteSql(scope.id)}
-      AND r.source_id = ${quoteSql(scope.source_id)}
-      AND l.locked_by = json_extract(r.metadata_json, '$.${RUN_FENCE_METADATA_KEY}.owner')
-      AND l.locked_at = json_extract(r.metadata_json, '$.${RUN_FENCE_METADATA_KEY}.locked_at')
-      AND julianday(l.locked_at) IS NOT NULL
-      AND l.locked_at > ${quoteSql(hardLeaseCutoff)}
-      AND s.cursor_json IS r.cursor_before_json
-      AND ${error ? "1" : cursorCanAdvanceSql("r.cursor_before_json", cursorJsonSql)};
+    ${runFenceGuardSql(scope, id, now, { extraPredicate: error ? "1" : cursorCanAdvanceSql("r.cursor_before_json", cursorJsonSql) })}
 ${recordWritesSql(normalizedRecords, now)}
     UPDATE sync_runs
     SET status = ${quoteSql(error ? "failed" : "succeeded")},
@@ -1393,32 +1382,14 @@ function larkDetailRoot(raw: JsonObject, requireMerge = true) {
 }
 
 function larkRunFenceSql(scope: SyncScope, runId: number, now: string) {
-  const cutoff = new Date(Date.parse(now) - DEFAULT_HARD_LEASE_SECONDS * 1000).toISOString();
-  return `
-    CREATE TEMP TABLE __run_fence_guard (
-      allowed INTEGER PRIMARY KEY CHECK (allowed = 1), lock_owner TEXT NOT NULL,
-      lock_acquired_at TEXT NOT NULL, implicit INTEGER NOT NULL
-    );
-    INSERT INTO __run_fence_guard
-    SELECT 1, l.locked_by, l.locked_at,
-      COALESCE(json_extract(r.metadata_json, '$.${RUN_FENCE_METADATA_KEY}.implicit'), 0)
-    FROM sync_runs r JOIN sync_scopes s ON s.id = r.scope_id AND s.source_id = r.source_id
-    JOIN sync_locks l ON l.scope_id = r.scope_id
-    WHERE r.id = ${checkedRunId(runId)} AND r.status = 'running'
-      AND r.scope_id = ${quoteSql(scope.id)} AND r.source_id = ${quoteSql(scope.source_id)}
-      AND l.locked_by = json_extract(r.metadata_json, '$.${RUN_FENCE_METADATA_KEY}.owner')
-      AND l.locked_at = json_extract(r.metadata_json, '$.${RUN_FENCE_METADATA_KEY}.locked_at')
-      AND julianday(l.locked_at) IS NOT NULL AND l.locked_at > ${quoteSql(cutoff)}
-      AND s.cursor_json IS r.cursor_before_json AND s.cursor_json IS ${quoteSql(scopeCursorJson(scope))}
+  return `${runFenceGuardSql(scope, runId, now, { assert: true, extraPredicate: `s.cursor_json IS ${quoteSql(scopeCursorJson(scope))}
       AND json_object('chat_id', json_extract(s.config_json, '$.chat_id')) IS json_extract(r.metadata_json, '$.${RUN_FENCE_METADATA_KEY}.scope_config')
       AND json_object('chat_id', json_extract(s.config_json, '$.chat_id')) IS ${quoteSql(larkScopeIdentity(scope))}
       AND COALESCE((SELECT generation FROM lark_im_list_progress WHERE scope_id = s.id), 0)
         = json_extract(r.metadata_json, '$.${RUN_FENCE_METADATA_KEY}.list_generation')
       AND NOT EXISTS (SELECT 1 FROM lark_im_list_progress p WHERE p.scope_id = s.id
-        AND (p.anchor_cursor_json IS NOT s.cursor_json OR p.scope_config_json IS NOT json_object('chat_id', json_extract(s.config_json, '$.chat_id'))));
-    CREATE TEMP TABLE __lark_guard (allowed INTEGER NOT NULL CHECK (allowed = 1));
-    INSERT INTO __lark_guard SELECT CASE WHEN EXISTS (SELECT 1 FROM __run_fence_guard) THEN 1 ELSE 0 END;
-  `;
+        AND (p.anchor_cursor_json IS NOT s.cursor_json OR p.scope_config_json IS NOT json_object('chat_id', json_extract(s.config_json, '$.chat_id'))))` })}
+    CREATE TEMP TABLE __lark_guard (allowed INTEGER NOT NULL CHECK (allowed = 1));`;
 }
 
 /** Finish list or detail work using only durable coverage and debt as evidence. */
@@ -1640,6 +1611,7 @@ export {
   ownerStartedAtMs,
   defaultOwnerState,
   recoverStaleSyncState,
+  runFenceGuardSql,
   quoteSql,
   readScope,
   releaseLock,
