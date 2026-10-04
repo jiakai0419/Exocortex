@@ -64,7 +64,7 @@ function fakeServiceDeps(overrides = {}) {
       if (state.run) return state.run(cmd, args, options, calls, state);
       if (cmd === "which") return spawnResult({ stdout: "/usr/local/bin/lark-cli\n" });
       if (cmd === "launchctl" && args[0] === "print") {
-        return state.launchdLoaded ? spawnResult({ stdout: "state = running\n" }) : spawnResult({ status: 113 });
+        return state.launchdLoaded ? spawnResult({ stdout: "state = running\n" }) : spawnResult({ status: 113, stderr: 'Could not find service "com.exocortex.lark-im-worker" in domain for user gui: 501' });
       }
       return spawnResult();
     },
@@ -279,7 +279,7 @@ test("service install writes plist and bootstraps LaunchAgent through injected d
         ["bootstrap", "gui/501", "/home/tester/Library/LaunchAgents/com.exocortex.lark-im-worker.plist"],
         {},
       ],
-      ["launchctl", ["kickstart", "-k", "gui/501/com.exocortex.lark-im-worker"], { allowFailure: true }],
+      ["launchctl", ["kickstart", "-k", "gui/501/com.exocortex.lark-im-worker"], {}],
     ],
   );
 });
@@ -289,12 +289,12 @@ test("service start kickstarts when LaunchAgent is already loaded", () => {
 
   runServiceCommand(parseArgs(["start"]), deps);
 
-  assert.equal(stdout.text(), "started com.exocortex.lark-im-worker\n");
+  assert.equal(stdout.text(), "start requested com.exocortex.lark-im-worker\n");
   assert.deepEqual(
     calls.filter((call) => call[0] === "run").map((call) => call.slice(1, 4)),
     [
       ["launchctl", ["print", "gui/501/com.exocortex.lark-im-worker"], { allowFailure: true }],
-      ["launchctl", ["kickstart", "-k", "gui/501/com.exocortex.lark-im-worker"], { allowFailure: true }],
+      ["launchctl", ["kickstart", "-k", "gui/501/com.exocortex.lark-im-worker"], {}],
     ],
   );
 });
@@ -304,7 +304,7 @@ test("service start bootstraps when LaunchAgent is installed but not loaded", ()
 
   runServiceCommand(parseArgs(["start"]), deps);
 
-  assert.equal(stdout.text(), "started com.exocortex.lark-im-worker\n");
+  assert.equal(stdout.text(), "start requested com.exocortex.lark-im-worker\n");
   assert.deepEqual(
     calls.filter((call) => call[0] === "run").map((call) => call.slice(1, 4)),
     [
@@ -314,13 +314,17 @@ test("service start bootstraps when LaunchAgent is installed but not loaded", ()
         ["bootstrap", "gui/501", "/home/tester/Library/LaunchAgents/com.exocortex.lark-im-worker.plist"],
         { allowFailure: true },
       ],
-      ["launchctl", ["kickstart", "-k", "gui/501/com.exocortex.lark-im-worker"], { allowFailure: true }],
+      ["launchctl", ["kickstart", "-k", "gui/501/com.exocortex.lark-im-worker"], {}],
     ],
   );
 });
 
 test("service stop bootouts both targets and verifies unloaded state", () => {
-  const { calls, deps, stdout } = fakeServiceDeps({ launchdLoaded: false });
+  let inspections = 0;
+  const { calls, deps, stdout } = fakeServiceDeps({ run: (cmd, args) => {
+    if (args[0] === "print") return inspections++ === 0 ? spawnResult({ stdout: "state = running\n" }) : spawnResult({ status: 113, stderr: 'Could not find service "com.exocortex.lark-im-worker" in domain for user gui: 501' });
+    return spawnResult();
+  } });
 
   runServiceCommand(parseArgs(["stop"]), deps);
 
@@ -328,6 +332,7 @@ test("service stop bootouts both targets and verifies unloaded state", () => {
   assert.deepEqual(
     calls.filter((call) => call[0] === "run").map((call) => call.slice(1, 4)),
     [
+      ["launchctl", ["print", "gui/501/com.exocortex.lark-im-worker"], { allowFailure: true }],
       ["launchctl", ["bootout", "gui/501/com.exocortex.lark-im-worker"], { allowFailure: true }],
       [
         "launchctl",
@@ -374,7 +379,7 @@ test("service restart stops then starts through the same stable wrapper", () => 
     plistExists: true,
     run: (cmd, args) => {
       if (cmd === "launchctl" && args[0] === "print") {
-        return spawnResult({ status: 113 });
+        return spawnResult({ status: 113, stderr: 'Could not find service "com.exocortex.lark-im-worker" in domain for user gui: 501' });
       }
       return spawnResult();
     },
@@ -382,12 +387,10 @@ test("service restart stops then starts through the same stable wrapper", () => 
 
   runServiceCommand(parseArgs(["restart"]), deps);
 
-  assert.equal(stdout.text(), "stopped com.exocortex.lark-im-worker\nstarted com.exocortex.lark-im-worker\n");
+  assert.equal(stdout.text(), "stopped com.exocortex.lark-im-worker\nstart requested com.exocortex.lark-im-worker\n");
   assert.deepEqual(
     calls.filter((call) => call[0] === "run").map((call) => call.slice(1, 3)),
     [
-      ["launchctl", ["bootout", "gui/501/com.exocortex.lark-im-worker"]],
-      ["launchctl", ["bootout", "gui/501", "/home/tester/Library/LaunchAgents/com.exocortex.lark-im-worker.plist"]],
       ["launchctl", ["print", "gui/501/com.exocortex.lark-im-worker"]],
       ["launchctl", ["print", "gui/501/com.exocortex.lark-im-worker"]],
       ["launchctl", ["bootstrap", "gui/501", "/home/tester/Library/LaunchAgents/com.exocortex.lark-im-worker.plist"]],
@@ -495,4 +498,82 @@ test("service status passes an explicit database and install rejects ignored DB 
     renderServiceStatusText: () => "",
   });
   assert.equal(seen.db, "/synthetic/custom.sqlite");
+});
+
+test("start and install propagate kickstart failures without claiming success", () => {
+  for (const command of ["start", "install"]) {
+    for (const loaded of [true, false]) {
+      const { deps, stdout } = fakeServiceDeps({ run: (cmd, args) => {
+        if (args[0] === "print") return loaded ? spawnResult() : spawnResult({ status: 113, stderr: 'Could not find service "com.exocortex.lark-im-worker" in domain for user gui: 501' });
+        if (args[0] === "kickstart") return spawnResult({ status: 5, stderr: "synthetic kickstart denied" });
+        return spawnResult();
+      } });
+      assert.throws(() => runServiceCommand(parseArgs([command]), deps), /launchctl failed: synthetic kickstart denied/);
+      assert.equal(stdout.text(), "");
+    }
+  }
+});
+
+test("start surfaces bootstrap errors but tolerates a concurrently loaded service", () => {
+  for (const concurrentlyLoaded of [false, true]) {
+    let prints = 0;
+    const { calls, deps, stdout } = fakeServiceDeps({ run: (cmd, args) => {
+      if (args[0] === "print") return prints++ > 0 && concurrentlyLoaded ? spawnResult() : spawnResult({ status: 113, stderr: 'Could not find service "com.exocortex.lark-im-worker" in domain for user gui: 501' });
+      if (args[0] === "bootstrap") return spawnResult({ status: 5, stderr: "synthetic bootstrap failure" });
+      return spawnResult();
+    } });
+    if (concurrentlyLoaded) {
+      runServiceCommand(parseArgs(["start"]), deps);
+      assert.match(stdout.text(), /^start requested /);
+    } else {
+      assert.throws(() => runServiceCommand(parseArgs(["start"]), deps), /synthetic bootstrap failure/);
+      assert.equal(stdout.text(), "");
+      assert.equal(calls.some((call) => call[0] === "run" && call[2][0] === "kickstart"), false);
+    }
+  }
+});
+
+test("inspection failures abort start, stop and uninstall without success or plist removal", () => {
+  const failures = [
+    { status: 1, stderr: "Operation not permitted" },
+    { status: 113, stderr: "Could not find domain for user gui: 501" },
+    { status: 1, stderr: 'Could not find service "com.exocortex.lark-im-worker" in domain for user gui: 501' },
+    { status: 113, stderr: "" },
+    { status: null, error: new Error("synthetic spawn failure") },
+    { status: null, signal: "SIGTERM" },
+  ];
+  for (const command of ["start", "stop", "uninstall"]) {
+    for (const failure of failures) {
+      const { calls, deps, stdout } = fakeServiceDeps({ run: (cmd, args) => args[0] === "print" ? spawnResult(failure) : spawnResult() });
+      assert.throws(() => runServiceCommand(parseArgs([command]), deps), /cannot inspect .*launchctl print failed/);
+      assert.equal(stdout.text(), "");
+      assert.equal(calls.some((call) => call[0] === "rm"), false);
+      assert.deepEqual(calls.filter((call) => call[0] === "run").map((call) => call[2][0]), ["print"]);
+    }
+  }
+});
+
+test("stop and uninstall cannot claim success when final inspection fails", () => {
+  for (const command of ["stop", "uninstall"]) {
+    let prints = 0;
+    const { calls, deps, stdout } = fakeServiceDeps({ run: (cmd, args) => {
+      if (args[0] === "print") return prints++ === 0 ? spawnResult() : spawnResult({ status: 1, stderr: "synthetic inspection failure" });
+      return spawnResult();
+    } });
+    assert.throws(() => runServiceCommand(parseArgs([command]), deps), /cannot inspect/);
+    assert.equal(stdout.text(), "");
+    assert.equal(calls.some((call) => call[0] === "rm"), false);
+    assert.equal(calls.filter((call) => call[0] === "run" && call[2][0] === "bootout").length, 2);
+  }
+});
+
+test("wait-ok does not accept a completed cycle followed by unfinished history", () => {
+  const summary = {
+    last_cycle: { cycle: 1, ok: true, at: "2026-06-20T00:00:01.000Z" },
+    in_progress: false,
+    unfinished_cycle: true,
+  };
+  const evaluation = evaluateWaitOkState(Date.parse("2026-06-20T00:00:00.000Z"), { health: "ok" }, summary);
+  assert.equal(evaluation.ready, false);
+  assert.match(evaluation.reason, /unfinished_cycle=true/);
 });

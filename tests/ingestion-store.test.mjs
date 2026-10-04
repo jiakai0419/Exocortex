@@ -19,6 +19,7 @@ import {
   createRun,
   ensureInitialized,
   failRun,
+  failRecordRun,
   isMaintenanceLocked,
   ownerPid,
   ownerStartedAtMs,
@@ -806,4 +807,66 @@ test("missing sqlite3 errors name the missing executable instead of dereferencin
   assert.equal(result.status, 7);
   assert.match(result.stderr, /sqlite3 executable not found \(ENOENT\)/);
   assert.doesNotMatch(result.stderr, /Cannot read properties/);
+});
+
+
+test("incomplete record run saves ordinary records atomically without successful coverage or cursor advance", (t) => {
+  const dbPath = tempDb(t);
+  const scope = installTestScope(dbPath);
+  const cursor = { kind: "test.cursor/v1", occurred_at_ms: record().occurred_at_ms };
+  succeedWithExplicitLock(dbPath, scope.id, [record()], cursor);
+  const before = readScope(dbPath, scope.id);
+  const markersBefore = sqliteQuery(dbPath, `SELECT cursor_json, cursor_updated_at, last_success_run_id FROM sync_scopes WHERE id='${scope.id}';`, "coverage markers before")[0];
+  const runId = createRun(dbPath, before, { fixture: true });
+  const partial = record({ external_id: "external:ordinary", content_hash: "synthetic-ordinary-hash" });
+  assert.deepEqual(failRecordRun(dbPath, before, runId, [partial], 2,
+    new Error("synthetic details incomplete"), { window_complete: false, missing_detail_count: 1 }),
+    { inserted: 1, updated: 0, duplicate: 0 });
+  const markersAfter = sqliteQuery(dbPath, `SELECT cursor_json, cursor_updated_at, last_success_run_id FROM sync_scopes WHERE id='${scope.id}';`, "coverage markers after")[0];
+  assert.deepEqual(markersAfter, markersBefore);
+  assert.equal(sqliteQuery(dbPath, `SELECT last_error_run_id FROM sync_scopes WHERE id='${scope.id}';`, "last error")[0].last_error_run_id, runId);
+  const run = sqliteQuery(dbPath, `SELECT * FROM sync_runs WHERE id=${runId};`, "read partial run")[0];
+  assert.equal(run.status, "failed");
+  assert.equal(run.cursor_after_json, null);
+  assert.equal(run.scanned_count, 2);
+  assert.equal(run.inserted_count, 1);
+  assert.equal(JSON.parse(run.metadata_json).window_complete, false);
+  assert.equal(sqliteQuery(dbPath, "SELECT COUNT(*) AS count FROM records;", "count records")[0].count, 2);
+  assert.equal(sqliteQuery(dbPath, "SELECT COUNT(*) AS count FROM sync_locks;", "count locks")[0].count, 0);
+});
+
+for (const corruption of ["lease replaced", "lease expired", "cursor changed", "run cancelled"]) {
+  test(`incomplete record commit rejects ${corruption} without writing records or run metadata`, (t) => {
+    const dbPath = tempDb(t);
+    const scope = installTestScope(dbPath);
+    const runId = createRun(dbPath, scope, { fixture: true });
+    const mutation = {
+      "lease replaced": "UPDATE sync_locks SET locked_by='fixture:replacement';",
+      "lease expired": "UPDATE sync_locks SET locked_at='2001-01-02T03:04:05.000Z'; UPDATE sync_runs SET metadata_json=json_set(metadata_json, '$.__run_fence.locked_at', '2001-01-02T03:04:05.000Z');",
+      "cursor changed": "UPDATE sync_scopes SET cursor_json='{\"kind\":\"test.cursor/v1\",\"occurred_at_ms\":17}';",
+      "run cancelled": "UPDATE sync_runs SET status='cancelled';",
+    }[corruption];
+    sqliteExec(dbPath, mutation, "mutate synthetic run authority");
+    const before = sqliteQuery(dbPath, `SELECT * FROM sync_runs WHERE id=${runId};`, "run before")[0];
+    assert.throws(() => failRecordRun(dbPath, scope, runId, [record()], 1,
+      new Error("synthetic missing details"), { window_complete: false }), /rejected/);
+    assert.equal(sqliteQuery(dbPath, "SELECT COUNT(*) AS count FROM records;", "count records")[0].count, 0);
+    assert.deepEqual(sqliteQuery(dbPath, `SELECT * FROM sync_runs WHERE id=${runId};`, "run after")[0], before);
+  });
+}
+
+
+test("incomplete record run rolls back every record and status update if a write fails", (t) => {
+  const dbPath = tempDb(t);
+  const scope = installTestScope(dbPath);
+  const runId = createRun(dbPath, scope, { fixture: true });
+  sqliteExec(dbPath, `CREATE TRIGGER reject_partial BEFORE INSERT ON records
+    WHEN NEW.external_id='external:rejected'
+    BEGIN SELECT RAISE(ABORT, 'synthetic partial write rejected'); END;`, "install partial rejection");
+  assert.throws(() => failRecordRun(dbPath, scope, runId,
+    [record(), record({ external_id: "external:rejected" })], 2,
+    new Error("synthetic incomplete details"), { window_complete: false }), /synthetic partial write rejected/);
+  assert.equal(sqliteQuery(dbPath, "SELECT COUNT(*) AS count FROM records;", "count rollback records")[0].count, 0);
+  assert.equal(sqliteQuery(dbPath, `SELECT status FROM sync_runs WHERE id=${runId};`, "rolled back run")[0].status, "running");
+  assert.equal(sqliteQuery(dbPath, `SELECT last_error_run_id FROM sync_scopes WHERE id='${scope.id}';`, "rolled back scope")[0].last_error_run_id, null);
 });

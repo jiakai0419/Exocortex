@@ -2,10 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { plain } from "../dist/terminal/index.js";
+import { summarizeWorkerEvents } from "../dist/runtime/worker/lark-im-worker-core.js";
 import {
   buildServiceStatusReport,
   buildServiceOverview,
   collectRecentFailureKinds,
+  classifyLaunchdPrint,
   parseJsonOutput,
   parseLaunchdState,
   summarizeWorkerStability,
@@ -261,7 +263,7 @@ test("service status report preserves not-loaded and sync-unavailable states", (
     {
       runCommand: (cmd) => {
         if (cmd === "launchctl") {
-          return spawnResult({ status: 113, stderr: "Could not find service" });
+          return spawnResult({ status: 113, stderr: 'Could not find service "com.example.worker" in domain for user gui: 501' });
         }
         return spawnResult({ status: 1, stderr: "sync unavailable" });
       },
@@ -282,7 +284,7 @@ test("service status report preserves not-loaded and sync-unavailable states", (
   assert.equal(report.launchd.loaded, false);
   assert.equal(report.overview.service.status, "stopped");
   assert.equal(report.overview.health.status, "problem");
-  assert.equal(report.overview.activity.status, "idle");
+  assert.equal(report.overview.activity.status, "unknown");
   assert.equal(report.sync.status, null);
   assert.match(report.sync.error_text, /sync unavailable/);
   assert.equal(report.worker.log.exists, false);
@@ -293,6 +295,7 @@ test("service overview separates service, health, activity, and freshness", () =
     launchd: { loaded: true, state: "running", pid: "123" },
     syncStatus: syncStatusFixture({
       health: "syncing",
+      locks: [{ locked_at: "2026-06-20T00:00:50.000Z", expires_at: "2026-06-20T00:02:00.000Z" }],
       scopes: {
         received_enabled: 2,
         received_without_cursor: 0,
@@ -366,13 +369,14 @@ test("service overview maps delayed and stale live caches to freshness states", 
 test("service overview can show sync activity from locks without claiming worker log progress", () => {
   const overview = buildServiceOverview({
     launchd: { loaded: true, state: "running", pid: "123" },
-    syncStatus: syncStatusFixture({ health: "syncing" }),
+    syncStatus: syncStatusFixture({ health: "syncing", locks: [{ locked_at: "2026-06-20T00:00:00.000Z", expires_at: "2026-06-20T00:02:00.000Z" }] }),
     workerSummary: workerSummaryFixture({ in_progress: false }),
+    nowMs: Date.parse("2026-06-20T00:01:00.000Z"),
   });
 
   assert.equal(overview.health.status, "ok");
   assert.equal(overview.activity.status, "syncing");
-  assert.equal(overview.activity.detail, "sync lock or run active");
+  assert.equal(overview.activity.detail, "unexpired sync lease observed");
 });
 
 test("service status view renders launchd, sync, unsupported scopes, and worker sections", () => {
@@ -522,4 +526,145 @@ test("freshness requires a bound nonempty sample with a current bounded lease", 
   assert.equal(read(base, probeContext, now - 120000).reason, "invalid_timestamp");
   assert.equal(read(base, probeContext, now + 240000).reason, "expired");
   assert.equal(read({ ...base, expires_at: "2027-01-01T00:00:00.000Z" }, probeContext, now + 240000).reason, "expired");
+});
+
+test("launchd missing-service classification requires matching status and diagnostic", () => {
+  const absent = 'Could not find service "com.example.worker" in domain for user gui: 501';
+  assert.equal(classifyLaunchdPrint(spawnResult()), "loaded");
+  assert.equal(classifyLaunchdPrint(spawnResult({ status: 113, stderr: absent })), "absent");
+  for (const failure of [
+    { status: 1, stderr: absent },
+    { status: 113, stderr: "Operation not permitted" },
+    { status: 113, stderr: "Could not find domain for user gui: 501" },
+    { status: 113, stderr: "" },
+    { status: null, signal: "SIGTERM" },
+    { status: 0, error: new Error("synthetic spawn failure") },
+  ]) assert.equal(classifyLaunchdPrint(spawnResult(failure)), "unknown");
+});
+
+test("unavailable launchd inspection is UNKNOWN in report and view, not stopped", () => {
+  const report = buildServiceStatusReport(
+    { label: "com.example.worker", target: "gui/501/com.example.worker", logDir: "logs/test" },
+    {
+      runCommand: (cmd) => cmd === "launchctl" ? spawnResult({ status: 1, stderr: "Operation not permitted" }) : spawnResult({ stdout: JSON.stringify(syncStatusFixture()) }),
+      readRecentWorkerEvents: () => ({ path: "worker.jsonl", exists: false, events: [] }),
+      readLiveProbeCache: () => null,
+      liveProbeContext: () => null,
+      sqliteJson: () => [],
+    },
+  );
+  assert.equal(report.service_state, "unknown");
+  assert.equal(report.launchd.loaded, null);
+  assert.equal(report.overview.service.status, "unknown");
+  assert.equal(report.overview.health.status, "problem");
+  const output = plain(renderServiceStatusText(report));
+  assert.match(output, /Service\s+UNKNOWN/);
+  assert.match(output, /Loaded\s+UNKNOWN/);
+  assert.doesNotMatch(output, /STOPPED|NOT LOADED/);
+});
+
+test("foreground leases establish activity even when background service is stopped", () => {
+  const now = Date.parse("2026-06-20T12:00:00.000Z");
+  const overview = buildServiceOverview({
+    launchd: { loaded: false },
+    syncStatus: syncStatusFixture({ health: "syncing", locks: [{ locked_at: "2026-06-20T11:59:00.000Z", expires_at: "2026-06-20T12:01:00.000Z" }] }),
+    workerSummary: { has_events: false, in_progress: false },
+    nowMs: now,
+  });
+  assert.equal(overview.service.status, "stopped");
+  assert.equal(overview.health.status, "problem");
+  assert.equal(overview.activity.status, "syncing");
+  assert.equal(overview.activity.detail, "unexpired sync lease observed");
+});
+
+test("expired, malformed, future and hard-expired leases cannot establish activity", () => {
+  const now = Date.parse("2026-06-20T12:00:00.000Z");
+  const leases = [
+    { locked_at: "2026-06-20T11:59:00.000Z", expires_at: "2026-06-20T12:00:00.000Z" },
+    { locked_at: "2026-06-20T12:00:01.000Z", expires_at: "2026-06-20T12:01:00.000Z" },
+    { locked_at: "invalid", expires_at: "2026-06-20T12:01:00.000Z" },
+    { locked_at: "2026-06-20T11:59:00.000Z", expires_at: "invalid" },
+    { locked_at: "2026-06-20T11:00:00.000Z", expires_at: "2026-06-20T12:01:00.000Z" },
+    { locked_at: "2026-05-18T12:00:00.000Z", expires_at: "2026-06-21T12:00:00.000Z" },
+  ];
+  for (const lease of leases) {
+    const overview = buildServiceOverview({
+      launchd: { loaded: true, state: "running" },
+      syncStatus: syncStatusFixture({ health: "syncing", locks: [lease] }),
+      workerSummary: workerSummaryFixture(),
+      nowMs: now,
+    });
+    assert.equal(overview.activity.status, "unknown");
+    assert.equal(overview.health.status, "problem");
+    assert.match(overview.health.detail, /no current activity evidence/);
+  }
+});
+
+test("unfinished steps or running rows without leases never masquerade as active sync", () => {
+  const now = Date.parse("2026-06-20T12:00:00.000Z");
+  for (const at of ["2026-05-18T12:00:00.000Z", "2026-06-20T11:59:59.000Z"]) {
+    const workerSummary = summarizeWorkerEvents([{ type: "lark_im_worker_step", cycle: 91, name: "sent", ok: true, finished_at: at }], now);
+    for (const loaded of [true, false]) {
+      const overview = buildServiceOverview({
+        launchd: { loaded, state: loaded ? "running" : null },
+        syncStatus: syncStatusFixture({ health: "syncing", runs: { by_status: { running: 1 } } }),
+        workerSummary,
+        nowMs: now,
+      });
+      assert.equal(overview.activity.status, "unknown");
+      assert.equal(overview.health.status, "problem");
+      assert.equal(workerSummary.last_step.cycle, 91);
+    }
+  }
+  const completed = buildServiceOverview({
+    launchd: { loaded: false }, syncStatus: syncStatusFixture(), workerSummary: workerSummaryFixture(), nowMs: now,
+  });
+  assert.equal(completed.activity.status, "idle");
+  const unavailable = buildServiceOverview({
+    launchd: { loaded: false }, syncStatus: null, workerSummary: workerSummaryFixture(), nowMs: now,
+  });
+  assert.equal(unavailable.activity.status, "unknown");
+  assert.match(unavailable.activity.detail, /sync status unavailable/);
+});
+
+test("catch-up detail does not repeat a stale raw syncing claim", () => {
+  const overview = buildServiceOverview({
+    launchd: { loaded: true, state: "running" },
+    syncStatus: syncStatusFixture({
+      health: "syncing", health_detail: "worker is currently syncing",
+      scopes: { received_without_cursor: 1 },
+    }),
+    workerSummary: workerSummaryFixture(),
+  });
+  assert.equal(overview.health.status, "catching_up");
+  assert.equal(overview.activity.status, "unknown");
+  assert.equal(overview.health.detail, "known scopes still need catch-up");
+});
+
+test("current lease permits recovery activity after a failed historical cycle", () => {
+  const overview = buildServiceOverview({
+    launchd: { loaded: true, state: "running" },
+    syncStatus: syncStatusFixture({ health: "syncing", locks: [{ locked_at: "2026-06-20T11:59:00.000Z", expires_at: "2026-06-20T12:01:00.000Z" }] }),
+    workerSummary: workerSummaryFixture({ last_cycle: { cycle: 1, ok: false }, in_progress: false }),
+    nowMs: Date.parse("2026-06-20T12:00:00.000Z"),
+  });
+  assert.equal(overview.health.status, "ok");
+  assert.equal(overview.activity.status, "syncing");
+  assert.match(overview.health.detail, /does not verify remote freshness/);
+});
+
+test("failed sync subprocess cannot establish activity with otherwise valid JSON", () => {
+  const report = buildServiceStatusReport(
+    { label: "com.example.worker", target: "gui/501/com.example.worker", logDir: "logs/test" },
+    {
+      runCommand: (cmd) => cmd === "launchctl" ? spawnResult({ stdout: "state = running\n" }) : spawnResult({ status: 1, stdout: JSON.stringify(syncStatusFixture()) }),
+      readRecentWorkerEvents: () => ({ path: "worker.jsonl", exists: false, events: [] }),
+      readLiveProbeCache: () => null,
+      liveProbeContext: () => null,
+      sqliteJson: () => [],
+    },
+  );
+  assert.equal(report.sync.status, null);
+  assert.equal(report.overview.activity.status, "unknown");
+  assert.equal(report.overview.health.status, "problem");
 });

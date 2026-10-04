@@ -86,7 +86,7 @@ function quoteSql(value) {
   return `'${String(value).replaceAll("'", "''")}'`;
 }
 
-function installFakeLarkCli(dir, { dbPath = null, beforeSelfSql = "", assertNoMaintenanceLock = false } = {}) {
+function installFakeLarkCli(dir, { dbPath = null, beforeSelfSql = "", assertNoMaintenanceLock = false, denyLookups = false, contactUsers = null } = {}) {
   const path = join(dir, "fake-lark-cli.mjs");
   writeFileSync(
     path,
@@ -111,6 +111,14 @@ if (args.join(" ") === "contact +get-user --as user --format json") {
     }
   }
   process.stdout.write(JSON.stringify(${JSON.stringify(LAB.self)}));
+  process.exit(0);
+}
+if (${JSON.stringify(denyLookups)}) {
+  process.stderr.write('synthetic permission denied');
+  process.exit(1);
+}
+if (args[0] === 'contact' && args[1] === '+search-user' && ${JSON.stringify(contactUsers)} !== null) {
+  process.stdout.write(JSON.stringify({ users: ${JSON.stringify(contactUsers)} }));
   process.exit(0);
 }
 process.stderr.write("unexpected lark-cli call: " + args.join(" "));
@@ -551,3 +559,73 @@ for (const replacement of [false, true]) {
     }
   });
 }
+
+
+test("failed app probe keeps existing name and provenance byte-stable", (t) => {
+  const fixture = enrichmentFixture(t, { denyLookups: true, record: {
+    sender: { id: LAB.app.id, sender_type: "app" },
+    canonical: { chat_name: LAB.room.name, sender_name: LAB.app.name,
+      sender_name_source: "application_api", sender_name_confidence: "high" },
+  } });
+  const before = readRecords(fixture.dbPath);
+  const result = runEnrichment(fixture, ["--probe-apps"]);
+  assert.equal(result.status, 0, result.stderr);
+  const summary = JSON.parse(result.stdout);
+  assert.equal(summary.app_lookup_permission_denied, 1);
+  assert.equal(summary.updated, 0);
+  assert.deepEqual(readRecords(fixture.dbPath), before);
+});
+
+test("explicit cleared app name survives failed enrichment without unknown diagnostics churn", (t) => {
+  const fixture = enrichmentFixture(t, { denyLookups: true, record: {
+    sender: { id: LAB.app.id, name: "Historical Counter Name", sender_type: "app" },
+    canonical: { chat_name: LAB.room.name, sender_name: null, sender_name_state: "cleared",
+      sender_name_source: "synthetic_authority", sender_name_confidence: "high" },
+  } });
+  const before = readRecords(fixture.dbPath);
+  const result = runEnrichment(fixture, ["--probe-apps"]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).updated, 0);
+  assert.deepEqual(readRecords(fixture.dbPath), before);
+});
+
+test("fresh partner lookup replaces explicit clear and removes its clear marker once", (t) => {
+  const partnerId = "ou_fixture_pendulum_reader";
+  const fixture = enrichmentFixture(t, {
+    contactUsers: [{ open_id: partnerId, name: "Pendulum Reader" }],
+    record: { canonical: { chat_name: LAB.room.name,
+      chat_partner: { open_id: partnerId, name: null, name_state: "cleared" } } },
+  });
+  const before = readRecords(fixture.dbPath)[0];
+  const result = runEnrichment(fixture);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).updated, 1);
+  const after = readRecords(fixture.dbPath)[0];
+  const partner = JSON.parse(after.canonical_json).chat_partner;
+  assert.equal(partner.name, "Pendulum Reader");
+  assert.equal(partner.name_state, undefined);
+  for (const field of ["raw_json", "content_hash", "external_version", "body"]) assert.equal(after[field], before[field]);
+  const repeated = runEnrichment(fixture);
+  assert.equal(repeated.status, 0, repeated.stderr);
+  assert.equal(JSON.parse(repeated.stdout).updated, 0);
+  assert.deepEqual(readRecords(fixture.dbPath)[0], after);
+});
+
+test("fresh contact lookup replaces a cleared sender with current provenance", (t) => {
+  const personId = "ou_fixture_pendulum_maker";
+  const fixture = enrichmentFixture(t, {
+    contactUsers: [{ open_id: personId, name: "Pendulum Maker" }],
+    record: { sender: { id: personId, sender_type: "user" }, canonical: {
+      chat_name: LAB.room.name, sender_name: null, sender_name_state: "cleared",
+      sender_name_source: "synthetic_authority", sender_name_confidence: "high",
+    } },
+  });
+  const result = runEnrichment(fixture);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).updated, 1);
+  const canonical = JSON.parse(readRecords(fixture.dbPath)[0].canonical_json);
+  assert.equal(canonical.sender_name, "Pendulum Maker");
+  assert.equal(canonical.sender_name_state, undefined);
+  assert.equal(canonical.sender_name_source, "contact");
+  assert.equal(canonical.sender_name_confidence, "high");
+});

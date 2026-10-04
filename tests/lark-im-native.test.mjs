@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createLarkImAdapter } from "../src/adapters/lark-im/adapter.mjs";
+import { MessageDetailsIncompleteError, MessageWindowBudgetError } from "../src/adapters/lark-im/core.mjs";
 import { recordFromMessage } from "../src/adapters/lark-im/message-record.mjs";
 import { transportOperation } from "../src/adapters/lark-im/transport.mjs";
 import { PaginationLimitError } from "../dist/core/sync.js";
@@ -359,7 +360,13 @@ test("native merge rejects duplicate, orphan, cyclic, invalid-parent and overdee
   for (const changedRoot of [merge(root.message_id, { update_time: String(BASE_MS + 9_999) }),
     merge(root.message_id, { body: { content: PRIVATE } })]) {
     const h = harness((call) => call.path === LIST ? page([root]) : details([changedRoot, raw("om_child")]));
-    rejectsSafely(() => h.received(), /source changed/);
+    assert.throws(() => h.received(), (error) => {
+      assert.ok(error instanceof MessageDetailsIncompleteError);
+      assert.deepEqual(error.messages, []);
+      assert.equal(error.missingDetails[0].reason, "source_changed");
+      assert.doesNotMatch(error.message, new RegExp(PRIVATE));
+      return true;
+    });
     assert.equal(h.calls.length, 2);
   }
 });
@@ -418,4 +425,48 @@ test("native endpoint routing preserves operation cooldown buckets without priva
   assert.equal(transportOperation(["api", "GET", MGET]), "message_search_bundle");
   assert.equal(transportOperation(["api", "GET", `${LIST}/om_synthetic`]), "message_history_bundle");
   assert.equal(transportOperation(["api", "GET", `${LIST}/om_synthetic/resources/file_synthetic`]), "other");
+});
+
+test("merge detail permissions preserve validated ordinary messages across complete list pagination", () => {
+  for (const kind of ["restricted_mode", "bot_user_out_of_chat", "permission_denied"]) {
+    const root = merge("om_denied_root");
+    const h = harness((call) => {
+      if (call.path !== LIST) throw new Error(`lark-cli failed: kind=${kind}; ${PRIVATE}`);
+      return call.params.page_token ? page([root, raw("om_after")])
+        : page([raw("om_before"), root], true, "next");
+    });
+    assert.throws(() => h.received(), (error) => {
+      assert.ok(error instanceof MessageDetailsIncompleteError);
+      assert.deepEqual(error.messages.map((item) => item.message_id), ["om_before", "om_after"]);
+      assert.equal(error.pages, 2);
+      assert.deepEqual(error.missingDetails, [{ message_id: root.message_id, reason: kind }]);
+      assert.doesNotMatch(error.message, /synthetic-private|om_denied_root|kind=/);
+      return true;
+    });
+    assert.deepEqual(h.calls.map((call) => call.path), [LIST, `${LIST}/${root.message_id}`, LIST]);
+  }
+});
+
+test("a list failure following missing details still rejects all incomplete pagination", () => {
+  const root = merge("om_denied_root");
+  const failure = new Error("lark-cli failed: kind=network_error retry_exhausted=1");
+  const h = harness((call) => {
+    if (call.path !== LIST) throw new Error("kind=restricted_mode");
+    if (call.params.page_token) throw failure;
+    return page([raw("om_validated"), root], true, "next");
+  });
+  assert.throws(() => h.received(), (error) => error === failure);
+});
+
+test("only a request timeout consuming the shared deadline becomes a window-budget signal", () => {
+  for (const [elapsed, kind, expectedBudget] of [[120_000, "network_timeout", false],
+    [180_000, "network_timeout", true], [180_000, "rate_limited", false],
+    [180_000, "restricted_mode", false]]) {
+    let ms = 0;
+    const failure = new Error(`lark-cli failed: kind=${kind} retry_exhausted=1`);
+    const h = harness(() => { ms += elapsed; throw failure; }, () => ms);
+    assert.throws(() => h.received(), (error) => expectedBudget
+      ? error instanceof MessageWindowBudgetError && error.cause === failure : error === failure);
+    assert.equal(h.calls.length, 1);
+  }
 });

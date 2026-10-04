@@ -3,6 +3,8 @@ import test from "node:test";
 
 import {
   fetchMessageWindowWithBisection,
+  MessageWindowBudgetError,
+  MessageDetailsIncompleteError,
   prepareRecords,
   readBoundedPages,
 } from "../src/adapters/lark-im/core.mjs";
@@ -156,4 +158,73 @@ test("message window bisection fails explicitly when one cursor unit is saturate
     }, startMs, startMs + 60_000),
     /one 60000ms message window still exceeds the page limit/,
   );
+});
+
+test("a shared native deadline shrinks a month window directly to one aligned cursor unit", () => {
+  const startMs = Date.parse("2026-07-01T00:00:30.125Z");
+  const target = startMs + 33 * 86_400_000;
+  const minimum = Date.parse("2026-07-01T00:01:00.000Z");
+  const calls = [];
+  const result = fetchMessageWindowWithBisection((start, end) => {
+    calls.push([start, end]);
+    if (end !== minimum) throw new MessageWindowBudgetError("message_history_bundle");
+    return { messages: [], pages: 1 };
+  }, startMs, target);
+  assert.deepEqual(calls, [[startMs, target], [startMs, minimum]]);
+  assert.equal(result.window_end_ms, minimum);
+  assert.equal(result.window_bisections, 1);
+});
+
+test("an exhausted smallest prefix stops after one timeout retry without fabricating progress", () => {
+  const startMs = Date.parse("2026-07-01T00:00:00Z");
+  for (const width of [0, 30_000, 60_000, 33 * 86_400_000]) {
+    let calls = 0;
+    assert.throws(() => fetchMessageWindowWithBisection(() => {
+      calls += 1;
+      throw new MessageWindowBudgetError("message_search_bundle");
+    }, startMs, startMs + width), (error) => {
+      assert.equal(error.name, "MessageWindowBudgetSaturatedError");
+      assert.match(error.message, /shared time budget/);
+      return true;
+    });
+    assert.equal(calls, width > 60_000 ? 2 : 1);
+  }
+});
+
+test("ordinary transport timeouts and rate limits never trigger window bisection", () => {
+  for (const kind of ["network_timeout", "rate_limited", "permission_denied", "network_error"]) {
+    const error = new Error(`lark-cli failed: kind=${kind} retry_exhausted=1`);
+    let calls = 0;
+    assert.throws(() => fetchMessageWindowWithBisection(() => {
+      calls += 1;
+      throw error;
+    }, 0, 33 * 86_400_000), (actual) => actual === error);
+    assert.equal(calls, 1);
+  }
+});
+
+test("incomplete detail evidence retains the actual smaller attempted window and never returns success", () => {
+  const failure = new MessageDetailsIncompleteError([], 1, [{ message_id: "synthetic-root", reason: "restricted_mode" }]);
+  let calls = 0;
+  assert.throws(() => fetchMessageWindowWithBisection(() => {
+    calls += 1;
+    if (calls === 1) throw new MessageWindowBudgetError("message_history_bundle");
+    throw failure;
+  }, 0, 10 * 60_000), (error) => error === failure);
+  assert.equal(failure.windowEndMs, 60_000);
+  assert.equal(failure.windowBisections, 1);
+  assert.equal(calls, 2);
+});
+
+test("a page cap followed by a shared deadline permits only the remaining minimum-prefix attempt", () => {
+  const ends = [];
+  const result = fetchMessageWindowWithBisection((_start, end) => {
+    ends.push(end);
+    if (ends.length === 1) throw new PaginationLimitError("synthetic page cap", 2);
+    if (ends.length === 2) throw new MessageWindowBudgetError("message_history_bundle");
+    return { messages: [], pages: 1 };
+  }, 0, 8 * 60_000);
+  assert.deepEqual(ends, [8 * 60_000, 4 * 60_000, 60_000]);
+  assert.equal(result.window_end_ms, 60_000);
+  assert.equal(result.window_bisections, 2);
 });

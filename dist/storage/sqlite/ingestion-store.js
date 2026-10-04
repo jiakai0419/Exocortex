@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { mergeLarkNameProjectionSql } from "./lark-name-projection.js";
 import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, } from "node:fs";
 import { dirname, resolve, } from "node:path";
@@ -734,8 +735,17 @@ const MUTABLE_RECORD_COLUMNS = [
     "canonical_json",
     "raw_json",
 ];
+function mergedCanonicalSql(existingAlias, incomingAlias) {
+    const existing = existingAlias;
+    const incoming = incomingAlias;
+    return `(CASE WHEN ${existing}.source_id = 'lark.im' AND ${incoming}.source_id = 'lark.im'
+    AND ${existing}.record_type = 'lark.im.message' AND ${incoming}.record_type = 'lark.im.message'
+    THEN ${mergeLarkNameProjectionSql(`${existing}.canonical_json`, `${incoming}.canonical_json`, `${existing}.actor_id`, `${incoming}.actor_id`, `${existing}.container_id`, `${incoming}.container_id`)}
+    ELSE ${incoming}.canonical_json END)`;
+}
 function recordDiffSql(existingAlias, incomingAlias) {
-    return `(${MUTABLE_RECORD_COLUMNS.map((column) => `${existingAlias}.${column} IS NOT ${incomingAlias}.${column}`).join(" OR ")})`;
+    return `(${MUTABLE_RECORD_COLUMNS.map((column) => `${existingAlias}.${column} IS NOT ${column === "canonical_json"
+        ? mergedCanonicalSql(existingAlias, incomingAlias) : `${incomingAlias}.${column}`}`).join(" OR ")})`;
 }
 function strictlyNewerVersionSql(existingAlias, incomingAlias) {
     const existing = `${existingAlias}.external_version`;
@@ -798,7 +808,7 @@ ON CONFLICT(source_id, external_id) DO UPDATE SET
   title = excluded.title,
   body = excluded.body,
   content_hash = excluded.content_hash,
-  canonical_json = excluded.canonical_json,
+  canonical_json = ${mergedCanonicalSql("records", "excluded")},
   raw_json = excluded.raw_json,
   updated_at = excluded.updated_at
 WHERE ${(options.strictVersionIncrease ? strictlyNewerVersionSql : versionCanReplaceSql)("records", "excluded")}
@@ -960,7 +970,7 @@ CREATE TEMP TABLE __incoming_records (
 ${inserts}
 `;
 }
-function succeedRecordRun(dbPath, scope, runId, records, scannedCount, cursor, metadata) {
+function finishRecordRun(dbPath, scope, runId, records, scannedCount, cursor, metadata, error = null) {
     const id = checkedRunId(runId);
     validateRecordCursor(cursor, "record cursor");
     const cursorJsonSql = sqlJson(cursor);
@@ -998,7 +1008,7 @@ function succeedRecordRun(dbPath, scope, runId, records, scannedCount, cursor, m
       AND julianday(l.locked_at) IS NOT NULL
       AND l.locked_at > ${quoteSql(hardLeaseCutoff)}
       AND s.cursor_json IS r.cursor_before_json
-      AND ${cursorCanAdvanceSql("r.cursor_before_json", cursorJsonSql)};
+      AND ${error ? "1" : cursorCanAdvanceSql("r.cursor_before_json", cursorJsonSql)};
 ${incomingRecordsSql(normalizedRecords)}
     CREATE TEMP TABLE __write_effects (
       inserted INTEGER NOT NULL,
@@ -1037,14 +1047,16 @@ ${incomingRecordsSql(normalizedRecords)}
       title = excluded.title,
       body = excluded.body,
       content_hash = excluded.content_hash,
-      canonical_json = excluded.canonical_json,
+      canonical_json = ${mergedCanonicalSql("records", "excluded")},
       raw_json = excluded.raw_json,
       updated_at = excluded.updated_at
     WHERE ${versionCanReplaceSql("records", "excluded")}
       AND ${recordDiffSql("records", "excluded")};
     UPDATE sync_runs
-    SET status = 'succeeded',
-        cursor_after_json = ${cursorJsonSql},
+    SET status = ${quoteSql(error ? "failed" : "succeeded")},
+        cursor_after_json = ${error ? "cursor_after_json" : cursorJsonSql},
+        error_type = ${quoteSql(error ? error.name || "Error" : null)},
+        error_message = ${quoteSql(error ? String(error.message || error).slice(0, 4000) : null)},
         finished_at = ${quoteSql(now)},
         scanned_count = ${Number(scannedCount)},
         inserted_count = (SELECT inserted FROM __write_effects),
@@ -1054,9 +1066,9 @@ ${incomingRecordsSql(normalizedRecords)}
     WHERE id = ${id}
       AND EXISTS (SELECT 1 FROM __run_fence_guard);
     UPDATE sync_scopes
-    SET cursor_json = ${cursorJsonSql},
+    SET ${error ? `last_error_run_id = ${id}` : `cursor_json = ${cursorJsonSql},
         cursor_updated_at = ${quoteSql(now)},
-        last_success_run_id = ${id},
+        last_success_run_id = ${id}`},
         updated_at = ${quoteSql(now)}
     WHERE id = ${quoteSql(scope.id)}
       AND EXISTS (SELECT 1 FROM __run_fence_guard);
@@ -1071,9 +1083,9 @@ ${incomingRecordsSql(normalizedRecords)}
       COALESCE((SELECT updated FROM __write_effects), 0) AS updated,
       COALESCE((SELECT duplicate FROM __write_effects), 0) AS duplicate;
     COMMIT;
-    `, `succeed run ${id}`);
+    `, `${error ? "fail" : "succeed"} record run ${id}`);
     if (Number(rows[0]?.fenced || 0) !== 1) {
-        throw new Error(`succeed run ${id} rejected: stale, cancelled, mismatched, or unfenced run`);
+        throw new Error(`${error ? "fail" : "succeed"} run ${id} rejected: stale, cancelled, mismatched, or unfenced run`);
     }
     return {
         inserted: Number(rows[0]?.inserted || 0),
@@ -1081,5 +1093,12 @@ ${incomingRecordsSql(normalizedRecords)}
         duplicate: Number(rows[0]?.duplicate || 0),
     };
 }
+function succeedRecordRun(dbPath, scope, runId, records, scannedCount, cursor, metadata) {
+    return finishRecordRun(dbPath, scope, runId, records, scannedCount, cursor, metadata);
+}
+/** Save validated records from an incomplete window without claiming coverage. */
+function failRecordRun(dbPath, scope, runId, records, scannedCount, error, metadata) {
+    return finishRecordRun(dbPath, scope, runId, records, scannedCount, null, metadata, error);
+}
 const succeedMessageRun = succeedRecordRun;
-export { DEFAULT_HARD_LEASE_SECONDS, acquireLock, acquireMaintenanceLock, countWriteEffects, commitBoundedReplayRecords, normalizeBoundedReplayRecords, createRun, ensureInitialized, ensureSourceInitialSyncStart, existingRecordMap, failRun, isMaintenanceLocked, normalizeExternalVersion, normalizeStoredRecords, ownerPid, ownerStartedAtMs, defaultOwnerState, recoverStaleSyncState, quoteSql, readScope, releaseLock, releaseMaintenanceLock, secureDatabasePaths, sqlJson, sqliteExec, sqliteQuery, succeedMessageRun, succeedRecordRun, upsertRecordsSql, validateInitialSyncStartMs, };
+export { DEFAULT_HARD_LEASE_SECONDS, acquireLock, acquireMaintenanceLock, countWriteEffects, commitBoundedReplayRecords, normalizeBoundedReplayRecords, createRun, ensureInitialized, ensureSourceInitialSyncStart, existingRecordMap, failRun, failRecordRun, isMaintenanceLocked, normalizeExternalVersion, normalizeStoredRecords, ownerPid, ownerStartedAtMs, defaultOwnerState, recoverStaleSyncState, quoteSql, readScope, releaseLock, releaseMaintenanceLock, secureDatabasePaths, sqlJson, sqliteExec, sqliteQuery, succeedMessageRun, succeedRecordRun, upsertRecordsSql, validateInitialSyncStartMs, };

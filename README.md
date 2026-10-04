@@ -6,7 +6,7 @@
 
 ## Development
 
-需要 Node.js 22、npm、SQLite CLI 和 Python 3。
+需要 Node.js 22、npm、SQLite CLI 3.35 或更新版本（含 JSON 函数）和 Python 3。
 
 ```sh
 npm ci
@@ -42,6 +42,9 @@ python3 -B scripts/lark-im-coverage-check.py --target "$COVERAGE_TARGET_ISO"
 - 同步记录、统计和游标在事务内提交，校验运行租约与版本。默认只读诊断不恢复遗留状态；手动修复使用 `sync-repair --apply`，同步写路径取得 scope 锁前仍会自动检查并恢复该 scope 的 stale 状态。
 - 备份先验证再发布，自动清理仅处理同一来源的有效备份。
 - received 使用原生分页并包含主题回复；sent 使用搜索与 mget 核对详情；原始内容和主题关系保留。
+- 合并转发详情失败不禁用整个会话：完整取得的记录可随失败 run 保存，缺失详情可重试，未完整窗口不推进游标。原生窗口耗尽总时间预算后只再尝试一个最小可推进前缀。
+- service 区分未加载与无法确认，启动请求失败会报错；已结束的历史 step 不证明当前同步，活动需要有效租约证据。
+- 同步与姓名补全共用合并规则：同一身份的未知姓名保留已有值，明确清空与解析失败分开，同版本投影改善仍可写入。
 - hot/fair 队列轮转并保留公平容量。自适应为可选参数；操作组冷却与重试预算不等于逐 endpoint QPS 限流。
 
 这些是代码能力，不能代替当前环境的运行验收。详细参数、默认值和边界见 [Operations](docs/operations.md)。
@@ -53,3 +56,4 @@ python3 -B scripts/lark-im-coverage-check.py --target "$COVERAGE_TARGET_ISO"
 - [Sync hardening design](docs/sync-core-hardening-plan.md)
 - [Language and module boundaries](docs/language-and-refactor-plan.md)
 - [Terminal experience](docs/terminal-experience.md)
+- [Node reliability fixes and regression evidence](docs/node-reliability-fixes.md)

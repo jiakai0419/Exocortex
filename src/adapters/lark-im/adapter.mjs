@@ -2,6 +2,9 @@
 
 import {
   assertValidLarkMessage,
+  MessageDetailsIncompleteError,
+  MessageWindowBudgetError,
+  isPaginationLimitError,
   parseLarkTimeMs,
   readBoundedPages,
 } from "./core.mjs";
@@ -289,16 +292,27 @@ function createLarkImAdapter({ run = runLark, clock = Date.now } = {}) {
     let detailItems = 0;
     /** @type {Map<string, JsonObject[]>} */
     const mergeCache = new Map();
+    /** @type {Map<string, {message_id: string, reason: string}>} */
+    const missingDetails = new Map();
     /** @param {string} method @param {string} path @param {JsonObject} params @param {JsonObject} [body] */
     const request = (method, path, params, body) => {
       const remaining = Math.floor(deadline - now());
       if (remaining <= 0) {
-        throw new Error(`lark-cli failed: kind=network_timeout operation=${operation} retry_exhausted=1`);
+        throw new MessageWindowBudgetError(operation);
       }
       const args = ["api", method, path, "--as", "user", "--params", JSON.stringify(params), "--format", "json"];
       if (body !== undefined) args.push("--data", JSON.stringify(body));
-      return run(args, { redactedFlags: ["--params", "--data"], retries: opts.retries,
-        retryDelayMs: opts.retryDelayMs, timeoutMs: Math.min(DEFAULT_LARK_CLI_TIMEOUT_MS, remaining), retryBudgetMs: remaining });
+      try {
+        return run(args, { redactedFlags: ["--params", "--data"], retries: opts.retries,
+          retryDelayMs: opts.retryDelayMs, timeoutMs: Math.min(DEFAULT_LARK_CLI_TIMEOUT_MS, remaining), retryBudgetMs: remaining });
+      } catch (error) {
+        // Only an exhausted shared deadline justifies a smaller time window.
+        // Permission, rate limits and ordinary request failures keep their meaning.
+        if (error instanceof Error && /\bkind=network_timeout\b/.test(error.message) && now() >= deadline) {
+          throw new MessageWindowBudgetError(operation, error);
+        }
+        throw error;
+      }
     };
     /** @param {JsonObject[]} messages */
     const normalize = (messages) => messages.filter((message) => {
@@ -306,43 +320,66 @@ function createLarkImAdapter({ run = runLark, clock = Date.now } = {}) {
       return created >= startMs && created <= endMs;
     }).map((message) => {
       if (message.msg_type !== "merge_forward") return normalizeApiMessage(message);
-      let items = mergeCache.get(message.message_id);
-      if (!items) {
-        /** @type {JsonObject[]} */
-        const collected = [];
-        const tokens = new Set();
-        let token = "";
-        for (;;) {
-          // Details consume the same page budget; the caller may retry a smaller complete time prefix.
-          if (detailCalls >= Math.min(opts.maxPages, 50)) {
-            throw new PaginationLimitError("merge-forward details exceed the bounded page budget", opts.maxPages);
+      if (missingDetails.has(message.message_id)) return null;
+      try {
+        let items = mergeCache.get(message.message_id);
+        if (!items) {
+          /** @type {JsonObject[]} */
+          const collected = [];
+          const tokens = new Set();
+          let token = "";
+          for (;;) {
+            // Details consume the same page budget; the caller may retry a smaller complete time prefix.
+            if (detailCalls >= Math.min(opts.maxPages, 50)) {
+              throw new PaginationLimitError("merge-forward details exceed the bounded page budget", opts.maxPages);
+            }
+            detailCalls += 1;
+            const json = request("GET", `/open-apis/im/v1/messages/${encodeURIComponent(message.message_id)}`,
+              { user_id_type: "open_id", card_msg_content_type: "raw_card_content", ...(token ? { page_token: token } : {}) });
+            const data = nativeData(json, "message-details");
+            const pageItems = nativeItems(data, "message-details");
+            assertRawMessagePage(pageItems, "message-details");
+            detailItems += pageItems.length;
+            if (detailItems > 1000) throw new PaginationLimitError("merge-forward details exceed the bounded item budget", opts.maxPages);
+            collected.push(...pageItems);
+            // The documented CLI detail path returns a single items array without pagination fields.
+            if (data.has_more === undefined) {
+              if (data.page_token != null && data.page_token !== "") throw new Error("message-details returned a token without has_more");
+              break;
+            }
+            const page = nativePage(json, "message-details", tokens);
+            if (!page.has_more) break;
+            token = page.page_token;
           }
-          detailCalls += 1;
-          const json = request("GET", `/open-apis/im/v1/messages/${encodeURIComponent(message.message_id)}`,
-            { user_id_type: "open_id", card_msg_content_type: "raw_card_content", ...(token ? { page_token: token } : {}) });
-          const data = nativeData(json, "message-details");
-          const pageItems = nativeItems(data, "message-details");
-          assertRawMessagePage(pageItems, "message-details");
-          detailItems += pageItems.length;
-          if (detailItems > 1000) throw new PaginationLimitError("merge-forward details exceed the bounded item budget", opts.maxPages);
-          collected.push(...pageItems);
-          // The documented CLI detail path returns a single items array without pagination fields.
-          if (data.has_more === undefined) {
-            if (data.page_token != null && data.page_token !== "") throw new Error("message-details returned a token without has_more");
-            break;
-          }
-          const page = nativePage(json, "message-details", tokens);
-          if (!page.has_more) break;
-          token = page.page_token;
+          if (!collected.length) throw new Error("message-details returned no merge-forward items");
+          assertMergeTree(message.message_id, collected);
+          items = collected;
+          mergeCache.set(message.message_id, items);
         }
-        if (!collected.length) throw new Error("message-details returned no merge-forward items");
-        assertMergeTree(message.message_id, collected);
-        items = collected;
-        mergeCache.set(message.message_id, items);
+        return normalizeApiMessage(message, { mergeItems: items });
+      } catch (error) {
+        // A detail denial says nothing about list access to this chat. Keep
+        // reading ordinary messages; do not turn a partial merge into a record
+        // that could erase an already stored complete expansion.
+        if (error instanceof MessageWindowBudgetError || isPaginationLimitError(error)) throw error;
+        const text = error instanceof Error ? error.message : "";
+        const kind = text.match(/\bkind=(restricted_mode|bot_user_out_of_chat|permission_denied|network_timeout|network_error|rate_limited|service_unavailable)\b/)?.[1];
+        const reason = isRestrictedModeError(error) ? "restricted_mode"
+          : isBotUserOutOfChatError(error) ? "bot_user_out_of_chat"
+          : text === "merge-forward source changed during detail retrieval" ? "source_changed"
+          : kind || "invalid_or_unavailable_details";
+        missingDetails.set(message.message_id, { message_id: message.message_id, reason });
+        return null;
       }
-      return normalizeApiMessage(message, { mergeItems: items });
-    });
-    return { request, normalize };
+    }).filter((message) => message !== null);
+    /** @param {MessageFetchResult} result */
+    const complete = (result) => {
+      if (missingDetails.size) {
+        throw new MessageDetailsIncompleteError(result.messages, result.pages, [...missingDetails.values()]);
+      }
+      return result;
+    };
+    return { request, normalize, complete };
   }
 
   /** @param {AdapterOptions} [opts] */
@@ -383,9 +420,9 @@ function createLarkImAdapter({ run = runLark, clock = Date.now } = {}) {
    */
   function fetchSentMessages(selfOpenId, startMs, endMs, opts) {
     assertFetchBounds(startMs, endMs, opts);
-    const { request, normalize } = nativeWindow(opts, "message_search_bundle", startMs, endMs);
+    const { request, normalize, complete } = nativeWindow(opts, "message_search_bundle", startMs, endMs);
     const tokens = new Set();
-    return readBoundedPages({
+    return complete(readBoundedPages({
       maxPages: opts.maxPages,
       missingPageTokenMessage: "messages-search returned has_more without page_token",
       maxPagesMessage: (maxPages) => `messages-search still has more data after ${maxPages} pages`,
@@ -427,7 +464,7 @@ function createLarkImAdapter({ run = runLark, clock = Date.now } = {}) {
           page_token: envelope.page_token,
         };
       },
-    });
+    }));
   }
 
   /**
@@ -438,9 +475,9 @@ function createLarkImAdapter({ run = runLark, clock = Date.now } = {}) {
    */
   function fetchChatMessages(chatIdValue, startMs, endMs, opts) {
     assertFetchBounds(startMs, endMs, opts);
-    const { request, normalize } = nativeWindow(opts, "message_history_bundle", startMs, endMs);
+    const { request, normalize, complete } = nativeWindow(opts, "message_history_bundle", startMs, endMs);
     const tokens = new Set();
-    return readBoundedPages({
+    return complete(readBoundedPages({
       maxPages: opts.maxPages,
       missingPageTokenMessage: "chat-messages-list returned has_more without page_token",
       maxPagesMessage: (maxPages) => `chat-messages-list still has more data after ${maxPages} pages`,
@@ -459,7 +496,7 @@ function createLarkImAdapter({ run = runLark, clock = Date.now } = {}) {
           page_token: envelope.page_token,
         };
       },
-    });
+    }));
   }
 
   /**

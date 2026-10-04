@@ -147,7 +147,7 @@ function renderServiceStatusText(report) {
   const stability = report.stability || null;
   const overview = report.overview || {
     service: {
-      status: report.service_state === "not loaded" ? "stopped" : "running",
+      status: report.service_state === "unknown" ? "unknown" : report.service_state === "not loaded" ? "stopped" : "running",
       detail: report.service_state || "unknown",
     },
     health: {
@@ -155,8 +155,8 @@ function renderServiceStatusText(report) {
       detail: syncStatus?.health_detail || report.sync?.error_text || "",
     },
     activity: {
-      status: workerSummary.in_progress ? "syncing" : "idle",
-      detail: workerSummary.in_progress ? "worker is currently syncing" : "worker is idle",
+      status: workerSummary.in_progress || workerSummary.unfinished_cycle || !syncStatus ? "unknown" : "idle",
+      detail: workerSummary.in_progress || workerSummary.unfinished_cycle || !syncStatus ? "current activity is unverified" : "no unfinished worker cycle observed",
     },
     freshness: {
       status: "unknown",
@@ -195,7 +195,7 @@ function renderServiceStatusText(report) {
     "",
     section("LaunchAgent"),
     kv([
-      ["Loaded", report.launchd?.loaded ? statusBadge("loaded") : statusBadge("not loaded")],
+      ["Loaded", report.launchd?.loaded === null || report.launchd?.loaded === undefined ? statusBadge("unknown") : report.launchd.loaded ? statusBadge("loaded") : statusBadge("not loaded")],
       ["State", report.launchd?.state || "unknown"],
       ["PID", report.launchd?.pid || "none"],
       ["Last exit", report.launchd?.last_exit_code || "none"],
@@ -266,7 +266,7 @@ function renderServiceStatusText(report) {
       ["Last cycle", formatWorkerCycle(workerSummary)],
       ["Last event", formatWorkerEvent(workerSummary)],
       ["Last step", formatWorkerStep(workerSummary)],
-      ["In progress", workerSummary.in_progress ? "yes" : "no"],
+      ["In progress", workerSummary.in_progress || workerSummary.unfinished_cycle ? "unknown (unfinished history)" : "no"],
       ["Last failure", formatWorkerFailure(workerSummary)],
       ["Log", workerLog.exists ? basename(workerLog.path) : `${basename(workerLog.path)} (missing)`],
     ]),

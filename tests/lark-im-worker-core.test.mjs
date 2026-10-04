@@ -295,7 +295,7 @@ test("compactSummary keeps worker logs small while preserving run confidence sig
   });
 });
 
-test("summarizeWorkerEvents reports heartbeat and in-progress cycles", () => {
+test("summarizeWorkerEvents retains unfinished history without claiming an active step", () => {
   const events = [
     {
       type: "lark_im_worker_step",
@@ -326,7 +326,8 @@ test("summarizeWorkerEvents reports heartbeat and in-progress cycles", () => {
   assert.equal(summary.last_cycle.ok, true);
   assert.equal(summary.last_step.cycle, 2);
   assert.equal(summary.last_step.name, "sent");
-  assert.equal(summary.in_progress, true);
+  assert.equal(summary.in_progress, false);
+  assert.equal(summary.unfinished_cycle, true);
   assert.equal(summary.last_event_age_ms, 30_000);
 });
 
@@ -355,4 +356,26 @@ test("summarizeWorkerEvents keeps the latest failure visible", () => {
   assert.equal(summary.last_failure.cycle, 1);
   assert.equal(summary.last_failure.age_ms, 175_000);
   assert.equal(shimSummarizeWorkerEvents([], Date.parse("2026-06-14T00:03:00.000Z")).has_events, false);
+});
+
+test("old, recent, future and malformed unfinished step history never proves active work", () => {
+  const now = Date.parse("2026-06-20T00:00:00.000Z");
+  for (const at of ["2026-05-18T00:00:00.000Z", "2026-06-19T23:59:59.000Z", "2026-06-20T00:00:01.000Z", "invalid", undefined]) {
+    const summary = summarizeWorkerEvents([{ type: "lark_im_worker_step", cycle: 91, name: "sent", ok: true, finished_at: at }], now);
+    assert.equal(summary.in_progress, false);
+    assert.equal(summary.unfinished_cycle, true);
+    assert.equal(summary.last_step.cycle, 91);
+  }
+});
+
+test("worker restart cycle numbers do not override later completion order", () => {
+  const events = [
+    { type: "lark_im_worker_step", cycle: 91, name: "sent", ok: true, finished_at: "2026-05-18T00:00:00.000Z" },
+    { type: "lark_im_worker_cycle", cycle: 1, ok: true, at: "2026-06-20T00:00:00.000Z" },
+  ];
+  const summary = summarizeWorkerEvents(events, Date.parse("2026-06-20T00:00:01.000Z"));
+  assert.equal(summary.in_progress, false);
+  assert.equal(summary.unfinished_cycle, false);
+  assert.equal(summary.last_step.cycle, 91);
+  assert.equal(summary.last_cycle.cycle, 1);
 });

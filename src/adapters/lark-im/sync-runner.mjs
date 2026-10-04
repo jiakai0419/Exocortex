@@ -12,6 +12,7 @@ import {
   acquireLock,
   createRun,
   failRun,
+  failRecordRun,
   isMaintenanceLocked,
   quoteSql,
   readScope,
@@ -22,6 +23,7 @@ import {
   succeedMessageRun,
 } from "../../../dist/storage/sqlite/ingestion-store.js";
 import {
+  MessageDetailsIncompleteError,
   CHAT_DISCOVERY_SCOPE_ID,
   CHAT_HOT_DISCOVERY_SCOPE_ID,
   CHAT_RECONCILE_SCOPE_ID,
@@ -116,6 +118,7 @@ const defaultDeps = {
   buildPeopleContext,
   createRun,
   failRun,
+  failRecordRun,
   fetchChatDiscoveryPage,
   fetchChatMessages,
   fetchSentMessages,
@@ -370,6 +373,40 @@ VALUES (CASE WHEN EXISTS (SELECT 1 FROM __lark_run_fence_guard) THEN 1 ELSE 0 EN
 `;
 }
 
+/** Persist validated records without promoting an incomplete window to coverage.
+ * Missing roots stay absent (or keep prior complete data); the unchanged cursor
+ * makes normal scheduling retry them. Metadata describes only aggregate reasons.
+ * @param {string} dbPath @param {ScopeRow} scope @param {number} runId
+ * @param {MessageDetailsIncompleteError} error @param {SyncOptions} opts
+ * @param {SelfProfile} selfProfile @param {number} startMs
+ * @param {"sent" | "received"} direction @param {SyncRunnerDeps} deps
+ * @returns {RunResult}
+ */
+function failIncompleteMessageWindow(dbPath, scope, runId, error, opts, selfProfile, startMs, direction, deps) {
+  const context = deps.buildPeopleContext(error.messages, opts, selfProfile, scope.config);
+  const records = direction === "sent"
+    ? prepareRecords(error.messages, scope.id, "sent", scope.cursor, opts.startMs, error.windowEndMs,
+      null, context, scope.config)
+    : prepareChatWindowRecords(error.messages, scope.id, scope.cursor, opts.startMs, error.windowEndMs,
+      selfProfile.open_id, context, scope.config || {});
+  /** @type {Record<string, number>} */
+  const reasons = {};
+  for (const missing of error.missingDetails) reasons[missing.reason] = (reasons[missing.reason] || 0) + 1;
+  const scanned = error.messages.length + error.missingDetails.length;
+  const effects = deps.failRecordRun(dbPath, scope, runId, records, scanned, error, {
+    adapter: direction === "sent" ? "lark.im.sent_by_me" : "lark.im.received_per_chat",
+    pages: error.pages,
+    window_complete: false,
+    attempted_window_start: localIsoFromMs(startMs),
+    attempted_window_end: localIsoFromMs(error.windowEndMs),
+    window_bisections: error.windowBisections,
+    missing_detail_count: error.missingDetails.length,
+    missing_detail_reasons: reasons,
+    stored_candidate_count: records.length,
+  });
+  return { ok: false, incomplete: true, error: error.message, scanned, records: records.length, ...effects };
+}
+
 /**
  * @param {string} dbPath
  * @param {SyncOptions} opts
@@ -380,12 +417,20 @@ VALUES (CASE WHEN EXISTS (SELECT 1 FROM __lark_run_fence_guard) THEN 1 ELSE 0 EN
 function syncSent(dbPath, opts, selfProfile, deps = defaultDeps) {
   return syncScope(dbPath, SENT_SCOPE_ID, opts, (scope, runId) => {
     const { startMs, endMs: targetEndMs } = messageWindow(scope, opts);
-    const fetched = fetchMessageWindowWithBisection(
-      (windowStartMs, windowEndMs) =>
-        deps.fetchSentMessages(selfProfile.open_id, windowStartMs, windowEndMs, opts),
-      startMs,
-      targetEndMs,
-    );
+    let fetched;
+    try {
+      fetched = fetchMessageWindowWithBisection(
+        (windowStartMs, windowEndMs) =>
+          deps.fetchSentMessages(selfProfile.open_id, windowStartMs, windowEndMs, opts),
+        startMs,
+        targetEndMs,
+      );
+    } catch (error) {
+      if (error instanceof MessageDetailsIncompleteError) {
+        return failIncompleteMessageWindow(dbPath, scope, runId, error, opts, selfProfile, startMs, "sent", deps);
+      }
+      throw error;
+    }
     const completedEndMs = Number(fetched.window_end_ms);
     const peopleContext = deps.buildPeopleContext(fetched.messages, opts, selfProfile, scope.config);
     const records = prepareRecords(
@@ -902,6 +947,9 @@ function syncReceivedScope(dbPath, opts, scope, selfProfile, deps = defaultDeps)
         targetEndMs,
       );
     } catch (error) {
+      if (error instanceof MessageDetailsIncompleteError) {
+        return failIncompleteMessageWindow(dbPath, lockedScope, runId, error, opts, selfProfile, startMs, "received", deps);
+      }
       if (deps.isRestrictedModeError(error)) {
         succeedUnsupportedRun(dbPath, lockedScope, runId, error, "restricted_mode", deps);
         return { ok: true, skipped: true, reason: "restricted_mode", scanned: 0, records: 0, inserted: 0, updated: 0, duplicate: 0 };

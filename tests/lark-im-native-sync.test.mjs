@@ -46,7 +46,7 @@ test("native root and replies commit atomically; later page failure retains curs
   const runner = createSyncRunner({ ...adapter, buildPeopleContext: () => ({ self: PROFILE,
     contacts: new Map(), chat_members: new Map(), apps: new Map(), app_fallbacks: new Map() }) });
   const initial = runner.syncReceivedScope(dbPath, opts(START + 60_000), readScope(dbPath, SCOPE), PROFILE);
-  assert.equal(initial.ok, true);
+  assert.equal(initial.ok, true, JSON.stringify(initial));
   assert.equal(initial.records, 9);
   const stored = sqliteQuery(dbPath, "SELECT external_id,external_version,direction,raw_json,canonical_json,body FROM records ORDER BY external_id;");
   assert.equal(stored.length, 9);
@@ -68,4 +68,185 @@ test("native root and replies commit atomically; later page failure retains curs
   assert.equal(sqliteQuery(dbPath, "SELECT COUNT(*) AS n FROM sync_locks;")[0].n, 0);
   assert.deepEqual(sqliteQuery(dbPath, "SELECT status FROM sync_runs ORDER BY id;").map((row) => row.status), ["succeeded", "failed"]);
   assert.equal(calls, 3);
+});
+
+function syntheticDatabase(t) {
+  const directory = mkdtempSync(join(tmpdir(), "exocortex-incomplete-sync-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const dbPath = join(directory, "synthetic.sqlite");
+  ensureInitialized(dbPath);
+  sqliteExec(dbPath, `INSERT INTO sync_scopes(id,source_id,name,config_json) VALUES(
+    ${quoteSql(SCOPE)},'lark.im','synthetic incomplete details',${quoteSql(JSON.stringify({ chat_id: "oc_fixture", chat_type: "group" }))});`);
+  return dbPath;
+}
+
+const context = () => ({ self: PROFILE, contacts: new Map(), chat_members: new Map(),
+  apps: new Map(), app_fallbacks: new Map() });
+const rawMerge = (index, ms) => ({ ...raw(index, ms), msg_type: "merge_forward",
+  body: { content: "synthetic merged root" } });
+const nativePage = (items, has_more = false, page_token = "") => ({ ok: true,
+  data: { items, has_more, page_token } });
+
+for (const direction of ["received", "sent"]) {
+  test(`${direction} detail denial saves ordinary pages as a failed run, keeps scope enabled and retries missing roots`, (t) => {
+    const dbPath = syntheticDatabase(t);
+    const scopeId = direction === "sent" ? "lark.im.sent_by_me" : SCOPE;
+    const root = rawMerge(40, START + 30_000);
+    const ordinary = [raw(41, START + 1_000), raw(42, START + 45_000)];
+    let denied = true;
+    const paths = [];
+    const adapter = createLarkImAdapter({ run(args) {
+      const path = args[2];
+      paths.push(path);
+      const params = JSON.parse(args[args.indexOf("--params") + 1]);
+      if (path.endsWith("/search")) {
+        const items = params.page_token ? [ordinary[1]] : [ordinary[0], root];
+        return nativePage(items.map((item) => ({ meta_data: { message_id: item.message_id } })),
+          !params.page_token, params.page_token ? "" : "next");
+      }
+      if (path.endsWith("/mget")) {
+        return nativePage(params.message_ids.map((id) => [root, ...ordinary].find((item) => item.message_id === id)));
+      }
+      if (path === "/open-apis/im/v1/messages") {
+        return params.page_token ? nativePage([ordinary[1]]) : nativePage([ordinary[0], root], true, "next");
+      }
+      assert.equal(path, `/open-apis/im/v1/messages/${root.message_id}`);
+      if (denied) throw new Error("lark-cli failed: kind=bot_user_out_of_chat; synthetic-private-detail");
+      return nativePage([root, raw(43, START - 60_000)]);
+    } });
+    const runner = createSyncRunner({ ...adapter, buildPeopleContext: context });
+    const sync = () => direction === "sent" ? runner.syncSent(dbPath, opts(START + 60_000), PROFILE)
+      : runner.syncReceivedScope(dbPath, opts(START + 60_000), readScope(dbPath, scopeId), PROFILE);
+    const before = sqliteQuery(dbPath, `SELECT cursor_json,cursor_updated_at,last_success_run_id FROM sync_scopes WHERE id=${quoteSql(scopeId)};`)[0];
+    const failed = sync();
+    assert.equal(failed.ok, false);
+    assert.equal(failed.incomplete, true, JSON.stringify(failed));
+    assert.equal(failed.inserted, 2);
+    assert.doesNotMatch(failed.error, /synthetic-private|om_fixture|oc_fixture/);
+    const after = sqliteQuery(dbPath, `SELECT cursor_json,cursor_updated_at,last_success_run_id FROM sync_scopes WHERE id=${quoteSql(scopeId)};`)[0];
+    assert.deepEqual(after, before);
+    assert.equal(readScope(dbPath, scopeId).enabled, 1);
+    assert.deepEqual(sqliteQuery(dbPath, "SELECT external_id FROM records ORDER BY external_id;").map((row) => row.external_id),
+      ordinary.map((item) => item.message_id));
+    const run = sqliteQuery(dbPath, "SELECT status,cursor_after_json,metadata_json FROM sync_runs;")[0];
+    assert.equal(run.status, "failed");
+    const metadata = JSON.parse(run.metadata_json);
+    assert.equal(metadata.window_complete, false);
+    assert.equal(metadata.pages, 2);
+    assert.equal(metadata.missing_detail_count, 1);
+    assert.deepEqual(metadata.missing_detail_reasons, { bot_user_out_of_chat: 1 });
+    assert.equal(metadata.window_start, undefined, "failed attempts must not emit successful coverage-window keys");
+    assert.doesNotMatch(run.metadata_json, /synthetic-private|om_fixture|oc_fixture/);
+    assert.equal(sqliteQuery(dbPath, "SELECT COUNT(*) AS n FROM sync_locks;")[0].n, 0);
+
+    const repeated = sync();
+    assert.equal(repeated.ok, false);
+    assert.equal(repeated.duplicate, 2);
+    denied = false;
+    const recovered = sync();
+    assert.equal(recovered.ok, true);
+    assert.equal(recovered.inserted, 1);
+    assert.equal(recovered.duplicate, 2);
+    assert.equal(readScope(dbPath, scopeId).cursor.created_at_ms, START + 60_000);
+    assert.deepEqual(sqliteQuery(dbPath, "SELECT status FROM sync_runs ORDER BY id;").map((row) => row.status),
+      ["failed", "failed", "succeeded"]);
+    assert.equal(sqliteQuery(dbPath, "SELECT COUNT(*) AS n FROM records;")[0].n, 3);
+    assert.match(sqliteQuery(dbPath, `SELECT body FROM records WHERE external_id=${quoteSql(root.message_id)};`)[0].body, /synthetic 43/);
+    assert.equal(paths.filter((path) => path.endsWith(root.message_id)).length, 3);
+  });
+}
+
+test("a previously expanded boundary root survives denied details while newer ordinary messages persist", (t) => {
+  const dbPath = syntheticDatabase(t);
+  const root = rawMerge(50, START + 60_000);
+  let denied = false;
+  const adapter = createLarkImAdapter({ run(args) {
+    if (args[2] === "/open-apis/im/v1/messages") return nativePage(denied ? [root, raw(51, START + 90_000)] : [root]);
+    if (denied) throw new Error("lark-cli failed: kind=restricted_mode");
+    return nativePage([root, raw(52, START)]);
+  } });
+  const runner = createSyncRunner({ ...adapter, buildPeopleContext: context });
+  assert.equal(runner.syncReceivedScope(dbPath, opts(START + 60_000), readScope(dbPath, SCOPE), PROFILE).ok, true);
+  const saved = sqliteQuery(dbPath, `SELECT raw_json,canonical_json,body,updated_at FROM records WHERE external_id=${quoteSql(root.message_id)};`)[0];
+  const before = sqliteQuery(dbPath, `SELECT cursor_json,cursor_updated_at,last_success_run_id FROM sync_scopes WHERE id=${quoteSql(SCOPE)};`)[0];
+  denied = true;
+  const failed = runner.syncReceivedScope(dbPath, opts(START + 120_000), readScope(dbPath, SCOPE), PROFILE);
+  assert.equal(failed.ok, false);
+  assert.equal(failed.inserted, 1);
+  assert.deepEqual(sqliteQuery(dbPath, `SELECT raw_json,canonical_json,body,updated_at FROM records WHERE external_id=${quoteSql(root.message_id)};`)[0], saved);
+  assert.deepEqual(sqliteQuery(dbPath, `SELECT cursor_json,cursor_updated_at,last_success_run_id FROM sync_scopes WHERE id=${quoteSql(SCOPE)};`)[0], before);
+  assert.equal(readScope(dbPath, SCOPE).enabled, 1);
+});
+
+test("native window deadline retries a complete minute prefix and next run resumes without losing boundary messages", (t) => {
+  const dbPath = syntheticDatabase(t);
+  let now = 0;
+  const windowStarts = [];
+  const windowEnds = [];
+  let failLarge = true;
+  const adapter = createLarkImAdapter({ clock: () => now, run(args) {
+    const params = JSON.parse(args[args.indexOf("--params") + 1]);
+    const start = Number(params.start_time) * 1000;
+    const end = Number(params.end_time) * 1000;
+    windowStarts.push(start);
+    windowEnds.push(end);
+    if (failLarge && end - start > 60_000) {
+      now += 180_000;
+      throw new Error("lark-cli failed: kind=network_timeout retry_exhausted=1");
+    }
+    return nativePage([raw(60, START), raw(61, START + 60_000), raw(62, START + 120_000)]);
+  } });
+  const runner = createSyncRunner({ ...adapter, buildPeopleContext: context });
+  const target = START + 33 * 86_400_000;
+  const first = runner.syncReceivedScope(dbPath, opts(target), readScope(dbPath, SCOPE), PROFILE);
+  assert.equal(first.ok, true, JSON.stringify(first));
+  assert.equal(first.inserted, 2);
+  assert.deepEqual(windowEnds, [target, START + 60_000]);
+  assert.equal(readScope(dbPath, SCOPE).cursor.created_at_ms, START + 60_000);
+  failLarge = false;
+  const next = runner.syncReceivedScope(dbPath, opts(target), readScope(dbPath, SCOPE), PROFILE);
+  assert.equal(next.ok, true);
+  assert.equal(next.inserted, 1);
+  assert.equal(next.duplicate, 1, "the minute boundary is deliberately reread");
+  assert.equal(windowStarts.at(-1), START + 60_000);
+  assert.equal(sqliteQuery(dbPath, "SELECT COUNT(*) AS n FROM records;")[0].n, 3);
+});
+
+test("native one-minute budget saturation leaves cursor and records unchanged", (t) => {
+  const dbPath = syntheticDatabase(t);
+  let now = 0;
+  let calls = 0;
+  const adapter = createLarkImAdapter({ clock: () => now, run() {
+    calls += 1;
+    now += 180_000;
+    throw new Error("lark-cli failed: kind=network_timeout retry_exhausted=1");
+  } });
+  const runner = createSyncRunner({ ...adapter, buildPeopleContext: context });
+  const result = runner.syncReceivedScope(dbPath, opts(START + 33 * 86_400_000), readScope(dbPath, SCOPE), PROFILE);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /shared time budget/);
+  assert.equal(calls, 2);
+  assert.equal(readScope(dbPath, SCOPE).cursor, null);
+  assert.equal(readScope(dbPath, SCOPE).enabled, 1);
+  assert.equal(sqliteQuery(dbPath, "SELECT COUNT(*) AS n FROM records;")[0].n, 0);
+  assert.equal(sqliteQuery(dbPath, "SELECT status FROM sync_runs;")[0].status, "failed");
+});
+
+test("a later list failure after detail denial commits neither ordinary records nor cursor", (t) => {
+  const dbPath = syntheticDatabase(t);
+  const root = rawMerge(70, START);
+  const adapter = createLarkImAdapter({ run(args) {
+    if (args[2] !== "/open-apis/im/v1/messages") throw new Error("kind=restricted_mode");
+    const params = JSON.parse(args[args.indexOf("--params") + 1]);
+    if (params.page_token) throw new Error("lark-cli failed: kind=network_error retry_exhausted=1");
+    return nativePage([root, raw(71, START)], true, "next");
+  } });
+  const runner = createSyncRunner({ ...adapter, buildPeopleContext: context });
+  const result = runner.syncReceivedScope(dbPath, opts(START + 60_000), readScope(dbPath, SCOPE), PROFILE);
+  assert.equal(result.ok, false);
+  assert.equal(result.incomplete, undefined, "ordinary records are safe to commit only after list pagination completes");
+  assert.equal(readScope(dbPath, SCOPE).enabled, 1);
+  assert.equal(readScope(dbPath, SCOPE).cursor, null);
+  assert.equal(sqliteQuery(dbPath, "SELECT COUNT(*) AS n FROM records;")[0].n, 0);
+  assert.equal(sqliteQuery(dbPath, "SELECT status FROM sync_runs;")[0].status, "failed");
 });

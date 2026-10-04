@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import { resolve } from "node:path";
 import { summarizeWorkerEvents } from "../../dist/runtime/worker/lark-im-worker-core.js";
+import { DEFAULT_HARD_LEASE_SECONDS } from "../../dist/storage/sqlite/ingestion-store.js";
 import { classifyLarkFailure } from "../adapters/lark-im/transport.mjs";
 import { readLiveProbeCache, liveProbeContext, DEFAULT_LIVE_PROBE_TTL_MS } from "./live-probe-cache.mjs";
 import { diagnosticSubprocessError } from "./public-safe.mjs";
@@ -48,9 +49,9 @@ const DEFAULT_DB = "data/exocortex.sqlite";
  * @property {number=} freshnessMaxAgeMs
  * @property {number=} stabilityWindowMs
  *
- * @typedef {"running" | "stopped"} ServiceRuntimeStatus
+ * @typedef {"running" | "stopped" | "unknown"} ServiceRuntimeStatus
  * @typedef {"ok" | "catching_up" | "problem"} ServiceHealthStatus
- * @typedef {"idle" | "syncing"} ServiceActivityStatus
+ * @typedef {"idle" | "syncing" | "unknown"} ServiceActivityStatus
  * @typedef {"sampled" | "unknown" | "behind"} ServiceFreshnessStatus
  *
  * @typedef {object} ServiceOverview
@@ -102,6 +103,22 @@ function parseLaunchdState(stdout) {
     if (match) result[match[1]] = match[2];
   }
   return result;
+}
+
+/**
+ * A failed inspection is not evidence that a service is absent. Require both
+ * launchctl's missing-service status and its specific diagnostic; missing GUI
+ * domains, permission errors, signals and spawn failures remain unknown.
+ * @param {{status: number | null, stdout?: string, stderr?: string, error?: Error, signal?: unknown}} result
+ * @returns {"loaded" | "absent" | "unknown"}
+ */
+function classifyLaunchdPrint(result) {
+  if (result.error || result.signal) return "unknown";
+  if (result.status === 0) return "loaded";
+  if (result.status === 113 && /^Could not find service "[^"\r\n]+" in domain\b/m.test(`${result.stderr || ""}\n${result.stdout || ""}`)) {
+    return "absent";
+  }
+  return "unknown";
 }
 
 /**
@@ -269,10 +286,11 @@ function collectRecentFailureKinds(dbPath, nowMs, windowMs, deps = {}) {
 }
 
 /**
- * @param {{loaded?: boolean, state?: unknown, pid?: unknown}} launchd
+ * @param {{loaded?: boolean | null, state?: unknown, pid?: unknown}} launchd
  * @returns {{status: ServiceRuntimeStatus, detail: string}}
  */
 function summarizeServiceRuntime(launchd) {
+  if (launchd.loaded === null || launchd.loaded === undefined) return { status: "unknown", detail: "LaunchAgent state unavailable: launchctl print failed" };
   if (!launchd.loaded) return { status: "stopped", detail: "LaunchAgent not loaded" };
   const state = String(launchd.state || "").toLowerCase();
   const hasWorkerProcess = Boolean(launchd.pid);
@@ -295,23 +313,25 @@ function isCatchingUp(syncStatus) {
 }
 
 /**
- * @param {{service: {status: ServiceRuntimeStatus}, syncStatus: JsonObject | null, syncErrorText?: string, workerSummary: JsonObject}} input
+ * @param {{service: {status: ServiceRuntimeStatus}, syncStatus: JsonObject | null, syncErrorText?: string, workerSummary: JsonObject, activity?: {status: ServiceActivityStatus}}} input
  * @returns {{status: ServiceHealthStatus, detail: string}}
  */
-function summarizeServiceHealth({ service, syncStatus, syncErrorText = "", workerSummary }) {
+function summarizeServiceHealth({ service, syncStatus, syncErrorText = "", workerSummary, activity }) {
+  if (service.status === "unknown") return { status: "problem", detail: "background service state is unavailable" };
   if (service.status !== "running") return { status: "problem", detail: "background service is stopped" };
   if (!syncStatus) return { status: "problem", detail: syncErrorText || "sync status unavailable" };
   const rawHealth = String(syncStatus.health || "").toLowerCase();
   if (["failed", "needs_attention", "problem", "command_failed", "not_ready", "unknown"].includes(rawHealth)) {
     return { status: "problem", detail: syncStatus.health_detail || rawHealth };
   }
-  if (workerSummary.last_cycle?.ok === false && !workerSummary.in_progress) {
+  if (workerSummary.last_cycle?.ok === false && activity?.status !== "syncing") {
     return { status: "problem", detail: "last worker cycle failed" };
   }
   if (isCatchingUp(syncStatus)) {
-    return { status: "catching_up", detail: syncStatus.health_detail || "sync is still catching up" };
+    return { status: "catching_up", detail: rawHealth === "catching_up" ? syncStatus.health_detail || "sync is still catching up" : "known scopes still need catch-up" };
   }
   if (rawHealth === "syncing") {
+    if (activity?.status !== "syncing") return { status: "problem", detail: "unfinished sync history has no current activity evidence" };
     return { status: "ok", detail: "sync activity observed; this does not verify remote freshness" };
   }
   if (!["ok", "ok_with_history"].includes(rawHealth)) return { status: "problem", detail: "sync health is unknown" };
@@ -319,16 +339,23 @@ function summarizeServiceHealth({ service, syncStatus, syncErrorText = "", worke
 }
 
 /**
- * @param {{service: {status: ServiceRuntimeStatus}, syncStatus: JsonObject | null, workerSummary: JsonObject}} input
+ * @param {{service: {status: ServiceRuntimeStatus}, syncStatus: JsonObject | null, workerSummary: JsonObject, nowMs?: number}} input
  * @returns {{status: ServiceActivityStatus, detail: string}}
  */
-function summarizeServiceActivity({ service, syncStatus, workerSummary }) {
-  if (workerSummary.in_progress) {
-    const step = workerSummary.last_step?.name ? `: ${workerSummary.last_step.name}` : "";
-    return { status: "syncing", detail: `worker is currently syncing${step}` };
+function summarizeServiceActivity({ service, syncStatus, workerSummary, nowMs = Date.now() }) {
+  if (!syncStatus || syncStatus.status === "command_failed" || !syncStatus.health) {
+    return { status: "unknown", detail: "sync status unavailable; current activity cannot be determined" };
   }
-  if (String(syncStatus?.health || "").toLowerCase() === "syncing") {
-    return { status: "syncing", detail: "sync lock or run active" };
+  const activeLease = (Array.isArray(syncStatus?.locks) ? syncStatus.locks : []).some((lock) => {
+    const lockedAt = Date.parse(String(lock.locked_at || ""));
+    const expiresAt = Date.parse(String(lock.expires_at || ""));
+    return Number.isFinite(lockedAt) && Number.isFinite(expiresAt) && lockedAt <= nowMs &&
+      nowMs < Math.min(expiresAt, lockedAt + DEFAULT_HARD_LEASE_SECONDS * 1000);
+  });
+  // Foreground sync owns the same database leases even while launchd is stopped.
+  if (activeLease) return { status: "syncing", detail: "unexpired sync lease observed" };
+  if (workerSummary.unfinished_cycle || workerSummary.in_progress || String(syncStatus?.health || "").toLowerCase() === "syncing") {
+    return { status: "unknown", detail: "unfinished sync history has no current activity evidence" };
   }
   if (workerSummary.last_cycle) {
     return { status: "idle", detail: `last cycle #${workerSummary.last_cycle.cycle}` };
@@ -414,10 +441,11 @@ function buildServiceOverview({
   freshnessMaxAgeMs = DEFAULT_FRESHNESS_MAX_AGE_MS,
 }) {
   const service = summarizeServiceRuntime(launchd);
+  const activity = summarizeServiceActivity({ service, syncStatus, workerSummary, nowMs });
   return {
     service,
-    health: summarizeServiceHealth({ service, syncStatus, syncErrorText, workerSummary }),
-    activity: summarizeServiceActivity({ service, syncStatus, workerSummary }),
+    health: summarizeServiceHealth({ service, syncStatus, syncErrorText, workerSummary, activity }),
+    activity,
     freshness: summarizeServiceFreshness(liveProbe, nowMs, freshnessMaxAgeMs, expectedContext),
   };
 }
@@ -431,12 +459,13 @@ function buildServiceStatusReport(opts, deps = {}) {
   const readWorkerLog = deps.readRecentWorkerEvents || readRecentWorkerEvents;
   const summarize = deps.summarizeWorkerEvents || summarizeWorkerEvents;
   const readFreshnessCache = deps.readLiveProbeCache || readLiveProbeCache;
-  const nowMs = deps.nowMs || Date.now();
+  const nowMs = deps.nowMs ?? Date.now();
   const launchd = run("launchctl", ["print", opts.target], { allowFailure: true });
-  const loaded = launchd.status === 0;
+  const inspection = classifyLaunchdPrint(launchd);
+  const loaded = inspection === "unknown" ? null : inspection === "loaded";
   const launchdState = loaded ? parseLaunchdState(launchd.stdout || "") : {};
   const sync = run(process.execPath, ["scripts/sync-status.mjs", "--db", opts.db || DEFAULT_DB, "--format", "json"], { allowFailure: true });
-  const syncStatus = parseJsonOutput(sync);
+  const syncStatus = sync.status === 0 && !sync.error && !sync.signal ? parseJsonOutput(sync) : null;
   const workerLog = readWorkerLog(opts.logDir);
   const workerSummary = summarize(workerLog.events, nowMs);
   const workerStability = summarizeWorkerStability(
@@ -456,9 +485,10 @@ function buildServiceStatusReport(opts, deps = {}) {
   }
   const liveProbeCachePath = resolve(opts.logDir, "live-probe.json");
   const liveProbe = readFreshnessCache(liveProbeCachePath);
-  const serviceState = loaded ? launchdState.state || "loaded" : "not loaded";
+  const serviceState = loaded === null ? "unknown" : loaded ? launchdState.state || "loaded" : "not loaded";
   const launchdReport = {
     loaded,
+    inspection,
     state: launchdState.state || null,
     pid: launchdState.pid || null,
     last_exit_code: launchdState["last exit code"] || null,
@@ -502,6 +532,7 @@ function buildServiceStatusReport(opts, deps = {}) {
 export {
   buildServiceOverview,
   buildServiceStatusReport,
+  classifyLaunchdPrint,
   collectRecentFailureKinds,
   durationText,
   DEFAULT_DB,

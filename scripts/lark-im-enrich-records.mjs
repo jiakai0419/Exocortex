@@ -9,6 +9,8 @@ import {
   releaseMaintenanceLock,
 } from "../dist/storage/sqlite/ingestion-store.js";
 
+import { mergeLarkNameProjectionSql } from "../dist/storage/sqlite/lark-name-projection.js";
+
 const DEFAULT_DB = "data/exocortex.sqlite";
 
 function usage() {
@@ -150,7 +152,7 @@ function senderId(raw, row, canonical) {
 
 function senderName(raw, canonical) {
   const sender = raw?.sender && typeof raw.sender === "object" ? raw.sender : {};
-  return canonical.sender_name || sender.name || sender.display_name || "";
+  return canonical.sender_name_state === "cleared" ? "" : canonical.sender_name || sender.name || sender.display_name || "";
 }
 
 function senderType(raw, canonical) {
@@ -167,7 +169,7 @@ function chatType(raw, canonical, config) {
 }
 
 function chatName(raw, canonical, config) {
-  return canonical.chat_name || raw?.chat_name || raw?.chat?.name || config.chat_name || "";
+  return canonical.chat_name_state === "cleared" ? "" : canonical.chat_name || raw?.chat_name || raw?.chat?.name || config.chat_name || "";
 }
 
 function chatPartner(raw, canonical) {
@@ -579,12 +581,13 @@ function main() {
   const appFallbackNames = resolveChatBotAppFallbackNames(appIdsByChat, appNames, diagnostics);
   const appProbeResultsById = new Map(diagnostics.app_lookup_results.map((result) => [result.app_id, result]));
 
-  const updates = [];
+  const proposals = [];
   for (const row of rows) {
     const next = { ...row.canonical };
     const cid = chatId(row.raw, row, row.canonical, row.config);
     const ctype = chatType(row.raw, row.canonical, row.config);
-    const cname = chatName(row.raw, row.canonical, row.config) || knownChatNames.get(cid) || "";
+    const cname = row.canonical.chat_name_state === "cleared" ? null
+      : chatName(row.raw, row.canonical, row.config) || knownChatNames.get(cid) || "";
     const sid = senderId(row.raw, row, row.canonical);
     const isAppSender = senderType(row.raw, row.canonical) === "app" || String(sid || "").startsWith("cli_");
     const existingSenderName = senderName(row.raw, row.canonical);
@@ -606,6 +609,8 @@ function main() {
 
     next.sender_id = next.sender_id || sid || null;
     next.sender_name = sname;
+    // This scan supplies a fresh resolved name or unknown, never a new clear.
+    delete next.sender_name_state;
     if (sname) {
       if (next.sender_name_resolution_status === "unresolved_app_sender") delete next.sender_name_resolution_status;
       if (next.sender_name_resolution_reason) delete next.sender_name_resolution_reason;
@@ -621,6 +626,12 @@ function main() {
     } else if (appFallbackName && (opts.probeApps || !existingSenderName)) {
       next.sender_name_source = appFallback.source || "chat_bot_unique";
       next.sender_name_confidence = appFallback.confidence || "medium";
+    } else if (!existingSenderName && memberNames.get(`${cid}:${sid}`)) {
+      next.sender_name_source = "chat_member";
+      next.sender_name_confidence = "high";
+    } else if (!existingSenderName && contactNames.get(sid)) {
+      next.sender_name_source = "contact";
+      next.sender_name_confidence = "high";
     }
     if (!next.sender_type && String(sid || "").startsWith("cli_")) next.sender_type = "app";
     next.chat_id = next.chat_id || cid || null;
@@ -632,31 +643,52 @@ function main() {
         open_id: partnerId,
         name: partnerName,
       };
+      delete next.chat_partner.name_state;
     }
     if (typeof row.raw.deleted === "boolean" && typeof next.deleted !== "boolean") next.deleted = row.raw.deleted;
 
     const body = normalizedBody(row, next, row.raw);
-    const canonicalJson = JSON.stringify(next);
-    if (canonicalJson !== row.canonical_json || body !== row.body) {
-      updates.push(
-        `UPDATE records
-         SET canonical_json = ${quoteSql(canonicalJson)},
-             body = ${quoteSql(body)},
-             updated_at = ${quoteSql(new Date().toISOString())}
-         WHERE id = ${Number(row.id)}
-           AND source_id = 'lark.im'
-           AND record_type = 'lark.im.message'
-           AND external_id IS ${quoteSql(row.external_id)}
-           AND external_version IS ${quoteSql(row.external_version)}
-           AND content_hash IS ${quoteSql(row.content_hash)}
-           AND actor_id IS ${quoteSql(row.actor_id)}
-           AND container_id IS ${quoteSql(row.container_id)}
-           AND raw_json IS ${quoteSql(row.raw_json)}
-           AND canonical_json IS ${quoteSql(row.canonical_json)}
-           AND body IS ${quoteSql(row.body)};
-         INSERT INTO __enrichment_effects (updated) VALUES (changes());`,
-      );
+    const proposedJson = JSON.stringify(next);
+    if (proposedJson !== row.canonical_json || body !== row.body) {
+      proposals.push({ id: row.id, old: row.canonical_json, next: proposedJson,
+        actor: row.actor_id, container: row.container_id, body });
     }
+  }
+
+  // Batch the shared SQL projection calculation in one read-only query. Dry-run
+  // sees exactly the commit policy without acquiring a lease or writing data.
+  const merged = proposals.length === 0 ? [] : sqliteJson(dbPath, `
+    WITH proposals AS (
+      SELECT json_extract(value, '$.id') AS id, json_extract(value, '$.old') AS old,
+        json_extract(value, '$.next') AS next, json_extract(value, '$.actor') AS actor,
+        json_extract(value, '$.container') AS container, json_extract(value, '$.body') AS body
+      FROM json_each(${quoteSql(JSON.stringify(proposals))})
+    )
+    SELECT id, body, ${mergeLarkNameProjectionSql("p.old", "p.next", "p.actor", "p.actor", "p.container", "p.container")} AS canonical_json
+    FROM proposals p;`, "merge name projections");
+  const rowsById = new Map(rows.map((row) => [row.id, row]));
+  const updates = [];
+  for (const result of merged) {
+    const row = rowsById.get(result.id);
+    if (result.canonical_json === row.canonical_json && result.body === row.body) continue;
+    updates.push(
+      `UPDATE records
+       SET canonical_json = ${quoteSql(result.canonical_json)},
+           body = ${quoteSql(result.body)},
+           updated_at = ${quoteSql(new Date().toISOString())}
+       WHERE id = ${Number(row.id)}
+         AND source_id = 'lark.im'
+         AND record_type = 'lark.im.message'
+         AND external_id IS ${quoteSql(row.external_id)}
+         AND external_version IS ${quoteSql(row.external_version)}
+         AND content_hash IS ${quoteSql(row.content_hash)}
+         AND actor_id IS ${quoteSql(row.actor_id)}
+         AND container_id IS ${quoteSql(row.container_id)}
+         AND raw_json IS ${quoteSql(row.raw_json)}
+         AND canonical_json IS ${quoteSql(row.canonical_json)}
+         AND body IS ${quoteSql(row.body)};
+       INSERT INTO __enrichment_effects (updated) VALUES (changes());`,
+    );
   }
 
   let updated = 0;

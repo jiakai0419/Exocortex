@@ -17,7 +17,6 @@
 保留现有代码不等于已经解决所有可靠性问题：
 
 - coverage-check 从保留的 `sync_runs` 重建覆盖；清理旧 run 会失去窗口证明，即使记录和 cursor 未变。worker 默认每 1440 个周期自动执行 `prune-runs --apply`，当前 CLI 不接受间隔 0，没有永久禁用开关。调大间隔只能延期，不能解决证据丢失；需要长期连续覆盖证明时，这仍是未解决限制。
-- 合并转发详情的受限错误仍可能被按整个 chat 分类并禁用 scope；应独立核对列表与详情失败。
 - doctor 子命令非零退出但输出合法健康 JSON 时，可能仍显示本地就绪；不能只靠 doctor 验收。
 - 名称解析仍可能把返回的 ID 当名称；独立 enrich-records 脚本没有自动 resolver 的全部批次和超时限制。
 - 非整分钟初始基线在短首轮成功后，游标向下取整可能落到基线之前；后续窗口可能包含起点前记录。整分钟起点不触发此特定边界，非整分钟使用仍需修复。
@@ -25,7 +24,7 @@
 
 ## Local Setup and Verification
 
-从目标 checkout 根目录执行本文命令。开发检查需要 Node.js 22、npm、SQLite CLI；覆盖工具还需要 Python 3。先在隔离 checkout 安装 lockfile 依赖并检查候选代码：
+从目标 checkout 根目录执行本文命令。开发检查需要 Node.js 22、npm、SQLite CLI 3.35 或更新版本（含 JSON 函数）；记录事务使用 RETURNING，姓名合并使用 MATERIALIZED CTE 防止查询展开。覆盖工具还需要 Python 3。先在隔离 checkout 安装 lockfile 依赖并检查候选代码：
 
 ```bash
 npm ci
@@ -80,7 +79,9 @@ RUNNING  LaunchAgent 已加载，worker 进程活着。
 STOPPED  LaunchAgent 未加载，或已加载但 worker 进程没起来。
 ```
 
-主状态只区分 `RUNNING / STOPPED`。细节里会继续展示 LaunchAgent loaded、PID 和 last exit。
+另有 `UNKNOWN`：无法确认 launchd 状态。只有成功的 `launchctl print` 或明确的 service-not-found 结果才能判定加载或未加载；权限错误、命令启动失败和其他异常不能当作 STOPPED。细节里继续展示 LaunchAgent loaded、PID 和 last exit。
+
+`start` 的成功输出为 `start requested`，表示 bootstrap/kickstart 请求已接受，是否持续运行仍需查看 status 与后续周期。kickstart 失败会非零退出。`stop` 与 `uninstall` 必须确认 job 已不存在；无法检查时失败，uninstall 保留 plist。
 
 ### Health
 
@@ -96,14 +97,19 @@ PROBLEM      当前有需要处理的问题。
 
 ### Activity
 
-worker 此刻是否正在执行同步 step。
+当前是否有同步活动的有效证据，包含独立前台同步。
 
 ```text
 IDLE     当前没有同步 step 在跑。
-SYNCING  当前正在执行同步 step。
+SYNCING  观察到时间有效且未超过硬租约上限的同步锁。
+UNKNOWN  只有未结束周期或遗留 running 状态，或无法读取当前证据。
 ```
 
-`SYNCING` 通常是正常活动，不等于故障。
+`SYNCING` 通常是正常活动，不等于故障，也不证明远端完整性。worker 日志在 step 完成后才写入，最近甚至尚未收尾的历史周期都不能单独证明有 step 在跑。周期号在重启后归零，历史顺序按日志顺序处理。Service STOPPED 仍可能同时显示前台同步 Activity SYNCING。
+
+租约判断使用 `locked_at <= now < min(expires_at, locked_at + 1 小时)`，拒绝未来、无效和超过硬上限的时间。未过期锁是活动证据，不是 owner 进程仍存活的独立证明。
+
+Service 总览不把原始 `sync-status` 的 `health=syncing` 直接当作当前活动；该底层摘要仍可能包含遗留 run/lock，需结合 Service 的有效租约判断，不应将历史状态作为运行验收。
 
 ### Freshness
 
@@ -541,7 +547,9 @@ node scripts/doctor.mjs --live
 
 ### Unsupported Chat Scopes
 
-Received chat scope 可能进入 unsupported 状态。它表示同步器已经正确识别到该会话不能继续通过当前 lark-cli 身份同步，后续会暂停这个 scope，但本地已同步的 records 会保留。
+Received chat scope 的列表读取可能进入 unsupported 状态。它表示同步器识别到当前 lark-cli 身份不能读取会话列表，后续会暂停这个 scope，但本地已同步的 records 会保留。单条合并转发的详情失败不证明整个会话不可读取，不会禁用 scope。
+
+候选修复不会自动重启用历史已被禁用的 scope；纠正已有运行数据需另行确认原因并授权，不属于代码升级的隐式动作。
 
 当前已知原因：
 
@@ -669,7 +677,15 @@ received 直接分页读取原生消息列表，显式请求 `only_thread_root_m
 
 原始 `body.content`、`update_time`、root/parent/thread 关系进入 `raw_json`。正文是可重建投影，canonical 保留 `content_rendering` 状态与版本。复杂卡片、图片和未知结构保留原始 JSON 并明确标注未完整渲染；不会凭空补用户姓名。合并转发的完整原生子项进入 `raw_api_expansions`，子项不冒充当前会话里的独立消息。
 
-每个 adapter 窗口共享 180 秒请求预算；合并转发详情最多 `min(maxPages,50)` 次、1000 项、64 层关系。超过预算拒绝截断成功。正常同步可沿用窗口二分完成较小前缀，worker 的 600 秒步骤上限仍有效。有界回填不二分，任何未完成 scope 均不提交。
+列表分页完整但部分合并转发详情缺失时，本轮为失败且可重试。已验证的普通消息和已完整展开的转发可在同一租约校验事务内保存；缺失转发根不写入，避免覆盖已有完整展开。run 保存缺失详情数量和原因，scope 游标、游标时间与最近成功 run 不变。后续同步从原游标重读，补齐后才形成成功窗口证据。列表本身不完整时不采用这条部分保存路径。持续无权限的详情仍会阻塞该窗口推进，需要显式处理，不能跳过后冒充完整。
+
+每个 adapter 窗口共享 180 秒请求预算；合并转发详情最多 `min(maxPages,50)` 次、1000 项、64 层关系。超过预算拒绝截断成功。页数超限沿用分钟边界二分；只有整个窗口总时间预算耗尽时，正常同步才直接收缩到起点之后的首个分钟边界，并至多再试一次该最小前缀。单次请求的普通网络超时、限流或权限错误不触发缩窗。最小前缀仍超限则失败，不推进游标。worker 的 600 秒步骤上限仍有效；此前页数二分、名称查询等也占用步骤时间，因此不保证每次都能在步骤上限内取得进展。有界回填不二分，任何未完成 scope 均不提交。
+
+### 姓名投影合并
+
+同步入库和 `lark-im-enrich-records` 使用同一姓名合并规则。空值或失败的 lookup 表示 unknown，不能抹掉同一发送者、会话或会话对方的已知姓名与来源。明确的 `*_name_state=cleared`（对方姓名为 `chat_partner.name_state`）表示权威清空；普通空 lookup 不产生此标记，也不能复活已清空的姓名。身份变化时不继承旧身份的姓名。
+
+姓名属于可补全投影，`raw_json` 与 source content hash 仍保留原始内容语义。同 raw/hash/version 的未知姓名重放保持幂等；同版本解析得到姓名或改善投影仍可更新。合并不取消原有版本防回退和补全的并发比较检查。有界回填的严格更高版本规则保持独立。
 
 旧游标覆盖仅证明成功扫描窗口连续，不能证明旧 CLI 展开策略没有漏消息。明确选样对账后，可在停止 worker、完成一致备份和显式迁移后执行：
 

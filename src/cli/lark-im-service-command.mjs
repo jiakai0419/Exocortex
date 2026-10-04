@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 import { summarizeWorkerEvents } from "../../dist/runtime/worker/lark-im-worker-core.js";
 import {
   buildServiceStatusReport,
+  classifyLaunchdPrint,
   parseJsonOutput,
   readRecentWorkerEvents,
 } from "../diagnostics/lark-im-service-report.mjs";
@@ -73,6 +74,7 @@ const SYNC_STATUS_SCRIPT = resolve(PROJECT_ROOT, "scripts/sync-status.mjs");
  * @property {string} stdout
  * @property {string} stderr
  * @property {Error=} error
+ * @property {NodeJS.Signals | null=} signal
  *
  * @typedef {object} PlistXmlDeps
  * @property {string=} cwd
@@ -267,7 +269,13 @@ function launchdPrint(deps = {}) {
 
 /** @param {ServiceCommandDeps} [deps] */
 function isLaunchdLoaded(deps = {}) {
-  return launchdPrint(deps).status === 0;
+  const result = launchdPrint(deps);
+  const inspection = classifyLaunchdPrint(result);
+  if (inspection === "unknown") {
+    const detail = result.error?.message || result.stderr.trim() || result.stdout.trim() || `exit ${result.status}`;
+    throw new Error(`cannot inspect ${LABEL}: launchctl print failed: ${detail}`);
+  }
+  return inspection === "loaded";
 }
 
 /**
@@ -278,16 +286,16 @@ function isLaunchdLoaded(deps = {}) {
  * @returns {SpawnResult}
  */
 function run(cmd, args, options = {}, deps = {}) {
-  if (deps.run) return deps.run(cmd, args, options);
   const spawn = deps.spawnSync || spawnSync;
-  const result = spawn(cmd, args, { encoding: "utf8", maxBuffer: 20 * 1024 * 1024 });
+  const result = deps.run ? deps.run(cmd, args, options) : spawn(cmd, args, { encoding: "utf8", maxBuffer: 20 * 1024 * 1024 });
   const normalized = {
     status: result.status,
     stdout: String(result.stdout || ""),
     stderr: String(result.stderr || ""),
     error: result.error,
+    signal: result.signal,
   };
-  if (normalized.status !== 0 && !options.allowFailure) {
+  if ((normalized.status !== 0 || normalized.error || normalized.signal) && !options.allowFailure) {
     const detail = normalized.error?.message || normalized.stderr.trim() || normalized.stdout.trim() || `exit ${normalized.status}`;
     throw new Error(`${cmd} failed: ${detail}`);
   }
@@ -437,7 +445,7 @@ function install(opts, deps = {}) {
     run("launchctl", ["bootout", target(deps)], { allowFailure: true }, deps);
     run("launchctl", ["bootout", domain(deps), plistPath(deps)], { allowFailure: true }, deps);
     run("launchctl", ["bootstrap", domain(deps), plistPath(deps)], {}, deps);
-    run("launchctl", ["kickstart", "-k", target(deps)], { allowFailure: true }, deps);
+    run("launchctl", ["kickstart", "-k", target(deps)], {}, deps);
   } catch (error) {
     if (!deps.writeFileSync) {
       if (previousPlist === null) rmSync(path, { force: true });
@@ -458,21 +466,25 @@ function start(deps = {}) {
   const output = deps.stdout || process.stdout;
   if (!exists(plistPath(deps))) throw new Error(`plist not found: ${plistPath(deps)}`);
   if (isLaunchdLoaded(deps)) {
-    run("launchctl", ["kickstart", "-k", target(deps)], { allowFailure: true }, deps);
-    output.write(`started ${LABEL}\n`);
+    run("launchctl", ["kickstart", "-k", target(deps)], {}, deps);
+    output.write(`start requested ${LABEL}\n`);
     return;
   }
   const boot = run("launchctl", ["bootstrap", domain(deps), plistPath(deps)], { allowFailure: true }, deps);
-  if (boot.status !== 0 && !isLaunchdLoaded(deps)) {
-    throw new Error(boot.stderr.trim() || "launchctl bootstrap failed");
+  if ((boot.status !== 0 || boot.error || boot.signal) && !isLaunchdLoaded(deps)) {
+    throw new Error(boot.error?.message || boot.stderr.trim() || "launchctl bootstrap failed");
   }
-  run("launchctl", ["kickstart", "-k", target(deps)], { allowFailure: true }, deps);
-  output.write(`started ${LABEL}\n`);
+  run("launchctl", ["kickstart", "-k", target(deps)], {}, deps);
+  output.write(`start requested ${LABEL}\n`);
 }
 
 /** @param {ServiceCommandDeps} [deps] */
 function stop(deps = {}) {
   const output = deps.stdout || process.stdout;
+  if (!isLaunchdLoaded(deps)) {
+    output.write(`stopped ${LABEL}\n`);
+    return;
+  }
   const attempts = [
     run("launchctl", ["bootout", target(deps)], { allowFailure: true }, deps),
     run("launchctl", ["bootout", domain(deps), plistPath(deps)], { allowFailure: true }, deps),
@@ -524,12 +536,13 @@ function evaluateWaitOkState(startedAt, syncStatus, workerSummary) {
   const lastCycleAt = lastCycle?.at ? Date.parse(String(lastCycle.at)) : NaN;
   const newOkCycle = lastCycle?.ok === true && Number.isFinite(lastCycleAt) && lastCycleAt >= startedAt;
   const healthReady = syncStatus ? isReadyHealth(syncStatus.health) : false;
-  const ready = Boolean(lastCycle && newOkCycle && !workerSummary.in_progress && healthReady);
+  const ready = Boolean(lastCycle && newOkCycle && !workerSummary.in_progress && !workerSummary.unfinished_cycle && healthReady);
   const reason = [
     `cycle=${workerSummary.last_cycle?.cycle || "none"}`,
     `cycle_ok=${workerSummary.last_cycle?.ok ?? "unknown"}`,
     `cycle_new=${newOkCycle}`,
     `in_progress=${Boolean(workerSummary.in_progress)}`,
+    `unfinished_cycle=${Boolean(workerSummary.unfinished_cycle)}`,
     `health=${syncStatus?.health || "unavailable"}`,
   ].join(" ");
   return { ready, newOkCycle, healthReady, reason };
@@ -595,7 +608,7 @@ function waitOk(opts, deps = {}) {
 
   while (nowMs() <= deadline) {
     const sync = run(execPath, [SYNC_STATUS_SCRIPT, "--db", opts.db || "data/exocortex.sqlite", "--format", "json"], { allowFailure: true }, deps);
-    const syncStatus = parseJson(sync);
+    const syncStatus = sync.status === 0 && !sync.error && !sync.signal ? parseJson(sync) : null;
     const workerLog = readWorkerEvents(opts.logDir);
     const workerSummary = summarize(workerLog.events);
     const lastCycle = workerSummary.last_cycle;

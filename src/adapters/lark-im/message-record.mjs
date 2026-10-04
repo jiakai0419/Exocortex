@@ -34,7 +34,8 @@ import { renderSystemContent } from "./system-content.mjs";
  * @property {string=} parent_id
  *
  * @typedef {object} NameDetails
- * @property {string} name
+ * @property {string | null} name
+ * @property {"cleared"=} state
  * @property {string} source
  * @property {string} confidence
  *
@@ -248,6 +249,13 @@ function nameCandidate(value, source, confidence) {
   if (typeof value === "string") return { name: value, source, confidence };
   if (typeof value === "object") {
     const objectValue = /** @type {Record<string, any>} */ (value);
+    // Empty API fields and lookup failures are unknown. A caller with an
+    // authoritative deletion must opt in explicitly; current remote lookups do
+    // not infer deletion from absence or permission errors.
+    if (objectValue.state === "cleared") {
+      return { name: null, state: "cleared", source: objectValue.source || source,
+        confidence: objectValue.confidence || confidence };
+    }
     const name = objectValue.name || objectValue.display_name || objectValue.bot_name || "";
     if (!name) return null;
     return {
@@ -312,12 +320,17 @@ function recordFromMessage(message, scopeId, direction, context = {}, scopeConfi
   const chatType = message?.chat_type || message?.chat?.chat_type || scopeConfig.chat_type || null;
   const partnerId = chatPartner?.open_id || chatPartner?.id || chatPartner?.user_id || null;
   const senderDirectName = sender.name || sender.display_name || "";
+  /** @type {NameDetails | null} */
   const senderNameDetails = senderDirectName
     ? { name: senderDirectName, source: "message_sender", confidence: "high" }
     : lookupDisplayNameDetails(context, actorId, containerId);
   const senderDisplayName = senderNameDetails?.name || "";
-  const partnerDisplayName =
-    chatPartner?.name || chatPartner?.display_name || lookupDisplayName(context, partnerId, containerId);
+  const partnerDirectName = chatPartner?.name || chatPartner?.display_name || "";
+  /** @type {NameDetails | null} */
+  const partnerNameDetails = partnerDirectName
+    ? { name: partnerDirectName, source: "message_partner", confidence: "high" }
+    : lookupDisplayNameDetails(context, partnerId, containerId);
+  const partnerDisplayName = partnerNameDetails?.name || "";
   const canonical = {
     message_id: externalId,
     msg_type: message?.msg_type || message?.message_type || null,
@@ -327,8 +340,9 @@ function recordFromMessage(message, scopeId, direction, context = {}, scopeConfi
     update_time_ms: updatedAtMs,
     sender_id: actorId,
     sender_name: senderDisplayName || null,
-    sender_name_source: senderDisplayName ? senderNameDetails?.source || null : null,
-    sender_name_confidence: senderDisplayName ? senderNameDetails?.confidence || null : null,
+    ...(senderNameDetails?.state === "cleared" ? { sender_name_state: "cleared" } : {}),
+    sender_name_source: senderDisplayName || senderNameDetails?.state === "cleared" ? senderNameDetails?.source || null : null,
+    sender_name_confidence: senderDisplayName || senderNameDetails?.state === "cleared" ? senderNameDetails?.confidence || null : null,
     sender_type: senderType(message),
     chat_id: containerId,
     chat_type: chatType,
@@ -337,6 +351,7 @@ function recordFromMessage(message, scopeId, direction, context = {}, scopeConfi
       ? {
           open_id: partnerId,
           name: partnerDisplayName || null,
+          ...(partnerNameDetails?.state === "cleared" ? { name_state: "cleared" } : {}),
         }
       : null,
     thread_id: message?.thread_id || null,

@@ -111,6 +111,32 @@ const CHAT_HOT_DISCOVERY_SCOPE_ID = "lark.im.unmuted_chat_hot";
 const CHAT_RECONCILE_SCOPE_ID = "lark.im.unmuted_chat_reconcile";
 const LARK_MESSAGE_CURSOR_PRECISION_MS = 60_000;
 
+/** A whole native window exhausted its shared deadline, not one request's timeout. */
+class MessageWindowBudgetError extends Error {
+  /** @param {string} operation @param {unknown} [cause] */
+  constructor(operation, cause) {
+    super(`lark-cli failed: kind=network_timeout operation=${operation} retry_exhausted=1 window_budget_exhausted=1`, { cause });
+    this.name = "MessageWindowBudgetError";
+  }
+}
+
+/** List pagination completed, but some merged roots could not be hydrated.
+ * Valid ordinary messages and complete roots can be saved without claiming coverage.
+ */
+class MessageDetailsIncompleteError extends Error {
+  /** @param {LarkMessage[]} messages @param {number} pages
+   * @param {{message_id: string, reason: string}[]} missingDetails */
+  constructor(messages, pages, missingDetails) {
+    super(`merge-forward message-details unavailable: ${missingDetails.length} unresolved; window incomplete and retryable`);
+    this.name = "MessageDetailsIncompleteError";
+    this.messages = messages;
+    this.pages = pages;
+    this.missingDetails = missingDetails;
+    this.windowEndMs = NaN;
+    this.windowBisections = 0;
+  }
+}
+
 /** @param {number} n */
 function pad2(n) {
   return String(n).padStart(2, "0");
@@ -171,9 +197,10 @@ function bisectMessageWindowEnd(startMs, endMs) {
 }
 
 /**
- * A page-budget failure must not make the scope retry the same ever-growing
- * window forever. Find one complete prefix and let the caller checkpoint that
- * prefix in this run; the next run resumes from its cursor.
+ * Page overflow halves the window; shared deadline exhaustion jumps directly
+ * to the smallest minute-aligned prefix. At most one fresh deadline is then
+ * available, so a large timed-out window cannot consume another deadline for
+ * every intermediate half. Only a fully fetched prefix may be checkpointed.
  *
  * @param {(startMs: number, endMs: number) => Record<string, any>} fetchWindow
  * @param {number} startMs
@@ -196,14 +223,23 @@ function fetchMessageWindowWithBisection(fetchWindow, startMs, requestedEndMs) {
         window_bisections: bisections,
       };
     } catch (error) {
-      if (!isPaginationLimitError(error)) throw error;
-      const nextEndMs = bisectMessageWindowEnd(startMs, endMs);
+      if (error instanceof MessageDetailsIncompleteError) {
+        error.windowEndMs = endMs;
+        error.windowBisections = bisections;
+        throw error;
+      }
+      const budgetExhausted = error instanceof MessageWindowBudgetError;
+      if (!budgetExhausted && !isPaginationLimitError(error)) throw error;
+      const minimumEndMs = floorToLarkMessageCursorMs(startMs) + LARK_MESSAGE_CURSOR_PRECISION_MS;
+      const nextEndMs = budgetExhausted
+        ? minimumEndMs > startMs && minimumEndMs < endMs ? minimumEndMs : null
+        : bisectMessageWindowEnd(startMs, endMs);
       if (nextEndMs === null) {
         const saturated = new Error(
-          `${error.message}; one ${LARK_MESSAGE_CURSOR_PRECISION_MS}ms message window still exceeds the page limit`,
+          `${error.message}; one ${LARK_MESSAGE_CURSOR_PRECISION_MS}ms message window still exceeds the ${budgetExhausted ? "shared time budget" : "page limit"}`,
           { cause: error },
         );
-        saturated.name = "PaginationWindowSaturatedError";
+        saturated.name = budgetExhausted ? "MessageWindowBudgetSaturatedError" : "PaginationWindowSaturatedError";
         throw saturated;
       }
       endMs = nextEndMs;
@@ -276,6 +312,8 @@ function chatScopeId(chatIdValue) {
 }
 
 export {
+  MessageDetailsIncompleteError,
+  MessageWindowBudgetError,
   CHAT_DISCOVERY_SCOPE_ID,
   CHAT_HOT_DISCOVERY_SCOPE_ID,
   CHAT_RECONCILE_SCOPE_ID,

@@ -479,11 +479,9 @@ function summarizeWorkerEvents(events: unknown[], nowMs = Date.now()) {
   const lastCycleMs = eventTimeMs(lastCycle);
   const lastStepMs = eventTimeMs(lastStep);
   const lastFailureMs = eventTimeMs(lastFailure);
-  const stepAfterCycle =
-    lastStep &&
-    (!lastCycle ||
-      Number(lastStep.cycle) > Number(lastCycle.cycle) ||
-      (lastStepMs !== null && lastCycleMs !== null && lastStepMs > lastCycleMs));
+  // Cycle counters restart with the worker. Append order, not the largest
+  // cycle number, determines whether its latest step still lacks a completion.
+  const stepAfterCycle = Boolean(lastStep && (!lastCycle || normalized.lastIndexOf(lastStep) > normalized.lastIndexOf(lastCycle)));
 
   return {
     has_events: normalized.length > 0,
@@ -507,7 +505,11 @@ function summarizeWorkerEvents(events: unknown[], nowMs = Date.now()) {
           age_ms: lastStepMs === null ? null : Math.max(0, nowMs - lastStepMs),
         }
       : null,
-    in_progress: Boolean(stepAfterCycle),
+    // These events are written after each step has finished. Even a recent
+    // unfinished cycle cannot prove another step is running. Live activity is
+    // established separately by a current database lease in the service report.
+    in_progress: false,
+    unfinished_cycle: stepAfterCycle,
     last_failure: lastFailure
       ? {
           type: lastFailure.type,

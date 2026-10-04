@@ -177,6 +177,7 @@ declare function summarizeWorkerEvents(events: unknown[], nowMs?: number): {
         age_ms: number | null;
     } | null;
     in_progress: boolean;
+    unfinished_cycle: boolean;
     last_failure: {
         type: string | undefined;
         cycle: number | undefined;
