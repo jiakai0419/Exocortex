@@ -10,7 +10,7 @@
 
 | 命令 | 能力 | 默认效果 | 默认输出级别 |
 | --- | --- | --- | --- |
-| `messages` | Read recent messages, including original private JSON. | local-read | `private` |
+| `messages` | Read recent messages, including original private JSON. Cards are captured API snapshots and may differ from the current client state. | local-read | `private` |
 | `status` | Observe service, health, activity and freshness without live requests. | local-read | `public-safe` |
 | `check` | Collect database, sync and quality evidence and requested extensions. | local-read | `public-safe` |
 | `sync` | Run one bounded pass, preserving message and detail-debt contracts. | remote-read, database-write, activity-write | `public-safe` |
@@ -43,7 +43,7 @@ node bin/exocortex.mjs --help --all --format json
 
 ### messages
 
-Read recent messages, including original private JSON.
+Read recent messages, including original private JSON. Cards are captured API snapshots and may differ from the current client state.
 
 默认效果：`local-read`；输出：`private`。
 

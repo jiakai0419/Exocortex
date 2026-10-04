@@ -22,6 +22,9 @@ function renderMessagesText(messages) {
   const lines = [];
   lines.push(title(`Messages (${messages.length})`));
   lines.push(subtitle("Latest synced messages first."));
+  if (messages.some((message) => message.display.card)) {
+    lines.push(subtitle("卡片来自已采集的 API 快照，可能与客户端当前状态不同。"));
+  }
   lines.push("");
   for (const message of messages) {
     const time = message.occurred_at ? new Date(message.occurred_at).toLocaleString() : "unknown time";

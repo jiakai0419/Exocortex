@@ -29,7 +29,7 @@ export const GROUPS = Object.freeze([
 ]);
 
 export const COMMANDS = Object.freeze([
-  route("messages", "Read recent messages, including original private JSON.", [db, format,
+  route("messages", "Read recent messages, including original private JSON. Cards are captured API snapshots and may differ from the current client state.", [db, format,
     option("--direction", "direction", "enum", "Message direction.", { choices: ["all", "sent", "received"], default: "all" }),
     positive("--limit", "limit", 30, "Maximum messages."), text("--search", "search", "Search message body.", { default: "" }),
   ], ["local-read"], "private"),

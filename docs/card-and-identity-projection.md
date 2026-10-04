@@ -12,6 +12,8 @@
 
 保留现有 JSON 字段与含义，尤其 `body`、`raw`、`canonical`、原始 JSON 字符串及 `display.body`。卡片由 `display.card = {text,status,reason,version}` 表达；可选的 `omitted_actions` 计数也随新入库 `content_rendering` 保留；该计数与纯动作的中性收起说明仅表示有意省略，不表示任务或审批状态；历史阅读使用当前解析器，但不修改 raw/hash/source version/canonical。更新历史 sender 姓名必须经显式、有界补全，不能让 `messages` 在阅读时联网。搜索仍匹配已存 body，不因读取时重投影改变索引语义。
 
+人读 `messages` 依据过滤、方向和条数限制后的最终结果，在含有 `display.card` 时于整段标题区提示一次：“卡片来自已采集的 API 快照，可能与客户端当前状态不同。”空列表和纯非卡结果不提示；多卡、混合结果以及部分解析、空内容或仅含动作的卡片使用同一规则，不按真实 ID、应用或正文关键词判断。默认和显式 `text` 的彩色、无色、管道输出都保留此说明；帮助简述相同限制。说明不进入 `display.card.text` 或 JSON，也不改变原文中的状态文字；原文恰好包含相同句子时仍完整保留。消息创建、源更新或本地记录更新时间不冒充采集或当前状态核验时间。
+
 ## 身份与姓名证据
 
 统一规则是先确认身份命名空间，再取姓名；共同规则不要求把纯本地卡片解析和可联网 sender resolver 合成一个服务。
