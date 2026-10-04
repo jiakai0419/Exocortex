@@ -75,8 +75,10 @@ function normalizeStoredRecords(records, sourceId) {
         };
         const key = `${record.source_id}\u0000${record.external_id}`;
         const current = deduped.get(key);
-        if (current && current.record_type !== record.record_type)
-            throw new Error("conflicting record types for one source identity");
+        if (current && (current.expected_external_version !== undefined || record.expected_external_version !== undefined) &&
+            (current.record_type !== record.record_type || current.expected_external_version !== record.expected_external_version)) {
+            throw new Error("conflicting CAS candidates for one source identity");
+        }
         if (!current || preferIncomingRecord(current, record))
             deduped.set(key, record);
     }
@@ -176,16 +178,17 @@ function recordUpdateSetSql() {
             ? mergedCanonicalSql("records", "excluded") : `excluded.${column}`}`), "updated_at = excluded.updated_at"].join(",\n  ");
 }
 /** A failed explicit predecessor check aborts its surrounding transaction.
- * Type is part of an adapter's identity even though the legacy unique key is
- * source + external ID. Hints cannot repurpose an existing record. */
+ * A CAS hint cannot repurpose an existing record's type. Ordinary writes retain
+ * their version-protected type replacement semantics. */
 function recordIdentityGuardSql(records) {
     if (!records.length)
         return "";
     return `CREATE TEMP TABLE IF NOT EXISTS __record_identity_guard (allowed INTEGER NOT NULL CHECK (allowed = 1));
     ${records.map((record) => {
         const identity = `source_id=${quoteSql(record.source_id)} AND external_id=${quoteSql(record.external_id)}`;
-        const sameType = `NOT EXISTS (SELECT 1 FROM records WHERE ${identity} AND record_type IS NOT ${quoteSql(record.record_type)})`;
         const expected = record.expected_external_version;
+        const sameType = expected === undefined ? "1"
+            : `NOT EXISTS (SELECT 1 FROM records WHERE ${identity} AND record_type IS NOT ${quoteSql(record.record_type)})`;
         const cas = expected === undefined ? "1" : expected === null
             ? `NOT EXISTS (SELECT 1 FROM records WHERE ${identity} AND external_version IS NOT NULL)`
             : `EXISTS (SELECT 1 FROM records WHERE ${identity} AND external_version IS ${quoteSql(expected)})`;

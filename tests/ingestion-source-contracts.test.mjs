@@ -148,3 +148,65 @@ test("a source cannot attach its record to another source's scope", (t) => {
   assert.equal(rows(db).length, 0);
   assert.equal(store.readScope(db, scope.id).cursor, null);
 });
+
+for (const mode of ["run", "direct"]) {
+  for (const [label, beforeVersion, nextVersion, accepted] of [
+    ["equal revision", "1", "1", true],
+    ["newer revision", "1", "2", true],
+    ["older revision", "2", "1", false],
+    ["equal opaque token", token("same"), token("same"), true],
+    ["different opaque token", token("old"), token("new"), false],
+    ["unversioned", null, null, true],
+  ]) {
+    test(`${mode}: ordinary type replacement retains ${label} version rules without CAS`, (t) => {
+      const { db, scope } = fixture(t);
+      write(db, scope, [record(scope, { external_version: beforeVersion })]);
+      const incoming = record(scope, { external_version: nextVersion, record_type: "synthetic.reclassified",
+        expected_external_version: undefined, body: "Invented reclassified body", canonical_json: '{"sender_name":null}' });
+      if (mode === "run") write(db, scope, [incoming]);
+      else store.sqliteExec(db, `BEGIN IMMEDIATE; ${store.upsertRecordsSql([incoming])} COMMIT;`);
+      assert.equal(rows(db)[0].record_type, accepted ? incoming.record_type : "synthetic.note");
+      assert.equal(rows(db)[0].body, accepted ? incoming.body : "Invented original body");
+      assert.deepEqual(JSON.parse(rows(db)[0].canonical_json), accepted
+        ? { sender_name: null } : { sender_name: "Invented Name", chat_name: "Invented Chat" });
+    });
+  }
+  test(`${mode}: ordinary duplicate type candidates follow version order; CAS cannot repurpose or lose its hint`, (t) => {
+    const { db, scope } = fixture(t);
+    const old = record(scope, { external_version: "1" });
+    const newer = record(scope, { external_version: "2", record_type: "synthetic.reclassified" });
+    for (const batch of [[old, newer], [newer, old]]) {
+      assert.equal(store.normalizeStoredRecords(batch)[0].record_type, "synthetic.reclassified");
+    }
+    if (mode === "run") write(db, scope, [old, newer]);
+    else store.sqliteExec(db, `BEGIN IMMEDIATE; ${store.upsertRecordsSql([old, newer])} COMMIT;`);
+    assert.equal(rows(db)[0].record_type, "synthetic.reclassified");
+    for (const expected of [null, "2"]) {
+      assert.throws(() => store.normalizeStoredRecords([newer,
+        { ...old, expected_external_version: expected }]), /conflicting.*record type|conflicting.*CAS/i);
+    }
+    assert.throws(() => store.normalizeStoredRecords([
+      { ...newer, expected_external_version: "1" }, { ...newer, expected_external_version: "2" },
+    ]), /ambiguous expected|conflicting.*CAS/i);
+    assert.throws(() => store.normalizeStoredRecords([
+      { ...newer, expected_external_version: "2" }, newer,
+    ]), /ambiguous expected|conflicting.*CAS/i);
+  });
+}
+
+for (const mode of ["run", "direct"]) {
+  for (const predecessor of [null, token("observed")]) {
+    test(`${mode}: explicit ${predecessor === null ? "null" : "opaque"} CAS cannot reclassify an otherwise replaceable record`, (t) => {
+      const { db, scope } = fixture(t);
+      write(db, scope, [record(scope, { external_version: predecessor })]);
+      const before = rows(db);
+      const cursor = store.readScope(db, scope.id).cursor;
+      const incoming = record(scope, { external_version: token("fresh"), expected_external_version: predecessor,
+        record_type: "synthetic.reclassified", body: "must not repurpose" });
+      assert.throws(() => mode === "run" ? write(db, scope, [incoming], T + 1000)
+        : store.sqliteExec(db, `BEGIN IMMEDIATE; ${store.upsertRecordsSql([incoming])} COMMIT;`), /CHECK constraint/);
+      assert.deepEqual(rows(db), before);
+      assert.deepEqual(store.readScope(db, scope.id).cursor, cursor);
+    });
+  }
+}

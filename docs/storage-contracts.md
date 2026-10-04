@@ -47,7 +47,9 @@ Different opaque tokens have no intrinsic order. Without an explicit predecessor
 
 A matching string hint can authorize an unordered-token replacement only when both versions are nonnumeric. It cannot authorize numeric regression, erase a known version, change the record type, or move a record across sources. Failed CAS aborts the surrounding batch, including run/cursor/progress effects. The hint is not persisted in the record, canonical projection or raw payload. CAS proves absence of an intervening local replacement, not the ordering or freshness of remote tokens.
 
-Batch normalization rejects conflicting record types and different unordered versions for one source identity. Source plus external identity remains the database uniqueness key; adapters must choose external identities that are unique within their source. The record's first-seen scope must belong to that source. These guards also apply inside the write transaction.
+Ordinary writes without a CAS hint retain version-protected `record_type` replacement: equal or newer revisions, equal opaque tokens, and unversioned replacements can reclassify a record. Older revisions or different opaque tokens still cannot replace it. Batch normalization applies the same version selection without treating record type as globally immutable.
+
+Explicit CAS candidates cannot repurpose a record's type. A batch with any CAS hint rejects conflicting types or predecessor hints for the same identity, so normalization cannot discard a CAS assertion. Different unordered versions in one batch are also rejected. Source plus external identity remains the database uniqueness key; adapters must choose external identities that are unique within their source. The record's first-seen scope must belong to that source. Type and predecessor guards for explicit CAS, and source/scope ownership for all writes, are checked inside the write transaction.
 
 ## Queries and entrypoints
 
