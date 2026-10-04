@@ -142,16 +142,16 @@ test("remaining inline expansion budget cannot truncate a shorter URL mention in
   }
 });
 
-test("rejecting an inline mention expansion preserves the source URL userinfo separator", () => {
+test("URL-internal mention syntax never enters the expansion budget or loses its userinfo separator", () => {
   const name = `https://${"A".repeat(100_000)}@example.invalid/public`;
   const mentions = [{ key: "@_user_1", name }];
   const source = "@_user_1 @_user_1 https://SYNTHETIC_SECRET@_user_1";
   const result = renderCardContent(card(source), mentions);
   assertNoUserinfoDisclosure(result);
-  assert.equal(result.status, "partial");
+  assert.equal(result.status, "rendered");
   assert.match(result.text, /https:\/\/example\.invalid\/public/);
-  // The third expansion does not fit. Its original token already belongs to
-  // the input budget and must retain the '@', not join surrounding URL text.
+  // Only the two external mentions expand. The third occurrence is raw URL
+  // data and retains its separator without entering the expansion budget.
   assert.match(result.text, /https:\/\/_user_1\//);
 });
 

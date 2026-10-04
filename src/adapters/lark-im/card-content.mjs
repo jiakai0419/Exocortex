@@ -33,37 +33,45 @@ function object(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-/** Remote text cannot supply terminal escapes or text-direction controls. @param {string} text */
-function cleanText(text) {
-  const parts = [];
-  // Each input character is consumed once. Unterminated OSC/control strings
-  // consume their remaining payload; another opener cannot restart a search.
-  let state = "text";
-  for (let index = 0; index < text.length; index += 1) {
-    const code = text.charCodeAt(index);
+/** Consume one complete terminal sequence without inspecting its payload as
+ * URL, Markdown or mention syntax. Every caller advances past the whole span.
+ * @param {string} text @param {number} index
+ */
+function controlEnd(text, index) {
+  const first = text.charCodeAt(index);
+  let state = first === 0x1b ? "escape" : first === 0x9d ? "osc" : first === 0x9b ? "csi" :
+    first === 0x90 || first === 0x98 || first === 0x9e || first === 0x9f ? "string" : null;
+  if (state === null) return index;
+  for (let cursor = index + 1; cursor < text.length; cursor += 1) {
+    const code = text.charCodeAt(cursor);
     if (state === "osc" || state === "string") {
-      if (code === 0x9c || state === "osc" && code === 0x07) state = "text";
-      else if (code === 0x1b && text[index + 1] === "\\") { state = "text"; index += 1; }
-      continue;
-    }
-    if (state === "csi") {
+      if (code === 0x9c || state === "osc" && code === 0x07) return cursor + 1;
+      if (code === 0x1b && text[cursor + 1] === "\\") return cursor + 2;
+    } else if (state === "csi") {
       if (code === 0x1b) state = "escape";
       else if (code === 0x9d) state = "osc";
       else if (code === 0x90 || code === 0x98 || code === 0x9e || code === 0x9f) state = "string";
-      else if (code >= 0x40 && code <= 0x7e) state = "text";
-      continue;
-    }
-    if (state === "escape") {
+      else if (code >= 0x40 && code <= 0x7e) return cursor + 1;
+    } else {
       if (code === 0x5d) state = "osc";
       else if (code === 0x5b) state = "csi";
       else if (code === 0x50 || code === 0x58 || code === 0x5e || code === 0x5f) state = "string";
-      else if (code >= 0x30 && code <= 0x7e) state = "text";
-      continue;
+      else if (code >= 0x30 && code <= 0x7e) return cursor + 1;
     }
-    if (code === 0x1b) { state = "escape"; continue; }
-    if (code === 0x9d) { state = "osc"; continue; }
-    if (code === 0x9b) { state = "csi"; continue; }
-    if (code === 0x90 || code === 0x98 || code === 0x9e || code === 0x9f) { state = "string"; continue; }
+  }
+  return text.length;
+}
+
+/** Remote text cannot supply terminal escapes or text-direction controls.
+ * This shares the lexer's opaque control spans instead of resetting state at
+ * a mention inside a hidden payload. @param {string} text
+ */
+function cleanText(text) {
+  const parts = [];
+  for (let index = 0; index < text.length; index += 1) {
+    const end = controlEnd(text, index);
+    if (end > index) { index = end - 1; continue; }
+    const code = text.charCodeAt(index);
     if (code === 0x061c || code === 0x200e || code === 0x200f ||
         code >= 0x202a && code <= 0x202e || code >= 0x2066 && code <= 0x2069) continue;
     if (code === 0x0d) {
@@ -90,8 +98,8 @@ function renderCardContent(content, mentions = []) {
   const active = new WeakSet();
   /** @type {Map<string, string | null>} */
   const names = new Map();
-  /** Cache name strings and standalone projections across aliases.
-   * @type {Map<string, {plain: string, linked?: string}>} */
+  /** Cache terminal name projections across aliases; never reparse them in a parent.
+   * @type {Map<string, string>} */
   const formattedNames = new Map();
   let parseChars = 0;
   let textChars = 0;
@@ -172,47 +180,26 @@ function renderCardContent(content, mentions = []) {
     }
   }
 
-  /** @param {string} id @param {boolean} [projectLinks] */
-  function mention(id, projectLinks = true) {
+  /** A name is an independent source value, projected once without resolving
+   * any mention-like text inside it. The caller only appends terminal output.
+   * @param {string} id
+   */
+  function mention(id) {
     const name = names.get(id);
     if (name) {
       let formatted = formattedNames.get(name);
       if (formatted === undefined) {
-        formatted = { plain: `@${name}` };
+        formatted = projectText(`@${name}`, false).slice(0, MAX_OUTPUT_CHARS + 1);
         formattedNames.set(name, formatted);
       }
-      // Inline names are inserted as opaque text before the single final link
-      // scan. Standalone at nodes need their own cached, final link projection.
-      if (!projectLinks) return formatted.plain;
-      if (formatted.linked === undefined) formatted.linked = safeLinks(`@${name}`).slice(0, MAX_OUTPUT_CHARS + 1);
-      return formatted.linked;
+      return formatted;
     }
     mark("unresolved_card_mention");
     return "@未知用户";
   }
 
-  /** The same URL rules apply to bare URLs and Markdown destinations.
-   * @param {string} value
-   */
-  function visibleText(value) {
-    let text = boundedRawText(value);
-    // Names must reach the URL lexer whole. This separate finite workspace
-    // budget retains ordinary long-name prefixes without allocating N names
-    // of arbitrary size; only the final, safe projection is output-truncated.
-    let remainingExpansion = Math.max(0, MAX_INPUT_CHARS - text.length);
-    text = text.replace(/<at\s+id=["']([^"'<>]*)["']\s*>[^<]*<\/at>|@_user_\d+\b/gi,
-      (matched, id) => {
-        if (remainingExpansion === 0) { mark("card_output_limit"); return matched; }
-        const replacement = mention(id ?? matched, false);
-        if (replacement.length > remainingExpansion) { mark("card_output_limit"); return matched; }
-        remainingExpansion -= replacement.length;
-        return replacement;
-      });
-    // Original text is input-bounded; all inserted names together are bounded
-    // by the finite expansion budget. Keep the whole original URL syntax for
-    // redaction rather than truncating a destination before it is inspected.
-    return safeLinks(text);
-  }
+  /** @param {string} value */
+  function visibleText(value) { return projectText(boundedRawText(value), true); }
 
   /**
    * URL atoms take priority over Markdown at every source offset, including
@@ -220,17 +207,17 @@ function renderCardContent(content, mentions = []) {
    * become syntax. Markdown destinations have a separate bounded delimiter
    * scan; success and failure both advance past all inspected input. Generated
    * fragments are final output, never fed back through the lexer.
-   * @param {string} text
+   * Only original source offsets are tokenized. URL/control atoms and whole
+   * Markdown destinations are consumed before external mention resolution.
+   * @param {string} text @param {boolean} resolveMentions
    */
-  function safeLinks(text) {
+  function projectText(text, resolveMentions) {
     // Cleaning can remove @host, erase a scheme, or create one from separated
     // letters. Its leftover prose might itself be credential/query text. With
     // no unambiguous original boundary, reject the whole affected text value.
     // Control-only prose still follows the ordinary terminal cleanup rules.
     const uncertainLinks = LINK_SYNTAX_CONTROLS.test(text);
-    const originalHasLink = uncertainLinks && LINK_SCHEME.test(text);
-    text = cleanText(text);
-    if (uncertainLinks && (originalHasLink || LINK_SCHEME.test(text))) {
+    if (uncertainLinks && (LINK_SCHEME.test(text) || LINK_SCHEME.test(cleanText(text)))) {
       mark("unsupported_card_link");
       return "[不支持的链接]";
     }
@@ -245,9 +232,11 @@ function renderCardContent(content, mentions = []) {
     // Sticky matching examines at most 32 scheme characters on the original
     // string. It never slices the remaining input at each candidate position.
     const scheme = new RegExp(LINK_SCHEME.source, "iy");
+    const mentionToken = /<at\s+id=["']([^"'<>]*)["']\s*>[^<]*<\/at>|@_user_\d+\b/iy;
+    let remainingExpansion = Math.max(0, MAX_INPUT_CHARS - text.length);
     /** @param {number} end */
     function flush(end) {
-      if (end > plainStart) (label ?? parts).push(text.slice(plainStart, end));
+      if (end > plainStart) (label ?? parts).push(cleanText(text.slice(plainStart, end)));
       plainStart = end;
     }
     function literalLabel() {
@@ -261,6 +250,13 @@ function renderCardContent(content, mentions = []) {
       labelHasUrl = false;
     }
     while (index < text.length) {
+      const hiddenEnd = controlEnd(text, index);
+      if (hiddenEnd > index) {
+        flush(index);
+        index = hiddenEnd;
+        plainStart = index;
+        continue;
+      }
       scheme.lastIndex = index;
       const urlStart = scheme.exec(text);
       if (urlStart) {
@@ -277,8 +273,39 @@ function renderCardContent(content, mentions = []) {
         plainStart = end;
         continue;
       }
+      if (resolveMentions && (text[index] === "@" || text[index] === "<")) {
+        mentionToken.lastIndex = index;
+        const token = mentionToken.exec(text);
+        if (token) {
+          flush(index);
+          let tokenEnd = mentionToken.lastIndex;
+          let crossedControl = false;
+          // Match identities against original bytes. If a hidden sequence
+          // outlives this token, also consume its tail rather than exposing it
+          // after substituting the tag. Complete in-tag controls stay in IDs.
+          for (let cursor = index; cursor < tokenEnd; cursor += 1) {
+            const hiddenEnd = controlEnd(text, cursor);
+            if (hiddenEnd > tokenEnd) { tokenEnd = hiddenEnd; crossedControl = true; break; }
+            if (hiddenEnd > cursor) cursor = hiddenEnd - 1;
+          }
+          const id = crossedControl ? "" : token[1] ?? token[0];
+          const cost = (names.get(id)?.length ?? 5) + 1;
+          let projected;
+          if (cost > remainingExpansion) {
+            mark("card_output_limit");
+            projected = "@提及未展开";
+          } else {
+            remainingExpansion -= cost;
+            projected = mention(id);
+          }
+          (label ?? parts).push(projected);
+          index = tokenEnd;
+          plainStart = index;
+          continue;
+        }
+      }
       const char = text[index];
-      if (char === "\n" && label !== null) {
+      if (/[\r\n\u2028\u2029]/.test(char) && label !== null) {
         flush(index);
         literalLabel();
       } else if (char === "[") {
@@ -303,8 +330,16 @@ function renderCardContent(content, mentions = []) {
           let nesting = 1;
           let excessive = false;
           let end = index + 2;
-          for (; end < text.length && text[end] !== "\n"; end += 1) {
-            if (text[end] === "\\" && end + 1 < text.length && text[end + 1] !== "\n") { end += 1; continue; }
+          for (; end < text.length && !/[\r\n\u2028\u2029]/.test(text[end]); end += 1) {
+            const hiddenEnd = controlEnd(text, end);
+            if (hiddenEnd > end) { end = hiddenEnd - 1; continue; }
+            if (text[end] === "\\" && end + 1 < text.length && !/[\r\n\u2028\u2029]/.test(text[end + 1])) {
+              // A Markdown escape never hides a terminal-sequence opener
+              // from this scan; control payloads remain one opaque span.
+              const escapedEnd = controlEnd(text, end + 1);
+              end = escapedEnd > end + 1 ? escapedEnd - 1 : end + 1;
+              continue;
+            }
             if (text[end] === "(") nesting += 1;
             if (nesting > MAX_DEPTH) excessive = true;
             if (text[end] === ")" && --nesting === 0) break;
