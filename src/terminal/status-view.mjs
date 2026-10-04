@@ -4,15 +4,18 @@ import { formatStabilityCycles, formatStabilityFailures, formatStabilityLastSucc
   serviceTimeRange, serviceTimestamp, unsupportedScopeRows, formatReconcile, durationText } from "./lark-im-service-view.mjs";
 import { kv, section } from "../../dist/terminal/index.js";
 import { formatLogLine } from "./status-log-view.mjs";
+import { activityReasonText } from "../diagnostics/public-activity.mjs";
 
 /** Render only the public status projection; raw service reports are never accepted here.
  * @param {Record<string, any>} report */
 export function renderStatusText(report) {
   const referenceMs = Date.parse(report.observed_at);
+  const activityPhase = ["cycle", "between_steps", "step"].includes(report.activity.phase)
+    ? report.activity.phase.replaceAll("_", " ") : null;
   const lines = [
     `Service: ${report.service.status.toUpperCase()} · target ${report.service.target_match}`,
     `Health: ${report.health.status.toUpperCase()}`,
-    `Activity: ${report.activity.state.toUpperCase()}`,
+    `Activity: ${report.activity.state.toUpperCase()} · ${activityReasonText(report.activity.reason)}${activityPhase ? ` · ${activityPhase}` : ""}`,
     `Freshness: ${report.freshness.status.toUpperCase()}${report.freshness.reason !== "unknown" ? ` · ${report.freshness.reason}` : ""}`,
     `Time zone: ${Intl.DateTimeFormat().resolvedOptions().timeZone}`,
   ];

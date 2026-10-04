@@ -328,7 +328,7 @@ test("review regression: an unrelated orphan cannot suppress verified independen
     uid: () => 999, stdout: { write: (text) => { output += text; } },
     buildServiceStatusReport: (opts) => buildServiceStatusReport(opts, fixture.deps),
   }), 0);
-  assert.match(plain(output), /Activity: SYNCING/);
+  assert.match(plain(output), /Activity: SYNCING · independent foreground sync observed/);
 });
 
 test("all activity consumers reject missing required fields and malformed types without old-phase fallback", async (t) => {
@@ -356,7 +356,7 @@ test("all activity consumers reject missing required fields and malformed types 
     uid: () => 999, stdout: { write: (text) => { output += text; } },
     buildServiceStatusReport: (opts) => buildServiceStatusReport(opts, fixture.deps),
   });
-  assert.match(plain(output), /Activity: UNKNOWN/);
+  assert.match(plain(output), /Activity: UNKNOWN · current phase evidence is incomplete/);
 });
 
 test("explicit unknown identity is valid schema, blocks its old phase, and does not poison later real evidence", (t) => {

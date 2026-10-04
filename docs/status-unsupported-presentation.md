@@ -11,3 +11,5 @@ Service status declares the local IANA time zone once. `Recent cycles (up to 24h
 Other timestamps in this view use the same local context. Offsets appear only where a daylight-saving transition or repeated local hour would otherwise make an instant ambiguous. JSON timestamps, window bounds, and coverage evidence retain their existing values; only the Service text formatter changes.
 
 Activity uses its additive `state` field when present, with the earlier `status` as a compatibility fallback. Its evidence rules are documented separately in [Activity evidence](activity-evidence.md).
+
+The Activity line retains a fixed public explanation, for example `SYNCING · independent foreground sync observed`, `SYNCING · worker sync observed · step`, or `UNKNOWN · current phase evidence is incomplete`. JSON preserves the corresponding finite source, evidence, phase and reason categories. Internal detail text and process identities are never copied into this explanation.

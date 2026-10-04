@@ -6,6 +6,8 @@ import { sanitizeStatusReportForPublicOutput } from "./sync-status-report.mjs";
 import { evaluateActivityEvent } from "./lark-im-activity-evidence.mjs";
 import { LABEL, target, readInstalledServiceConfig } from "../runtime/service/launchd.mjs";
 import { publicFailureKind, publicTimestamp } from "./public-safe.mjs";
+import { publicActivity } from "./public-activity.mjs";
+import { REQUIRED_CYCLE_STEPS } from "../../dist/runtime/worker/lark-im-worker-core.js";
 
 /** @typedef {Record<string, any>} JsonObject */
 const choice = (/** @type {unknown} */ value, /** @type {string[]} */ values) => values.includes(String(value)) ? String(value) : "unknown";
@@ -84,37 +86,52 @@ function publicSyncSummary(sync) {
  * @param {JsonObject} report @param {number} nowMs */
 function serviceTargetEvidence(report, nowMs) {
   const evidence = report.activity_evidence;
-  if (!evidence || !evidence.database_identity_stable || evidence.integrity === false || evidence.truncated) return { target_match: "unknown" };
-  const worker = evidence.events.find((/** @type {JsonObject} */ event) => event.role === "worker" && event.pid === Number(report.probe.pid));
-  if (!worker) return { target_match: "unknown" };
-  const phase = evaluateActivityEvent(worker, evidence.processes.get(worker.pid), evidence.database_key, nowMs);
-  if (!["waiting", "syncing"].includes(phase.state)) return { target_match: "unknown" };
+  if (!evidence || evidence.database_identity_stable !== true || evidence.integrity === false || evidence.truncated) return { target_match: "unknown" };
+  const serviceEvents = Object.hasOwn(evidence, "service_worker_events") ? evidence.service_worker_events : evidence.events;
+  if (!Array.isArray(serviceEvents)) return { target_match: "unknown" };
+  const workers = serviceEvents.filter((/** @type {JsonObject} */ event) => event.role === "worker" && event.pid === report.probe.pid)
+    .map((/** @type {JsonObject} */ worker) => ({ worker,
+      phase: evaluateActivityEvent(worker, evidence.processes.get(worker.pid), worker.database_key, nowMs) }))
+    .filter((/** @type {JsonObject} */ value) => !["dead", "stopped"].includes(value.phase.state));
+  if (workers.length !== 1) return { target_match: "unknown" };
+  const { worker, phase } = workers[0];
+  if (worker.database_key !== evidence.database_key || !["waiting", "syncing"].includes(phase.state)) return { target_match: "unknown" };
   return { target_match: "matched", worker, phase };
 }
 
-/** Derive complete-cycle evidence from the existing bounded log; no new worker
- * event format or second scheduler is introduced. @param {JsonObject} report @param {JsonObject} binding */
+/** A completion belongs to an explicitly identified worker instance and file.
+ * Legacy or damaged records cannot supply missing evidence through adjacency.
+ * @param {JsonObject} report @param {JsonObject} binding */
 function waitWorkerSummary(report, binding) {
   const summary = { ...report.worker.summary };
-  const events = report.worker.log.events;
-  let index = events.length - 1;
-  while (index >= 0 && events[index].type !== "lark_im_worker_cycle") index--;
-  const cycle = events[index];
-  const steps = [];
-  for (let i = index - 1; i >= 0 && events[i].type !== "lark_im_worker_cycle"; i--) {
-    if (events[i].type === "lark_im_worker_step" && events[i].cycle === cycle?.cycle) steps.push(events[i]);
-  }
-  const starts = steps.map((step) => Date.parse(String(step.started_at || "")));
-  const at = Date.parse(String(cycle?.at || ""));
-  const complete = binding.target_match === "matched" && binding.phase?.state === "waiting" &&
-    binding.worker.cycle === cycle?.cycle && Number.isSafeInteger(cycle?.step_count) && cycle.step_count > 0 &&
-    Number.isFinite(at) && at <= Date.parse(String(binding.worker.updated_at || "")) &&
-    steps.length === cycle.step_count && steps.every((step, index) => {
-      const end = Date.parse(String(step.finished_at || step.at || ""));
-      return step.ok === true && Number.isFinite(end) && end >= starts[index] && end <= at;
-    }) && starts.every((start) => Number.isFinite(start) && start >= binding.worker.process_started_at_ms && start <= at);
-  summary.last_cycle = cycle ? { ...summary.last_cycle, complete, started_at: complete ? new Date(Math.min(...starts)).toISOString() : null } : null;
-  summary.in_progress = summary.in_progress || binding.phase?.state === "syncing";
+  const worker = binding.target_match === "matched" ? binding.worker : null;
+  const events = worker ? report.worker.log.events.filter((/** @type {JsonObject} */ event) => event.instance_id === worker.instance_id) : [];
+  const cycle = events.findLast((/** @type {JsonObject} */ event) => event.type === "lark_im_worker_cycle");
+  const cycleIndex = events.lastIndexOf(cycle);
+  const rows = cycle ? events.filter((/** @type {JsonObject} */ event) => event.cycle === cycle.cycle) : [];
+  const steps = rows.filter((/** @type {JsonObject} */ event) => event.type === "lark_im_worker_step");
+  const timestamp = (/** @type {unknown} */ value) => typeof value === "string" ? Date.parse(value) : NaN;
+  const bound = (/** @type {JsonObject} */ event) => event.version === 1 && event.database_key === worker?.database_key &&
+    typeof event.database_key === "string" && /^[a-f0-9]{64}$/.test(event.database_key) &&
+    event.instance_id === worker?.instance_id && Number.isSafeInteger(event.cycle) && event.cycle > 0;
+  const starts = steps.map((/** @type {JsonObject} */ step) => timestamp(step.started_at));
+  const ends = steps.map((/** @type {JsonObject} */ step) => timestamp(step.finished_at));
+  const at = timestamp(cycle?.at);
+  const expectedNames = cycle?.step_count === REQUIRED_CYCLE_STEPS.length + 1 ? [...REQUIRED_CYCLE_STEPS, "retention"] : REQUIRED_CYCLE_STEPS;
+  const complete = Boolean(worker && binding.phase?.state === "waiting" && cycle && bound(cycle) && cycle.ok === true &&
+    worker.cycle === cycle.cycle && Array.isArray(cycle.failed_steps) && cycle.failed_steps.length === 0 &&
+    cycle.step_count === expectedNames.length && steps.length === cycle.step_count &&
+    rows.filter((/** @type {JsonObject} */ event) => event.type === "lark_im_worker_cycle").length === 1 &&
+    Number.isFinite(at) && at <= timestamp(worker.updated_at) &&
+    steps.every((/** @type {JsonObject} */ step, /** @type {number} */ index) => bound(step) &&
+      step.step_index === index && step.name === expectedNames[index] && step.ok === true && step.exit_code === 0 &&
+      (step.partial === undefined || step.partial === false) &&
+      events.indexOf(step) < cycleIndex && Number.isFinite(starts[index]) && starts[index] >= worker.process_started_at_ms &&
+      (index === 0 || starts[index] >= ends[index - 1]) && Number.isFinite(ends[index]) && ends[index] >= starts[index] && ends[index] <= at));
+  summary.last_cycle = cycle ? { cycle: cycle.cycle, ok: cycle.ok === true, at: Number.isFinite(at) ? new Date(at).toISOString() : null,
+    complete, started_at: complete ? new Date(starts[0]).toISOString() : null } : null;
+  summary.in_progress = binding.phase?.state === "syncing";
+  summary.unfinished_cycle = events.some((/** @type {JsonObject} */ event, /** @type {number} */ index) => event.type === "lark_im_worker_step" && index > cycleIndex);
   return summary;
 }
 
@@ -140,8 +157,7 @@ function publicStatusReport(collected, options) {
     service: { status: choice(service.status, ["running", "loaded", "absent", "unknown"]), target_match: service.target_match,
       configuration: choice(installed.status, ["installed", "missing", "unknown"]), pid: count(service.pid), last_exit_code: Number.isSafeInteger(service.last_exit_code) ? service.last_exit_code : null },
     health: { status: choice(overview.health.status, ["ok", "catching_up", "problem"]), local: choice(sync?.health, ["ok", "ok_with_history", "catching_up", "syncing", "not_ready", "needs_attention", "unknown"]) },
-    activity: { status: choice(overview.activity.status, ["idle", "syncing", "unknown"]), state: choice(overview.activity.state, ["waiting", "stopped", "syncing", "unknown"]),
-      observed_at: publicTimestamp(overview.activity.observed_at), updated_at: publicTimestamp(overview.activity.updated_at), valid_until: publicTimestamp(overview.activity.valid_until) },
+    activity: publicActivity(overview.activity),
     freshness: { status: choice(overview.freshness.status, ["sampled", "unknown", "behind"]), auth_identity: "unknown",
       scope: choice(overview.freshness.scope, ["recent_hot_messages"]), reason: choice(overview.freshness.reason, FRESHNESS_REASONS),
       window: { start: publicTimestamp(overview.freshness.window?.start), end: publicTimestamp(overview.freshness.window?.end) },

@@ -438,10 +438,10 @@ function cyclePayload(
   return {
     type: "lark_im_worker_cycle",
     cycle,
-    ok: steps.every((step) => step.ok),
+    ok: steps.length > 0 && steps.every((step) => step.ok === true),
     at: now(),
     step_count: steps.length,
-    failed_steps: steps.filter((step) => !step.ok).map((step) => step.name || "unknown"),
+    failed_steps: steps.filter((step) => step.ok !== true).map((step) => step.name || "unknown"),
   };
 }
 
@@ -457,7 +457,7 @@ function runCycleWithRunner(
   for (const spec of buildCycleStepSpecs(opts, cycle)) {
     const step = runStep(spec.name, spec.args, spec.command || "sync");
     steps.push(step);
-    writeLog(opts, { type: "lark_im_worker_step", cycle, ...step });
+    writeLog(opts, { ...step, type: "lark_im_worker_step", cycle, step_index: steps.length - 1 });
   }
   const payload = cyclePayload(cycle, steps, now);
   writeLog(opts, payload);
@@ -505,7 +505,7 @@ function summarizeWorkerEvents(events: unknown[], nowMs = Date.now()) {
     last_cycle: lastCycle
       ? {
           cycle: lastCycle.cycle,
-          ok: Boolean(lastCycle.ok),
+          ok: lastCycle.ok === true,
           at: eventTimeIso(lastCycle),
           age_ms: lastCycleMs === null ? null : Math.max(0, nowMs - lastCycleMs),
         }
@@ -514,7 +514,7 @@ function summarizeWorkerEvents(events: unknown[], nowMs = Date.now()) {
       ? {
           cycle: lastStep.cycle,
           name: lastStep.name,
-          ok: Boolean(lastStep.ok),
+          ok: lastStep.ok === true,
           at: eventTimeIso(lastStep),
           age_ms: lastStepMs === null ? null : Math.max(0, nowMs - lastStepMs),
         }
@@ -537,6 +537,7 @@ function summarizeWorkerEvents(events: unknown[], nowMs = Date.now()) {
 }
 
 export {
+  REQUIRED_CYCLE_STEPS,
   adaptiveFairDecision,
   buildCycleStepSpecs,
   compactRun,

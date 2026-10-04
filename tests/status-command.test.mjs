@@ -52,10 +52,14 @@ test("private log rendering retains cycle, failed step, counters, stderr and raw
 function boundReport() {
   const worker = { type: "lark_im_worker_activity", version: 1, role: "worker", pid: 1234, instance_id: "invented", parent_instance: null, database_key: "a".repeat(64),
     process_started_at_ms: at - 60000, phase: "waiting", cycle: 3, step: null, updated_at: new Date(at + 1000).toISOString(), valid_until: new Date(at + 6000).toISOString() };
-  const cycle = { type: "lark_im_worker_cycle", cycle: 3, ok: true, at: new Date(at + 1000).toISOString(), step_count: 1 };
-  const step = { type: "lark_im_worker_step", cycle: 3, ok: true, name: "sent", started_at: new Date(at).toISOString(), finished_at: new Date(at + 999).toISOString() };
+  const identity = { version: 1, instance_id: worker.instance_id, database_key: worker.database_key, cycle: 3 };
+  const cycle = { ...identity, type: "lark_im_worker_cycle", ok: true, at: new Date(at + 1000).toISOString(), step_count: 6, failed_steps: [] };
+  const steps = ["sent", "discover-hot", "received-hot", "discover-catchup", "discover-reconcile", "received-fair"].map((name, index) => ({
+    ...identity, type: "lark_im_worker_step", ok: true, exit_code: 0, name, step_index: index,
+    started_at: new Date(at + index * 100).toISOString(), finished_at: new Date(at + index * 100 + 99).toISOString(),
+  }));
   return report({ probe: { status: "running", pid: 1234 }, activity_evidence: { events: [worker], database_key: worker.database_key, database_identity_stable: true, integrity: true,
-    processes: new Map([[1234, { state: "alive", started_at_ms: at - 60000 }]]) }, worker: { log: { events: [step, cycle] }, summary: { last_cycle: { cycle: 3, ok: true, at: cycle.at } } } });
+    processes: new Map([[1234, { state: "alive", started_at_ms: at - 60000 }]]) }, worker: { log: { events: [...steps, cycle] }, summary: { last_cycle: { cycle: 3, ok: true, at: cycle.at } } } });
 }
 test("installed disk config alone never proves running database association", () => {
   assert.equal(serviceTargetEvidence(report(), at).target_match, "unknown");
@@ -66,7 +70,7 @@ test("installed disk config alone never proves running database association", ()
 test("wait summary requires a current matching worker and every successful step of its completed cycle", () => {
   const r = boundReport(); const binding = serviceTargetEvidence(r, at + 2000);
   const summary = waitWorkerSummary(r, binding); assert.equal(summary.last_cycle.complete, true); assert.equal(summary.last_cycle.started_at, new Date(at).toISOString());
-  for (const mutate of [(r) => r.worker.log.events.pop(), (r) => r.worker.log.events.shift(), (r) => { r.worker.log.events[0].ok = false; }, (r) => { r.worker.log.events[0].started_at = "bad"; }, (r) => { r.worker.log.events[1].step_count = 2; }, (r) => { r.worker.log.events[1].at = new Date(at + 90000).toISOString(); }, (r) => { r.worker.log.events[0].finished_at = new Date(at - 1).toISOString(); }, (r) => { r.worker.log.events[0].finished_at = new Date(at + 90000).toISOString(); }, (r) => { r.activity_evidence.events[0].cycle = 4; }]) {
+  for (const mutate of [(r) => r.worker.log.events.pop(), (r) => r.worker.log.events.shift(), (r) => { r.worker.log.events[0].ok = false; }, (r) => { r.worker.log.events[0].started_at = "bad"; }, (r) => { r.worker.log.events.at(-1).step_count = 2; }, (r) => { r.worker.log.events.at(-1).at = new Date(at + 90000).toISOString(); }, (r) => { r.worker.log.events[0].finished_at = new Date(at - 1).toISOString(); }, (r) => { r.worker.log.events[0].finished_at = new Date(at + 90000).toISOString(); }, (r) => { r.activity_evidence.events[0].cycle = 4; }]) {
     const bad = boundReport(); mutate(bad); assert.notEqual(waitWorkerSummary(bad, serviceTargetEvidence(bad, at + 2000)).last_cycle?.complete, true);
   }
 });

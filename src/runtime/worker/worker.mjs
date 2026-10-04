@@ -1,6 +1,6 @@
 // @ts-check
 
-import { ACTIVITY_GAP_MS, ACTIVITY_GRACE_MS, createActivityWriter } from "../../diagnostics/lark-im-activity-evidence.mjs";
+import { ACTIVITY_GAP_MS, ACTIVITY_GRACE_MS, activityDatabaseKey, createActivityWriter } from "../../diagnostics/lark-im-activity-evidence.mjs";
 
 import { spawnSync } from "node:child_process";
 import { parseOptions } from "../../cli/parse-options.mjs";
@@ -95,13 +95,13 @@ function usage(bridge = false) {
     `  ${spec.flag}${spec.type === "boolean" ? "" : " <value>"}  ${spec.description} Default: ${spec.default}`).join("\n")}\n  --once  Run one cycle and exit.\n  --max-cycles <n>  Stop after N cycles.\n  --help  Show this help.\n`;
 }
 
-/** @param {string[]} argv @returns {WorkerOptions} */
-function parseArgs(argv) {
+/** @param {string[]} argv @param {{legacy?:boolean}} [context] @returns {WorkerOptions} */
+function parseArgs(argv, { legacy = false } = {}) {
   const lifetime = [
     { flag: "--once", key: "once", type: "boolean" },
     { flag: "--max-cycles", key: "maxCycles", type: "integer" },
   ];
-  const parsed = parseOptions(argv, [...WORKER_OPTION_SPECS, ...lifetime], { resolvePaths: false });
+  const parsed = parseOptions(argv, [...WORKER_OPTION_SPECS, ...lifetime], { resolvePaths: false, allowDuplicates: legacy });
   const opts = /** @type {WorkerOptions} */ ({ ...parsed.options, maxCycles: null });
   // Keep the registered bridge's established last lifetime flag behavior.
   for (let i = 0; i < argv.length; i += 1) {
@@ -202,6 +202,8 @@ function runStep(name, args, deps = {}) {
 function runCycle(opts, cycle, deps = {}) {
   const cooldowns = deps.cooldownsByOperation || {};
   const nowMs = deps.nowMs || Date.now;
+  const databaseKey = activityDatabaseKey(opts.db);
+  let databaseStable = databaseKey !== null;
   return runCycleWithRunner(
     opts,
     cycle,
@@ -241,7 +243,11 @@ function runCycle(opts, cycle, deps = {}) {
       Object.assign(cooldowns, merged);
       return step;
     },
-    (logOpts, payload) => writeLog(logOpts, payload, deps.writeLog),
+    (logOpts, payload) => {
+      databaseStable = databaseStable && activityDatabaseKey(opts.db) === databaseKey;
+      writeLog(logOpts, { ...payload, version: 1, instance_id: deps.activity?.instanceId || null,
+        database_key: databaseStable ? databaseKey : null }, deps.writeLog);
+    },
     deps.now || (() => new Date(nowMs()).toISOString()),
     deps.onComplete,
   );
@@ -272,12 +278,12 @@ function runWorker(opts, deps = {}) {
     /** @type {JsonObject[] | undefined} */
     let observedSteps;
     const cycleOpts = opts.adaptiveFair ? { ...opts, receivedScopesPerCycle: adaptiveState.batch } : opts;
-    const cycleOk = Boolean(runOneCycle(cycleOpts, cycle, {
+    const cycleOk = runOneCycle(cycleOpts, cycle, {
       cooldownsByOperation: cooldowns,
       activity, activityEnv,
       nowMs,
       onComplete: (steps) => { observedSteps = steps; },
-    }));
+    }) === true;
     ok = cycleOk && ok;
     if (opts.adaptiveFair) {
       const outcome = adaptiveFairDecision(adaptiveState, {
@@ -286,7 +292,8 @@ function runWorker(opts, deps = {}) {
         steps: observedSteps,
       }, opts);
       adaptiveState = outcome.state;
-      logScheduler(cycleOpts, { type: "lark_im_worker_scheduler", cycle, at: new Date(nowMs()).toISOString(), ...outcome.decision });
+      logScheduler(cycleOpts, { type: "lark_im_worker_scheduler", version: 1, instance_id: activity?.instanceId || null,
+        database_key: activityDatabaseKey(opts.db), cycle, at: new Date(nowMs()).toISOString(), ...outcome.decision });
     }
     if (opts.maxCycles !== null && cycle >= opts.maxCycles) break;
     activity?.update("waiting", { cycle, durationMs: opts.intervalSeconds * 1000 + ACTIVITY_GRACE_MS });
@@ -298,7 +305,7 @@ function runWorker(opts, deps = {}) {
 
 /** Internal execution policy; the registered legacy bridge alone keeps cwd defaults. */
 function main(argv = process.argv.slice(2), context = {}) {
-  let opts = parseArgs(argv);
+  let opts = parseArgs(argv, { legacy: context.legacyPaths === true });
   if (opts.help) { (context.stdout || process.stdout).write(usage(context.legacyPaths)); return 0; }
   const provided = new Set(argv.filter((arg) => arg.startsWith("--")));
   opts = resolveWorkerPaths(opts, { root: context.legacyPaths ? (context.cwd || process.cwd()) : (context.root || PROJECT_ROOT),

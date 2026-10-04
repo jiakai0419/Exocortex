@@ -40,6 +40,7 @@ export function createProbeRunner({ spawn = spawnSync, clock = Date.now } = {}) 
     return {
       id, command: `lark-cli ${label}`, ok: result?.status === 0 && !result?.error && !result?.signal && !apiFailed && (!parseFailed || options.keepStdout === true),
       exit_code: result?.status ?? null, signal: result?.signal ?? null,
+      execution_error: result === null || Boolean(result.error),
       failure_kind: parseFailed && options.keepStdout === true ? null : failure,
       json_parse_failed: parseFailed && options.keepStdout !== true,
       started_at: new Date(started).toISOString(), finished_at: new Date(clock()).toISOString(),

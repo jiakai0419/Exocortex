@@ -1,5 +1,5 @@
 /** Primitive parsing is shared; domain window, identity and effect rules are not a DSL. */
-export function parseOptions(argv: any, specs: any, { context, allowAll, resolvePaths }?: {
+export function parseOptions(argv: any, specs: any, { context, allowAll, resolvePaths, allowDuplicates }?: {
     context?: {
         cwd: string;
         root: string;
@@ -16,6 +16,7 @@ export function parseOptions(argv: any, specs: any, { context, allowAll, resolve
     } | undefined;
     allowAll?: boolean | undefined;
     resolvePaths?: boolean | undefined;
+    allowDuplicates?: boolean | undefined;
 }): {
     options: Record<string, any>;
     provided: Set<any>;

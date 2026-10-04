@@ -24,6 +24,8 @@ node tools/probes/cursors.mjs --api convenience \
 
 native 是默认路径，convenience 只作显式对照，报告保留 api_family/version。实验观察顺序、包含式时间边界、has_more/page_token、过滤前后位置与计数；不能把一个 API 家族或一个样本的结果推广为全部会话、全历史或生产 cursor 证明。请求和输出有界且不自动重试，不因失败而悄悄扩窗或落完整报告。
 
+Cursor 探针需要可识别的 CLI 版本和可用的自身身份，才能报告 `ok: true`。版本命令执行失败计入失败并退出 1；执行成功但版本不可识别，或身份缺失、空白、类型无效，则返回 `incomplete: true`、退出 2。身份不足时跳过 sent 查询，保留 received 原观察；已有分页失败和异常边界仍使结果失败或不完整。版本命令的完整观察只保存在显式私有报告，默认摘要只公开安全版本字段、计数与布尔状态。
+
 ## Questions that remain distinct
 
 - 事件是否覆盖 user 身份可见消息，是否有足够的离线补偿；仅 bot 可见性不能代替用户态轮询。

@@ -25,7 +25,7 @@ function probe(t, entries, self = SELF, api = "native") {
   writeFileSync(cli, `#!/usr/bin/env node
 const args = process.argv.slice(2);
 let result;
-if (args[0] === "--version") result = "1.2.3";
+if (args[0] === "--version") { process.stdout.write("1.2.3"); process.exit(0); }
 else if (args[0] === "contact" && args[1] === "+get-user") result = ${JSON.stringify(self ? { open_id: self } : {})};
 else if (args[1] === "+chat-list") result = { chats: [{ chat_id: "oc_synthetic_cursor_room" }] };
 else if (args[1] === "+chat-messages-list") result = { messages: ${JSON.stringify(messages)} };
@@ -44,7 +44,8 @@ process.stdout.write(JSON.stringify(result));
       XDG_CONFIG_HOME: home, XDG_CACHE_HOME: home, XDG_DATA_HOME: home, TMPDIR: directory,
       TZ: "UTC", LANG: "C", LARK_CLI: cli },
   });
-  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.status, self ? 0 : 2, result.stderr);
+  assert.equal(JSON.parse(result.stdout).incomplete, !self);
   const reportText = readFileSync(output, "utf8");
   assert.doesNotMatch(reportText, /SYNTHETIC_BODY_MUST_NOT_APPEAR|ou_synthetic_cursor_|om_synthetic_cursor_/);
   const report = JSON.parse(reportText);

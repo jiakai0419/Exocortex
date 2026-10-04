@@ -339,19 +339,20 @@ function summarizeServiceHealth({ service, syncStatus, syncErrorText = "", worke
  * @param {{service: {status: ServiceRuntimeStatus}, syncStatus: JsonObject | null, workerSummary: JsonObject, nowMs?: number, activityEvidence?: JsonObject, launchd?: JsonObject}} input
  */
 function summarizeServiceActivity({ service, syncStatus, nowMs = Date.now(), activityEvidence, launchd = {} }) {
-  /** @param {string} state @param {string} detail @param {JsonObject} [fields] */
-  const result = (state, detail, fields = {}) => ({
-    status: /** @type {ServiceActivityStatus} */ (state === "waiting" || state === "stopped" ? "idle" : state), state, detail, ...fields,
+  /** @param {string} state @param {string} detail @param {string} reason @param {JsonObject} [fields] */
+  const result = (state, detail, reason, fields = {}) => ({
+    status: /** @type {ServiceActivityStatus} */ (state === "waiting" || state === "stopped" ? "idle" : state), state, detail, reason,
+    evidence: "unavailable", source: "unknown", phase: "unknown", ...fields,
   });
   if (!syncStatus || syncStatus.status === "command_failed" || !syncStatus.health) {
-    return result("unknown", "sync status unavailable; current activity cannot be determined");
+    return result("unknown", "sync status unavailable; current activity cannot be determined", "sync_status_unavailable");
   }
-  if (activityEvidence?.database_identity_stable === false) return result("unknown", "database file identity changed or is unavailable");
+  if (activityEvidence?.database_identity_stable === false) return result("unknown", "database file identity changed or is unavailable", "database_identity_unavailable");
   if (activityEvidence?.integrity === false || activityEvidence?.truncated) {
-    return result("unknown", "current phase evidence is incomplete");
+    return result("unknown", "current phase evidence is incomplete", "phase_evidence_incomplete");
   }
   const events = activityEvidence?.events || [];
-  if (!events.every(validateActivityEventShape)) return result("unknown", "current phase evidence is incomplete");
+  if (!events.every(validateActivityEventShape)) return result("unknown", "current phase evidence is incomplete", "phase_evidence_incomplete");
   const processes = activityEvidence?.processes || new Map();
   const evaluated = events.map((event) => ({ event,
     value: evaluateActivityEvent(event, processes.get(event.pid), activityEvidence?.database_key || "", nowMs),
@@ -377,26 +378,27 @@ function summarizeServiceActivity({ service, syncStatus, nowMs = Date.now(), act
       if (!worker || parent !== worker.event.instance_id || ppid !== worker.event.pid
         || worker.value.state !== "syncing") {
         const belongsToCurrentWorker = worker && (parent === worker.event.instance_id || ppid === worker.event.pid);
-        childEvidenceIssue = belongsToCurrentWorker ? "worker and child phase evidence disagree"
-          : childEvidenceIssue || "a worker child has no verified current parent phase";
+        childEvidenceIssue = belongsToCurrentWorker
+          ? { detail: "worker and child phase evidence disagree", reason: "worker_child_conflict" }
+          : childEvidenceIssue || { detail: "a worker child has no verified current parent phase", reason: "worker_parent_unverified" };
       }
     } else if (!Number.isSafeInteger(ppid) || ppid < 1) {
-      childEvidenceIssue ||= "foreground process parent is unavailable";
+      childEvidenceIssue ||= { detail: "foreground process parent is unavailable", reason: "foreground_parent_unavailable" };
     } else independent.push(child);
   }
   // Verified independent work proves activity for this database even if a
   // different worker/child remains unexplained. Never promote that child.
   const foreground = independent.find((item) => item.value.state === "syncing");
-  if (foreground) return result("syncing", "foreground sync observed", {
+  if (foreground) return result("syncing", "foreground sync observed", "foreground_sync_observed", {
     phase: "sync", updated_at: foreground.value.updated_at, valid_until: foreground.value.valid_until,
-    evidence: "recent_foreground_phase", observed_at: activityEvidence?.observed_at || null,
+    evidence: "recent_foreground_phase", source: "foreground", observed_at: activityEvidence?.observed_at || null,
   });
-  if (childEvidenceIssue) return result("unknown", childEvidenceIssue);
+  if (childEvidenceIssue) return result("unknown", childEvidenceIssue.detail, childEvidenceIssue.reason);
   if (worker?.value.state === "syncing" && service.status !== "unknown") {
     const value = worker.value;
-    return result("syncing", `cycle #${value.cycle || "?"}${value.step ? ` · ${value.step}` : " · between steps"}`, {
+    return result("syncing", `cycle #${value.cycle || "?"}${value.step ? ` · ${value.step}` : " · between steps"}`, "worker_phase_observed", {
       phase: value.phase, cycle: value.cycle, updated_at: value.updated_at, valid_until: value.valid_until,
-      evidence: "verified_worker_phase", observed_at: activityEvidence?.observed_at || null,
+      evidence: "verified_worker_phase", source: "worker", observed_at: activityEvidence?.observed_at || null,
     });
   }
   const uncertainEvent = evaluated.some((item) => item.value.state === "unknown" || item.value.state === "syncing");
@@ -406,15 +408,18 @@ function summarizeServiceActivity({ service, syncStatus, nowMs = Date.now(), act
     const at = Date.parse(String(lock.owner_observed_at || ""));
     return lock.owner_state !== "dead" || !Number.isFinite(at) || at > nowMs || nowMs - at > 5000;
   });
-  if (uncertainEvent || uncertainOwner) return result("unknown", "current phase or owner evidence is unavailable");
+  if (uncertainEvent || uncertainOwner) return result("unknown", "current phase or owner evidence is unavailable",
+    uncertainEvent ? service.status === "unknown" ? "service_state_unavailable" : "current_phase_unavailable" : "owner_evidence_unavailable");
   if (worker?.value.state === "waiting" && service.status !== "unknown") {
-    return result("waiting", `between cycles · last cycle #${worker.value.cycle || "?"}`, {
+    return result("waiting", `between cycles · last cycle #${worker.value.cycle || "?"}`, "worker_waiting", {
       phase: "waiting", cycle: worker.value.cycle, updated_at: worker.value.updated_at, valid_until: worker.value.valid_until,
-      evidence: "verified_worker_phase", observed_at: activityEvidence?.observed_at || null,
+      evidence: "verified_worker_phase", source: "worker", observed_at: activityEvidence?.observed_at || null,
     });
   }
-  if (service.status === "stopped") return result("stopped", "no current local sync process observed");
-  return result("unknown", "current worker phase is unavailable");
+  if (service.status === "stopped") return result("stopped", "no current local sync process observed", "no_current_sync_observed",
+    { evidence: "no_current_process_observed", source: "none", phase: "stopped" });
+  return result("unknown", "current worker phase is unavailable",
+    service.status === "unknown" ? "service_state_unavailable" : "worker_phase_unavailable");
 }
 
 /**
@@ -505,6 +510,24 @@ function buildServiceOverview({
   };
 }
 
+/** Service ownership must see other database bindings for the probed PID.
+ * The input already has the log reader's byte/row bound; unrelated PIDs never
+ * consume the activity classifier's 32-instance budget here.
+ * @param {JsonObject[]} events @param {number | null} pid */
+function latestServiceWorkerEvents(events, pid) {
+  const seen = new Set();
+  const latest = [];
+  for (let index = events.length - 1; index >= 0; index--) {
+    const event = events[index];
+    if (event.type !== "lark_im_worker_activity" || event.role !== "worker" || event.pid !== pid) continue;
+    if (!validateActivityEventShape(event)) return [event];
+    if (seen.has(event.instance_id)) continue;
+    seen.add(event.instance_id);
+    latest.push(event);
+  }
+  return latest;
+}
+
 /**
  * @param {ServiceStatusOptions} opts
  * @param {ServiceStatusReportDeps} [deps]
@@ -539,12 +562,16 @@ function buildServiceStatusReport(opts, deps = {}) {
   // Synchronous diagnostic reads can outlast a lease or observe one acquired
   // after collection began. Evaluate all temporal evidence after those reads.
   const candidates = latestActivityEvents(workerLog.events, initialDatabaseKey, now());
-  const processes = (deps.inspectActivityProcesses || inspectActivityProcesses)(candidates.events.map((event) => Number(event.pid)));
+  const serviceWorkerEvents = latestServiceWorkerEvents(workerLog.events, probe.pid);
+  const processes = (deps.inspectActivityProcesses || inspectActivityProcesses)([...new Set([
+    ...(serviceWorkerEvents.length > 0 && probe.pid !== null ? [probe.pid] : []), ...candidates.events.map((event) => Number(event.pid)),
+  ])]);
   const parentIdentities = collectWorkerParentIdentities(workerLog.events, candidates.events
     .filter((event) => event.role === "sync").map((event) => processes.get(Number(event.pid))?.ppid));
   const finalDatabaseKey = activityDatabaseKey(opts.db || DEFAULT_DB);
   const nowMs = now();
-  const activityEvidence = { ...candidates, processes, parent_identities: parentIdentities, database_key: finalDatabaseKey,
+  const activityEvidence = { ...candidates, processes, service_worker_events: serviceWorkerEvents,
+    parent_identities: parentIdentities, database_key: finalDatabaseKey,
     database_identity_stable: initialDatabaseKey !== null && initialDatabaseKey === finalDatabaseKey,
     integrity: workerLog.activity_integrity !== false && candidates.integrity !== false, observed_at: new Date(nowMs).toISOString() };
   const workerSummary = summarize(workerLog.events.filter((event) => event.type !== "lark_im_worker_activity"), nowMs);

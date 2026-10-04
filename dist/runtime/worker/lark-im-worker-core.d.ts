@@ -62,6 +62,7 @@ type AdaptiveCycleObservation = {
     durationMs: number;
     steps?: WorkerEvent[];
 };
+declare const REQUIRED_CYCLE_STEPS: string[];
 declare function compactTransportCooldowns(input: unknown): Record<string, number>;
 declare function mergeTransportCooldowns(previous: unknown, incoming: unknown, nowMs?: number): {
     [k: string]: number;
@@ -202,4 +203,4 @@ declare function summarizeWorkerEvents(events: unknown[], nowMs?: number): {
         age_ms: number | null;
     } | null;
 };
-export { adaptiveFairDecision, buildCycleStepSpecs, compactRun, compactSummary, compactTransportCooldowns, compactTransportStats, createAdaptiveFairState, mergeTransportCooldowns, cyclePayload, runCycleWithRunner, summarizeWorkerEvents, };
+export { REQUIRED_CYCLE_STEPS, adaptiveFairDecision, buildCycleStepSpecs, compactRun, compactSummary, compactTransportCooldowns, compactTransportStats, createAdaptiveFairState, mergeTransportCooldowns, cyclePayload, runCycleWithRunner, summarizeWorkerEvents, };

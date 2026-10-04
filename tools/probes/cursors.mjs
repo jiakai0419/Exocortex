@@ -113,7 +113,7 @@ function getEnvelope(json, collectionName) {
 
 function getSelfOpenId(selfJson) {
   if (!selfJson || typeof selfJson !== "object") return "";
-  return (
+  const id = (
     selfJson.open_id ||
     selfJson.user?.open_id ||
     selfJson.data?.open_id ||
@@ -121,6 +121,7 @@ function getSelfOpenId(selfJson) {
     selfJson.data?.user_id?.open_id ||
     ""
   );
+  return typeof id === "string" && id.length > 0 && !/[\s\u0000-\u001f\u007f-\u009f]/u.test(id) ? id : "";
 }
 
 function senderId(message) {
@@ -237,7 +238,7 @@ function boundarySkipReason(boundary, opts) {
 
 function probeSentByMe(opts, selfOpenId) {
   if (!selfOpenId) {
-    return { skipped: true, reason: "self_open_id_unavailable" };
+    return { skipped: true, incomplete: true, reason: "self_open_id_unavailable" };
   }
 
   const baseArgs = [
@@ -529,12 +530,12 @@ function main() {
   api = opts.api;
   const version = runLark("version", ["--version"], { keepStdout: true });
   const self = runLark("self", ["contact", "+get-user", "--as", "user", "--format", "json"]);
-  const selfOpenId = getSelfOpenId(self.json);
+  const selfOpenId = self.ok ? getSelfOpenId(self.json) : "";
 
   const report = {
     generated_at: new Date().toISOString(),
     api_family: api, api_version: api === "native" ? "im/v1" : "lark-cli-convenience",
-    cli_version: probeVersion(version),
+    cli_version: version.ok ? probeVersion(version) : "unknown",
     discovery_family: "lark-cli-convenience",
     native_observations: nativeObservations,
     probe_window: {
@@ -551,10 +552,14 @@ function main() {
       chat_types: opts.chatTypes,
     },
     commands: {
+      version,
       self: {
         ok: self.ok,
         command: self.command,
         exit_code: self.exit_code,
+        signal: self.signal,
+        execution_error: self.execution_error,
+        failure_kind: self.failure_kind,
         stderr: self.stderr,
         open_id_present: Boolean(selfOpenId),
         open_id_hash: hashId(selfOpenId),
@@ -572,12 +577,13 @@ function main() {
   const received = report.probes.received_from_unmuted_chats;
   const pages = [sent.first_page, sent.second_page, sent.start_boundary_probe?.page,
     ...received.chat_list.pages, ...received.chats.flatMap((chat) => [chat.first_page, chat.second_page, chat.start_boundary_probe?.page])].filter(Boolean);
-  const failed = pages.filter((page) => page && !page.ok).length + (self.ok ? 0 : 1);
-  const incomplete = sent.start_boundary_probe?.incomplete === true || received.chats.some((chat) => chat.start_boundary_probe?.incomplete === true);
+  const failed = pages.filter((page) => page && !page.ok).length + (self.ok ? 0 : 1) + (version.ok ? 0 : 1);
+  const incomplete = report.cli_version === "unknown" || sent.incomplete === true ||
+    sent.start_boundary_probe?.incomplete === true || received.chats.some((chat) => chat.start_boundary_probe?.incomplete === true);
   process.stdout.write(`${JSON.stringify({ schema_version: 1, api_family: report.api_family,
     api_version: report.api_version, cli_version: report.cli_version, ok: failed === 0 && !incomplete,
     pages: pages.length, failed, incomplete, report_written: reportWritten })}\n`);
-  process.exitCode = failed || incomplete ? 2 : 0;
+  process.exitCode = !version.ok ? 1 : failed || incomplete ? 2 : 0;
 }
 
 try {
