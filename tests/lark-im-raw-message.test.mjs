@@ -108,8 +108,8 @@ test("unsupported post elements preserve the entire original structure with a pa
   assert.deepEqual(JSON.parse(record(normalizeApiMessage(item)).raw_json), item);
 });
 
-test("cards, unknown types and malformed content have complete declared structural fallbacks", () => {
-  for (const type of ["interactive", "future_type", "image"]) {
+test("unknown types and malformed content have complete declared structural fallbacks", () => {
+  for (const type of ["future_type", "image"]) {
     const item = nativeMessage(type, { title: "Synthetic title", elements: [{ future: [1, 2, { all_fields: true }] }] });
     const normalized = normalizeApiMessage(item);
     assert.equal(normalized.content_rendering.status, "structured_fallback");
@@ -197,7 +197,10 @@ test("merge-forward flattening cannot loop or discard unknown descendants", () =
   assert.equal(normalized.content_rendering.status, "partial");
   assert.match(normalized.content, /列出 3 条/);
   assert.match(normalized.content, /Cyclic child A/);
-  assert.equal(normalized.content.includes(childB.body.content), true);
+  assert.match(normalized.content, /卡片/);
+  assert.equal(normalized.content.includes(childB.body.content), false, "unsupported cards keep raw evidence outside the bounded text projection");
+  assert.equal(normalized.raw_api_expansions.merge_forward.items.find((item) => item.message_id === childB.message_id).body.content,
+    childB.body.content);
   assert.equal(normalized.content.includes(nested.body.content), true);
   assert.match(normalized.content, /未展开转发合并内容/);
 });

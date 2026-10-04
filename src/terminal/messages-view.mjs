@@ -4,6 +4,7 @@ import {
   block,
   compact,
   key,
+  sanitizeTerminalText,
   section,
   statusBadge,
   subtitle,
@@ -33,7 +34,16 @@ function renderMessagesText(messages) {
     if (message.display.recipient) lines.push(`  ${key("接收人")}  ${value(message.display.recipient)}`);
     if (message.display.chat) lines.push(`  ${key("群")}      ${value(message.display.chat)}`);
     lines.push(`  ${key("类型")}    ${value(message.display.sender_type)} / ${value(message.display.message_type)}`);
-    lines.push(`  ${key("消息")}    ${compact(message.display.body)}`);
+    if (message.display.card) {
+      // Never feed a failed card projection back into the legacy raw-JSON body
+      // fallback. Preserve lines, sanitize before indentation, and keep styling
+      // restricted to trusted labels.
+      lines.push(`  ${key("消息")}`);
+      const text = sanitizeTerminalText(message.display.card.text, { preserveNewlines: true });
+      for (const line of (text || "[卡片没有可展示的文本]").split("\n")) lines.push(`    ${line}`);
+    } else {
+      lines.push(`  ${key("消息")}    ${compact(message.display.body)}`);
+    }
     lines.push("");
   }
   return `${block(lines)}\n`;

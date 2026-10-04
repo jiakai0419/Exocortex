@@ -2,11 +2,13 @@
 
 ## Scope and implementation plan
 
-This change is limited to three reliability fixes on the existing Node implementation.
+This change covers three reliability fixes on the existing Node implementation, plus the explicitly scoped status and card-reading follow-ups below.
 
 1. Isolate merged-message detail failures from conversation availability. Preserve ordinary messages, represent missing details, and keep them retryable. Split oversized native windows after bounded timeout, with explicit limits; incomplete windows must never advance a cursor.
 2. Make service lifecycle results reflect launchd outcomes. Distinguish an absent job from an inspection failure and propagate start failures. Require fresh activity evidence before reporting active synchronization, including independent foreground synchronization.
 3. Use one merge policy for synchronization and enrichment. An unknown name lookup must preserve a known name; an explicit authoritative clear must remain expressible. Same-version projection improvements remain valid and idempotent.
+4. Clarify retained-log timing, chat-list review and active refresh semantics, and abnormal lease evidence without introducing new discovery counters.
+5. Read stored cards through one bounded text projection, preserving old-record data and existing JSON fields while improving multiline human output.
 
 ## Acceptance plan
 
@@ -54,6 +56,12 @@ The Lark-specific SQL merge is shared by ingestion and enrichment. Null/empty lo
 
 Ingestion applies the merge within its transaction before calculating actual write effects. Enrichment applies the same expression to its snapshot and commits only under the existing exact comparison and maintenance fence. Equivalent typed JSON projections retain stored bytes so property ordering does not create spurious updates. Same-version projection improvements remain allowed; older source versions cannot replace newer records. The helper explicitly materializes intermediate SQLite results to prevent exponential expression expansion.
 
+### Bounded card reading
+
+Native interactive messages and read-only historical views share the same limited card parser. It reads the outer payload and nested `json_card`, then projects known title, text, field, layout and button nodes. Unknown visible structures, unresolved identities, malformed payloads and resource limits remain explicit; no callback is executed and no network request is made. Mentions require exact, unambiguous ID evidence. Input parsing, traversal and output are bounded, and terminal controls are removed before multiline indentation.
+
+Historical reads leave stored body, raw, canonical, hashes and source versions unchanged. Existing JSON fields, including `display.body`, retain their meanings; optional `display.card` adds the current projection and its status/version. The human view always uses that card result and never falls back to dumping unsupported raw JSON. Newly ingested cards can improve their derived projection while retaining source evidence and same-version idempotency. Links display only HTTP(S) origin/path with explicit omission of credentials, query and fragment; original URLs remain private raw data. Search still filters stored body. See the [operational contract](operations.md#卡片阅读与原始数据契约) for limits and compatibility details.
+
 ## Regression and counterexample map
 
 All identities, message bodies, clocks, subprocess outcomes, and databases in new tests were invented from scratch.
@@ -63,6 +71,7 @@ All identities, message bodies, clocks, subprocess outcomes, and databases in ne
 | Detail isolation and progress | A denied root disabled the conversation; the initial fix then pinned list progress at a shrinking prefix | Both directions, repeated shrinking, fresh runner instances, late ordinary records, default page limits, independent repair, continued healthy detail tasks, preserved old expansions | `lark-im-detail-progress.test.mjs`, `lark-im-native-sync.test.mjs` |
 | Durable list/debt transactions | A restart must retain both progress and unresolved root descriptors | List failure commits nothing; baseline/gaps, lock/lease/cursor/generation/identity/fingerprint fences; mutable discovery metadata allowed; receipts, version conflicts, rollback and final closure | `lark-detail-store.test.mjs`, `lark-im-detail-adapter.test.mjs` |
 | Status timing and presentation | Window edges inflated a success-to-success interval; technical counts duplicated existing status | Synthetic dominant-edge intervals, zero/one success, exact time bounds, partial/rotated logs, safe completion timestamps, normal versus abnormal lease display | `lark-im-service-stability.test.mjs`, service view and lease evidence tests |
+| Card reading and compatibility | Interactive content stayed an unsupported JSON fallback and human output collapsed it to one short line | Nested card JSON, property/i18n text, multiline fields/buttons, unknown nodes, exact/ambiguous mentions, safe URLs, malformed/deep/large input, read-only database bytes, unchanged raw/hash/version and same-version improvement | `lark-im-card-content.test.mjs`, `lark-im-card-record.test.mjs`, `messages-card.integration.test.mjs` |
 | Consistent status snapshot | Separate read-only connections combined old zero debt with a new incomplete list and failed run | Real concurrent WAL writer; consistent before/after reports; Service and wait-ok; schema preflight race; malformed/missing evidence fails closed | `sync-status-snapshot.test.mjs`, `sync-status-command.test.mjs`, `diagnostics-readonly.test.mjs` |
 | Coverage and diagnostics | List-only evidence or historical health could hide pending details | Partial flags and malformed composed intervals rejected; target-relative debt; legacy versus damaged schema; public aggregate output | `lark_im_coverage_check_test.py`, `sync-status-command.test.mjs`, `sync-status-core.test.mjs` |
 | Window timeout | Shared deadline repeatedly retried one large window without progress | One minimum-prefix retry; boundary messages reread; non-minute start; ordinary timeout/rate limit unchanged; minimum saturation and incomplete pagination never advance | `lark-im-core-pagination.test.mjs`, `lark-im-native-sync.test.mjs` |
@@ -83,8 +92,8 @@ Final checks use Node.js 22 and SQLite CLI 3.51.0. The initial candidate passed 
 | --- | --- |
 | `npm run build` | PASS |
 | `npm run typecheck` | PASS |
-| `npm run check` | PASS; 70 JavaScript files |
-| `npm test` | PASS; 642 tests, 0 failures, 0 skipped; includes synthetic Python coverage tests |
+| `npm run check` | PASS; 71 JavaScript files |
+| `npm test` | PASS; 685 tests, 0 failures, 0 skipped; includes synthetic Python coverage tests |
 | `git diff --check` | PASS |
 | `npm run build:check` | PASS; generated files match committed source |
 | Production service/account/data and deployment acceptance | NOT RUN; deferred until independent final review |

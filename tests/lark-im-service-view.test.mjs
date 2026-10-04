@@ -19,6 +19,14 @@ test("success intervals require two observed successes instead of a misleading z
   assert.equal(ageText(53600), "53s ago");
 });
 
+test("success intervals retain seconds above an hour without changing age formatting", () => {
+  for (const [milliseconds, expected] of [[3601000, "1h1s"], [3601499, "1h1s"],
+    [3601500, "1h2s"], [3661000, "1h1m1s"], [90061500, "1d1h1m2s"]]) {
+    assert.equal(formatStabilityInterval({ cycles: { ok: 2 }, longest_between_successes_ms: milliseconds }), expected);
+  }
+  assert.equal(ageText(3601000), "1h ago");
+});
+
 test("local timestamps include each instant's offset across a daylight-saving boundary", () => {
   const moduleUrl = new URL("../src/terminal/lark-im-service-view.mjs", import.meta.url).href;
   const result = spawnSync(process.execPath, ["--input-type=module", "-e", `

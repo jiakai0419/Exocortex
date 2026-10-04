@@ -136,7 +136,18 @@ function formatStabilityInterval(stability) {
   if (Number(stability.cycles?.ok || 0) < 2) return "unavailable (need 2 successes)";
   const interval = stability.longest_between_successes_ms;
   // Round measured intervals independently of ages, which still round down.
-  return typeof interval === "number" && Number.isFinite(interval) && interval >= 0 ? durationText(Math.round(interval / 1000) * 1000).replaceAll(" ", "") : "unknown";
+  if (typeof interval !== "number" || !Number.isFinite(interval) || interval < 0) return "unknown";
+  let seconds = Math.round(interval / 1000);
+  if (!Number.isSafeInteger(seconds)) return "unknown";
+  /** @type {Array<[number, string]>} */
+  const units = [[86400, "d"], [3600, "h"], [60, "m"], [1, "s"]];
+  const parts = [];
+  for (const [size, label] of units) {
+    const count = Math.floor(seconds / size);
+    if (count) parts.push(`${count}${label}`);
+    seconds %= size;
+  }
+  return parts.join("") || "0s";
 }
 
 /** @param {JsonObject | null | undefined} stability */

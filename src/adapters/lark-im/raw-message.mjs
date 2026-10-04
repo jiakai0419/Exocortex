@@ -1,6 +1,7 @@
 // @ts-check
 
 import { renderSystemContent } from "./system-content.mjs";
+import { renderCardContent } from "./card-content.mjs";
 
 const SOURCE_API = "im.v1.messages";
 const RENDER_VERSION = 1;
@@ -182,6 +183,9 @@ function renderApiMessageContent(item, options = {}) {
     return fallback(item, "merge_forward_not_expanded", "未展开转发合并内容，以下为原始内容");
   }
   const content = sourceContent(item);
+  // Cards keep the same raw evidence/hash contract as every native message.
+  // The shared bounded projection is also used by read-only historical views.
+  if (type === "interactive") return renderCardContent(content, item.mentions);
   const payload = parseContent(content);
   if (type === "text" && isObject(payload) && typeof payload.text === "string") {
     return result(resolveTextMentions(payload.text, item));

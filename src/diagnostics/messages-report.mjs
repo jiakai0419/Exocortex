@@ -2,6 +2,7 @@
 
 import { readOnlySqliteJson } from "../storage/sqlite/readonly-query.mjs";
 import { renderSystemContent } from "../adapters/lark-im/system-content.mjs";
+import { renderCardContent } from "../adapters/lark-im/card-content.mjs";
 
 /**
  * @typedef {"all" | "sent" | "received"} MessageDirection
@@ -26,7 +27,8 @@ import { renderSystemContent } from "../adapters/lark-im/system-content.mjs";
  *     message_type: string,
  *     recipient: string | null,
  *     chat: string | null,
- *     body: unknown
+ *     body: unknown,
+ *     card?: import("../adapters/lark-im/raw-message.mjs").RenderResult
  *   }
  * }} EnrichedMessage
  *
@@ -169,6 +171,20 @@ function displayBody(body, canonical, raw) {
 }
 
 /**
+ * Rebuild only the display projection. Stored body/raw/canonical and the JSON
+ * display.body contract remain unchanged; missing evidence never reinterprets
+ * an old human-readable fallback as native card JSON.
+ * @param {Row} raw
+ */
+function displayCard(raw) {
+  const native = raw.raw_api && typeof raw.raw_api === "object" && !Array.isArray(raw.raw_api)
+    ? raw.raw_api : raw;
+  const content = native.body && typeof native.body === "object" && !Array.isArray(native.body)
+    ? native.body.content : native.content;
+  return renderCardContent(content, native.mentions);
+}
+
+/**
  * @param {Row} row
  * @returns {EnrichedMessage}
  */
@@ -219,6 +235,7 @@ function enrichRow(row) {
           : null,
       chat: isGroupLike ? nameOrId(chatName, chatId) : null,
       body: displayBody(row.body, canonical, raw),
+      ...(messageType === "interactive" ? { card: displayCard(raw) } : {}),
     },
   };
 }

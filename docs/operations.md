@@ -156,7 +156,7 @@ Failures                     窗口内失败 cycle、失败 step 和可分类失
 
 `Received scopes` 保留已启用会话总数与尚无消息游标的会话数。`Chat list review`（会话列表盘点，对应 reconcile）展示名单盘点状态及快照的 `completed_at`；没有完成时间证据时明确未知，不能用后来更新游标的时间替代。`Active chat refresh`（活跃会话刷新，对应 hot discovery）显示最近一次成功刷新时间，不把它叫作任务开始时间或最新消息时间。分页等技术字段仍保留在详细诊断中，不增加重复会话计数。
 
-这两种发现当前默认都通过 `im +chat-list --as user --exclude-muted --types group,p2p --sort active_time --page-size 100` 读取未静音群聊和私聊名单，并不是无限范围的全部会话。reconcile 默认每个 cycle 续读一页，直到 `has_more=false`，最后一页成功后在事务中记录完成时间；完成后至少间隔配置的复核周期（默认 24 小时）再开始。hot discovery 默认每个 cycle 从首页刷新一页，展示拉取成功后、提交前采集并随成功事务保存的刷新时间。两者都只是会话名单，不表示这些会话的消息已扫描完整。
+这两种发现当前默认都通过 `im +chat-list --as user --exclude-muted --types group,p2p --sort active_time --page-size 100` 读取未静音群聊和私聊名单，并不是无限范围的全部会话。reconcile 默认每个 cycle 续读一页，直到 `has_more=false`，最后一页成功后在事务中记录完成时间；完成后至少间隔配置的复核周期（默认 24 小时）再开始。hot discovery 每个 cycle 从首页刷新，代码默认最多五页；当前部署通过 `--hot-discovery-pages-per-cycle 1` 限为一页，这不是代码默认值。它展示拉取成功后、提交前采集并随成功事务保存的刷新时间。两者都只是会话名单，不表示这些会话的消息已扫描完整。
 
 整体 `Health` 只在 Overview 显示一次。正常租约已由 `Activity` 的现有租约证据表达，不另列 `Locks`。过期、超过硬期限、未来开始时间或无效时间区间等已有时间戳证据会显示原因与诊断检查建议；过期不能证明进程已死亡，租约存在也不能证明进程存活或存在等待。没有阻塞证据时不声称正在等待，不猜等待时长。详细诊断仍保留原有数量、时间等信息，不默认增加原始持有者标识。
 
@@ -686,7 +686,21 @@ worker 默认仍使用固定批量；显式 `--adaptive-fair` 才启用自适应
 
 received 直接分页读取原生消息列表，显式请求 `only_thread_root_messages=false`；sent 先搜索 ID，再以 mget 严格核对全部详情。错误信封、缺详情、重复详情、循环分页 token 或不完整分页均使窗口失败，不推进游标。查询的秒级边界向外取整，最终记录按原始毫秒起止裁剪。search 时间按官方契约使用无小数秒的 ISO8601。
 
-原始 `body.content`、`update_time`、root/parent/thread 关系进入 `raw_json`。正文是可重建投影，canonical 保留 `content_rendering` 状态与版本。复杂卡片、图片和未知结构保留原始 JSON 并明确标注未完整渲染；不会凭空补用户姓名。合并转发的完整原生子项进入 `raw_api_expansions`，子项不冒充当前会话里的独立消息。
+原始 `body.content`、`update_time`、root/parent/thread 关系进入 `raw_json`。正文是可重建投影，canonical 保留 `content_rendering` 状态与版本。卡片使用下述有界文本投影；图片和未知结构保留原始 JSON 并明确标注未完整渲染，不会凭空补用户姓名。合并转发的完整原生子项进入 `raw_api_expansions`，子项不冒充当前会话里的独立消息。
+
+### 卡片阅读与原始数据契约
+
+`messages` 的卡片阅读从已存 `raw_json` 构建展示结果，不联网、不执行按钮、不回写正文或 canonical，也不需要重同步。优先读取原生 `body.content`，解开外层 JSON 与 `json_card` 字符串；兼容旧 CLI 原始 `content`。不会把旧的格式化 fallback 或派生 canonical 正文猜成卡片原文。
+
+人类文本输出按标题、段落、字段和按钮分行，卡片不再经过普通消息的 240 字符单行压缩。解析器只处理明确支持的文本与布局节点，包括 `property` 包装、选定语言的 `i18nContent` / `i18nElements`、常见文本/Markdown、分栏、字段和按钮。它是文本投影，不是完整飞书客户端：图片、图表和未知可见节点会标明部分解析；缺少可读内容时显示说明，不将原始 JSON 倾倒到文本界面。人员提及只接受原始 mentions 中明确且无歧义的 ID 对应，不按出现顺序或 ID 前缀猜姓名。
+
+`--format json` 保留已有 `body`、`canonical`、`raw`、对应 JSON 字符串与 `display.body` 的含义；卡片只新增 `display.card = {text, status, reason, version}`。展示版本为 2，旧记录 canonical 中的历史渲染版本不会被阅读命令改写。普通消息仍使用原有展示。新同步的卡片也调用同一解析器，派生正文和渲染元数据可以改善，但 source `raw_json`、content hash 与源版本不因文本投影变化而变化；同版本投影改善仍遵守已有入库比较规则。
+
+按钮地址、Markdown 和裸链接只展示 HTTP(S) 的 origin/path，省略凭证、查询参数和 fragment 时明确标记；其他协议或无效地址显示安全说明，不自动发请求。完整链接仍在私有 raw 中，JSON 输出也保留原始数据。路径和正文仍可能包含私密信息，这不是可公开分享的诊断输出。原用户应通过私有 JSON 原文查看必要的完整地址，不能将显示后的省略地址当作原链接。
+
+解析的累计 JSON 字符串和待检查文本分别最多 256 Ki 个 UTF-16 单元，嵌套最多 24 层、节点访问最多 2048 次，输出含说明最多 16,000 个 UTF-16 单元。超限明确标注不完整；终端输出清除远端控制序列与双向控制符。限制只作用于投影，不删除已存原文。`--search` 仍匹配数据库中已有 body，读取时的卡片投影不会建立新索引或改变筛选语义。
+
+### 列表覆盖与详情重试
 
 正常同步分开提交列表覆盖与完整内容覆盖。完整 list/search/mget 分页返回普通消息和合并根；迁移 009 的 `lark_im_list_progress` 保存连续列表水位，`lark_im_detail_tasks` 保存每个根的原始描述、指纹、版本、尝试次数、下次重试时间及安全错误分类。普通消息、待办、列表水位与 run 元数据在同一租约和代际校验事务提交。列表本身不完整时全部不提交。详情失败不覆盖已入库的完整根，不禁用会话，也不回退列表水位；进程重启后继续从持久化水位读取普通消息。
 
