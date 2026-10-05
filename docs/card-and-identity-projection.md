@@ -20,6 +20,8 @@
 
 ## 身份与姓名证据
 
+已知来源只能确认特定群内应用的姓名时，可使用[本机局部应用名配置](local-chat-app-names.md)补充未知 sender 的阅读投影。配置绑定所选数据库文件及原始 tenant/chat/app，已有姓名与明确清空优先；命中仅改变 `display.sender` 并添加可选的 `display.sender_name_source`，不回写 canonical 或原始记录，不成为全局应用名或联网姓名缓存。
+
 统一规则是先确认身份命名空间，再取姓名；共同规则不要求把纯本地卡片解析和可联网 sender resolver 合成一个服务。
 
 - 身份按 `(namespace, value)` 比较，并受账号/应用边界约束；群成员名字还受会话范围约束。`open_id`、`user_id`、`union_id`、`app_id`、消息内 `mention_key` 与卡片 `nativeRef` 相互独立。open-ID 查询通道仅接受明确的 open-ID 证据及 `ou_` 形式，不能把任意 `user_id` 或别的命名空间中的同字符串当作 open ID。

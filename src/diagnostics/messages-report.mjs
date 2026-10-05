@@ -24,6 +24,7 @@ import { renderCardContent } from "../adapters/lark-im/card-content.mjs";
  *     scene: string,
  *     sender: string,
  *     sender_type: string,
+ *     sender_name_source?: {kind: string, source_kind: string, recorded_at: string, evidence_refs: string[]},
  *     message_type: string,
  *     recipient: string | null,
  *     chat: string | null,

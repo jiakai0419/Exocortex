@@ -6,6 +6,7 @@ node_modules/
 *.key
 *.pem
 *.p12
+*.chat-app-names.json
 
 reports/**/*.json
 # Local reviewer reports can contain machine-specific runtime metadata.

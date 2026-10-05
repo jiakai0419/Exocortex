@@ -585,6 +585,8 @@ received 直接分页读取原生消息列表，显式请求 `only_thread_root_m
 
 ### 卡片阅读与原始数据契约
 
+对于只有用户提供的同消息证据能确认的群内应用名称，见[本机局部应用名配置](local-chat-app-names.md)。该私有配置只为精确数据库/tenant/chat/app 范围内的未知 sender 提供带来源的阅读名称，不修改消息或扩大 API 权限；删除配置即可撤销，其他群与已有姓名不受影响。
+
 身份命名空间、内容语义、诊断与实现边界统一遵循 [卡片与身份投影设计](card-and-identity-projection.md)。
 
 `messages` 的卡片阅读从已存 `raw_json` 构建展示结果，不联网、不执行按钮、不回写正文或 canonical，也不需要重同步。优先读取原生 `body.content`，解开外层 JSON 与 `json_card` 字符串；兼容旧 CLI 原始 `content`。不会把旧的格式化 fallback 或派生 canonical 正文猜成卡片原文。
