@@ -1,3 +1,4 @@
+import { runManualRemoteSample } from "../runtime/worker/remote-sample-scheduler.mjs";
 // @ts-check
 import { accessSync, constants, statSync } from "node:fs";
 import { delimiter, isAbsolute, resolve } from "node:path";
@@ -5,7 +6,8 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { readDatabaseEvidence, verifyBackupEvidence } from "../storage/sqlite/maintenance.mjs";
 import { buildStatus, sanitizeStatusReportForPublicOutput } from "./sync-status-report.mjs";
 import { collectQualityReport, hasQualityIssues, sanitizeQualityReportForPublicOutput } from "./lark-im-quality-report.mjs";
-import { collectLagReport, runLark } from "./lark-im-lag-report.mjs";
+import { runReadOnlyRemoteSample, writeRemoteSampleCache } from "./remote-sample.mjs";
+import { publicRemoteReport } from "./remote-sample-cache.mjs";
 import { sanitizeLagReportForPublicOutput } from "./lark-im-lag-core.mjs";
 import { liveProbeContext, writeLiveProbeCache } from "./live-probe-cache.mjs";
 import { collectStatusEvidence } from "./status-report.mjs";
@@ -22,7 +24,7 @@ function executableAvailable(command, env) {
 }
 /** Dependency planning is read-only and never invokes remote tools. @param {JsonObject} plan @param {JsonObject} context */
 function checkDependencies(plan, context) {
-  return { sqlite: executableAvailable("sqlite3", context.env), python: !plan.through || executableAvailable("python3", context.env),
+  return { sqlite: executableAvailable("sqlite3", context.env), python: !plan.through && !plan.live || executableAvailable("python3", context.env),
     live: !plan.live || executableAvailable(context.env.LARK_CLI || "lark-cli", context.env),
     wait: !plan.wait || executableAvailable("launchctl", context.env) };
 }
@@ -115,27 +117,45 @@ async function collectCheckReport(options, context, deps = {}) {
   }
   let live = null;
   let cacheBefore = null;
+  let remoteResult = /** @type {any} */ (null);
+  let manualAttempt = /** @type {any} */ (null);
   if (plan.live) {
     const waitFailed = plan.wait && checks.wait.status !== "passed";
-    const failedDependency = !dependencies.live || !dependencies.sqlite || plan.through && !dependencies.python || plan.wait && !dependencies.wait;
+    const failedDependency = !dependencies.live || !dependencies.sqlite || (plan.through || plan.live) && !dependencies.python || plan.wait && !dependencies.wait;
     const localReadFailed = ["database", "sync", "quality"].some((key) => checks[key].status === "unavailable");
     if (waitFailed || failedDependency || localReadFailed) {
       checks.live = { status: "skipped", observed_at: observed(), reason: waitFailed ? "wait_not_passed" : "dependency_or_local_read_failed" };
       issues.push({ code: !dependencies.live ? "live_dependency_unavailable" : "live_skipped", check: "live" });
     } else {
       if (plan.writeLiveCache) cacheBefore = (deps.liveProbeContext || liveProbeContext)(plan.db);
-      live = await collect("live", () => (deps.collectLagReport || collectLagReport)(plan.db, plan, { runLark: (args) => runLark(args, { env: context.env }) }), liveReady,
-        (value) => plan.unsafeDetails ? value : sanitizeLagReportForPublicOutput(value));
+      live = await collect("live", () => {
+        if (deps.collectLagReport) return deps.collectLagReport(plan.db, plan);
+        if (plan.writeLiveCache) {
+          manualAttempt = (deps.runManualRemoteSample || runManualRemoteSample)({ db: plan.db, logDir: plan.logDir }, {
+            nowMs: context.now, collectorOptions: { startMs: plan.startMs, endMs: plan.endMs, hotChats: plan.hotChats, messagesPerChat: plan.messagesPerChat },
+          });
+          return manualAttempt.report || { schema_version: 3, ok: false, status: manualAttempt.outcome === "failed" ? "unavailable" : "inconclusive",
+            reason: manualAttempt.reason, checked_at: observed(), window: { start: plan.start, end: plan.end }, probe: {}, findings: {}, binding: { state: "unverified" } };
+        }
+        remoteResult = (deps.collectRemoteSample || runReadOnlyRemoteSample)(plan.db, { ...plan, env: context.env }, { now: context.now });
+        return remoteResult.report;
+      }, liveReady, (value) => value.schema_version === 3 ? publicRemoteReport(value)
+        : plan.unsafeDetails ? value : sanitizeLagReportForPublicOutput(value));
     }
   }
-  let cache = { status: "not_requested" };
-  if (plan.writeLiveCache) {
+  if (remoteResult?.outcome === "failed" || manualAttempt?.outcome === "failed") checks.live.status = "unavailable";
+  let cache = { status: manualAttempt ? manualAttempt.cacheWritten ? "written" : "skipped" : "not_requested" };
+  if (plan.writeLiveCache && !manualAttempt) {
     cache = { status: "skipped" };
     if (live) {
       const cacheAfter = (deps.liveProbeContext || liveProbeContext)(plan.db);
       if (!cacheBefore || !cacheAfter || cacheBefore.database_key !== cacheAfter.database_key) issues.push({ code: "cache_context_unavailable", check: "live" });
       else {
-        try { (deps.writeLiveProbeCache || writeLiveProbeCache)(resolve(plan.logDir, "live-probe.json"), { live, checked_at: checks.live.observed_at, cache_context: cacheAfter }); cache = { status: "written" }; }
+        try {
+          if (remoteResult) (deps.writeRemoteSampleCache || writeRemoteSampleCache)(resolve(plan.logDir, "live-probe.json"), remoteResult);
+          else (deps.writeLiveProbeCache || writeLiveProbeCache)(resolve(plan.logDir, "live-probe.json"), { live, checked_at: checks.live.observed_at, cache_context: cacheAfter });
+          cache = { status: "written" };
+        }
         catch { cache = { status: "failed" }; issues.push({ code: "cache_write_failed", check: "live" }); }
       }
     }

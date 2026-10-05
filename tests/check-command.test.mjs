@@ -51,13 +51,13 @@ for (const overrides of [{ probe: { remote_messages_checked: 0, probe_errors: 0 
   const result = await collectCheckReport(options({ live: true }), f.context, f.deps);
   assert.equal(result.exit_code, 2); assert.equal(result.checks.live.status, "incomplete");
 });
-test("live defaults are 5 pages, 5 chats, 3 messages and fixed invocation bounds with no cache access", async () => {
+test("live defaults use bounded discovered chats and a frozen stable 24-hour window without cache access", async () => {
   const f = fixture(); let received;
   f.deps.collectLagReport = (_db, plan) => { received = plan; return live(); };
   f.deps.liveProbeContext = () => { throw new Error("cache must not be inspected"); };
   assert.equal((await collectCheckReport(options({ live: true }), f.context, f.deps)).exit_code, 0);
-  assert.deepEqual([received.chatPages, received.hotChats, received.messagesPerChat], [5, 5, 3]);
-  assert.equal(received.endMs, at); assert.equal(received.startMs, new Date(at).setHours(0, 0, 0, 0));
+  assert.deepEqual([received.chatPages, received.hotChats, received.messagesPerChat], [5, 5, 20]);
+  assert.equal(received.endMs, Math.floor((at - 600000) / 60000) * 60000); assert.equal(received.startMs, received.endMs - 86400000);
 });
 test("all extensions run in fixed order; wait rechecks final readiness and cache writes last", async () => {
   const f = fixture(); f.deps.collectStatusEvidence = () => { f.calls.push("wait"); return waitEvidence(at); };

@@ -11,6 +11,8 @@ import {
 } from "node:fs";
 import { dirname } from "node:path";
 import { createHash } from "node:crypto";
+import { readStableJsonFile } from "./private-json-file.mjs";
+import { parseRemoteSampleCache } from "./remote-sample-cache.mjs";
 import { publicTimestamp } from "./public-safe.mjs";
 
 const DEFAULT_LIVE_PROBE_CACHE_PATH = "logs/lark-im/live-probe.json";
@@ -133,7 +135,10 @@ function readLiveProbeCache(path, deps = {}) {
   const readFile = deps.readFileSync || readFileSync;
   if (!exists(path)) return null;
   try {
-    const parsed = JSON.parse(readFile(path, "utf8"));
+    const stable = deps.readFileSync ? null : readStableJsonFile(path, { maxBytes: 65536, requirePrivate: false });
+    if (stable && stable.status !== "ready") return null;
+    const parsed = stable ? stable.value : JSON.parse(readFile(path, "utf8"));
+    if (parsed?.kind === "lark_im_live_probe_cache/v3") return stable?.private ? parseRemoteSampleCache(parsed) : null;
     if (!["lark_im_live_probe_cache/v1", "lark_im_live_probe_cache/v2"].includes(parsed?.kind)) return null;
     const base = {
       kind: parsed.kind,

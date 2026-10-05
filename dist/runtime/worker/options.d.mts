@@ -36,6 +36,7 @@ export const WORKER_DEFAULTS: Readonly<{
     adaptiveFairMin: number;
     adaptiveFairMax: number;
     adaptiveTargetCycleSeconds: number;
+    remoteSampleIntervalSeconds: number;
 }>;
 /**
  * @typedef {{flag:string,key:string,type:"path"|"string"|"boolean"|"integer"|"enum",default?:any,choices?:string[],min?:number,max?:number,repeat?:boolean,required?:boolean,description:string}} OptionSpec
@@ -74,5 +75,6 @@ declare namespace defaults {
     let adaptiveFairMin: number;
     let adaptiveFairMax: number;
     let adaptiveTargetCycleSeconds: number;
+    let remoteSampleIntervalSeconds: number;
 }
 export {};

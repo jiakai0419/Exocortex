@@ -1,3 +1,4 @@
+import { summarizeRemoteSample } from "./remote-sample-cache.mjs";
 // @ts-check
 
 import { readOnlySqliteJson } from "../storage/sqlite/readonly-query.mjs";
@@ -108,6 +109,36 @@ function readFileTailEvidence(path, maxBytes) {
   }
 }
 
+/** Scheduling observations are not sync completions or activity evidence. Only
+ * the bounded writer contract may coexist with verified worker history.
+ * @param {unknown} input */
+function validateRemoteSampleScheduleEvent(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return false;
+  const event = /** @type {JsonObject} */ (input);
+  const required = ["type", "version", "at", "database_key", "outcome", "reason", "next_due"];
+  const allowed = [...required, "instance_id", "cycle"];
+  if (!required.every((field) => Object.hasOwn(event, field)) ||
+    !Object.keys(event).every((field) => allowed.includes(field))) return false;
+  const at = typeof event.at === "string" ? Date.parse(event.at) : NaN;
+  /** @type {Record<string, string[]>} */
+  const reasons = {
+    started: ["sample_started"],
+    ok: ["sampled"],
+    busy: ["scheduler_busy", "sync_busy"],
+    failed: ["sample_failed", "state_invalid", "database_unavailable", "state_write_failed", "database_changed",
+      "scheduler_unavailable", "cache_write_failed", "sample_process_failed", "invalid_interval"],
+  };
+  return event.type === "lark_im_remote_sample_schedule" && event.version === 1 &&
+    Number.isSafeInteger(at) && new Date(at).toISOString() === event.at &&
+    (event.database_key === null || typeof event.database_key === "string" && /^[a-f0-9]{64}$/.test(event.database_key)) &&
+    (!Object.hasOwn(event, "instance_id") || event.instance_id === null ||
+      typeof event.instance_id === "string" && /^[a-zA-Z0-9-]{1,80}$/.test(event.instance_id)) &&
+    (!Object.hasOwn(event, "cycle") || Number.isSafeInteger(event.cycle) && event.cycle > 0) &&
+    typeof event.outcome === "string" && Object.hasOwn(reasons, event.outcome) &&
+    reasons[event.outcome].includes(event.reason) &&
+    (event.next_due === null || Number.isSafeInteger(event.next_due) && event.next_due >= 0);
+}
+
 /**
  * Only current worker.jsonl is read; rotated files are not history evidence.
  * @param {string} logDir
@@ -132,7 +163,9 @@ function readRecentWorkerEvents(logDir, limits = {}) {
     try {
       const event = JSON.parse(line);
       if (!event || typeof event !== "object" || Array.isArray(event)) { activityIntegrity = false; continue; }
-      if (!["lark_im_worker_cycle", "lark_im_worker_step", "lark_im_worker_scheduler", "lark_im_worker_activity"].includes(event.type)) activityIntegrity = false;
+      if (event.type === "lark_im_remote_sample_schedule") {
+        if (!validateRemoteSampleScheduleEvent(event)) activityIntegrity = false;
+      } else if (!["lark_im_worker_cycle", "lark_im_worker_step", "lark_im_worker_scheduler", "lark_im_worker_activity"].includes(event.type)) activityIntegrity = false;
       if (event.type === "lark_im_worker_activity" && !validateActivityEventShape(event)) activityIntegrity = false;
       events.push(event);
     } catch {
@@ -465,6 +498,7 @@ function durationText(ms) {
  * @returns {{status: ServiceFreshnessStatus, detail: string, [key: string]: any}}
  */
 function summarizeServiceFreshness(liveProbe, nowMs = Date.now(), maxAgeMs = DEFAULT_FRESHNESS_MAX_AGE_MS, expectedContext = null) {
+  if (liveProbe?.kind === "lark_im_live_probe_cache/v3") return summarizeRemoteSample(liveProbe, nowMs, expectedContext);
   const unknown = (/** @type {string} */ reason, /** @type {string} */ detail) => ({
     status: /** @type {ServiceFreshnessStatus} */ ("unknown"), reason, detail, auth_identity: "unknown",
   });

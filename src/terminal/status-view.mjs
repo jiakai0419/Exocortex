@@ -88,11 +88,10 @@ export function renderStatusText(report, options = {}) {
   const runtimeReason = { worker_unverified: "current worker unverified", log_unavailable: "log unavailable",
     log_damaged: "log evidence incomplete", completion_invalid: "completion evidence invalid",
     completion_conflict: "completion records conflict", completion_unbound: "log records lack binding" }[runtime.reason] || "runtime evidence unavailable";
-  screen.row("Total runs", runtimeAvailable ? `${number(runtime.total_runs)} completed rounds · current worker / retained log` : `Unavailable · ${runtimeReason}`);
-  screen.row("Successful runs", runtimeAvailable ? number(runtime.successful_runs) : "Unavailable");
-  screen.row("Last completed", runtimeAvailable ? runtime.last_completed_at ? timed(runtime.last_completed_at) : "None recorded" : "Unavailable");
-  screen.row("Last duration", runtimeAvailable && countValid(runtime.last_duration_ms) ? durationText(runtime.last_duration_ms)
-    : runtimeAvailable ? runtime.last_completed_at ? "Unavailable · incomplete step evidence" : "None recorded" : "Unavailable");
+  screen.row("Runs", runtimeAvailable ? `${number(runtime.total_runs)} total · ${number(runtime.successful_runs)} successful` : `Unavailable · ${runtimeReason}`);
+  const runtimeDuration = countValid(runtime.last_duration_ms) ? `${durationText(runtime.last_duration_ms)} duration` : "duration unavailable · incomplete step evidence";
+  screen.row("Last completed", runtimeAvailable ? runtime.last_completed_at ? `${timed(runtime.last_completed_at)} · ${runtimeDuration}` : "None recorded" : "Unavailable");
+  if (detailed) screen.row("Run scope", "Completed rounds · current worker / retained log");
 
   screen.heading("Messages & progress");
   if (!sync) {
@@ -109,7 +108,7 @@ export function renderStatusText(report, options = {}) {
     if (detailed || scopes.message_without_success > 0) screen.row("Message sources", `${number(scopes.message_enabled)} enabled · ${number(scopes.message_without_success)} without a successful sync`);
     if (progress.evidence !== "available") screen.row("Message lists", evidenceText(progress.evidence));
     else if (progress.invalid_cursor_scopes > 0) screen.row("Message lists", `${number(progress.invalid_cursor_scopes)} invalid list checkpoints`);
-    screen.row("Message details", details.evidence === "available" ? `${number(details.pending_count)} pending${details.pending_count > 0 || detailed ? ` · ${number(details.due_count)} due for retry · ${number(details.scopes_pending)} sources` : ""}` : evidenceText(details.evidence));
+    if (detailed) screen.row("Message details", details.evidence === "available" ? `${number(details.pending_count)} pending · ${number(details.due_count)} due for retry · ${number(details.scopes_pending)} sources` : evidenceText(details.evidence));
     const reasons = scopes.unsupported_reasons || [];
     const reasonText = (row) => row.reason === "restricted_mode" ? "access restricted" : row.reason === "bot_user_out_of_chat" ? "not a conversation member" : "unclassified restriction";
     if (detailed || scopes.received_unsupported > 0) screen.row("Restricted chats", `${number(scopes.received_unsupported)} excluded${!detailed && reasons.length ? ` · ${reasons.map((row) => `${number(row.count)} ${reasonText(row)}`).join(" · ")}` : ""}`);
@@ -118,7 +117,24 @@ export function renderStatusText(report, options = {}) {
     if (detailed || discovery.complete && !sync.reconcile?.complete) screen.row("Chat list review", sync.reconcile?.complete ? `Complete · ${stamp(sync.reconcile.cursor?.completed_at)}`
       : sync.reconcile?.cursor?.has_more ? "More conversation pages remain to be reviewed" : "No completed review recorded");
   }
-  if (freshness.status === "sampled" || freshness.status === "behind") {
+  if (freshness.scope === "discovered_chats_rotating") {
+    const f = freshness.findings || {};
+    const result = freshness.reason === "expired" ? "Expired" : freshness.result === "healthy" && freshness.status === "sampled" ? "Sample matched"
+      : f.confirmed_missing > 0 ? `${number(f.confirmed_missing)} confirmed missing`
+      : f.stale_version > 0 || f.content_mismatch > 0 ? `${number(f.stale_version)} older versions · ${number(f.content_mismatch)} content differences`
+      : f.suspected_missing > 0 ? `${number(f.suspected_missing)} suspected missing`
+      : f.pending_sync > 0 ? `${number(f.pending_sync)} awaiting sync`
+      : f.unresolved_prior > 0 ? `${number(f.unresolved_prior)} prior findings unresolved` : "Not verified";
+    screen.row("Remote sample", `${result} · ${number(freshness.sample_count)} messages / ${number(freshness.chat_count)} discovered chats · checked ${stamp(freshness.checked_at)}`);
+    if (detailed) {
+      screen.row("Sample window", range(freshness.window?.start, freshness.window?.end));
+      screen.row("Sample coverage", `${number(freshness.sample?.hot_chats)} hot + ${number(freshness.sample?.fair_chats)} rotating · ${number(freshness.sample?.eligible_chats)} eligible chats · ${number(freshness.sample?.truncated_chats)} truncated`);
+      screen.row("Sample content", `${number(f.content_equal)} static bodies matched · ${number(f.content_unverified)} unverified`);
+      screen.row("Sample identity", freshness.binding?.state === "verified" ? `Matched at check · ${freshness.binding?.evidence === "single_sent_actor" ? "stored sent identity" : "initial empty database binding"}` : "Account association unverified");
+      screen.row("Sample limits", "Discovered chat creation window; thread-only replies and client dynamic cards unverified");
+      screen.row("Sample result", `${freshness.reason || "matched"} · expires ${stamp(freshness.expires_at)}`);
+    }
+  } else if (freshness.status === "sampled" || freshness.status === "behind") {
     screen.row("Remote sample", `${freshness.status === "sampled" ? "Sample matched" : "Sample has missing messages"} · ${number(freshness.sample_count)} messages · checked ${stamp(freshness.checked_at)}`);
     if (detailed) {
       screen.row("Sample window", range(freshness.window?.start, freshness.window?.end));
@@ -128,6 +144,10 @@ export function renderStatusText(report, options = {}) {
   } else screen.row("Remote sample", `Not verified · ${FRESHNESS[freshness.reason] || "sample evidence unavailable"}`);
 
   /** @type {Array<[string, string]>} */ const problems = [];
+  if (!detailed && sync && (details.evidence !== "available" || !countValid(details.pending_count) ||
+    details.pending_count > 0 || details.due_count > 0 || details.scopes_pending > 0)) {
+    problems.push(["Message details", details.evidence === "available" ? `${number(details.pending_count)} pending · ${number(details.due_count)} due for retry · ${number(details.scopes_pending)} sources` : evidenceText(details.evidence)]);
+  }
   if (leases.evidence === "available" && leases.abnormal_count > 0) problems.push(["Sync reservations", formatLeaseIssues(leases)]);
   if (leases.evidence !== "available") problems.push(["Sync reservations", "Reservation evidence unavailable"]);
   if (failureRuns.evidence !== "available" || !countValid(failureRuns.failed_runs)) problems.push(["Database failures", "Failed-run query unavailable; count is not known"]);

@@ -5,9 +5,10 @@ schema and existing fields, adding evidence needed for honest human summaries.
 All examples and tests are invented from scratch. No operational records,
 screenshots, accounts, paths, IDs or log excerpts belong in this document or Git.
 
-The later [four runtime statistics addition](status-runtime-stats.md) adds only
-total runs, successful runs, last completion and last duration after current work;
-all other rows, sections and meanings below remain unchanged.
+The [four runtime statistics](status-runtime-stats.md) appear in two rows after
+current work: total/successful runs, then last completion/duration. Their scope is
+shown in `--detail`. Remote evidence follows the separate [bounded sample
+contract](remote-sample-design.md); the screen retains its default/detail hierarchy.
 
 ## Reading order and visual grammar
 
@@ -20,7 +21,9 @@ Normal implementation evidence and commands belong in `--detail` / help.
    A normal result has no repeated qualification. Database association is shown
    only when it cannot be established (always available in detail).
 3. **Messages & progress**: retained messages, enabled received conversations,
-   content-checkpoint gaps and independent detail debt.
+   content-checkpoint gaps. Message-detail counts remain in `--detail` and JSON;
+   the default screen moves pending/retry debt or unavailable detail evidence to
+   **Problems**, and omits the normal zero-pending row.
    Received conversation counts do not include the global sent-message source.
    Missing/invalid list evidence remains visible; raw checkpoint times are detail-only.
    Restricted conversations appear once, as a collection limit. Remote sample
@@ -93,7 +96,7 @@ clipped, and errors/categories are not silently limited to three entries.
 | Message details | Pending content tasks, due retries, affected scopes, oldest pending and next retry | Pending content prevents a complete-content claim; no data/legacy is not zero |
 | Restricted chats | Disabled received scopes by finite public reason and numeric code | A source-access limitation, not a worker crash; no raw remote error |
 | Active chat refresh / chat review | Last successful cursor update / reconciliation completion | A completed list review is not proof of message freshness |
-| Remote sample | Cached bounded hot-message sample, checked/expiry/window/count | No implicit network request; expired/missing/unbound sample is unverified with specific reason. A matching sample only supports that sample; current remote identity remains unverified |
+| Remote sample | Cached bounded discovered-chat sample, with hot/rotating selection, checked/expiry/window/count and explicit findings; legacy hot samples retain their original meaning | No implicit network request; expired/missing/unbound sample is unverified with a specific reason. A match supports only that sample. Account association is evidence at check time, not ownership of all history or current remote identity; legacy caches cannot acquire the new proof |
 | Worker log window | Requested last-24h window, and retained observation start to observation end | Partial log, no events and truncation explicit; actual event span separate from query window; never claim continuous uptime |
 | Completed rounds | `cycle` completion events within log window, success/failure counts | One background round runs the scheduler's task sequence, not all remote content; numbers can restart |
 | Latest result | Most recent completed round/task in retained log, with absolute time and age | Label history explicitly; old events outside the window are still dated; no current phase inference |
@@ -138,13 +141,17 @@ Health & current work
   Local health       OK
   Background         Running
   Current work       Waiting · between background rounds
+  Runs               4 total · 4 successful
+  Last completed     Today 11:59:25 (35s ago) · 12s duration
 
 Messages & progress
   Stored messages    240 total · 40 sent · 200 received
   Received chats     12 enabled
-  Message details    2 pending · 1 due for retry · 1 source
   Restricted chats   1 excluded · access restricted
   Remote sample      Not verified · cached sample expired
+
+Problems
+  Message details    2 pending · 1 due for retry · 1 source
 ```
 
 Counts/times are invented. Known debt is not a fixed-target completion measure.

@@ -1,3 +1,4 @@
+import { REMOTE_REASONS } from "./remote-sample-cache.mjs";
 // @ts-check
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
@@ -19,7 +20,7 @@ const LEASE_REASONS = ["invalid_timestamp", "invalid_interval", "future_start", 
 const HEALTH_REASONS = ["service_state_unavailable", "service_stopped", "sync_status_unavailable", "detail_evidence_unavailable",
   "list_progress_unavailable", "initial_sync_unverified", "no_successful_runs", "unfinished_runs_unverified", "last_cycle_failed",
   "details_pending", "scopes_pending", "discovery_pending", "catchup_pending", "local_ready", "activity_observed", "health_unavailable"];
-const FRESHNESS_REASONS = ["no_cached_probe", "legacy_evidence", "context_mismatch", "invalid_timestamp", "expired", "no_usable_sample", "inconclusive"];
+const FRESHNESS_REASONS = ["no_cached_probe", "legacy_evidence", "context_mismatch", "invalid_timestamp", "expired", "no_usable_sample", "inconclusive", ...REMOTE_REASONS];
 
 /** Group only finite public categories; raw step names and errors stay private.
  * @param {unknown} rows @param {string} key @param {(value: unknown) => string} classify */
@@ -200,10 +201,21 @@ function publicStatusReport(collected, options) {
       reason: HEALTH_REASONS.includes(overview.health.reason) ? overview.health.reason : "health_unavailable", local: choice(sync?.health, ["ok", "ok_with_history", "catching_up", "syncing", "not_ready", "needs_attention", "unknown"]) },
     activity: publicActivity(overview.activity),
     runtime_stats: summarizeRuntimeStats(report, collected.binding, observedAt),
-    freshness: { status: choice(overview.freshness.status, ["sampled", "unknown", "behind"]), auth_identity: "unknown",
-      scope: choice(overview.freshness.scope, ["recent_hot_messages"]), reason: choice(overview.freshness.reason, FRESHNESS_REASONS),
+    freshness: { status: choice(overview.freshness.status, ["sampled", "unknown", "behind"]), auth_identity: choice(overview.freshness.auth_identity, ["unknown", "verified_at_check"]),
+      scope: choice(overview.freshness.scope, ["recent_hot_messages", "discovered_chats_rotating"]), reason: choice(overview.freshness.reason, FRESHNESS_REASONS),
       window: { start: publicTimestamp(overview.freshness.window?.start), end: publicTimestamp(overview.freshness.window?.end) },
-      sample_count: count(overview.freshness.sample_count), checked_at: publicTimestamp(overview.freshness.checked_at), expires_at: publicTimestamp(overview.freshness.expires_at) },
+      sample_count: count(overview.freshness.sample_count),
+      ...(overview.freshness.scope === "discovered_chats_rotating" ? {
+        result: choice(overview.freshness.result, ["healthy","delayed","needs_attention","inconclusive","unavailable"]),
+        chat_count: count(overview.freshness.chat_count),
+        binding: { state: choice(overview.freshness.binding?.state, ["verified","unverified","conflict","unavailable"]),
+          evidence: choice(overview.freshness.binding?.evidence, ["single_sent_actor","initialized_empty_database"]), tenant_verified: false },
+        findings: Object.fromEntries(["present","missing","pending_sync","suspected_missing","confirmed_missing","stale_version","content_mismatch",
+          "identity_conflict","local_newer","content_equal","content_unverified","unresolved_prior","expired_observations","observation_overflow"]
+          .map((key) => [key, count(overview.freshness.findings?.[key])])),
+        sample: Object.fromEntries(["eligible_chats","hot_chats","fair_chats","chats_checked","pages","truncated_chats","api_calls","unsupported_chats","probe_errors"]
+          .map((key) => [key, count(overview.freshness.sample?.[key])])),
+      } : {}), checked_at: publicTimestamp(overview.freshness.checked_at), expires_at: publicTimestamp(overview.freshness.expires_at) },
     sync: publicSyncSummary(sync),
     stability: publicStability(report.stability), failure_runs: publicFailureRuns(report.failure_runs), leases: publicLeases(overview.leases),
     worker: publicWorker(report.worker.summary, observedAt),

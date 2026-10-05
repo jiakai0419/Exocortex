@@ -96,7 +96,7 @@ test("only events mode starts exactly two event sessions, each with count and du
 test("probe transport makes exactly one bounded attempt and retains failure evidence only in detail", () => {
   let calls = 0;
   const run = createProbeRunner({ spawn: (_bin, _args, settings) => {
-    calls += 1; assert.equal(settings.timeout, PROBE_TIMEOUT_MS); assert.equal(settings.maxBuffer, PROBE_MAX_BUFFER_BYTES);
+    calls += 1; assert.ok(settings.timeout > 0 && settings.timeout <= PROBE_TIMEOUT_MS); assert.equal(settings.maxBuffer, PROBE_MAX_BUFFER_BYTES);
     assert.equal(settings.killSignal, "SIGKILL");
     return { status: 1, signal: null, stdout: "", stderr: `network timeout ${PRIVATE}` };
   } });

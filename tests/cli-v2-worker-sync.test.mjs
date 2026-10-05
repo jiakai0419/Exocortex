@@ -94,8 +94,8 @@ test("internal worker uses root defaults and explicit cwd-relative paths", () =>
   assert.equal(explicit.logDir, "/synthetic-invocation/explicit-logs");
 });
 
-test("persistent worker arguments contain db plus exactly 13 common and 4 adaptive fields", () => {
-  assert.equal(WORKER_OPTION_SPECS.length, 18);
+test("persistent worker arguments contain db plus exactly 13 common, 4 adaptive and 1 remote sample fields", () => {
+  assert.equal(WORKER_OPTION_SPECS.length, 19);
   const config = { ...WORKER_DEFAULTS, db: "/synthetic/data.sqlite", logDir: "/synthetic/logs", adaptiveFair: true };
   const args = workerProgramArguments({ ...config, maxCycles: 2, once: true });
   assert.deepEqual(parseWorkerProgramArguments(args), config);

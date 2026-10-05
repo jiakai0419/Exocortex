@@ -21,6 +21,7 @@ const defaults = {
     adaptiveFairMin: 10,
     adaptiveFairMax: 50,
     adaptiveTargetCycleSeconds: 90,
+    remoteSampleIntervalSeconds: 900,
 };
 /** @typedef {typeof defaults} WorkerSettings */
 export const WORKER_DEFAULTS = Object.freeze(defaults);
@@ -47,8 +48,13 @@ export const WORKER_OPTION_SPECS = Object.freeze([
     { flag: "--adaptive-fair-min", key: "adaptiveFairMin", type: "integer", default: defaults.adaptiveFairMin, description: "Minimum adaptive fair batch." },
     { flag: "--adaptive-fair-max", key: "adaptiveFairMax", type: "integer", default: defaults.adaptiveFairMax, description: "Maximum adaptive fair batch." },
     { flag: "--adaptive-target-cycle-seconds", key: "adaptiveTargetCycleSeconds", type: "integer", default: defaults.adaptiveTargetCycleSeconds, description: "Target work plus interval duration." },
+    { flag: "--remote-sample-interval-seconds", key: "remoteSampleIntervalSeconds", type: "integer", min: 0, max: 1800, default: defaults.remoteSampleIntervalSeconds, description: "Bounded remote sample interval (900–1800 seconds; 0 disables)." },
 ]);
 export function validateWorkerOptions(opts) {
+    if (opts.remoteSampleIntervalSeconds !== undefined && opts.remoteSampleIntervalSeconds !== 0 &&
+        (!Number.isSafeInteger(opts.remoteSampleIntervalSeconds) || opts.remoteSampleIntervalSeconds < 900 || opts.remoteSampleIntervalSeconds > 1800)) {
+        throw new Error("remote-sample-interval-seconds must be 0 or between 900 and 1800");
+    }
     if (opts.adaptiveFairMin > opts.adaptiveFairMax) {
         throw new Error("adaptive-fair-min must not exceed adaptive-fair-max");
     }

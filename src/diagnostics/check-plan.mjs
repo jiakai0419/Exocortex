@@ -45,15 +45,15 @@ function createCheckPlan(options, context) {
   }
   if (provided.has("--backup-dir") && !backup) throw new CliUsageError("--backup-dir requires a backup check");
   if (provided.has("--log-dir") && !wait && !options.writeLiveCache) throw new CliUsageError("--log-dir requires --wait or --write-live-cache");
-  const start = new Date(calledAt);
-  start.setHours(0, 0, 0, 0);
+  const stableEnd = Math.floor((calledAt - 600000) / 60000) * 60000;
+  const start = new Date(stableEnd - 86400000);
   const startMs = options.start === undefined ? start.getTime() : timestamp(options.start, "--start");
-  const endMs = options.end === undefined ? calledAt : timestamp(options.end, "--end");
+  const endMs = options.end === undefined ? stableEnd : timestamp(options.end, "--end");
   if (live && (startMs >= endMs || endMs > calledAt)) throw new CliUsageError("live window must be nonempty and end no later than invocation");
   const throughMs = options.through === undefined ? null : timestamp(options.through, "--through");
   if (throughMs !== null && throughMs > calledAt) throw new CliUsageError("--through must not be later than invocation");
   const plan = { ...options, live, wait, calledAt, throughMs,
-    chatPages: options.chatPages ?? 5, hotChats: options.hotChats ?? 5, messagesPerChat: options.messagesPerChat ?? 3,
+    chatPages: options.chatPages ?? 5, hotChats: options.hotChats ?? 5, messagesPerChat: options.messagesPerChat ?? 20,
     timeoutSeconds: options.timeoutSeconds ?? 180, pollSeconds: options.pollSeconds ?? 5,
     startMs, endMs, start: new Date(startMs).toISOString(), end: new Date(endMs).toISOString() };
   for (const key of ["chatPages", "hotChats", "messagesPerChat", "timeoutSeconds", "pollSeconds"]) {

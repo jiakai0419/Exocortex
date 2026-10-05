@@ -1,7 +1,9 @@
 """Check retained Lark IM run coverage from the persisted source baseline.
 
-No project helpers, recovery, source calls, message reads, business-data writes,
-or permission changes. SQLite may update WAL shared-memory reader coordination.
+No project helpers, recovery, source calls, business-data writes, or permission
+changes. The private sample mode also reads bounded matching message records in
+the same snapshot; its payload must never be forwarded to public diagnostics.
+SQLite may update WAL shared-memory reader coordination.
 Completion proves retained successful-run coverage, not remote completeness.
 """
 import argparse
@@ -11,6 +13,8 @@ import math
 import re
 from pathlib import Path
 import sqlite3
+import sys
+import time
 
 ROOT = Path(__file__).resolve().parents[2]
 UTC = datetime.timezone.utc
@@ -25,6 +29,27 @@ ISO_WITH_ZONE = re.compile(
 SENT_ID = 'lark.im.sent_by_me'
 RECEIVED_PREFIX = 'lark.im.received.chat.'
 DISCOVERY_ID = 'lark.im.unmuted_chat_discovery'
+SAMPLE_MAX_TARGETS = 200
+SAMPLE_MAX_INPUT_BYTES = 256 * 1024
+SAMPLE_MAX_RECORD_BYTES = 2 * 1024 * 1024
+SAMPLE_RUNS_PER_TARGET = 500
+SAMPLE_TOTAL_RUNS = 10_000
+SAMPLE_BUDGET_SECONDS = 3.5
+
+
+def successful_run_columns():
+    """One projection for both full-range and bounded sample inspection."""
+    metadata = "CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END"
+    values = ('window_start', 'window_end', 'window_start_ms', 'window_end_ms',
+              'window_complete', 'coverage_mode', 'list_complete', 'details_complete',
+              'pending_detail_count', 'skipped')
+    types = {'list_complete': 'list_complete_type', 'details_complete': 'details_complete_type',
+             'pending_detail_count': 'pending_detail_count_type',
+             'list_window_start_ms': 'list_window_start_type',
+             'list_window_end_ms': 'list_window_end_type'}
+    return ', '.join(['r.status', 'r.cursor_before_json', 'r.cursor_after_json'] +
+                     [f"json_extract({metadata}, '$.{key}') AS {key}" for key in values] +
+                     [f"json_type({metadata}, '$.{key}') AS {alias}" for key, alias in types.items()])
 
 
 def parse_json(value):
@@ -286,38 +311,8 @@ def inspect_connection(con, target_ms):
                        'skipped_successful_runs': 0, 'non_succeeded_runs_ignored': 0}
     invalid_reasons = {}
     # Read evidence/state only, not message contents or full metadata.
-    for run in con.execute("""
-        SELECT r.scope_id, r.status, r.cursor_before_json, r.cursor_after_json,
-          json_extract(CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END,
-                       '$.window_start') AS window_start,
-          json_extract(CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END,
-                       '$.window_end') AS window_end,
-          json_extract(CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END,
-                       '$.window_start_ms') AS window_start_ms,
-          json_extract(CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END,
-                       '$.window_end_ms') AS window_end_ms,
-          json_extract(CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END,
-                       '$.window_complete') AS window_complete,
-          json_extract(CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END,
-                       '$.coverage_mode') AS coverage_mode,
-          json_extract(CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END,
-                       '$.list_complete') AS list_complete,
-          json_extract(CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END,
-                       '$.details_complete') AS details_complete,
-          json_extract(CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END,
-                       '$.pending_detail_count') AS pending_detail_count,
-          json_type(CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END,
-                       '$.list_complete') AS list_complete_type,
-          json_type(CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END,
-                       '$.details_complete') AS details_complete_type,
-          json_type(CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END,
-                       '$.pending_detail_count') AS pending_detail_count_type,
-          json_type(CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END,
-                       '$.list_window_start_ms') AS list_window_start_type,
-          json_type(CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END,
-                       '$.list_window_end_ms') AS list_window_end_type,
-          json_extract(CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END,
-                       '$.skipped') AS skipped
+    for run in con.execute(f"""
+        SELECT r.scope_id, {successful_run_columns()}
         FROM sync_runs r JOIN sync_scopes s ON s.id=r.scope_id AND s.source_id=r.source_id
         WHERE r.source_id='lark.im' AND s.enabled=1
           AND (s.id='lark.im.sent_by_me' OR s.id LIKE 'lark.im.received.chat.%')
@@ -445,6 +440,184 @@ def inspect_database(db_path, target_ms):
         con.close()
 
 
+def validate_sample_targets(payload, now_ms):
+    """Accept only bounded caller correlation hashes and received-scope targets."""
+    if not isinstance(payload, dict) or set(payload) != {'targets'}:
+        raise ValueError('invalid sample targets')
+    targets = payload['targets']
+    if not isinstance(targets, list) or len(targets) > SAMPLE_MAX_TARGETS:
+        raise ValueError('invalid sample targets')
+    keys = set()
+    for target in targets:
+        if (not isinstance(target, dict) or not {'key', 'scope_id', 'message_id', 'created_ms'} <= set(target)
+                or set(target) - {'key', 'scope_id', 'message_id', 'created_ms', 'observed_after_ms'}):
+            raise ValueError('invalid sample target')
+        key, scope = target['key'], target['scope_id']
+        if (not isinstance(key, str) or not re.fullmatch(r'[a-f0-9]{64}', key) or key in keys
+                or not isinstance(scope, str) or not scope.startswith(RECEIVED_PREFIX)
+                or len(scope) <= len(RECEIVED_PREFIX) or len(scope) > 512
+                or any(ord(char) < 32 or ord(char) == 127 for char in scope)):
+            raise ValueError('invalid sample target')
+        message_id = target['message_id']
+        if (not isinstance(message_id, str) or not message_id.strip() or len(message_id) > 512
+                or any(ord(char) < 32 or ord(char) == 127 for char in message_id)):
+            raise ValueError('invalid sample target')
+        for field in ('created_ms', 'observed_after_ms'):
+            if field not in target:
+                continue
+            value = integer_ms(target[field])
+            if value is None or not MIN_EPOCH_MS <= value <= min(now_ms, MAX_EPOCH_MS):
+                raise ValueError('invalid sample timestamp')
+        keys.add(key)
+    return targets
+
+
+def sample_result(reason, covered=False, finished=None, pending=False):
+    return {'covered': covered, 'latest_finished_ms': finished,
+            'details_pending': pending, 'reason': reason}
+
+
+def inspect_sample_connection(con, targets, now_ms, deadline=None):
+    """Bounded read of one snapshot; a later run must cover this exact target.
+
+    No message rows, current cursor shortcuts or unrelated successful runs can
+    establish coverage. End boundaries are conservative: the next inclusive
+    replay owns the exact minute cursor boundary. SQL narrows the candidates;
+    successful_interval remains the sole window/cursor contract validator.
+    """
+    deadline = time.monotonic() + SAMPLE_BUDGET_SECONDS if deadline is None else deadline
+    source = con.execute("SELECT enabled,config_json FROM sources WHERE id='lark.im'").fetchone()
+    config = parse_json(source['config_json']) if source else None
+    baseline = integer_ms(config.get('initial_sync_start_ms')) if isinstance(config, dict) else None
+    source_valid = source is not None and source['enabled'] == 1 and baseline is not None and MIN_EPOCH_MS <= baseline <= now_ms
+    detail_tables = {row['name'] for row in con.execute("""
+        SELECT name FROM sqlite_schema WHERE type='table'
+          AND name IN ('lark_im_list_progress','lark_im_detail_tasks')
+    """)}
+    results = {}
+    remaining = SAMPLE_TOTAL_RUNS
+    for target in targets:
+        key, scope, created = target['key'], target['scope_id'], target['created_ms']
+        results[key] = sample_result('no_covering_run')
+        if time.monotonic() >= deadline or remaining < 2:
+            results[key] = sample_result('inspection_budget_exhausted')
+            continue
+        if not source_valid or created < baseline:
+            results[key] = sample_result('source_unavailable')
+            continue
+        row = con.execute("""
+            SELECT config_json FROM sync_scopes
+            WHERE id=? AND source_id='lark.im' AND enabled=1
+        """, (scope,)).fetchone()
+        scope_config = parse_json(row['config_json']) if row else None
+        if (not isinstance(scope_config, dict) or not isinstance(scope_config.get('chat_id'), str)
+                or not scope_config['chat_id'].strip() or scope_config.get('unsupported_reason') is not None):
+            results[key] = sample_result('scope_unavailable')
+            continue
+        if len(detail_tables) != 2:
+            results[key] = sample_result('detail_evidence_unavailable')
+            continue
+        # Any unresolved debt in this scope blocks a full-content assertion.
+        pending = con.execute("""
+            SELECT 1 FROM lark_im_detail_tasks WHERE scope_id=? AND status='pending' LIMIT 1
+        """, (scope,)).fetchone() is not None
+        if pending:
+            results[key] = sample_result('details_pending', pending=True)
+            continue
+        allowance = min(SAMPLE_RUNS_PER_TARGET, remaining - 1)
+        metadata = "CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END"
+        # Allow sub-millisecond SQL date rounding in this prefilter. Exact ISO
+        # parsing, chronology and interval containment are checked below.
+        rows = list(con.execute(f"""
+            SELECT r.finished_at,r.started_at,{successful_run_columns()}
+            FROM sync_runs r JOIN sync_scopes s ON s.id=r.scope_id AND s.source_id=r.source_id
+            WHERE r.scope_id=? AND r.source_id='lark.im' AND s.enabled=1 AND r.status='succeeded'
+              AND julianday(json_extract({metadata}, '$.window_start')) <= julianday(?/1000.0,'unixepoch') + 0.00000002
+              AND julianday(json_extract({metadata}, '$.window_end')) >= julianday(?/1000.0,'unixepoch') - 0.00000002
+              AND julianday(r.finished_at) >= julianday(?/1000.0,'unixepoch') - 0.00000002
+              AND julianday(r.finished_at) <= julianday(?/1000.0,'unixepoch') + 0.00000002
+            ORDER BY r.started_at DESC,r.id DESC LIMIT ?
+        """, (scope, created, created, target.get('observed_after_ms', MIN_EPOCH_MS), now_ms, allowance + 1)))
+        remaining -= len(rows)
+        if len(rows) > allowance:
+            results[key] = sample_result('inspection_budget_exhausted')
+            continue
+        latest = None
+        for run in rows:
+            interval, _ = successful_interval(run)
+            finished, started = iso_ms(run['finished_at']), iso_ms(run['started_at'])
+            if (interval is None or finished is None or started is None or not started <= finished <= now_ms
+                    or finished < interval[1] or not interval[0] <= created < interval[1]
+                    or 'observed_after_ms' in target and finished <= target['observed_after_ms']):
+                continue
+            latest = finished if latest is None else max(latest, finished)
+        if latest is not None:
+            results[key] = sample_result('covered', covered=True, finished=latest)
+    return results
+
+
+def sample_records(con, targets, deadline):
+    """Private comparison records from the caller's already-established snapshot.
+
+    Bound payload size before fetching raw JSON. A wrong local record type is
+    retained so the caller can report identity_conflict rather than absence.
+    """
+    if not targets:
+        return []
+    if time.monotonic() >= deadline:
+        raise ValueError('sample deadline exceeded')
+    identities = sorted({target['message_id'] for target in targets})
+    placeholders = ','.join('?' for _ in identities)
+    fields = ('external_id', 'source_id', 'record_type', 'container_id',
+              'external_version', 'raw_json', 'canonical_json')
+    selection = f"source_id='lark.im' AND external_id IN ({placeholders})"
+    byte_count = '+'.join(f'COALESCE(length(CAST({field} AS BLOB)),0)' for field in fields)
+    size = con.execute(f'SELECT count(*) AS count,COALESCE(sum({byte_count}),0) AS bytes '
+                       f'FROM records WHERE {selection}', identities).fetchone()
+    if size['count'] > len(identities) or size['bytes'] > SAMPLE_MAX_RECORD_BYTES:
+        raise ValueError('sample record budget exceeded')
+    rows = [dict(row) for row in con.execute(
+        f"SELECT {','.join(fields)} FROM records WHERE {selection} LIMIT ?", identities + [SAMPLE_MAX_TARGETS + 1])]
+    if len(rows) != size['count'] or time.monotonic() >= deadline:
+        raise ValueError('sample record evidence incomplete')
+    return rows
+
+
+def inspect_sample_database(db_path, payload, now_ms=None, after_coverage=None):
+    """Read coverage and records in one transaction, with no snapshot handoff.
+
+    after_coverage is an in-process synthetic concurrency-test hook; no CLI
+    option or environment variable enables it.
+    """
+    now_ms = int(datetime.datetime.now(UTC).timestamp() * 1000) if now_ms is None else now_ms
+    targets = validate_sample_targets(payload, now_ms)
+    deadline = time.monotonic() + SAMPLE_BUDGET_SECONDS
+    con = None
+    error = None
+    try:
+        con = sqlite3.connect(Path(db_path).resolve().as_uri() + '?mode=ro', uri=True, timeout=0.1)
+        con.row_factory = sqlite3.Row
+        con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+        con.execute('PRAGMA query_only=ON')
+        con.execute('BEGIN')
+        results = inspect_sample_connection(con, targets, now_ms, deadline)
+        if after_coverage is not None:
+            after_coverage()
+        records = sample_records(con, targets, deadline)
+    except (sqlite3.Error, OSError, ValueError, TypeError, OverflowError):
+        reason = 'inspection_budget_exhausted' if time.monotonic() >= deadline else 'readonly_inspection_failed'
+        results = {target['key']: sample_result(reason) for target in targets}
+        records = []
+        error = reason
+    finally:
+        if con is not None:
+            con.close()
+    result = {'kind': 'lark_im_sample_snapshot/v1', 'checked_at_ms': now_ms, 'coverage': results, 'records': records}
+    if error is not None:
+        result['error'] = error
+    return result
+
+
 def recent_cycles(log_path):
     cycles = []
     if not log_path.exists():
@@ -487,13 +660,29 @@ def target_argument(value):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--target', required=True, type=target_argument,
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--target', type=target_argument,
                         help='Required coverage end as an ISO timestamp with timezone; must be after baseline.')
+    mode.add_argument('--sample-targets', action='store_true',
+                      help='Private internal snapshot: read at most 200 targets from stdin; emit coverage and matching raw records.')
     parser.add_argument('--db', type=Path, default=ROOT / 'data/exocortex.sqlite',
                         help='Existing SQLite database; defaults to data/exocortex.sqlite under the installed project root.')
     parser.add_argument('--log', type=Path,
                         help='Optional worker JSONL log. Its availability never decides coverage.')
     args = parser.parse_args(argv)
+    if args.sample_targets:
+        if args.log is not None:
+            parser.error('--log cannot be used with --sample-targets')
+        try:
+            raw = getattr(sys.stdin, 'buffer', sys.stdin).read(SAMPLE_MAX_INPUT_BYTES + 1)
+            if len(raw if isinstance(raw, bytes) else raw.encode('utf-8')) > SAMPLE_MAX_INPUT_BYTES:
+                raise ValueError('sample input too large')
+            out = inspect_sample_database(args.db, json.loads(raw))
+        except (ValueError, TypeError, OverflowError, UnicodeError):
+            print(json.dumps({'kind': 'lark_im_sample_snapshot/v1', 'error': 'invalid_sample_targets'}))
+            return 2
+        print(json.dumps(out, ensure_ascii=False))
+        return 0
     try:
         out = inspect_database(args.db, args.target)
     except (sqlite3.Error, OSError, ValueError, TypeError, OverflowError):

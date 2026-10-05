@@ -97,11 +97,12 @@ for (const name of STATUS_SCREEN_SCENARIOS) {
   }
 }
 
-test("Problems is conditional and does not duplicate work, progress or sample status", () => {
-  for (const scenario of STATUS_SCREEN_SCENARIOS.filter((name) => !["failed", "unavailable"].includes(name))) {
+test("Problems is conditional and retains detail debt or missing detail evidence without duplicating progress", () => {
+  const problemScenarios = ["failed", "unavailable", "catching_up", "legacy"];
+  for (const scenario of STATUS_SCREEN_SCENARIOS.filter((name) => !problemScenarios.includes(name))) {
     assert.equal(hasSection(text(scenario), "Problems"), false, `${scenario} has no independent problem row`);
   }
-  for (const scenario of ["failed", "unavailable"]) {
+  for (const scenario of problemScenarios) {
     assert.equal(hasSection(text(scenario), "Problems"), true, `${scenario} must expose its independent problems`);
   }
 });
@@ -111,7 +112,9 @@ test("catch-up retains independent discovery, full-content cursors, detail debt 
   const coverage = section(output, "Messages & progress");
   assert.match(coverage, /(?:discover|conversation list).*?(?:remaining|more|progress|incomplete|not complete)/i);
   assert.match(coverage, /9.*(?:cursor|successful|initial|content)/i);
-  assert.match(coverage, /6 pending.*2 due.*3 sources/i);
+  assert.doesNotMatch(coverage, /Message details|6 pending.*2 due/i);
+  assert.match(section(output, "Problems"), /Message details 6 pending.*2 due.*3 sources/i);
+  assert.equal((output.match(/Message details/g) || []).length, 1);
   assert.match(coverage, /Restricted chats.*5.*excluded/i);
   assert.match(section(output, "Health & current work"), /catching up/i);
   assert.equal((output.match(/Restricted chats/g) || []).length, 1);
@@ -131,6 +134,15 @@ test("healthy local progress and waiting never claim complete remote freshness",
   assert.equal(hasSection(output, "Problems"), false);
   assertDefaultNoiseAbsent(output);
   assert.doesNotMatch(output, /all remote messages|fully up.to.date|real.time coverage|current work.*received-fair/i);
+});
+
+test("zero detail debt is hidden by default, stays in detail, and creates no Problems section", () => {
+  const output = text("healthy");
+  assert.doesNotMatch(output, /Message details|0 pending|0 due for retry/i);
+  assert.equal(hasSection(output, "Problems"), false);
+  const detailed = text("healthy", { detail: true });
+  assert.match(section(detailed, "Messages & progress"), /Message details 0 pending.*0 due for retry.*0 sources/i);
+  assert.equal(hasSection(detailed, "Problems"), false);
 });
 
 test("normal default health and database binding occupy one concise row each", () => {
@@ -173,15 +185,22 @@ test("unavailable and invalid list evidence remains visible in the default scree
   assertWidth(output, 40);
 });
 
-test("pending content remains visible and its affected sources are not renamed conversations", () => {
-  const report = statusScreenFixture();
-  Object.assign(report.sync.details, { pending_count: 3, due_count: 1, scopes_pending: 2,
-    oldest_pending_ms: STATUS_SCREEN_NOW - 2 * 3_600_000 });
-  const output = plain(renderStatusText(report, { columns: 96, stream }));
-  const progress = section(output, "Messages & progress");
-  assert.match(progress, /Message details 3 pending.*1 due.*2 sources/);
-  assert.doesNotMatch(progress, /2 (?:chats|conversations)|all messages|fully synced|complete content/i);
-  assert.doesNotMatch(output, /Content backlog/);
+test("pending content and retries move to Problems and affected sources are not renamed conversations", () => {
+  for (const [pending, due, sources] of [[3, 1, 2], [3, 0, 2], [0, 2, 1], [0, 0, 2]]) {
+    const report = statusScreenFixture();
+    Object.assign(report.sync.details, { pending_count: pending, due_count: due, scopes_pending: sources,
+      oldest_pending_ms: STATUS_SCREEN_NOW - 2 * 3_600_000 });
+    for (const columns of [96, 40]) {
+      const output = plain(renderStatusText(report, { columns, stream }));
+      assert.doesNotMatch(section(output, "Messages & progress"), /Message details/);
+      const problems = section(output, "Problems");
+      assert.match(problems, new RegExp(`Message details ${pending} pending.*${due} due.*${sources} sources`));
+      assert.doesNotMatch(problems, /\d+ (?:chats|conversations)|all messages|fully synced|complete content/i);
+      assert.equal((output.match(/Message details/g) || []).length, 1);
+      assert.doesNotMatch(output, /Content backlog/);
+      assertWidth(output, columns);
+    }
+  }
 });
 
 test("empty database retains missing initial evidence instead of implying complete coverage", () => {
@@ -209,10 +228,39 @@ test("stopped service and unavailable inspection remain different conclusions", 
 });
 
 test("a legacy database has unavailable detail and list evidence rather than zero debt", () => {
-  const coverage = section(text("legacy"), "Messages & progress");
-  assert.match(coverage, /Message (?:details|content).*(?:legacy|unavailable in this database version)/i);
+  const output = text("legacy");
+  const coverage = section(output, "Messages & progress");
+  assert.doesNotMatch(coverage, /Message (?:details|content)/i);
+  assert.match(section(output, "Problems"), /Message (?:details|content).*(?:legacy|unavailable in this database version)/i);
   assert.match(coverage, /Message lists.*(?:legacy|unavailable)/i);
-  assert.doesNotMatch(coverage, /Message (?:details|content)\s+0 pending/i);
+  assert.doesNotMatch(output, /Message (?:details|content)\s+0 pending/i);
+});
+
+test("unavailable detail evidence remains visible in Problems instead of becoming zero or vanishing", () => {
+  for (const evidence of ["unavailable", "legacy_unavailable"]) {
+    const report = statusScreenFixture();
+    report.sync.details = { evidence };
+    for (const columns of [96, 40]) {
+      const output = plain(renderStatusText(report, { columns, stream }));
+      assert.doesNotMatch(section(output, "Messages & progress"), /Message details/i);
+      const problems = section(output, "Problems");
+      assert.match(problems, /Message details.*(?:Evidence unavailable|Unavailable in this database version)/i);
+      assert.doesNotMatch(problems, /Message details\s+0 pending|0 due for retry/i);
+      assert.equal((output.match(/Message details/g) || []).length, 1);
+      assertWidth(output, columns);
+    }
+  }
+});
+
+test("an unavailable pending-detail count remains a problem instead of becoming zero debt", () => {
+  for (const pending of [null, undefined, -1, "0"]) {
+    const report = statusScreenFixture();
+    report.sync.details.pending_count = pending;
+    const output = plain(renderStatusText(report, { columns: 80, stream }));
+    assert.doesNotMatch(section(output, "Messages & progress"), /Message details/i);
+    assert.match(section(output, "Problems"), /Message details unavailable pending/i);
+    assert.doesNotMatch(section(output, "Problems"), /Message details 0 pending/i);
+  }
 });
 
 test("failures preserve all categories, numeric counts and abnormal reservations", () => {

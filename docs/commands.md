@@ -95,9 +95,9 @@ Collect database, sync and quality evidence and requested extensions.
 | `--live` | boolean | `false` | — | Read a bounded remote sample. |
 | `--write-live-cache` | boolean | `false` | — | Write the safe sample cache; requires --live. |
 | `--unsafe-details` | boolean | `false` | — | Include private sample details; requires --live. |
-| `--chat-pages` | integer | `5` | ≥ 1 | Chat discovery pages; requires --live. |
-| `--hot-chats` | integer | `5` | ≥ 1 | Sampled chats; requires --live. |
-| `--messages-per-chat` | integer | `3` | ≥ 1；≤ 50 | Messages per chat; requires --live. |
+| `--chat-pages` | integer | `5` | ≥ 1 | Legacy compatibility bound; live sampling uses local discovered chats. |
+| `--hot-chats` | integer | `5` | ≥ 1 | Maximum sampled chats, capped at five; requires --live. |
+| `--messages-per-chat` | integer | `20` | ≥ 1；≤ 50 | Messages per page, capped at twenty and two pages per chat; requires --live. |
 | `--start` | string | — | — | Sample start with timezone; requires --live. |
 | `--end` | string | — | — | Sample end with timezone; requires --live. |
 | `--through` | string | — | — | Verify coverage to this fixed timezone timestamp. |
@@ -158,6 +158,7 @@ Install configuration without starting the worker.
 | `--step-timeout-seconds` | integer | `600` | — | Hard timeout for each child step. |
 | `--log-max-bytes` | integer | `10485760` | — | Rotate worker.jsonl at this size. |
 | `--log-keep-files` | integer | `5` | — | Rotated worker logs to keep. |
+| `--remote-sample-interval-seconds` | integer | `900` | 0 或 900–1800 | Sample after successful cycles; 0 disables. |
 | `--retention-every-cycles` | integer | `1440` | — | Apply run retention every N cycles. |
 | `--adaptive-fair` | boolean | `false` | — | Adapt the fair scope batch; not an HTTP rate limiter. |
 | `--adaptive-fair-min` | integer | `10` | — | Minimum adaptive fair batch. |

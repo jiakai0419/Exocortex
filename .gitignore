@@ -21,3 +21,6 @@ data/*.bak
 logs/
 lark-im-resources/
 backups/private/
+
+*.remote-account-binding.json
+*.remote-account-binding.json.*.tmp

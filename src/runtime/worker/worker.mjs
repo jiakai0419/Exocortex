@@ -7,6 +7,7 @@ import { parseOptions } from "../../cli/parse-options.mjs";
 import { writeLog, rotateLogIfNeeded } from "./log.mjs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createRemoteSampleController, readScheduledRemoteCooldowns } from "./remote-sample-scheduler.mjs";
 import {
   adaptiveFairDecision,
   compactSummary,
@@ -82,6 +83,8 @@ const STEP_OPERATIONS = {
  * @property {(steps: JsonObject[], payload: JsonObject) => void=} onComplete
  *
  * @typedef {object} RunWorkerDeps
+ * @property {(opts: WorkerOptions, deps: JsonObject) => JsonObject=} runRemoteSample
+ * @property {{run: (deps: JsonObject) => JsonObject, stop: () => void}=} remoteSampleController
  * @property {ReturnType<typeof createActivityWriter>=} activity
  * @property {(opts: WorkerOptions, cycle: number, deps?: RunCycleDeps) => unknown=} runCycle
  * @property {(seconds: number) => void=} sleepSeconds
@@ -263,6 +266,10 @@ function runWorker(opts, deps = {}) {
   const nowMs = deps.nowMs || Date.now;
   const logScheduler = deps.writeScheduler || writeLog;
   const cooldowns = deps.cooldownsByOperation || {};
+  // Injected synthetic cycles never implicitly start real remote work.
+  const controller = deps.remoteSampleController || (!deps.runCycle && !deps.runRemoteSample ? createRemoteSampleController(opts) : null);
+  const sample = deps.runRemoteSample || (controller ? (_opts, sampleDeps) => controller.run(sampleDeps) : null);
+  if (!deps.runCycle) Object.assign(cooldowns, mergeTransportCooldowns(cooldowns, readScheduledRemoteCooldowns(opts, { nowMs }), nowMs()));
   const activity = deps.activity || (!deps.runCycle ? createActivityWriter({ db: opts.db, role: "worker", now: nowMs,
     emit: (event) => writeLog(opts, event, { stdout: { write() {} } }), }) : undefined);
   const activityEnv = activity ? { EXOCORTEX_ACTIVITY_PARENT: activity.instanceId, EXOCORTEX_ACTIVITY_LOG_DIR: resolve(opts.logDir),
@@ -274,6 +281,7 @@ function runWorker(opts, deps = {}) {
   while (opts.maxCycles === null || cycle < opts.maxCycles) {
     cycle += 1;
     const startedMs = nowMs();
+    if (!deps.runCycle) Object.assign(cooldowns, mergeTransportCooldowns(cooldowns, readScheduledRemoteCooldowns(opts, { nowMs }), startedMs));
     activity?.update("cycle", { cycle, durationMs: ACTIVITY_GAP_MS });
     /** @type {JsonObject[] | undefined} */
     let observedSteps;
@@ -295,12 +303,26 @@ function runWorker(opts, deps = {}) {
       logScheduler(cycleOpts, { type: "lark_im_worker_scheduler", version: 1, instance_id: activity?.instanceId || null,
         database_key: activityDatabaseKey(opts.db), cycle, at: new Date(nowMs()).toISOString(), ...outcome.decision });
     }
+    if (cycleOk && sample && opts.remoteSampleIntervalSeconds !== 0) {
+      try {
+        const sampled = sample(opts, { nowMs, cooldownsByOperation: cooldowns });
+        const merged = mergeTransportCooldowns(cooldowns, sampled.cooldownsByOperation, nowMs());
+        for (const key of Object.keys(cooldowns)) delete cooldowns[key];
+        Object.assign(cooldowns, merged);
+        if (!["not_due", "disabled"].includes(sampled.outcome)) {
+          logScheduler(opts, { type: "lark_im_remote_sample_schedule", version: 1, cycle,
+            database_key: activityDatabaseKey(opts.db), instance_id: activity?.instanceId || null,
+            at: new Date(nowMs()).toISOString(), outcome: sampled.outcome, reason: sampled.reason,
+            next_due: sampled.next_due });
+        }
+      } catch { /* Diagnostic collection/logging cannot change sync success. */ }
+    }
     if (opts.maxCycles !== null && cycle >= opts.maxCycles) break;
     activity?.update("waiting", { cycle, durationMs: opts.intervalSeconds * 1000 + ACTIVITY_GRACE_MS });
     sleep(opts.intervalSeconds);
   }
   return ok;
-  } finally { activity?.update("stopped", { cycle }); }
+  } finally { controller?.stop(); activity?.update("stopped", { cycle }); }
 }
 
 /** Internal execution policy: root defaults and explicit cwd-relative paths. */

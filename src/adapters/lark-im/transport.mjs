@@ -1,6 +1,7 @@
 // @ts-check
 
 import { spawnSync } from "node:child_process";
+import { getLarkApiLeaseStdio, readSharedLarkCooldown, writeSharedLarkCooldown } from "../../runtime/lark-api-lease.mjs";
 
 /**
  * @typedef {Record<string, any>} JsonObject
@@ -24,6 +25,8 @@ import { spawnSync } from "node:child_process";
  * @property {(ms: number) => void} [sleep]
  * @property {() => number} [clock]
  * @property {TransportState=} state
+ * @property {typeof readSharedLarkCooldown=} readSharedCooldown
+ * @property {typeof writeSharedLarkCooldown=} writeSharedCooldown
  * @typedef {(args: string[], options?: AdapterRunOptions) => JsonObject | null} LarkRunner
  */
 
@@ -119,6 +122,7 @@ function transportOperation(args) {
   if (args[0] === "contact" && args[1] === "+get-user") return "self_profile";
   if (args[0] === "contact" && args[1] === "+search-user") return "contact_search";
   if (args[0] === "api") {
+    if (args[1] === "GET" && args[2] === "/open-apis/authen/v1/user_info") return "self_profile";
     if (args[1] === "POST" && args[2] === "/open-apis/im/v1/messages/search") return "message_search_bundle";
     if (args[1] === "GET" && args[2] === "/open-apis/im/v1/messages/mget") return "message_search_bundle";
     if (args[1] === "GET" && (args[2] === "/open-apis/im/v1/messages" ||
@@ -329,6 +333,8 @@ function positiveInteger(value, fallback) {
 function createLarkCliRunner({
   bin = process.env.LARK_CLI || "lark-cli", spawn = spawnSync, sleep = sleepMs, clock = Date.now,
   state = defaultTransportState, timeoutMs: defaultTimeoutMs = DEFAULT_LARK_CLI_TIMEOUT_MS,
+  readSharedCooldown = spawn === spawnSync ? readSharedLarkCooldown : undefined,
+  writeSharedCooldown = spawn === spawnSync ? writeSharedLarkCooldown : undefined,
 } = {}) {
   return function runLark(args, options = {}) {
     const operation = transportOperation(args);
@@ -357,13 +363,18 @@ function createLarkCliRunner({
     for (let attempt = 0; attempt <= retries; attempt += 1) {
       // A best-effort caller may swallow an earlier error. Cooling this operation
       // remains mandatory, while unrelated operations can proceed immediately.
-      const target = Math.max(nextAttemptAt, state.cooldowns.get(operation) || 0);
-      const waitMs = Math.max(0, target - now());
-      if (target >= deadline || now() >= deadline) return fail(true);
-      if (waitMs > 0) {
+      while (true) {
+        const shared = readSharedCooldown?.({ operation, nowMs: now() });
+        if (shared?.state === "unavailable") throw new Error(`lark-cli failed: kind=unknown reason=shared_cooldown_unavailable operation=${operation}`);
+        if (shared?.state === "cooldown") state.cooldowns.set(operation, Math.max(state.cooldowns.get(operation) || 0, Number(shared.untilMs)));
+        const target = Math.max(nextAttemptAt, state.cooldowns.get(operation) || 0);
+        const waitMs = Math.max(0, target - now());
+        if (target >= deadline || now() >= deadline) return fail(true);
+        if (waitMs <= 0) break;
         sleep(waitMs);
         counters.wait_ms += waitMs;
-        // Account for injected sleeps and clock rollback conservatively as well.
+        // Re-read after waiting: another process may have lengthened the
+        // operation cooldown. Never launch from a stale ready decision.
         lastNow = Math.max(lastNow, target);
       }
       const remaining = Math.floor(deadline - now());
@@ -373,7 +384,8 @@ function createLarkCliRunner({
       if (attempt > 0) counters.retries += 1;
       let result;
       try {
-        result = spawn(bin, args, { encoding: "utf8", maxBuffer, timeout: lastTimeoutMs, killSignal: "SIGKILL" });
+        result = spawn(bin, args, { encoding: "utf8", maxBuffer, timeout: lastTimeoutMs, killSignal: "SIGKILL",
+          ...(spawn === spawnSync ? { stdio: getLarkApiLeaseStdio() } : {}) });
       } catch {
         // Do not leak paths, arguments or payloads from an executor exception.
         throw new Error(`lark-cli failed: kind=spawn_error operation=${operation}`);
@@ -395,6 +407,9 @@ function createLarkCliRunner({
         else counters.max_retry_after_ms = Math.max(counters.max_retry_after_ms, failure.retry_after_ms);
         const until = Math.min(Number.MAX_SAFE_INTEGER, now() + delay);
         state.cooldowns.set(operation, Math.max(state.cooldowns.get(operation) || 0, until));
+        if (writeSharedCooldown && until > now() && !writeSharedCooldown({ operation, untilMs: until, nowMs: now() })) {
+          throw new Error(`lark-cli failed: kind=rate_limited reason=shared_cooldown_unavailable operation=${operation}`);
+        }
       }
       if (!failure.transient) return fail(false);
       if (attempt >= retries) return fail(true);

@@ -6,6 +6,7 @@ import { createSyncRunner } from "./sync-runner.mjs";
 import { localIsoFromMs, parseLarkTimeMs, SOURCE_ID } from "./core.mjs";
 import { SYNC_DEFAULTS } from "./sync-options.mjs";
 import { ensureInitialized, ensureSourceInitialSyncStart, validateInitialSyncStartMs } from "../../../dist/storage/sqlite/ingestion-store.js";
+import { captureRemoteAccountBinding, recordSuccessfulSyncBinding } from "../../diagnostics/remote-account-binding.mjs";
 
 /**
  * @typedef {"all" | "sent" | "discover" | "received" | "details"} SyncScopeOption
@@ -62,6 +63,9 @@ import { ensureInitialized, ensureSourceInitialSyncStart, validateInitialSyncSta
  * @property {(dbPath: string) => string=} resolvePath
  * @property {() => JsonObject=} getTransportStats
  * @property {() => void=} resetTransportStats
+ * @property {typeof import("../../runtime/lark-api-lease.mjs").tryAcquireLarkApiLease=} tryAcquireLarkApiLease
+ * @property {typeof captureRemoteAccountBinding=} captureRemoteAccountBinding
+ * @property {typeof recordSuccessfulSyncBinding=} recordSuccessfulSyncBinding
  *
  * @typedef {object} CliIo
  * @property {{write: (text: string) => unknown}=} stdout
@@ -127,6 +131,7 @@ function executeLarkImSync(opts, deps = {}) {
   const loadSelfProfile = deps.getSelfProfile || getSelfProfile;
   const runner = deps.syncRunner || createSyncRunner(deps.syncRunnerDeps || {});
   initialize(dbPath);
+  const bindingBefore = (deps.captureRemoteAccountBinding || captureRemoteAccountBinding)({ db: dbPath, emptyOnly: true });
   const baseline = (deps.ensureSourceInitialSyncStart || ensureSourceInitialSyncStart)(
     dbPath, SOURCE_ID, opts.startMs, { explicit: opts.startExplicit, endMs: opts.endMs },
   );
@@ -187,6 +192,11 @@ function executeLarkImSync(opts, deps = {}) {
     summary.partial = summary.incomplete || runs.some((run) => run.ok === true || run.list_complete === true);
   }
 
+  if (selfProfile) (deps.recordSuccessfulSyncBinding || recordSuccessfulSyncBinding)({
+    db: dbPath, selfOpenId: selfProfile.open_id, before: bindingBefore,
+    successful: summary.ok === true && [summary.sent, ...summary.received, ...(summary.details || [])]
+      .some((run) => run?.ok === true && run.skipped !== true),
+  });
   return summary;
 }
 

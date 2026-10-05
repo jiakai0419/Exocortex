@@ -114,32 +114,38 @@ UNKNOWN  缺阶段、过期、进程检查失败、重启身份变化或证据�
 
 Service STOPPED 仍可同时存在独立前台 Activity SYNCING。共享 sync report 只读取数据库证据，其 `current_activity.evidence=database_only` 不能证明阶段；锁或遗留 run 导致 UNKNOWN，不再声称 currently syncing。Service 另有阶段与 OS 观察，因此可得出更具体结果；这些检查并非原子 OS 快照，期限按最终观察时间校验。公共 JSON 保留兼容 `status`（waiting/stopped 对应 idle），新增精确 `state` 和有限时间证据，不公开进程或原始锁标识。Activity 不证明健康、完整覆盖或远端新鲜度。
 
-### Freshness
+### Remote sample
 
-最近一次有界远端采样的证据，不代表所有会话或所有历史消息：
+`status` 只读 `logs/lark-im/live-probe.json`；不调用 API、不写业务库。默认一行显示结果、实际消息/已检查会话数和检查时间；detail 显示窗口、hot/轮换容量、截断、静态正文比较、账号证据及未核验范围。
 
-```text
-SAMPLED  当前数据库的近期热消息样本在本地均存在，证据尚未过期。
-BEHIND   有效样本中发现远端消息尚未入库。
-UNKNOWN  缺缓存、已过期、数据库不匹配、旧缓存或采样无结论。
-```
+后台现有 worker 在成功同步周期后检查一个持久 due，默认每 15 分钟运行、缓存 30 分钟；`--remote-sample-interval-seconds 0` 关闭，900–1800 设置周期，缓存有效期为两倍周期。失败采用 15 分钟到 6 小时指数退避，并尊重更长的官方限流重置；忙则稍后重试。重启保留 due、退避、账号关联、轮换位置和 hash 观察。新尝试/中断不延长上次正向证据。以上为工程策略，非官方同步时限保证。
 
-`status` 不联网，只读取 `logs/lark-im/live-probe.json`。`check --live` 默认 chat-pages=5、hot-chats=5、messages-per-chat=3，窗口为当日本地零点到调用时刻；只做本次采样；同时加 `--write-live-cache` 才显式写入 v2 缓存。摘要绑定数据库 canonical path 与文件身份的哈希和 `source_id=lark.im`，记录 `recent_hot_messages` 范围、window、sample count、checked_at、expires_at；默认 TTL 为 **五分钟**，不保存 ID、人名、群名、链接或正文。
+每轮从已发现的本地启用 received 会话中选至多 2 个近期 hot 和 3 个轮换会话，冻结最近 24 小时创建窗口，排除最近 10 分钟；每会话最多 2 页×20 条，最多 12 个直接 API 调用。子进程全部工作硬限 60 秒；单次 API 最多 4 秒，调用间最少 1 秒，probe 每次 try-lock 后只持锁完成该请求，sync 获得锁后本轮 probe 停止。没有第二个常驻调度服务。
 
-数据库/来源匹配不等于当前远端账号身份匹配。结果单列 `auth_identity=unknown`，缓存中 `auth_identity_verified=false`；不会额外申请账号授权。切换账号后不得据此复用上一账号 cursor。旧 v1 healthy 缓存不能升级为 SAMPLED；全空样本必须是 INCONCLUSIVE。`restricted_mode` 是被排除会话的原因，与缓存缺失/过期导致的 UNKNOWN 分开解释。
+- **Sample matched**：本次明确范围内的 ID 已存在，可比静态 API 正文/版本未发现差异。不证明所有历史或客户端动态卡片。
+- **Awaiting sync / suspected missing**：尚无目标覆盖证明，或只观察到一次已覆盖却缺失。
+- **Confirmed missing**：同一 DB、账号、消息和时间目标再次缺失，且首次发现之后确有新的成功窗口覆盖同一目标；任意 worker 成功不算。
+- **Older versions / body differences**：稳定窗口外的旧版本、可比较静态 API 正文差异。刚更新仍属于等待；动态卡片/合并转发/legacy body 明确未核验。
+- **Not verified / Expired**：无可用样本、账号无法关联、权限/连接/限流、异常响应、过期或数据库变化等。
 
-在已授权且能访问 lark-cli Keychain 的环境中，先给 `PROBE_START_ISO`、`PROBE_END_ISO` 设置明确的近期时间窗口，再运行受控采样：
+账号证据为当前 open_id 与本地单一 sent actor 匹配，或此前空库在成功同步后留下的绑定。报告保留证据类型，tenant/app 归属和全部历史记录所有权并未因此证明。未知或冲突不产生正向信号。诊断不自行认领旧库、不申请额外权限、不写远端或业务记录。旧 v1/v2 缓存不升级为新证明。
 
-```bash
+`check --live` 使用同一 collector，默认只返回本次有界结果。`--write-live-cache` 共用后台调度状态和锁，遵守已有 due/退避，不绕过限流；尚未到期会返回未完成而不联网。`--hot-chats` 可进一步收紧到 1–5，`--messages-per-chat` 可收紧每页至 1–20；`--chat-pages` 为兼容参数，不再触发远端目录扫描。显式时间窗仍被 24 小时/稳定边界收紧。采样不做修复。
+
+接入前须在与服务相同用户的受支持宿主会话验证真实 API `flock`：短 helper 退出后仍持锁、其他进程不能取得、请求子进程继承后保持、最后关闭才释放。锁是 UID 范围内不删除的私有常规文件，不以删除锁文件或修改权限取得通过。同步也使用该锁；关闭定期采样不绕过锁校验。获取预算使用单调时钟，helper、睡眠和尾部文件检查共享余量；持久 due/冷却时间仍使用墙钟。API 锁没有 `ps` 前置门禁；Activity 仍可能因进程观察不可用而显示未知。Keychain dry-run 不能证明远端身份、数据库关联或采样通过，权限或账号证据不可确认时停止，不重建绑定。
+
+统一切换后，先用下列最小范围只读验收（路径为示意）：
+
+```sh
 node bin/exocortex.mjs check --db /absolute/path/to/exocortex.sqlite \
-  --live --chat-pages 1 --hot-chats 1 --messages-per-chat 3 \
-  --start "$PROBE_START_ISO" --end "$PROBE_END_ISO" \
-  --write-live-cache --format json
+  --live --hot-chats 1 --messages-per-chat 1 --format json
 ```
 
-缓存写入安装 root 的 `logs/lark-im/live-probe.json`，service 的 log directory 必须对应。去掉 `--write-live-cache` 即仅查看本次结果。有效样本在 service 中显示 SAMPLED，并展示范围、窗口、数量、检查/失效时间及身份未知；五分钟后回到 UNKNOWN 是预期行为。`UNAVAILABLE / keychain_unavailable` 只说明当前 shell 未完成远端采样，不等于后台同步故障。`check` 保留本地 health 证据，采样不可用或执行失败不能给出绿色整体结果。
+该手动范围最多两条消息、四次直接 API 调用，采样进程组期限 60 秒，同步外层在 62 秒发出 SIGTERM 作为清理后备（仍等待 guardian 退出），不写业务数据、绑定或调度缓存；仍取得临时 API 锁，遇到限流会保存共享冷却证据。旧 worker 不参与新锁，不能以其运行空隙冒充已验证互斥。
 
-`check` 直接调用共享报告，不通过已退役的诊断子 CLI 拼接结果。执行失败、信号、坏 JSON 或有效但未满足的证据不能被健康字段覆盖。公共结果使用有限原因、状态和计数，不透出原始 stderr；本地与远端分项保留各自观察时间。
+手动范围参数不改变后台默认的最多十二次调用、二百条消息。获准启用定期采样后，应观察持续运行的新 worker 的正常到期轮次及最终安全缓存；`sample_started` 只证明启动，不能当作成功。后台、手动写缓存和无缓存检查共用 guardian，进程组清理后才接受手动输出；后台 worker 不等待 API；有限 `--once`/max-cycle 退出会取消未完成采样，不用于证明正常周期完成。显式手动写缓存沿用原 `--log-dir` 与已有 due/退避，不删除状态或换目录强制采样。
+
+设计、官方文档引用、故障恢复、隐私及合成验收见 [Remote sample design](remote-sample-design.md)。真实生产接入需独立审查、统一部署和已有授权内的必要有限验收；开发通过不代替真实验收。
 
 ### Status 的整屏层级与历史口径
 
@@ -596,6 +602,8 @@ received 直接分页读取原生消息列表，显式请求 `only_thread_root_m
 人员提及只接受同条原始消息中明确且无歧义的对应。除了直接匹配 `mentions` 的 ID，还读取 `body.content` 包装中的 `json_attachment.at_users`：卡片原生引用通过 `at_users` 的自有字典键或条目的 `user_id` 对应 `mention_key`，再连接同条消息的 `mentions` 取姓名。缺失或冲突的映射保持未知，不按出现顺序、ID 前缀或相似姓名猜测，不使用其他消息、缓存或联网查询补充。只有未解析提及时，在原位置显示未知提及占位，JSON 中仍保留 `status=partial` 和 `reason=unresolved_card_mention`，不再重复追加整行通用说明；同时存在其他关键缺失时，JSON 保留其状态与原因，文本保留可解析正文及具体位置未知标记，不追加笼统尾注。
 
 卡片的显式 `at_all` 节点在原位置显示 `@所有人`，不需要用户姓名或附件映射。读取历史卡片时直接从已存 raw 恢复该节点，无需重新同步或补写记录；其他未知内容仍保留原有诊断。这只解释明确的全员节点，不把普通 ID、附件键或正文中的 `all` 猜成全员提及。
+
+原生 Markdown 的 `list.items` 有序／无序条目会保留编号、层级、链接标题及相邻正文（包括原文日期），嵌套列表和列表后的文字也继续显示。它们属于正文；条目中的安全导航不会按纯请求按钮隐藏。未知序号或层级有明确占位和机器诊断，未知条目类型仍不展开。历史卡片可直接从已存 raw 恢复这类内容，不必 GET、重同步或补写数据库；具体支持边界见[原生 Markdown 列表](card-and-identity-projection.md#原生-markdown-列表)。
 
 `--format json` 保留已有 `body`、`canonical`、`raw`、对应 JSON 字符串与 `display.body` 的含义；卡片只新增 `display.card = {text, status, reason, version}`。展示版本为 3，旧记录 canonical 中的历史渲染版本不会被阅读命令改写。普通消息仍使用原有展示。新同步的卡片也调用同一解析器，派生正文和渲染元数据可以改善，但 source `raw_json`、content hash 与源版本不因文本投影变化而变化；同版本投影改善仍遵守已有入库比较规则。
 

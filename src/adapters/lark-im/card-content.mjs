@@ -37,6 +37,7 @@ const LOCAL_LIMIT_NOTICES = {
 /** @typedef {keyof typeof EXPLANATIONS} Reason */
 /** @typedef {{text: string, status: "rendered" | "partial" | "structured_fallback", reason: string | null, version: 3, omitted_actions?: number}} CardRenderResult */
 /** @typedef {{includePartialNotice?: boolean, includeDecorativeSeparators?: boolean}} CardRenderOptions */
+/** @typedef {{prefix: string, pending: boolean, leading: string[], level: number, parent: ListItem | null}} ListItem */
 
 /** @param {unknown} value @returns {value is JsonObject} */
 function object(value) {
@@ -129,6 +130,11 @@ function renderCardContent(content, mentions = [], options = {}) {
   let contentEmissions = 0;
   let stopped = false;
   let omittedActions = 0;
+  /** List markers are deferred until visible content; hidden actions leave no empty item.
+   * @type {ListItem | null} */
+  let currentListItem = null;
+  let firstListPrefix = true;
+  let leadingListLevel = 0;
   /** @param {Reason} reason */
   const mark = (reason) => {
     reasons.add(reason);
@@ -137,6 +143,8 @@ function renderCardContent(content, mentions = [], options = {}) {
     // mark the omitted branch immediately, before any readable sibling.
     if (reason !== "card_output_limit" && options.includePartialNotice === false &&
         Object.hasOwn(LOCAL_LIMIT_NOTICES, reason) && !stopped) {
+      flushListPrefixes();
+      if (stopped) return;
       const marker = LOCAL_LIMIT_NOTICES[/** @type {keyof typeof LOCAL_LIMIT_NOTICES} */ (reason)];
       contentEmissions += 1;
       if (output.length + marker.length <= MAX_OUTPUT_CHARS) output += marker;
@@ -198,9 +206,37 @@ function renderCardContent(content, mentions = [], options = {}) {
     } else visit();
   }
 
+  /** Visible resource notices belong to their list item just like body text. */
+  function flushListPrefixes() {
+    if (!currentListItem?.pending) return;
+    const pending = [];
+    /** @type {ListItem | null} */
+    let item = currentListItem;
+    while (item?.pending) { pending.push(item); item = item.parent; }
+    for (const item of pending.reverse()) {
+      item.pending = false;
+      if (firstListPrefix) {
+        firstListPrefix = false;
+        if (!output.trim()) leadingListLevel = item.level;
+      }
+      emit(item === currentListItem || item.leading.length ? item.prefix : item.prefix.trimEnd(), true);
+      for (const text of item.leading) emit(text, true);
+      item.leading = [];
+      if (stopped) {
+        // An output-limit notice is meaningful even when only a generated
+        // prefix fit. Ancestor slots must not roll it back as an empty item.
+        contentEmissions += 1;
+        return;
+      }
+      if (item !== currentListItem) lineBreak();
+    }
+  }
+
   /** @param {string} text @param {boolean} boundary */
   function emit(text, boundary = false) {
     if (!text || stopped) return;
+    if (!boundary) flushListPrefixes();
+    if (stopped) return;
     if (!boundary) contentEmissions += 1;
     const remaining = MAX_OUTPUT_CHARS - output.length;
     // A pending separator alone is not missing content. A subsequent text or
@@ -680,6 +716,43 @@ function renderCardContent(content, mentions = [], options = {}) {
     if (!recognized) mark("unsupported_card_structure");
   }
 
+  /** Native Markdown lists contain typed items, whose elements remain inline.
+   * Do not treat unknown item kinds or arbitrary children as presentation slots.
+   * @param {JsonObject} payload @param {number} depth */
+  function list(payload, depth) {
+    each(read(payload, "items"), depth + 1, (value, itemDepth) => enter(value, itemDepth, () => {
+      if (!object(value)) { mark("unsupported_card_structure"); return; }
+      const type = read(value, "type");
+      if (type !== "ol" && type !== "ul") { mark("unsupported_card_structure"); return; }
+      const elements = read(value, "elements");
+      if (!Array.isArray(elements)) { mark("unsupported_card_structure"); return; }
+      const parent = currentListItem;
+      const base = parent ? parent.level + 1 : 0;
+      const observedLevel = read(value, "level");
+      const level = observedLevel === undefined ? 0 : observedLevel;
+      const knownLevel = Number.isSafeInteger(level) && level >= 0 && base + level <= MAX_DEPTH;
+      if (!knownLevel) mark("unsupported_card_structure");
+      let marker = "- ";
+      if (type === "ol") {
+        const order = read(value, "order");
+        const knownOrder = Number.isSafeInteger(order) && order > 0;
+        if (!knownOrder) mark("unsupported_card_structure");
+        marker = knownOrder ? `${order}. ` : "[序号未知] ";
+      }
+      const indent = knownLevel ? base + level : Math.min(base, MAX_DEPTH);
+      const before = output.length;
+      const emissions = contentEmissions;
+      lineBreak();
+      currentListItem = { prefix: `${"  ".repeat(indent)}${knownLevel ? "" : "[层级未知] "}${marker}`, pending: true, leading: [], level: indent, parent };
+      try { inline(elements, itemDepth + 1); }
+      finally { currentListItem = parent; }
+      // A deferred marker can itself reach the output limit before body text.
+      // Preserve that limit notice instead of treating the item as hidden.
+      if (contentEmissions === emissions && !stopped) output = output.slice(0, before);
+      else lineBreak();
+    }));
+  }
+
   /** Inspect only documented navigation slots; action requests remain opaque.
    * @param {JsonObject} payload @param {number} depth @param {boolean} actionLinks */
   function navigationLinks(payload, depth, actionLinks = false) {
@@ -758,7 +831,16 @@ function renderCardContent(content, mentions = [], options = {}) {
   /** @param {unknown} value @param {number} depth @param {boolean} inLine */
   function node(value, depth, inLine) {
     enter(value, depth, () => {
-      if (typeof value === "string") { emit(visibleText(value)); return; }
+      if (typeof value === "string") {
+        const text = visibleText(value);
+        // Blank source fragments cannot make a list marker into visible body.
+        // Keep their order if content follows; boundedRawText and node visits
+        // already bound this buffer. Explicit br and resource notices still
+        // activate their item through the ordinary emission paths.
+        if (currentListItem?.pending && text && !text.trim()) currentListItem.leading.push(text);
+        else emit(text);
+        return;
+      }
       if (!object(value)) { mark("unsupported_card_structure"); return; }
       const property = read(value, "property");
       const payload = property === undefined ? value : property;
@@ -770,6 +852,8 @@ function renderCardContent(content, mentions = [], options = {}) {
         emit("@所有人");
       } else if (TEXT_TAGS.has(tag)) {
         if (!textSlots(payload, depth)) mark("unsupported_card_structure");
+      } else if (tag === "list") {
+        list(payload, depth);
       } else if (tag === "button" || tag === "a" || tag === "link") {
         const navigation = navigationLinks(payload, depth, tag === "button");
         if (tag === "button" && navigation.usable === 0) { omittedActions += 1; return; }
@@ -885,7 +969,9 @@ function renderCardContent(content, mentions = [], options = {}) {
     // Malformed non-JSON objects (including access traps) are never dumped.
     mark("unsupported_card_structure");
   }
-  output = output.trim();
+  // Preserve only generated indentation on an initial list; ordinary source
+  // whitespace keeps the established trim behavior.
+  output = `${"  ".repeat(leadingListLevel)}${output.trim()}`;
   const omissions = omittedActions > 0 ? { omitted_actions: omittedActions } : {};
   if (!output && reasons.size === 0 && omittedActions > 0) {
     return { text: "[卡片仅含交互操作，文本视图已收起]", status: "rendered", reason: null, version: 3, ...omissions };

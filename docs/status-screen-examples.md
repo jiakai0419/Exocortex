@@ -16,15 +16,12 @@ Health & current work
   Local health           OK
   Background             Running
   Current work           Waiting · between background rounds
-  Total runs             4 completed rounds · current worker / retained log
-  Successful runs        4
-  Last completed         Today 11:59:25 (35s ago)
-  Last duration          12s
+  Runs                   4 total · 4 successful
+  Last completed         Today 11:59:25 (35s ago) · 12s duration
 
 Messages & progress
   Stored messages        293 total · 54 sent · 232 received · 7 unclassified
   Received chats         14 enabled
-  Message details        0 pending
   Remote sample          Not verified · no cached remote sample
 ```
 
@@ -38,15 +35,12 @@ Health & current work
   Local health           OK
   Background             Running
   Current work           Syncing · conversation list review
-  Total runs             4 completed rounds · current worker / retained log
-  Successful runs        4
-  Last completed         Today 11:59:25 (35s ago)
-  Last duration          12s
+  Runs                   4 total · 4 successful
+  Last completed         Today 11:59:25 (35s ago) · 12s duration
 
 Messages & progress
   Stored messages        293 total · 54 sent · 232 received · 7 unclassified
   Received chats         14 enabled
-  Message details        0 pending
   Remote sample          Not verified · no cached remote sample
 ```
 
@@ -60,20 +54,20 @@ Health & current work
   Local health           CATCHING UP · message details remain to be retrieved
   Background             Running
   Current work           Syncing · other conversation messages
-  Total runs             4 completed rounds · current worker / retained log
-  Successful runs        4
-  Last completed         Today 11:59:25 (35s ago)
-  Last duration          12s
+  Runs                   4 total · 4 successful
+  Last completed         Today 11:59:25 (35s ago) · 12s duration
 
 Messages & progress
   Stored messages        293 total · 54 sent · 232 received · 7 unclassified
   Received chats         14 enabled · 9 with no content checkpoint
   Conversation list      Initial discovery has more pages to retrieve
   Message sources        15 enabled · 9 without a successful sync
-  Message details        6 pending · 2 due for retry · 3 sources
   Restricted chats       5 excluded · 3 access restricted · 2 not a conversation
                          member
   Remote sample          Not verified · no cached remote sample
+
+Problems
+  Message details        6 pending · 2 due for retry · 3 sources
 ```
 
 ## empty-80.txt
@@ -88,17 +82,14 @@ Health & current work
   Background             Running · cannot confirm it serves this database
   Current work           Unconfirmed · no current background phase could be
                          verified
-  Total runs             Unavailable · current worker unverified
-  Successful runs        Unavailable
+  Runs                   Unavailable · current worker unverified
   Last completed         Unavailable
-  Last duration          Unavailable
 
 Messages & progress
   Stored messages        0 total · 0 sent · 0 received
   Received chats         0 enabled
   Conversation list      Initial discovery not yet established
   Message sources        1 enabled · 1 without a successful sync
-  Message details        0 pending
   Remote sample          Not verified · no cached remote sample
 ```
 
@@ -112,15 +103,12 @@ Health & current work
   Local health           NEEDS ATTENTION · background service is stopped
   Background             Stopped (service not loaded)
   Current work           Syncing · foreground command
-  Total runs             Unavailable · current worker unverified
-  Successful runs        Unavailable
+  Runs                   Unavailable · current worker unverified
   Last completed         Unavailable
-  Last duration          Unavailable
 
 Messages & progress
   Stored messages        293 total · 54 sent · 232 received · 7 unclassified
   Received chats         14 enabled
-  Message details        0 pending
   Remote sample          Not verified · no cached remote sample
 ```
 
@@ -135,15 +123,12 @@ Health & current work
   Background             Running · cannot confirm it serves this database
   Current work           Unconfirmed · no current background phase could be
                          verified
-  Total runs             Unavailable · current worker unverified
-  Successful runs        Unavailable
+  Runs                   Unavailable · current worker unverified
   Last completed         Unavailable
-  Last duration          Unavailable
 
 Messages & progress
   Stored messages        293 total · 54 sent · 232 received · 7 unclassified
   Received chats         14 enabled
-  Message details        0 pending
   Remote sample          Not verified · no cached remote sample
 ```
 
@@ -159,10 +144,9 @@ Health & current work
   Background             Running · selected database verified
   Current work           Waiting · between background rounds
   Phase observed         Today 11:59:50 · evidence valid until Today 12:00:20
-  Total runs             4 completed rounds · current worker / retained log
-  Successful runs        3
-  Last completed         Today 11:59:25 (35s ago)
-  Last duration          12s
+  Runs                   4 total · 3 successful
+  Last completed         Today 11:59:25 (35s ago) · 12s duration
+  Run scope              Completed rounds · current worker / retained log
 
 Messages & progress
   Stored messages        293 total · 54 sent · 232 received · 7 unclassified
@@ -237,15 +221,11 @@ Health & current work
   Current work
     Syncing · other conversation
     messages
-  Total runs
-    4 completed rounds · current worker
-    / retained log
-  Successful runs
-    4
+  Runs
+    4 total · 4 successful
   Last completed
-    Today 11:59:25 (35s ago)
-  Last duration
-    12s
+    Today 11:59:25 (35s ago) · 12s
+    duration
 
 Messages & progress
   Stored messages
@@ -260,13 +240,15 @@ Messages & progress
   Message sources
     15 enabled · 9 without a successful
     sync
-  Message details
-    6 pending · 2 due for retry · 3
-    sources
   Restricted chats
     5 excluded · 3 access restricted · 2
     not a conversation member
   Remote sample
     Not verified · no cached remote
     sample
+
+Problems
+  Message details
+    6 pending · 2 due for retry · 3
+    sources
 ```

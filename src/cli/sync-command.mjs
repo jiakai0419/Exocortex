@@ -6,6 +6,7 @@ import { ACTIVITY_GRACE_MS, createActivityWriter } from "../diagnostics/lark-im-
 import { writeLog } from "../runtime/worker/log.mjs";
 import { classifyLarkFailure, getTransportStats, resetTransportStats } from "../adapters/lark-im/transport.mjs";
 import { executeLarkImSync, normalizeSyncOptions } from "../adapters/lark-im/sync-command.mjs";
+import { acquireSyncLarkApiLease } from "../runtime/lark-api-lease.mjs";
 
 /** The registry owns parsing, paths and help; the adapter owns sync semantics.
  * @param {Record<string, any>} options
@@ -20,8 +21,16 @@ export function runSyncCommand(options, context) {
   const readTransport = deps?.getTransportStats || getTransportStats;
   (deps?.resetTransportStats || resetTransportStats)();
   let activity;
+  let apiLease;
   try {
     const opts = normalizeSyncOptions(options, { now: () => context.startedAtMs ?? now(), provided: context.provided });
+    // Dependency-injected harnesses own their lease stub, as they do activity
+    // writers. The public CLI always takes the real cross-process lease.
+    const acquire = deps?.tryAcquireLarkApiLease || (!deps ? acquireSyncLarkApiLease : undefined);
+    apiLease = acquire?.({ db: opts.db, role: "sync" });
+    if (apiLease && apiLease.state !== "acquired") {
+      throw new CliExecutionError(apiLease.state === "busy" ? "sync skipped: Lark API is busy" : "sync skipped: Lark API lease unavailable");
+    }
     const parent = env.EXOCORTEX_ACTIVITY_PARENT || "";
     const timeout = Number(env.EXOCORTEX_ACTIVITY_STEP_TIMEOUT_MS);
     const durationMs = parent && Number.isSafeInteger(timeout) && timeout > 0 ? timeout + ACTIVITY_GRACE_MS : 5000;
@@ -42,5 +51,5 @@ export function runSyncCommand(options, context) {
     const transport = readTransport();
     if (transport.calls > 0) stderr.write(`${JSON.stringify({ type: "lark_transport_summary", transport })}\n`);
     return 1;
-  } finally { activity?.update("stopped"); }
+  } finally { try { activity?.update("stopped"); } finally { apiLease?.release(); } }
 }
