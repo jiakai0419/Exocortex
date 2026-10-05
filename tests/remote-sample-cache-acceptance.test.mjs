@@ -257,7 +257,8 @@ const CASES = [
     const item = attempt(f, 'startup', db, { mode: 'startup_failure' });
     const output = await completed(item.handle);
     assert.equal(output.result.outcome, 'failed'); assert.equal(output.result.reason, 'sample_process_failed');
-    assert.equal(output.result.guardian_diagnostic?.primary?.stage, 'child_exit');
+    assert.deepEqual(output.result.guardian_diagnostic, { version: 1,
+      primary: { stage: 'child_exit', errno: null }, cleanup: null });
     traceAttempt(f, item, output, { worker: false });
     const cachePath = join(f.logDir, 'live-probe.json'), marker = readJson(cachePath);
     assert.equal(marker.kind, 'lark_im_live_probe_cache/pending'); assert.equal(marker.ok, false); assert.equal(marker.reason, 'attempting');
@@ -269,7 +270,8 @@ const CASES = [
     const item = attempt(f, 'missing-stage', db, { mode: 'missing_stage' });
     const output = await completed(item.handle);
     assert.equal(output.result.outcome, 'failed'); assert.equal(output.result.reason, 'sample_process_failed');
-    assert.equal(output.result.guardian_diagnostic?.primary?.stage, 'guardian_result');
+    assert.deepEqual(output.result.guardian_diagnostic, { version: 1,
+      primary: { stage: 'guardian_result', errno: null }, cleanup: null });
     traceAttempt(f, item, output);
     const cachePath = join(f.logDir, 'live-probe.json'), marker = readJson(cachePath);
     assert.equal(marker.kind, 'lark_im_live_probe_cache/pending'); assert.equal(marker.ok, false); assert.equal(marker.reason, 'attempting');

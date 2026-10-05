@@ -123,6 +123,22 @@ function lifecycleTest(name, kind, mode, callerSignal = null) {
       assert.equal(call.signalError, null, 'signal refusal is not retried');
       if (callerSignal) assert.equal(call.signal, callerSignal);
       else { assert.equal(call.code, 0, call.stderr.toString()); assert.equal(call.signal, null); }
+      // Validate reported cleanup before any PID wait or lock probe. Observed
+      // process exit and a free lock cannot erase a reported cleanup failure.
+      if (!callerSignal) {
+        const result = JSON.parse(call.stdout.toString());
+        assert.equal(result.outcome, ['exit', 'fast0'].includes(mode) ? 'ok' : 'failed');
+        const diagnostic = result.guardian_diagnostic || result.report?.guardian_diagnostic;
+        if (!['exit', 'fast0'].includes(mode) || diagnostic) assert.equal(diagnostic?.cleanup, null);
+        if (mode === 'fast7') assert.equal(diagnostic?.primary?.stage, 'child_exit');
+        if (mode === 'overflow') assert.equal(diagnostic?.primary?.stage, 'output_limit');
+        if (mode === 'blocked') assert.ok(['deadline', 'anchor_deadline'].includes(diagnostic?.primary?.stage));
+        if (['exit', 'fast0'].includes(mode) && kind === 'manual_cache') {
+          assert.equal(result.cacheWritten, true);
+          assert.ok(parseRemoteSampleCache(JSON.parse(readFileSync(join(f.directory, 'live-probe.json'), 'utf8'))));
+        }
+        assert.doesNotMatch(JSON.stringify(result), /invented database|"probe":\d|"cli":\d/);
+      }
       const caller = recorded(f.callerRecord, f.nonce), worker = recorded(f.workerRecord, f.nonce);
       const guardian = recorded(f.guardianRecord, f.nonce);
       assert.equal(caller.pid, owner.child.pid);
@@ -140,20 +156,6 @@ function lifecycleTest(name, kind, mode, callerSignal = null) {
       await waitForPidsToExit(pids, deadline - 1000);
       await assertReleased(f, deadline);
       assert.ok(performance.now() < deadline, 'fallback exits cannot count as accepted cleanup');
-      if (!callerSignal) {
-        const result = JSON.parse(call.stdout.toString());
-        assert.equal(result.outcome, ['exit', 'fast0'].includes(mode) ? 'ok' : 'failed');
-        const diagnostic = result.guardian_diagnostic || result.report?.guardian_diagnostic;
-        assert.equal(diagnostic?.cleanup ?? null, null);
-        if (mode === 'fast7') assert.equal(diagnostic?.primary?.stage, 'child_exit');
-        if (mode === 'overflow') assert.equal(diagnostic?.primary?.stage, 'output_limit');
-        if (mode === 'blocked') assert.ok(['deadline', 'anchor_deadline'].includes(diagnostic?.primary?.stage));
-        if (['exit', 'fast0'].includes(mode) && kind === 'manual_cache') {
-          assert.equal(result.cacheWritten, true);
-          assert.ok(parseRemoteSampleCache(JSON.parse(readFileSync(join(f.directory, 'live-probe.json'), 'utf8'))));
-        }
-        assert.doesNotMatch(JSON.stringify(result), /invented database|"probe":\d|"cli":\d/);
-      }
       completed = true;
     } catch (error) {
       firstFailure = error;
