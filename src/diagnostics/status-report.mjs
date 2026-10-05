@@ -7,6 +7,7 @@ import { compareActivityProcessStarts, evaluateActivityEvent, validateActivityEv
 import { LABEL, target, readInstalledServiceConfig } from "../runtime/service/launchd.mjs";
 import { publicFailureKind, publicTimestamp } from "./public-safe.mjs";
 import { publicActivity } from "./public-activity.mjs";
+import { summarizeRuntimeStats } from "./status-runtime-stats.mjs";
 import { REQUIRED_CYCLE_STEPS } from "../../dist/runtime/worker/lark-im-worker-core.js";
 
 /** @typedef {Record<string, any>} JsonObject */
@@ -198,6 +199,7 @@ function publicStatusReport(collected, options) {
     health: { status: choice(overview.health.status, ["ok", "catching_up", "problem"]),
       reason: HEALTH_REASONS.includes(overview.health.reason) ? overview.health.reason : "health_unavailable", local: choice(sync?.health, ["ok", "ok_with_history", "catching_up", "syncing", "not_ready", "needs_attention", "unknown"]) },
     activity: publicActivity(overview.activity),
+    runtime_stats: summarizeRuntimeStats(report, collected.binding, observedAt),
     freshness: { status: choice(overview.freshness.status, ["sampled", "unknown", "behind"]), auth_identity: "unknown",
       scope: choice(overview.freshness.scope, ["recent_hot_messages"]), reason: choice(overview.freshness.reason, FRESHNESS_REASONS),
       window: { start: publicTimestamp(overview.freshness.window?.start), end: publicTimestamp(overview.freshness.window?.end) },

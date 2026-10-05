@@ -5,6 +5,10 @@ schema and existing fields, adding evidence needed for honest human summaries.
 All examples and tests are invented from scratch. No operational records,
 screenshots, accounts, paths, IDs or log excerpts belong in this document or Git.
 
+The later [four runtime statistics addition](status-runtime-stats.md) adds only
+total runs, successful runs, last completion and last duration after current work;
+all other rows, sections and meanings below remain unchanged.
+
 ## Reading order and visual grammar
 
 The default screen answers five questions: is local collection running, what is

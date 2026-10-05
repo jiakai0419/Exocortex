@@ -1,10 +1,13 @@
 // Invented whole-screen examples. No operational data or captured reports are used.
 import { publicStatusReport } from "../../src/diagnostics/status-report.mjs";
 import { summarizeWorkerStability } from "../../src/diagnostics/lark-im-service-report.mjs";
+import { REQUIRED_CYCLE_STEPS } from "../../dist/runtime/worker/lark-im-worker-core.js";
 
 export const STATUS_SCREEN_NOW = Date.parse("2032-02-04T12:00:00.000Z");
 export const STATUS_SCREEN_PRIVATE = "INVENTED_PRIVATE_STATUS_MARKER";
 const HOUR = 3_600_000;
+const RUNTIME_DATABASE = "a".repeat(64);
+const RUNTIME_INSTANCE = "invented-screen-worker";
 const iso = (offset = 0) => new Date(STATUS_SCREEN_NOW + offset).toISOString();
 const cycle = (offset, number, ok = true) => ({ type: "lark_im_worker_cycle", cycle: number, ok, at: iso(offset) });
 const summaryEvent = (offset, number, ok = true) => ({ cycle: number, ok, at: iso(offset), age_ms: -offset });
@@ -175,13 +178,45 @@ export function rawStatusScreenFixture(name = "healthy") {
     worker.last_event_age_ms = 0;
     report.overview.activity = noActivity("current_phase_unavailable");
   }
+  // Bound runtime evidence is independently invented. Existing history summaries
+  // above stay unchanged so adding the four statistics cannot alter prior rows.
+  const identity = { version: 1, database_key: RUNTIME_DATABASE, instance_id: RUNTIME_INSTANCE };
+  report.worker.log.events = events.map((event) => ({ ...event, ...identity,
+    step_count: REQUIRED_CYCLE_STEPS.length, failed_steps: [],
+  }));
+  const last = report.worker.log.events.at(-1);
+  if (last) {
+    if (name === "failed") Object.assign(last, { ok: false, failed_steps: ["received-hot"] });
+    const steps = REQUIRED_CYCLE_STEPS.map((stepName, stepIndex) => ({ ...identity,
+      type: "lark_im_worker_step", cycle: last.cycle, step_index: stepIndex, name: stepName,
+      ok: !(name === "failed" && stepName === "received-hot"),
+      exit_code: name === "failed" && stepName === "received-hot" ? 1 : 0,
+      started_at: iso(-47_000 + stepIndex * 2_000), finished_at: iso(-45_000 + stepIndex * 2_000),
+    }));
+    report.worker.log.events.splice(-1, 0, ...steps);
+  }
+  if (["empty", "unavailable"].includes(name)) report.worker.log.events = [];
+  if (name === "unavailable") report.worker.log.exists = false;
+  if (name === "truncated") Object.assign(report.worker.log, { truncated: true, activity_integrity: false });
+  if (name === "unbound_failure") report.worker.log.events.forEach((event) => { event.database_key = "b".repeat(64); });
   return report;
 }
 
 export function statusScreenFixture(name = "healthy", { detail = false } = {}) {
   const report = rawStatusScreenFixture(name);
+  const targetMatch = ["running", "loaded"].includes(report.probe.status) && !["old_history", "legacy", "truncated", "invalid_history", "empty", "expired_phase"].includes(name) ? "matched" : "unknown";
+  const activity = report.overview.activity;
+  const binding = { target_match: targetMatch, phase: { state: activity.state }, worker: {
+    type: "lark_im_worker_activity", version: 1, role: "worker", instance_id: RUNTIME_INSTANCE,
+    database_key: RUNTIME_DATABASE, parent_instance: null, pid: report.probe.pid, process_started_at_ms: STATUS_SCREEN_NOW - 3 * HOUR,
+    phase: activity.phase, cycle: activity.state === "syncing" ? 5 : 4,
+    step: activity.step || null, updated_at: iso(-10_000), valid_until: iso(20_000),
+  } };
+  report.activity_evidence = { database_identity_stable: true, integrity: true, database_key: RUNTIME_DATABASE,
+    processes: new Map([[report.probe.pid, { state: "alive", started_at_ms: binding.worker.process_started_at_ms }]]),
+  };
   return publicStatusReport({ report, observedAt: STATUS_SCREEN_NOW,
-    service: { ...report.probe, target_match: ["running", "loaded"].includes(report.probe.status) && !["old_history", "legacy", "truncated", "invalid_history", "empty", "expired_phase"].includes(name) ? "matched" : "unknown" },
+    binding, service: { ...report.probe, target_match: targetMatch },
     installed: { status: "installed", config: { db: STATUS_SCREEN_PRIVATE }, xml: STATUS_SCREEN_PRIVATE },
   }, { detail });
 }

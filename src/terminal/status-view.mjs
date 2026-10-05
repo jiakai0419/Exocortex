@@ -83,6 +83,17 @@ export function renderStatusText(report, options = {}) {
   screen.row("Current work", work, activity.state === "unknown" ? "yellow" : activity.state === "syncing" ? "cyan" : "");
   if (detailed && ["syncing", "waiting"].includes(activity.state)) screen.row("Phase observed", `${stamp(activity.updated_at)} · evidence valid until ${stamp(activity.valid_until)}`);
 
+  const runtime = report.runtime_stats || {};
+  const runtimeAvailable = runtime.state === "available";
+  const runtimeReason = { worker_unverified: "current worker unverified", log_unavailable: "log unavailable",
+    log_damaged: "log evidence incomplete", completion_invalid: "completion evidence invalid",
+    completion_conflict: "completion records conflict", completion_unbound: "log records lack binding" }[runtime.reason] || "runtime evidence unavailable";
+  screen.row("Total runs", runtimeAvailable ? `${number(runtime.total_runs)} completed rounds · current worker / retained log` : `Unavailable · ${runtimeReason}`);
+  screen.row("Successful runs", runtimeAvailable ? number(runtime.successful_runs) : "Unavailable");
+  screen.row("Last completed", runtimeAvailable ? runtime.last_completed_at ? timed(runtime.last_completed_at) : "None recorded" : "Unavailable");
+  screen.row("Last duration", runtimeAvailable && countValid(runtime.last_duration_ms) ? durationText(runtime.last_duration_ms)
+    : runtimeAvailable ? runtime.last_completed_at ? "Unavailable · incomplete step evidence" : "None recorded" : "Unavailable");
+
   screen.heading("Messages & progress");
   if (!sync) {
     screen.row("Local database", "Could not read message counts or sync progress");
