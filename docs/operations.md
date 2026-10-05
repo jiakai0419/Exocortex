@@ -532,7 +532,7 @@ node bin/exocortex.mjs status --detail
 - `check` 的 database/sync/quality 均通过；unknown、欠债、catching_up 或质量问题不能作为验收完成。
 - 固定终点的 coverage-check 确认成功窗口连续覆盖，单次成功 cycle 不足以证明完整。
 - `check --live` 获得非空、窗口明确、无 missing 的样本；全空、不可用和错误均不能算远端通过。
-- 如需 service 展示样本，显式写缓存并在五分钟内检查 SAMPLED 及范围，当前认证主体仍未知。
+- service 的样本展示按 [Remote sample](#remote-sample) 契约核对最终缓存、范围、有效期与账号关联证据；获准启用定期采样时须观察正常到期轮次完成，不能把 `sample_started` 当作完成。
 - `status --detail` 中 `Conversation list`、`Active chat refresh`、`Chat list review` 分别能看出 initial、hot 和周期复核状态。
 - `status --detail` 的 `Background history` 显示日志中最近完成的轮次；当前是否同步须查看 `Health & current work`，不能用历史推进替代当前阶段证据。
 - 最近消息能正常展示发送人、群名和消息内容。
@@ -660,7 +660,7 @@ node bin/exocortex.mjs maintenance replay --db data/exocortex.sqlite \
 
 命令最多选择三个 scope，起点不得早于持久基线，默认只读预览仍会读取远端。完整获取后才短时获取维护锁；事务内重新验证锁、scope 配置与基线。记录与 `bounded_replay_runs` 审计同事务提交，正常 `sync_runs` 和全部游标不变。已有记录仅在双方版本均为数字且新版本严格更高时更新；未知或同版本冲突保留现状并报告。中断后可原命令重跑。
 
-live freshness 对热会话原始列表的首屏（含回复）仅做消息 ID 存在性采样，不追页、不展开转发，不代表正文版本对账或全量完整性。话题会话的真实样本不能证明所有普通群内嵌话题都已覆盖；缺少对应样本时应保留这个未验证边界。
+live freshness 采用 [Remote sample](#remote-sample) 的有界采样与静态正文/版本比较契约，分页、截断、账号证据及未核验范围均按该契约报告，不代表全量完整性。话题会话的真实样本不能证明所有普通群内嵌话题都已覆盖；缺少对应样本时应保留这个未验证边界。
 
 ## 热会话轮转与公平调度
 
