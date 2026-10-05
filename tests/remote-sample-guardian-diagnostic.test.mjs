@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { REMOTE_SAMPLE_ANCHOR } from '../src/runtime/worker/remote-sample-anchor.mjs';
 import { REMOTE_SAMPLE_GUARDIAN, runGuardedRemoteSampleProcess, safeGuardianDiagnostic } from '../src/runtime/worker/remote-sample-process.mjs';
 import { runManualRemoteSample } from '../src/runtime/worker/remote-sample-scheduler.mjs';
 import { runReadOnlyRemoteSample } from '../src/diagnostics/remote-sample.mjs';
@@ -19,9 +20,9 @@ const failureOutput = (value = diagnostic()) => JSON.stringify({ outcome: 'faile
 
 // Only this fixture interpreter runs. It substitutes every OS/process module,
 // rejects unmocked imports and does not spawn, watch, signal or wait for a child.
-function mockGuardian(scenario = {}) {
+function mockGuardian(scenario = {}, mode = 'guardian') {
   const result = spawnSync('python3', [fileURLToPath(new URL('./remote_sample_guardian_mock.py', import.meta.url))], {
-    input: JSON.stringify({ code: REMOTE_SAMPLE_GUARDIAN, scenario }), encoding: 'utf8', timeout: 5000, maxBuffer: 262144,
+    input: JSON.stringify({ code: mode === 'anchor' ? REMOTE_SAMPLE_ANCHOR : REMOTE_SAMPLE_GUARDIAN, mode, scenario }), encoding: 'utf8', timeout: 5000, maxBuffer: 262144,
   });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.error, undefined);
@@ -33,79 +34,131 @@ function mockGuardian(scenario = {}) {
   return observed;
 }
 
-for (const primary of ['guardian_setup', 'child_spawn', 'capture_nonblocking', 'watch_create', 'watch_register', 'capture_read', 'watch_poll', 'wait_observe']) {
+const envelope = (observed) => JSON.parse(observed.stdout).guardian_diagnostic;
+const safeFailure = (primary, cleanup = null, primaryErrno = null, cleanupErrno = 1) => ({ version: 1,
+  primary: primary ? { stage: primary, errno: primaryErrno } : null,
+  cleanup: cleanup ? { stage: cleanup, errno: cleanupErrno } : null });
+
+for (const primary of ['guardian_setup', 'control_create', 'control_nonblocking', 'child_spawn', 'capture_nonblocking', 'capture_read', 'control_read', 'control_write']) {
   test(`mock guardian preserves safe primary stage ${primary}`, () => {
-    const observed = mockGuardian({ primary, waitid: primary === 'wait_observe' });
+    const observed = mockGuardian({ primary });
     assert.equal(observed.exit_code, 2);
-    assert.deepEqual(JSON.parse(observed.stdout).guardian_diagnostic, diagnostic(primary));
+    assert.deepEqual(envelope(observed), safeFailure(primary, null, 1));
     assert.equal(observed.calls.filter((value) => value === primary).length, 1);
     assert.ok(observed.calls.filter((value) => value === 'group_kill').length <= 1);
-    if (primary === 'capture_nonblocking') assert.equal(observed.calls.includes('capture_drain'), false);
-    if (primary === 'capture_read') assert.equal(observed.calls.includes('capture_drain'), false);
+    if (['capture_nonblocking', 'capture_read'].includes(primary)) assert.equal(observed.calls.includes('capture_drain'), false);
   });
 }
 
-for (const cleanup of ['group_kill', 'child_reap', 'capture_drain', 'watch_close']) {
+for (const cleanup of ['group_kill', 'child_reap', 'capture_drain', 'capture_close']) {
   test(`mock guardian preserves independent cleanup stage ${cleanup}`, () => {
-    const observed = mockGuardian({ primary: 'watch_poll', cleanup });
+    const observed = mockGuardian({ primary: 'control_read', cleanup });
     assert.equal(observed.exit_code, 2);
-    assert.deepEqual(JSON.parse(observed.stdout).guardian_diagnostic, diagnostic('watch_poll', cleanup));
+    assert.deepEqual(envelope(observed), safeFailure('control_read', cleanup, 1));
     assert.equal(observed.calls.filter((value) => value === cleanup).length, 1);
     if (cleanup === 'group_kill') assert.equal(observed.calls.includes('child_reap'), false);
   });
 }
 
-test('mock guardian treats cleanup-only failure as failed and bounds a reap after observed exit', () => {
-  const observed = mockGuardian({ cleanup: 'group_kill' });
-  assert.equal(observed.exit_code, 2);
-  assert.deepEqual(JSON.parse(observed.stdout).guardian_diagnostic, diagnostic(null, 'group_kill'));
-  assert.equal(observed.calls.filter((value) => value === 'group_kill').length, 1);
-  assert.equal(observed.calls.includes('wait_timeout_bounded'), true);
-});
-
-test('mock guardian retains the first cleanup error when later cleanup also fails', () => {
-  const observed = mockGuardian({ primary: 'watch_poll', cleanup: ['group_kill', 'capture_drain', 'watch_close'] });
-  assert.deepEqual(JSON.parse(observed.stdout).guardian_diagnostic, diagnostic('watch_poll', 'group_kill'));
-  assert.equal(observed.calls.includes('child_reap'), false);
-  for (const step of ['group_kill', 'capture_drain', 'watch_close']) assert.equal(observed.calls.filter((value) => value === step).length, 1);
-});
-
-test('mock guardian preserves confirmed nonzero child exit independently of cleanup errors', () => {
-  for (const cleanup of [null, 'watch_close', 'group_kill', 'capture_drain']) {
-    const observed = mockGuardian({ child_returncode: 7, cleanup });
-    assert.equal(observed.exit_code, 2);
-    assert.deepEqual(JSON.parse(observed.stdout).guardian_diagnostic, {
-      version: 1, primary: { stage: 'child_exit', errno: null }, cleanup: cleanup ? { stage: cleanup, errno: 1 } : null,
-    });
-    assert.equal(observed.calls.filter((value) => value === 'child_reap').length, 1);
-    assert.equal(observed.calls.includes('wait_timeout_bounded'), true);
+test('mock guardian successful fast worker retains live anchor until single group kill', () => {
+  for (const scenario of [{}, { live_descendants: true }, { status_chunk_bytes: 1 }]) {
+    const observed = mockGuardian(scenario);
+    assert.equal(observed.exit_code, 0);
+    assert.equal(observed.stdout, '{"outcome":"ok","synthetic":true}');
+    assert.equal(observed.spawns.length, 1);
+    assert.equal(observed.spawns[0].kwargs.start_new_session, true);
+    assert.equal(observed.spawns[0].kwargs.close_fds, true);
+    assert.deepEqual(observed.spawns[0].kwargs.pass_fds, [40, 43]);
+    assert.deepEqual(observed.frames, [{ role: 'control', frame: { version: 1, type: 'go' } }]);
+    const ops = observed.operations;
+    assert.ok(ops.findLastIndex((op) => op.op === 'pipe') < ops.findIndex((op) => op.op === 'Popen'));
+    assert.equal(ops.filter((op) => op.op === 'killpg').length, 1);
+    assert.equal(ops.some((op) => op.op === 'poll'), false);
+    assert.ok(ops.findIndex((op) => op.op === 'wait') > ops.findIndex((op) => op.op === 'killpg'));
+    assert.equal(ops.find((op) => op.op === 'wait').timeout, 1);
+    assert.ok(Object.values(observed.pipe_closed).every(Boolean));
+    assert.ok(Object.values(observed.nonblocking).every(Boolean));
   }
 });
 
-test('mock guardian never infers child exit from an unknown return code after reap timeout', () => {
-  for (const cleanup of [null, 'watch_close', 'group_kill', 'capture_drain']) {
-    // The configured return code is not observed because the fake reap times out.
-    const observed = mockGuardian({ child_returncode: 7, reap_timeout: true, cleanup });
-    assert.equal(observed.exit_code, 2);
-    assert.deepEqual(JSON.parse(observed.stdout).guardian_diagnostic, { version: 1, primary: null,
-      cleanup: cleanup === 'group_kill' ? { stage: 'group_kill', errno: 1 } : { stage: 'child_reap', errno: null } });
-    assert.equal(observed.calls.filter((value) => value === 'child_reap').length, 1);
-    assert.equal(observed.calls.includes('wait_timeout_bounded'), true);
-  }
+test('mock guardian never retries denied kill or reaps before successful termination', () => {
+  const denied = mockGuardian({ cleanup: ['group_kill', 'capture_drain', 'capture_close', 'control_close'] });
+  assert.equal(denied.exit_code, 2);
+  // Setup descriptor close fails first, so preserve that first cleanup failure.
+  assert.deepEqual(envelope(denied), safeFailure(null, 'control_close'));
+  assert.equal(denied.calls.filter((value) => value === 'group_kill').length, 1);
+  assert.equal(denied.calls.includes('child_reap'), false);
+  const killOnly = mockGuardian({ cleanup: 'group_kill' });
+  assert.deepEqual(envelope(killOnly), safeFailure(null, 'group_kill'));
+  assert.equal(killOnly.calls.includes('child_reap'), false);
+  const gone = mockGuardian({ already_gone: true });
+  assert.equal(gone.exit_code, 2);
+  assert.deepEqual(envelope(gone), safeFailure(null, 'group_kill', null, 3));
+  assert.equal(gone.calls.filter((value) => value === 'child_reap').length, 1);
 });
 
-test('mock guardian keeps deadline, overflow, parent loss, signal and child exit distinct', () => {
-  for (const [scenario, stage] of [[{ deadline: true }, 'deadline'], [{ overflow: true }, 'output_limit'],
-    [{ parent_exit: true }, 'parent_exit'], [{ signal_stop: true }, 'signal_stop'], [{ child_returncode: 7 }, 'child_exit']]) {
+test('mock guardian preserves confirmed worker failure independently of cleanup outcome', () => {
+  for (const scenario of [{}, { cleanup: 'group_kill' }, { cleanup: 'capture_drain' }, { reap_timeout: true }]) {
+    const observed = mockGuardian({ worker_returncode: 7, ...scenario });
+    assert.equal(observed.exit_code, 2);
+    const cleaning = scenario.reap_timeout ? 'child_reap' : scenario.cleanup || null;
+    assert.deepEqual(envelope(observed), safeFailure('child_exit', cleaning, null, scenario.reap_timeout ? null : 1));
+    assert.equal(observed.calls.filter((value) => value === 'child_reap').length, scenario.cleanup === 'group_kill' ? 0 : 1);
+  }
+  const unknown = mockGuardian({ deadline: true, no_done: true, reap_timeout: true });
+  assert.deepEqual(envelope(unknown), safeFailure('deadline', 'child_reap', null, null));
+});
+
+test('mock guardian rejects malformed, duplicated, premature and oversized frames', () => {
+  const ready = { version: 1, type: 'ready' };
+  for (const scenario of [
+    { duplicate_ready: true }, { duplicate_done: true }, { status_frames: [{ version: 1, type: 'done', code: 0 }] },
+    { ready_frame: { ...ready, private: privateToken } }, { ready_frame: { ...ready, version: true } },
+    { status_raw: 'x'.repeat(257) }, { status_raw: '{invalid}\n' },
+    { done_frame: { version: 1, type: 'done', code: true } }, { done_frame: { version: 1, type: 'done', code: 256 } },
+    { done_frame: { version: 1, type: 'error', stage: privateToken, errno: 1 } },
+    { done_frame: { version: 1, type: 'error', stage: 'anchor_worker_spawn', errno: 0 } },
+  ]) {
     const observed = mockGuardian(scenario);
     assert.equal(observed.exit_code, 2);
-    assert.deepEqual(JSON.parse(observed.stdout).guardian_diagnostic, { version: 1, primary: { stage, errno: null }, cleanup: null });
-    assert.ok(observed.fake_elapsed_ms <= 5);
-    if (scenario.parent_exit) assert.equal(observed.calls.includes('child_spawn'), false);
+    assert.deepEqual(envelope(observed), safeFailure('control_protocol'));
   }
+  for (const scenario of [{ status_eof: true }, { status_eof_after_go: true }, { anchor_returncode: 0 }]) {
+    const observed = mockGuardian(scenario);
+    assert.deepEqual(envelope(observed), safeFailure('anchor_lost'));
+  }
+  const anchorError = mockGuardian({ anchor_error: true, anchor_error_stage: 'anchor_worker_spawn', anchor_errno: 1 });
+  assert.deepEqual(envelope(anchorError), safeFailure('anchor_worker_spawn', null, 1));
 });
 
-test('mock guardian does not retry a failed result channel or a timed-out reap', () => {
+test('mock guardian distinguishes deadline, caller loss, signal, output overflow and partial GO', () => {
+  for (const [scenario, stage] of [[{ deadline: true }, 'deadline'], [{ overflow: true }, 'output_limit'],
+    [{ parent_exit: true }, 'parent_exit'], [{ parent_exit_after_go: true }, 'parent_exit'],
+    [{ parent_exit_after_reads: 2 }, 'parent_exit'], [{ signal_stop: true }, 'signal_stop'],
+    [{ write_chunk_bytes: 2 }, 'control_write']]) {
+    const observed = mockGuardian(scenario);
+    assert.equal(observed.exit_code, 2);
+    assert.deepEqual(envelope(observed), safeFailure(stage));
+    if (scenario.deadline) assert.ok(observed.fake_elapsed_ms <= 5);
+    if (scenario.parent_exit) assert.equal(observed.calls.includes('child_spawn'), false);
+    if (scenario.parent_exit_after_reads) assert.equal(observed.go_sent, false);
+  }
+  const blocked = mockGuardian({ write_blocked: true });
+  assert.equal(envelope(blocked).primary.stage, 'control_write');
+  assert.ok([11, 35].includes(envelope(blocked).primary.errno));
+});
+
+test('mock guardian fails control close and background silently without starting worker', () => {
+  const close = mockGuardian({ cleanup: 'control_close' });
+  assert.equal(close.go_sent, false);
+  assert.deepEqual(envelope(close), safeFailure(null, 'control_close'));
+  const background = mockGuardian({ background: true, primary: 'control_read' });
+  assert.equal(background.exit_code, 2);
+  assert.equal(background.stdout, '');
+  assert.deepEqual(background.primary, { stage: 'control_read', errno: 1 });
+});
+
+test('mock guardian does not retry failed result write, flush or timed-out reap', () => {
   const publish = mockGuardian({ primary: 'result_publish' });
   assert.equal(publish.exit_code, 2);
   assert.equal(publish.stdout, '');
@@ -118,22 +171,139 @@ test('mock guardian does not retry a failed result channel or a timed-out reap',
   assert.equal(flush.calls.filter((value) => value === 'publish_flush').length, 1);
   assert.equal(flush.calls.at(-1), 'immediate_exit');
   const reap = mockGuardian({ reap_timeout: true });
-  assert.equal(reap.exit_code, 2);
-  assert.deepEqual(JSON.parse(reap.stdout).guardian_diagnostic, { version: 1, primary: null, cleanup: { stage: 'child_reap', errno: null } });
+  assert.deepEqual(envelope(reap), safeFailure(null, 'child_reap', null, null));
   assert.equal(reap.calls.filter((value) => value === 'child_reap').length, 1);
 });
 
-test('mock guardian preserves success bytes, handles already-gone group and fails background silently', () => {
-  for (const scenario of [{}, { waitid: true }, { already_gone: true }]) {
-    const observed = mockGuardian(scenario);
-    assert.equal(observed.exit_code, 0);
-    assert.equal(observed.stdout, '{"outcome":"ok","synthetic":true}');
-    assert.equal(observed.calls.includes('wait_timeout_bounded'), true);
+test('mock anchor starts worker only after GO and separates worker result from anchor lifetime', () => {
+  for (const code of [0, 7, -15]) {
+    const observed = mockGuardian({ worker_returncode: code }, 'anchor');
+    assert.equal(observed.spawns.length, 1);
+    assert.equal(observed.spawns[0].kwargs.start_new_session, false);
+    assert.equal(observed.spawns[0].kwargs.close_fds, true);
+    assert.deepEqual(observed.spawns[0].kwargs.pass_fds, []);
+    assert.deepEqual(observed.frames.map((entry) => entry.frame), [{ version: 1, type: 'ready' }, { version: 1, type: 'done', code }]);
+    assert.equal(observed.calls.includes('group_kill'), false);
+    assert.equal(observed.calls.includes('child_reap'), false);
+    assert.equal(observed.calls.at(-1), 'immediate_exit');
   }
-  const background = mockGuardian({ background: true, primary: 'watch_register' });
-  assert.equal(background.exit_code, 2);
-  assert.equal(background.stdout, '');
-  assert.deepEqual(background.primary, { stage: 'watch_register', errno: 1 });
+});
+
+test('mock anchor bounds missing GO and rejects invalid, duplicate or private control fields', () => {
+  for (const scenario of [{ control_eof: true }, { control_raw: 'x'.repeat(257) },
+    { control_frames: [{ version: 1, type: 'go', private: privateToken }] },
+    { control_frames: [{ version: true, type: 'go' }] },
+    { control_frames: [{ version: 1, type: 'go' }, { version: 1, type: 'go' }] }]) {
+    const observed = mockGuardian(scenario, 'anchor');
+    assert.equal(observed.spawns.length, 0);
+    assert.deepEqual(observed.primary, { stage: 'anchor_protocol', errno: null });
+    assert.equal(observed.calls.includes('group_kill'), false);
+  }
+  const noGo = mockGuardian({ no_go: true, deadline: true }, 'anchor');
+  assert.equal(noGo.spawns.length, 0);
+  assert.equal(noGo.primary.stage, 'anchor_deadline');
+  assert.ok(noGo.fake_elapsed_ms <= 1005.001);
+});
+
+for (const primary of ['anchor_setup', 'anchor_control_read', 'anchor_control_write', 'anchor_worker_spawn', 'anchor_worker_poll']) {
+  test(`mock anchor safe failure ${primary} remains under single guardian ownership`, () => {
+    const observed = mockGuardian({ primary }, 'anchor');
+    assert.deepEqual(observed.primary, { stage: primary, errno: 1 });
+    assert.equal(observed.calls.includes('group_kill'), false);
+    if (primary === 'anchor_worker_poll') assert.equal(observed.calls.filter((step) => step === primary).length, 1);
+    if (primary === 'anchor_control_write') assert.equal(observed.calls.filter((step) => step === primary).length, 1);
+    assert.ok(observed.fake_elapsed_ms <= 6000.001);
+  });
+}
+
+test('mock anchor shares absolute deadline, parks after completion and exits on parent loss', () => {
+  const parked = mockGuardian({ park_until_deadline: true }, 'anchor');
+  assert.equal(parked.primary, null);
+  assert.ok(parked.fake_elapsed_ms >= 6000 && parked.fake_elapsed_ms <= 6000.001);
+  assert.equal(parked.calls.filter((step) => step === 'anchor_worker_poll').length, 1);
+  const lost = mockGuardian({ parent_exit: true }, 'anchor');
+  assert.equal(lost.spawns.length, 0);
+  assert.deepEqual(lost.primary, { stage: 'anchor_parent_exit', errno: null });
+  const running = mockGuardian({ deadline: true, worker_running: true }, 'anchor');
+  assert.deepEqual(running.primary, { stage: 'anchor_deadline', errno: null });
+  assert.equal(running.calls.includes('group_kill'), false);
+});
+
+test('mock cache guardian invalidates under lock before spawn and commits only after all cleanup', () => {
+  const observed = mockGuardian({ cache_enabled: true });
+  assert.equal(observed.exit_code, 0);
+  assert.equal(observed.cache_prepared, true);
+  assert.equal(observed.cache_committed, true);
+  assert.deepEqual(observed.spawns[0].kwargs.pass_fds, [40, 43, 200]);
+  const ops = observed.operations;
+  const prepare = ops.findIndex((op) => op.op === 'cache_rename' && op.role === 'marker');
+  const publish = ops.findIndex((op) => op.op === 'cache_rename' && op.role === 'stage');
+  assert.ok(prepare < ops.findIndex((op) => op.op === 'pipe'));
+  assert.ok(publish > ops.findIndex((op) => op.op === 'wait'));
+  assert.ok(publish > ops.findLastIndex((op) => op.op === 'close'));
+  assert.equal(observed.calls.at(-1), 'immediate_exit');
+});
+
+test('mock cache startup and cleanup failures never publish prepared positive stage', () => {
+  for (const scenario of [{ primary: 'control_create' }, { primary: 'child_spawn' }, { anchor_error: true },
+    { cleanup: 'group_kill' }, { reap_timeout: true }, { cleanup: 'capture_close' }, { worker_returncode: 2 }]) {
+    const observed = mockGuardian({ cache_enabled: true, ...scenario });
+    assert.equal(observed.exit_code, 2);
+    assert.equal(observed.cache_prepared, true);
+    assert.equal(observed.cache_committed, false);
+    assert.equal(observed.cache_discarded, true);
+  }
+});
+
+test('mock cache result-channel failure happens before final commit and is not retried', () => {
+  for (const scenario of [{ primary: 'result_publish' }, { publish_flush: true }]) {
+    const observed = mockGuardian({ cache_enabled: true, ...scenario });
+    assert.equal(observed.exit_code, 2);
+    assert.equal(observed.cache_committed, false);
+    assert.equal(observed.cache_discarded, true);
+    assert.deepEqual(observed.primary, { stage: 'result_publish', errno: 1 });
+    assert.equal(observed.calls.at(-1), 'immediate_exit');
+  }
+});
+
+test('mock cache publication failure cannot succeed even after buffered result was delivered', () => {
+  for (const scenario of [{ cache_missing_stage: true }, { cache_fault: { op: 'rename', role: 'stage', errno: 1 } }]) {
+    const observed = mockGuardian({ cache_enabled: true, ...scenario });
+    assert.equal(observed.exit_code, 2);
+    assert.equal(observed.cache_committed, false);
+    assert.equal(observed.primary.stage, 'cache_publish');
+    const wrapped = runGuardedRemoteSampleProcess('synthetic', [], {}, { spawnSync: () => ({ status: observed.exit_code, stdout: observed.stdout }) });
+    assert.equal(wrapped.guardian_diagnostic.primary.stage, 'guardian_result');
+  }
+  const denied = mockGuardian({ cache_enabled: true, cache_fault: { op: 'open', role: 'stage', errno: 1 } });
+  assert.equal(denied.cache_discarded, false);
+  assert.equal(denied.cache_operations.filter((op) => op.op === 'open' && op.role === 'stage').length, 1);
+});
+
+test('mock final commit rechecks deadline, caller and stop after publication fsync', () => {
+  for (const [event, stage] of [[{ advance_ms: 6000 }, 'deadline'], [{ parent_exit: true }, 'parent_exit'], [{ signal: true }, 'signal_stop']]) {
+    const observed = mockGuardian({ cache_enabled: true, cache_event: { op: 'fsync', role: 'directory', occurrence: 2, ...event } });
+    assert.equal(observed.exit_code, 2);
+    assert.equal(observed.cache_prepared, true);
+    assert.equal(observed.cache_committed, false);
+    assert.equal(observed.primary.stage, stage);
+  }
+});
+
+test('mock cache skip code is explicit and cannot publish a stale stage', () => {
+  const skipped = mockGuardian({ cache_enabled: true, worker_returncode: 3 });
+  assert.equal(skipped.exit_code, 0);
+  assert.equal(skipped.cache_prepared, true);
+  assert.equal(skipped.cache_committed, false);
+  assert.equal(skipped.cache_discarded, true);
+  const ordinary = mockGuardian({ worker_returncode: 3 });
+  assert.deepEqual(envelope(ordinary), safeFailure('child_exit'));
+});
+
+test('mock guardian rejects a duplicate terminal frame split across reads', () => {
+  const observed = mockGuardian({ duplicate_done: true, status_chunk_bytes: 1 });
+  assert.equal(observed.exit_code, 2);
+  assert.deepEqual(envelope(observed), safeFailure('control_protocol'));
 });
 
 test('diagnostic schema rejects unknown fields, stages, versions and invalid errno', () => {
@@ -183,7 +353,7 @@ test('read-only and manual cache-writing entry points preserve safe diagnostics 
       databaseKey: () => 'a'.repeat(64), invalidateCache: () => { invalidated++; }, spawnSync: spawn });
     assert.equal(manual.outcome, 'failed');
     assert.deepEqual(manual.guardian_diagnostic, diagnostic());
-    assert.equal(invalidated, 1);
+    assert.equal(invalidated, 0);
     assert.equal(JSON.stringify(manual).includes(privateToken), false);
   } finally { rmSync(logDir, { recursive: true, force: true }); }
 });

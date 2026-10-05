@@ -11,6 +11,7 @@ import { liveProbeContext } from "../../diagnostics/live-probe-cache.mjs";
 import { invalidateRemoteSampleCache, publicRemoteReport } from "../../diagnostics/remote-sample-cache.mjs";
 import { readStableJsonFile } from "../../diagnostics/private-json-file.mjs";
 import { REMOTE_SAMPLE_GUARDIAN, REMOTE_SAMPLE_TIMEOUT_MS, runGuardedRemoteSampleProcess, safeGuardianDiagnostic } from "./remote-sample-process.mjs";
+import { createRemoteSamplePublication, remoteSamplePublicationStage } from "./remote-sample-cache-gate.mjs";
 
 export { REMOTE_SAMPLE_GUARDIAN, REMOTE_SAMPLE_TIMEOUT_MS };
 export const REMOTE_SAMPLE_MAX_BACKOFF_MS = 6 * 60 * 60_000;
@@ -40,7 +41,8 @@ try:
     os.close(fd)
     os.set_inheritable(held,True)
     os.environ['EXOCORTEX_REMOTE_SAMPLE_LOCK_FD']=str(held)
-    os.execv(sys.argv[2],sys.argv[2:])
+    # The wrapper now execs the guardian in this same Python interpreter.
+    os.execv(sys.executable,[sys.executable,*sys.argv[3:]])
 except Exception:
     print(json.dumps({'outcome':'failed','reason':'scheduler_unavailable'})); sys.exit(2)
 `;
@@ -48,7 +50,7 @@ except Exception:
 /** @typedef {{first_seen:number,last_seen:number,run_finished:number,target:number,kind:'missing'|'version'|'content'}} Observation */
 /** @typedef {Record<string, Observation>} Observations */
 /** @typedef {{kind:string,database_key:string,account_key:string|null,written_at:number,next_due:number,failures:number,rotation:number,observations:Observations,last_outcome:string,cooldowns:Record<string,number>,blocked_reason:string|null}} ScheduleState */
-/** @typedef {{db:string,logDir:string,remoteSampleIntervalSeconds?:number}} ScheduleOptions */
+/** @typedef {{db:string,logDir:string,remoteSampleIntervalSeconds?:number,publication?:Record<string,any>}} ScheduleOptions */
 
 function plainObject(value) { return Boolean(value && typeof value === "object" && !Array.isArray(value)); }
 function integer(value) { return typeof value === "number" && Number.isSafeInteger(value) && value >= 0; }
@@ -102,7 +104,7 @@ export function validateRemoteSampleState(value, databaseKey, now) {
 
 export function remoteSamplePaths(logDir, databaseKey) {
   const directory = resolve(logDir, "remote-sample");
-  return { directory, state: join(directory, `${databaseKey}.json`), lock: join(directory, `${databaseKey}.lock`), cache: resolve(logDir, "live-probe.json") };
+  return { directory, state: join(directory, `${databaseKey}.json`), lock: join(directory, "live-probe.lock"), cache: resolve(logDir, "live-probe.json") };
 }
 
 function secureDirectory(path) {
@@ -172,10 +174,10 @@ export function readScheduledRemoteCooldowns(opts, deps = {}) {
 }
 
 /** Start a single bounded background attempt without waiting for its API calls.
- * Completion is published by the child in the existing cache and state files.
+ * The guardian holds the existing schedule lock through final cache publication.
  * @param {ScheduleOptions} opts */
 export function startScheduledRemoteSample(opts, deps = {}) {
-  const failed = (reason) => { invalidateAttempt(opts, deps, reason); return result("failed", reason); };
+  const failed = (reason) => result("failed", reason);
   try {
     const interval = intervalMs(opts);
     if (interval === 0) return result("disabled", "disabled");
@@ -192,15 +194,15 @@ export function startScheduledRemoteSample(opts, deps = {}) {
     const nextDue = loaded.state?.next_due ?? deps.notBeforeIfMissing ?? now;
     if (nextDue > now) return result("not_due", "not_due", nextDue, cooldowns);
     secureDirectory(paths.directory);
-    // This invalidation occurs before spawn, covering a child that cannot start.
-    if (!invalidateAttempt(opts, deps, "attempting")) return result("failed", "cache_write_failed");
+    const publication = createRemoteSamplePublication(opts.logDir, databaseKey);
     const input = JSON.stringify({ db: resolve(opts.db), logDir: resolve(opts.logDir), remoteSampleIntervalSeconds: interval / 1000,
-      cooldownsByOperation: cooldowns });
+      cooldownsByOperation: cooldowns, publication });
     if (Buffer.byteLength(input) > 16 * 1024) return failed("scheduler_unavailable");
     const python = deps.pythonPath || "python3";
-    const child = (deps.spawn || spawn)(python, ["-c", REMOTE_SAMPLE_GUARDIAN, String(process.pid), String(REMOTE_SAMPLE_TIMEOUT_MS),
-      python, "-c", REMOTE_SAMPLE_LOCK_WRAPPER, paths.lock, deps.execPath || process.execPath, deps.scriptPath || MAIN_PATH], {
-      stdio: "ignore", detached: true, env: { ...process.env, EXOCORTEX_REMOTE_SAMPLE_INPUT: input, EXOCORTEX_REMOTE_SAMPLE_CAPTURE: "0" },
+    const child = (deps.spawn || spawn)(python, ["-c", REMOTE_SAMPLE_LOCK_WRAPPER, paths.lock, python,
+      "-c", REMOTE_SAMPLE_GUARDIAN, String(process.pid), String(REMOTE_SAMPLE_TIMEOUT_MS), deps.execPath || process.execPath, deps.scriptPath || MAIN_PATH], {
+      stdio: "ignore", detached: true, env: { ...process.env, EXOCORTEX_REMOTE_SAMPLE_INPUT: input, EXOCORTEX_REMOTE_SAMPLE_CAPTURE: "0",
+        EXOCORTEX_REMOTE_SAMPLE_PUBLICATION: JSON.stringify(publication) },
     });
     // No pipe callbacks or timers are needed by the synchronous worker loop.
     child.once("error", () => {});
@@ -239,7 +241,6 @@ export function createRemoteSampleController(opts, deps = {}) {
  * @param {ScheduleOptions} opts */
 export function runScheduledRemoteSample(opts, deps = {}) {
   const failed = (reason, diagnostic = null) => {
-    invalidateAttempt(opts, deps, reason);
     const safe = safeGuardianDiagnostic(diagnostic);
     return { ...result("failed", reason), ...(safe ? { guardian_diagnostic: safe } : {}) };
   };
@@ -258,10 +259,13 @@ export function runScheduledRemoteSample(opts, deps = {}) {
     const cooldowns = mergeCooldowns(loaded.state?.cooldowns || {}, inherited, now);
     if (loaded.state && loaded.state.next_due > now) return result("not_due", "not_due", loaded.state.next_due, cooldowns);
     secureDirectory(paths.directory);
-    const child = runGuardedRemoteSampleProcess(deps.pythonPath || "python3", ["-c", REMOTE_SAMPLE_LOCK_WRAPPER, paths.lock,
-      deps.execPath || process.execPath, deps.scriptPath || MAIN_PATH], {
+    const publication = createRemoteSamplePublication(opts.logDir, databaseKey);
+    const python = deps.pythonPath || "python3";
+    const child = runGuardedRemoteSampleProcess(deps.execPath || process.execPath, [deps.scriptPath || MAIN_PATH], {
+      guardianPrefix: ["-c", REMOTE_SAMPLE_LOCK_WRAPPER, paths.lock, python],
+      env: { ...process.env, EXOCORTEX_REMOTE_SAMPLE_PUBLICATION: JSON.stringify(publication) },
       input: JSON.stringify({ db: resolve(opts.db), logDir: resolve(opts.logDir), remoteSampleIntervalSeconds: interval / 1000, cooldownsByOperation: cooldowns,
-        collectorOptions: boundedCollectorOptions(deps.collectorOptions), returnReport: deps.returnReport === true }),
+        collectorOptions: boundedCollectorOptions(deps.collectorOptions), returnReport: deps.returnReport === true, publication }),
     }, deps);
     if (child.guardian_diagnostic || child.error || child.signal) return failed("sample_process_failed", child.guardian_diagnostic);
     let output;
@@ -272,7 +276,6 @@ export function runScheduledRemoteSample(opts, deps = {}) {
     if (!reasons.has(output.reason)) return failed("sample_process_failed");
     const observed = safeCooldowns(output.cooldownsByOperation || {}, (deps.nowMs || Date.now)());
     if (!observed) return failed("state_invalid");
-    if (output.outcome === "failed" && output.reason !== "sample_failed") invalidateAttempt(opts, deps, output.reason);
     return { ...result(output.outcome, output.reason, integer(output.next_due) ? output.next_due : null, mergeCooldowns(cooldowns, observed, now)),
       ...(deps.returnReport === true && output.report ? { report: publicRemoteReport(output.report), cacheWritten: output.cacheWritten === true } : {}) };
   } catch { return failed("scheduler_unavailable"); }
@@ -288,7 +291,7 @@ export function runManualRemoteSample(opts, deps = {}) {
  * synthetic collector; this function never writes the business database.
  * @param {ScheduleOptions} opts */
 export async function executeRemoteSampleAttempt(opts, deps = {}) {
-  const failed = (reason) => { invalidateAttempt(opts, deps, reason); return result("failed", reason); };
+  const failed = (reason) => { invalidateAttempt(opts, deps, reason); return { ...result("failed", reason), cachePrepared: false }; };
   const nowMs = deps.nowMs || Date.now;
   const dbKey = deps.databaseKey || activityDatabaseKey;
   const interval = intervalMs(opts);
@@ -296,11 +299,13 @@ export async function executeRemoteSampleAttempt(opts, deps = {}) {
   const started = nowMs();
   const databaseKey = dbKey(opts.db);
   if (!databaseKey) return failed("database_unavailable");
+  const stagePath = remoteSamplePublicationStage(opts.logDir, databaseKey, opts.publication);
+  if (!stagePath) return failed("cache_write_failed");
   const paths = remoteSamplePaths(opts.logDir, databaseKey);
   const loaded = readRemoteSampleState(paths.state, databaseKey, started);
   if (loaded.status === "invalid") return failed("state_invalid");
   if (loaded.state?.blocked_reason) return failed("state_invalid");
-  if (loaded.state && loaded.state.next_due > started) return result("not_due", "not_due", loaded.state.next_due);
+  if (loaded.state && loaded.state.next_due > started) return { ...result("not_due", "not_due", loaded.state.next_due), cachePrepared: false };
   const previous = loaded.state || { kind: STATE_KIND, database_key: databaseKey, written_at: started,
     next_due: started, failures: 0, rotation: 0, observations: {}, last_outcome: "ok", cooldowns: {}, account_key: null, blocked_reason: null };
   const inherited = safeCooldowns(deps.cooldownsByOperation || {}, started);
@@ -312,7 +317,7 @@ export async function executeRemoteSampleAttempt(opts, deps = {}) {
   const writeState = deps.writeState || writeRemoteSampleState;
   // Invalidate before reserving and before any remote request. A killed child
   // can leave an attempted state, but cannot leave a renewed positive cache.
-  if (!invalidateAttempt(opts, deps, "attempting")) return result("failed", "cache_write_failed");
+  if (!invalidateAttempt(opts, deps, "attempting")) return { ...result("failed", "cache_write_failed"), cachePrepared: false };
   try { writeState(paths.state, reserved, started); } catch { return failed("state_write_failed"); }
   let sampled;
   try {
@@ -340,12 +345,13 @@ export async function executeRemoteSampleAttempt(opts, deps = {}) {
     rotation: ok ? sampled.rotation : previous.rotation, observations: changedUnverifiedAccount ? {} : ok ? observations : previous.observations };
   try { writeState(paths.state, finalState, finished); } catch { return failed("state_write_failed"); }
   if (!observedCooldowns) return failed("state_invalid");
-  // Publish a positive result only after durable schedule state succeeds.
+  // Prepare a private stage only after durable schedule state succeeds. The
+  // guardian alone can publish it after successful group cleanup and reap.
   let cacheWritten = false;
   if (sampled?.report && (successful || ["failed", "busy"].includes(sampled.outcome))) {
     try {
       const writeCache = deps.writeCache || (await import("../../diagnostics/remote-sample.mjs")).writeRemoteSampleCache;
-      cacheWritten = Boolean(await writeCache(paths.cache, sampled));
+      cacheWritten = Boolean(await writeCache(stagePath, sampled));
     } catch { cacheWritten = false; }
   }
   if (!cacheWritten) {
@@ -354,9 +360,9 @@ export async function executeRemoteSampleAttempt(opts, deps = {}) {
       const failedState = { ...finalState, failures, last_outcome: "failed", rotation: previous.rotation, observations: previous.observations,
         next_due: Math.max(finished + backoff, ...Object.values(finalCooldowns)) };
       try { writeState(paths.state, failedState, finished); } catch { return failed("state_write_failed"); }
-      return result("failed", "cache_write_failed", failedState.next_due, finalCooldowns);
+      return { ...result("failed", "cache_write_failed", failedState.next_due, finalCooldowns), cachePrepared: false };
     }
   }
-  return { ...result(ok ? "ok" : busy ? "busy" : "failed", ok ? "sampled" : busy ? "sync_busy" : "sample_failed", finalState.next_due, finalCooldowns),
+  return { ...result(ok ? "ok" : busy ? "busy" : "failed", ok ? "sampled" : busy ? "sync_busy" : "sample_failed", finalState.next_due, finalCooldowns), cachePrepared: cacheWritten,
     ...(deps.returnReport === true && sampled?.report ? { report: publicRemoteReport(sampled.report), cacheWritten } : {}) };
 }

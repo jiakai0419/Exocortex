@@ -11,6 +11,7 @@ import { executeRemoteSampleAttempt, readRemoteSampleState, readScheduledRemoteC
   createRemoteSampleController, REMOTE_SAMPLE_GUARDIAN, runManualRemoteSample, runScheduledRemoteSample, startScheduledRemoteSample,
   sanitizeRemoteObservations, validateRemoteSampleState, writeRemoteSampleState } from '../src/runtime/worker/remote-sample-scheduler.mjs';
 import { invalidateRemoteSampleCache } from '../src/diagnostics/remote-sample-cache.mjs';
+import { createRemoteSamplePublication } from '../src/runtime/worker/remote-sample-cache-gate.mjs';
 import { parseArgs, runWorker } from '../src/runtime/worker/worker.mjs';
 import { parseWorkerProgramArguments, validateWorkerOptions, workerProgramArguments } from '../src/runtime/worker/options.mjs';
 import { parseRouteOptions } from '../src/cli/registry.mjs';
@@ -23,12 +24,13 @@ function fixture(t) {
   const dir = mkdtempSync(join(tmpdir(), 'exo-synthetic-schedule-'));
   t.after(() => rmSync(dir, { force: true, recursive: true }));
   const db = join(dir, 'invented.sqlite'); writeFileSync(db, 'synthetic identity only', { mode: 0o600 });
-  const opts = { db, logDir: dir, remoteSampleIntervalSeconds: 900 };
   const key = activityDatabaseKey(db); const paths = remoteSamplePaths(dir, key);
+  const opts = { db, logDir: dir, remoteSampleIntervalSeconds: 900, publication: createRemoteSamplePublication(dir, key) };
   let now = START; let calls = 0; let caches = 0; let latestOptions;
   const result = () => ({ outcome: 'ok', rotation: 3, observations: { [OBS_KEY]: observation(now) },
     report: { status: 'healthy' }, cacheContext: { account_key: ACCOUNT, auth_identity_verified: true }, cooldownsByOperation: {} });
-  const deps = { nowMs: () => now, invalidateCache: () => true, collect: (_db, options) => { calls++; latestOptions = options; return result(); }, writeCache: () => { caches++; return {}; } };
+  const deps = { nowMs: () => now, invalidateCache: () => true, collect: (_db, options) => { calls++; latestOptions = options; return result(); },
+    writeCache: path => { assert.equal(path, opts.publication.stagePath); caches++; return {}; } };
   return { opts, key, paths, deps, result, setNow: value => { now = value; }, now: () => now,
     calls: () => calls, caches: () => caches, options: () => latestOptions,
     state: () => readRemoteSampleState(paths.state, key, now).state };
@@ -203,9 +205,11 @@ test('parent launches one hard-limited private child and returns no unrecognized
       body: 'SYNTHETIC_SECRET_BODY', observations: { invented: 'SYNTHETIC_ID' }, cooldownsByOperation: {} }), stderr: 'SYNTHETIC_SECRET_ERROR' };
   } });
   assert.equal(observed.command, 'python3'); assert.equal(observed.options.timeout, 62_000);
-  assert.equal(observed.args[3], '60000');
+  assert.deepEqual(observed.args.slice(0, 4), ['-c', REMOTE_SAMPLE_LOCK_WRAPPER, f.paths.lock, 'python3']);
+  assert.equal(observed.args[5], REMOTE_SAMPLE_GUARDIAN); assert.equal(observed.args[7], '60000');
   assert.equal(observed.options.killSignal, 'SIGTERM'); assert.equal(observed.options.maxBuffer, 64 * 1024);
   assert.equal(JSON.parse(observed.options.input).cooldownsByOperation.self_profile, START + 10_000);
+  assert.deepEqual(JSON.parse(observed.options.env.EXOCORTEX_REMOTE_SAMPLE_PUBLICATION), JSON.parse(observed.options.input).publication);
   assert.equal(sampled.outcome, 'ok'); assert.doesNotMatch(JSON.stringify(sampled), /SYNTHETIC|observations|body|stderr/);
 });
 
@@ -254,29 +258,36 @@ test('kernel lock excludes another worker and releases automatically on SIGKILL'
   const f = fixture(t); const lock = join(f.opts.logDir, 'synthetic.lock');
   const script = join(f.opts.logDir, 'hold.mjs');
   writeFileSync(script, "import{fstatSync}from'node:fs';process.stdout.write(String(fstatSync(Number(process.env.EXOCORTEX_REMOTE_SAMPLE_LOCK_FD)).isFile())+'\\n');setInterval(()=>{},1000);\n");
-  const args = ['-c', REMOTE_SAMPLE_LOCK_WRAPPER, lock, process.execPath, script];
+  // The wrapper execs the same Python interpreter. This small Python program
+  // then execs the synthetic Node owner without dropping its inherited fd.
+  const execNode = 'import os,sys;os.execv(sys.argv[1],sys.argv[1:])';
+  const args = ['-c', REMOTE_SAMPLE_LOCK_WRAPPER, lock, 'python3', '-c', execNode, process.execPath, script];
   const child = spawn('python3', args, { stdio: ['ignore', 'pipe', 'pipe'] });
   t.after(() => child.kill('SIGKILL'));
   const deadline = setTimeout(() => child.kill('SIGKILL'), 5_000);
   try {
     const [chunk] = await once(child.stdout, 'data'); assert.match(String(chunk), /true/);
-    const competing = spawnSync('python3', ['-c', REMOTE_SAMPLE_LOCK_WRAPPER, lock, process.execPath, '-e', 'process.stdout.write("acquired")'], { encoding: 'utf8', timeout: 2000 });
+    const contender = ['-c', REMOTE_SAMPLE_LOCK_WRAPPER, lock, 'python3', '-c', execNode, process.execPath, '-e', 'process.stdout.write("acquired")'];
+    const competing = spawnSync('python3', contender, { encoding: 'utf8', timeout: 2000 });
     assert.equal(competing.status, 0); assert.equal(JSON.parse(competing.stdout).reason, 'scheduler_busy');
     const finished = once(child, 'close'); child.kill('SIGKILL'); await finished;
-    const restarted = spawnSync('python3', ['-c', REMOTE_SAMPLE_LOCK_WRAPPER, lock, process.execPath, '-e', 'process.stdout.write("acquired")'], { encoding: 'utf8', timeout: 2000 });
+    const restarted = spawnSync('python3', contender, { encoding: 'utf8', timeout: 2000 });
     assert.equal(restarted.status, 0); assert.equal(restarted.stdout, 'acquired');
     assert.equal(statSync(lock).mode & 0o777, 0o600);
   } finally { clearTimeout(deadline); }
 });
 
-test('a killed child atomically replaces the previous positive cache with unavailable evidence', t => {
+test('a parent observing killed child cannot overwrite cache outside the guardian-held lock', t => {
   const f = fixture(t);
   writeFileSync(f.paths.cache, JSON.stringify({ status: 'healthy', ok: true }), { mode: 0o600 });
   const sampled = runScheduledRemoteSample(f.opts, { nowMs: f.now,
+    invalidateCache: () => { throw Error('parent must not publish outside the lock'); },
     spawnSync: () => ({ status: null, signal: 'SIGKILL', stdout: '' }) });
   assert.equal(sampled.outcome, 'failed');
   const cache = JSON.parse(readFileSync(f.paths.cache, 'utf8'));
-  assert.equal(cache.ok, false); assert.equal(cache.status, 'unavailable'); assert.equal(cache.reason, 'sample_process_failed');
+  // This fake spawn never executes the guardian. Its lock-held prepare hook
+  // owns invalidation; the parent must not race another attempt's publication.
+  assert.deepEqual(cache, { status: 'healthy', ok: true });
   assert.equal(statSync(f.paths.cache).mode & 0o777, 0o600);
 });
 
@@ -309,12 +320,12 @@ test('failure to retract previous cache prevents any new API collection', async 
   assert.equal(sampled.reason, 'cache_write_failed'); assert.equal(f.calls(), 0);
 });
 
-test('successful cache publication observes already committed state', async t => {
+test('successful cache stage preparation observes already committed state', async t => {
   const f = fixture(t);
   const sampled = await executeRemoteSampleAttempt(f.opts, { ...f.deps, writeCache: () => {
     assert.equal(f.state().last_outcome, 'ok'); assert.equal(f.state().rotation, 3); return {};
   } });
-  assert.equal(sampled.outcome, 'ok');
+  assert.equal(sampled.outcome, 'ok'); assert.equal(sampled.cachePrepared, true);
 });
 
 test('expired private observations reach the collector once for explicit aged-out accounting', async t => {
@@ -399,8 +410,8 @@ test('background start returns before a blocked probe and explicit stop kills it
 
 test('guardian enforces its deadline independently of the worker event loop', async t => {
   const f = fixture(t); const probe = blockedProbe(f); const before = Date.now();
-  const guardian = spawn('python3', ['-c', REMOTE_SAMPLE_GUARDIAN, String(process.pid), '600', 'python3', '-c',
-    REMOTE_SAMPLE_LOCK_WRAPPER, join(f.opts.logDir, 'synthetic-deadline.lock'), process.execPath, probe.script], { stdio: 'ignore', detached: true });
+  const guardian = spawn('python3', ['-c', REMOTE_SAMPLE_LOCK_WRAPPER, join(f.opts.logDir, 'synthetic-deadline.lock'), 'python3',
+    '-c', REMOTE_SAMPLE_GUARDIAN, String(process.pid), '600', process.execPath, probe.script], { stdio: 'ignore', detached: true });
   t.after(() => guardian.kill('SIGTERM'));
   const closed = once(guardian, 'close');
   await waitUntil(() => existsSync(probe.ready));
@@ -414,8 +425,8 @@ test('guardian enforces its deadline independently of the worker event loop', as
 test('guardian observes parent exit and removes an unfinished probe without waiting sixty seconds', async t => {
   const f = fixture(t); const probe = blockedProbe(f); const launcher = join(f.opts.logDir, 'synthetic-parent.mjs');
   writeFileSync(launcher, `import{spawn}from'node:child_process';import{existsSync}from'node:fs';
-    const guardian=spawn('python3',['-c',${JSON.stringify(REMOTE_SAMPLE_GUARDIAN)},String(process.pid),'60000','python3','-c',
-      ${JSON.stringify(REMOTE_SAMPLE_LOCK_WRAPPER)},${JSON.stringify(join(f.opts.logDir, 'parent-exit.lock'))},process.execPath,${JSON.stringify(probe.script)}],{stdio:'ignore',detached:true});
+    const guardian=spawn('python3',['-c',${JSON.stringify(REMOTE_SAMPLE_LOCK_WRAPPER)},${JSON.stringify(join(f.opts.logDir, 'parent-exit.lock'))},'python3',
+      '-c',${JSON.stringify(REMOTE_SAMPLE_GUARDIAN)},String(process.pid),'60000',process.execPath,${JSON.stringify(probe.script)}],{stdio:'ignore',detached:true});
     guardian.unref();const timer=setInterval(()=>{if(existsSync(${JSON.stringify(probe.ready)})){clearInterval(timer);process.exit(0)}},10);setTimeout(()=>process.exit(2),2000).unref();\n`);
   const parent = spawn(process.execPath, [launcher], { stdio: 'ignore' });
   t.after(() => parent.kill('SIGKILL'));
@@ -470,8 +481,8 @@ test('guardian removes a spawned CLI descendant when the probe leader exits', as
     const descendant=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});
     writeFileSync(${JSON.stringify(ready)},JSON.stringify({pid:descendant.pid}),{mode:0o600});
     descendant.unref();setTimeout(()=>process.exit(0),100);\n`);
-  const guardian = spawn('python3', ['-c', REMOTE_SAMPLE_GUARDIAN, String(process.pid), '2000', 'python3', '-c',
-    REMOTE_SAMPLE_LOCK_WRAPPER, join(f.opts.logDir, 'synthetic-descendant.lock'), process.execPath, script], { stdio: 'ignore', detached: true });
+  const guardian = spawn('python3', ['-c', REMOTE_SAMPLE_LOCK_WRAPPER, join(f.opts.logDir, 'synthetic-descendant.lock'), 'python3',
+    '-c', REMOTE_SAMPLE_GUARDIAN, String(process.pid), '2000', process.execPath, script], { stdio: 'ignore', detached: true });
   t.after(() => guardian.kill('SIGTERM'));
   const closed = once(guardian, 'close');
   await waitUntil(() => existsSync(ready));
