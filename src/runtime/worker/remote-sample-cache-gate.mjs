@@ -11,7 +11,8 @@ export function createRemoteSamplePublication(logDir, databaseKey, attemptId = r
   if (typeof logDir !== "string" || !logDir || !HASH.test(databaseKey) || !UUID.test(attemptId)) throw new Error("invalid sample publication");
   return { version: 1, attemptId, cachePath: resolve(logDir, "live-probe.json"),
     stagePath: resolve(logDir, `.live-probe.${attemptId}.pending`),
-    lockPath: resolve(logDir, "remote-sample", "live-probe.lock") };
+    lockPath: resolve(logDir, "remote-sample", "live-probe.lock"),
+    statePath: resolve(logDir, "remote-sample", `${databaseKey}.json`) };
 }
 
 /** Reject a missing contract or a caller-supplied destination outside logDir. */
@@ -29,24 +30,26 @@ export function remoteSamplePublicationStage(logDir, databaseKey, value) {
 // crash may lose the new directory entry, but cleanup failure cannot publish it.
 // The existing scheduler flock is held by the guardian throughout this helper.
 export const REMOTE_SAMPLE_CACHE_GATE = String.raw`
-import json,os,re,stat
+import json,os,re,stat,time
 def sample_cache_contract():
     raw=os.environ.get('EXOCORTEX_REMOTE_SAMPLE_PUBLICATION')
     if raw is None: return None
     if len(raw)>4096: raise ValueError('cache publication contract')
     value=json.loads(raw)
-    if type(value) is not dict or set(value)!={'version','attemptId','stagePath','cachePath','lockPath'} or type(value['version']) is not int or value['version']!=1:
+    if type(value) is not dict or set(value)!={'version','attemptId','stagePath','cachePath','lockPath','statePath'} or type(value['version']) is not int or value['version']!=1:
         raise ValueError('cache publication contract')
     token=value['attemptId']
     if type(token) is not str or re.fullmatch(r'[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}',token) is None:
         raise ValueError('cache publication token')
-    for key in ('stagePath','cachePath','lockPath'):
+    for key in ('stagePath','cachePath','lockPath','statePath'):
         if type(value[key]) is not str or os.path.abspath(value[key])!=value[key]: raise ValueError('cache publication path')
     directory=os.path.dirname(value['cachePath'])
     if os.path.basename(value['cachePath'])!='live-probe.json' or value['stagePath']!=os.path.join(directory,'.live-probe.'+token+'.pending'):
         raise ValueError('cache publication path')
     if value['lockPath']!=os.path.join(directory,'remote-sample','live-probe.lock'):
         raise ValueError('cache publication lock')
+    if os.path.dirname(value['statePath'])!=os.path.join(directory,'remote-sample') or re.fullmatch(r'[a-f0-9]{64}\.json',os.path.basename(value['statePath'])) is None:
+        raise ValueError('cache publication state')
     return value
 def sample_cache_regular(info,maximum=None):
     if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode & 0o077 or info.st_nlink!=1:
@@ -71,12 +74,67 @@ def remote_sample_cache_pass_fds():
     if sample_cache_identity(info)!=sample_cache_identity(os.stat(value['lockPath'],follow_symlinks=False)):
         raise ValueError('cache lock changed')
     return (fd,)
+def sample_cache_due(value):
+    # The parent's precheck may be stale by the time this shared flock is
+    # acquired. This read-only header gate can only skip work; the worker's
+    # existing JavaScript validator remains authoritative for actual attempts.
+    directory_fd=state_fd=None
+    try:
+        directory=os.path.dirname(value['statePath'])
+        directory_fd=os.open(directory,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_NONBLOCK)
+        before_directory=os.fstat(directory_fd)
+        sample_cache_directory(before_directory)
+        name=os.path.basename(value['statePath'])
+        try: state_fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=directory_fd)
+        except FileNotFoundError:
+            finished_fd=directory_fd
+            directory_fd=None
+            os.close(finished_fd)
+            return None
+        before=os.fstat(state_fd)
+        sample_cache_regular(before,98304)
+        data=bytearray()
+        while len(data)<before.st_size+1:
+            part=os.read(state_fd,before.st_size+1-len(data))
+            if not part: break
+            data.extend(part)
+        if len(data)!=before.st_size or sample_cache_identity(before)!=sample_cache_identity(os.fstat(state_fd)) or sample_cache_identity(before)!=sample_cache_identity(os.stat(name,dir_fd=directory_fd,follow_symlinks=False)):
+            raise ValueError('sample schedule changed')
+        after_directory=os.stat(directory,follow_symlinks=False)
+        sample_cache_directory(after_directory)
+        if (before_directory.st_dev,before_directory.st_ino)!=(after_directory.st_dev,after_directory.st_ino): raise ValueError('sample schedule directory changed')
+        finished_fd=state_fd
+        state_fd=None
+        os.close(finished_fd)
+        finished_fd=directory_fd
+        directory_fd=None
+        os.close(finished_fd)
+        state=json.loads(data)
+        now=int(time.time()*1000)
+        if type(state) is not dict or state.get('kind')!='lark_im_remote_sample_schedule/v1' or state.get('database_key')!=name[:-5]:
+            raise ValueError('sample schedule header')
+        written=state.get('written_at')
+        due=state.get('next_due')
+        if any(type(n) is not int or not 0<=n<=9007199254740991 for n in (now,written,due)) or written>now or due<written:
+            raise ValueError('sample schedule time')
+        cooldowns=state.get('cooldowns')
+        if type(cooldowns) is not dict or any(type(n) is not int or not 0<=n<=written+604800000 for n in cooldowns.values()):
+            raise ValueError('sample schedule cooldown')
+        if due>max([written+21600000,*cooldowns.values()]): raise ValueError('sample schedule time')
+        if due>now:
+            return {'outcome':'not_due','reason':'not_due','next_due':due,'cooldownsByOperation':{},'cachePrepared':False}
+        return None
+    finally:
+        sample_cache_close(state_fd)
+        sample_cache_close(directory_fd)
 def prepare_remote_sample_cache():
     value=sample_cache_contract()
     if value is None: return
     directory_fd=marker_fd=None
     try:
         remote_sample_cache_pass_fds()
+        skipped=sample_cache_due(value)
+        if skipped is not None: return skipped
         directory=os.path.dirname(value['cachePath'])
         directory_fd=os.open(directory,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_NONBLOCK)
         before=os.fstat(directory_fd)

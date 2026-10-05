@@ -77,7 +77,7 @@ test('mock guardian successful fast worker retains live anchor until single grou
     assert.ok(ops.findIndex((op) => op.op === 'wait') > ops.findIndex((op) => op.op === 'killpg'));
     assert.equal(ops.find((op) => op.op === 'wait').timeout, 1);
     assert.ok(Object.values(observed.pipe_closed).every(Boolean));
-    assert.ok(Object.values(observed.nonblocking).every(Boolean));
+    for (const fd of [17, 41, 42]) assert.equal(observed.nonblocking[String(fd)], true);
   }
 });
 
@@ -107,6 +107,19 @@ test('mock guardian preserves confirmed worker failure independently of cleanup 
   }
   const unknown = mockGuardian({ deadline: true, no_done: true, reap_timeout: true });
   assert.deepEqual(envelope(unknown), safeFailure('deadline', 'child_reap', null, null));
+});
+
+test('confirmed unexpected anchor exit survives an independent capture-close failure', () => {
+  // Reviewer counterexample: DONE(0), successful wait returning anchor code 0,
+  // then stdout.close raises. Neither independently confirmed error may vanish.
+  const observed = mockGuardian({ anchor_returncode: 0, cleanup: 'capture_close' });
+  assert.equal(observed.exit_code, 2);
+  assert.deepEqual(envelope(observed), safeFailure('anchor_lost', 'capture_close'));
+  for (const scenario of [{ reap_timeout: true }, { anchor_returncode: null }]) {
+    const unknown = mockGuardian({ ...scenario, cleanup: 'capture_close' });
+    assert.equal(envelope(unknown).primary, null);
+    assert.deepEqual(envelope(unknown).cleanup, { stage: 'child_reap', errno: null });
+  }
 });
 
 test('mock guardian rejects malformed, duplicated, premature and oversized frames', () => {
@@ -216,6 +229,21 @@ for (const primary of ['anchor_setup', 'anchor_control_read', 'anchor_control_wr
   });
 }
 
+test('anchor never parks on a control descriptor whose nonblocking setup failed', () => {
+  // Reviewer counterexample: setting control fd nonblocking raises, while the
+  // pipe remains open and empty. A real read here could outlive every deadline.
+  for (const fd of [40, 43]) {
+    const observed = mockGuardian({ set_blocking_fail_fd: fd, no_go: true, park_until_deadline: true }, 'anchor');
+    assert.deepEqual(observed.primary, { stage: 'anchor_setup', errno: 1 });
+    assert.equal(observed.spawns.length, 0);
+    assert.equal(observed.calls.includes('blocking_read_forbidden'), false);
+    const reads = observed.operations.filter(op => op.op === 'read' && op.args[0] === 40);
+    if (fd === 40) assert.equal(reads.length, 0);
+    else assert.ok(reads.length > 0);
+    assert.ok(observed.fake_elapsed_ms <= 6000.001);
+  }
+});
+
 test('mock anchor shares absolute deadline, parks after completion and exits on parent loss', () => {
   const parked = mockGuardian({ park_until_deadline: true }, 'anchor');
   assert.equal(parked.primary, null);
@@ -242,6 +270,28 @@ test('mock cache guardian invalidates under lock before spawn and commits only a
   assert.ok(publish > ops.findIndex((op) => op.op === 'wait'));
   assert.ok(publish > ops.findLastIndex((op) => op.op === 'close'));
   assert.equal(observed.calls.at(-1), 'immediate_exit');
+});
+
+test('stale parent due precheck cannot invalidate a newer lock-held completion', () => {
+  // Exact reviewer ordering: B passes its parent's due check and pauses. A
+  // finishes, writes a future next_due and publishes this cache. Only then B
+  // acquires the same lock. Model B's guardian at that lock-held entry point.
+  const current = JSON.stringify({ synthetic: true, outcome: 'A-completed', status: 'healthy', ok: true,
+    checked_at: '2027-01-15T08:00:00.000Z', expires_at: '2027-01-15T08:30:00.000Z' });
+  for (const background of [false, true]) {
+    const observed = mockGuardian({ cache_enabled: true, cache_not_due: true, cache_target_raw: current, background });
+    assert.equal(observed.exit_code, 0);
+    assert.equal(observed.cache_files['/synthetic/cache/live-probe.json'].content, current);
+    assert.equal(observed.cache_prepared, false);
+    assert.equal(observed.cache_committed, false);
+    assert.equal(observed.cache_discarded, false);
+    assert.equal(observed.spawns.length, 0);
+    assert.equal(observed.calls.includes('control_create'), false);
+    assert.equal(observed.cache_operations.some(op => ['write', 'rename', 'unlink', 'fsync'].includes(op.op)), false);
+    if (background) assert.equal(observed.stdout, '');
+    else assert.deepEqual(JSON.parse(observed.stdout), { outcome: 'not_due', reason: 'not_due',
+      next_due: 1800000900000, cooldownsByOperation: {}, cachePrepared: false });
+  }
 });
 
 test('mock cache startup and cleanup failures never publish prepared positive stage', () => {

@@ -61,6 +61,7 @@ worker_code=None
 killed=False
 reaped=False
 cache_enabled=False
+skip_result=None
 output=bytearray()
 control_buffer=bytearray()
 capture=os.environ.get('EXOCORTEX_REMOTE_SAMPLE_CAPTURE')=='1'
@@ -130,7 +131,21 @@ try:
         stage='cache_setup'
         cache_fds=remote_sample_cache_pass_fds()
         cache_enabled=bool(cache_fds)
-        prepare_remote_sample_cache()
+        skip_result=prepare_remote_sample_cache()
+        if skip_result is not None:
+            if not cache_enabled or type(skip_result) is not dict or set(skip_result)!={'outcome','reason','next_due','cooldownsByOperation','cachePrepared'} or skip_result['outcome']!='not_due' or skip_result['reason']!='not_due' or type(skip_result['next_due']) is not int or not 0<=skip_result['next_due']<=9007199254740991 or type(skip_result['cooldownsByOperation']) is not dict or skip_result['cooldownsByOperation']!={} or skip_result['cachePrepared'] is not False:
+                raise ValueError('cache skip result')
+            if not cache_commit_allowed(): raise ValueError('cache skip interrupted')
+            if capture:
+                try:
+                    sys.stdout.write(json.dumps(skip_result)+'\n')
+                    sys.stdout.flush()
+                except Exception as error:
+                    failure('result_publish',error)
+                    os._exit(2)
+            # This lock-held due recheck has not touched the cache or a stage.
+            # Exit without spawning an anchor or running stage cleanup.
+            os._exit(0)
         stage='control_create'
         control_read,control_write=os.pipe()
         handles.extend([control_read,control_write])
@@ -201,6 +216,11 @@ finally:
             try:
                 child.wait(timeout=1.0)
                 reaped=True
+                # Preserve confirmed abnormal anchor exit independently of any
+                # later cleanup failure. An unknown return code is not proof
+                # that the anchor exited unexpectedly.
+                if child.returncode is None: failure('child_reap',cleaning=True)
+                elif child.returncode!=-signal.SIGKILL: failure('anchor_lost')
             except Exception as error: failure('child_reap',error,True)
         if primary is None or primary['stage']!='capture_read':
             try: drain()
@@ -250,7 +270,7 @@ if not failed and cache_enabled:
     # The final rename is the last fallible publication operation. Bypass
     # interpreter shutdown (including implicit output flushes) after commit.
     os._exit(0)
-if failed and not (primary is not None and primary['stage'] in ('cache_setup','cache_publish') and primary['errno'] in (1,13)):
+if failed and skip_result is None and not (primary is not None and primary['stage'] in ('cache_setup','cache_publish') and primary['errno'] in (1,13)):
     discard_remote_sample_stage()
 if capture:
     try:

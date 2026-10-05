@@ -14,6 +14,7 @@ status_failed=False
 terminal_sent=False
 control_failed=False
 control_lost=False
+control_nonblocking=False
 buffer=bytearray()
 worker_fds=()
 def failure(where,error=None):
@@ -32,6 +33,7 @@ def send(frame):
         raise
 def read_control():
     global control_failed
+    if not control_nonblocking: raise ValueError('control is not nonblocking')
     try: return os.read(control,257-len(buffer))
     except BlockingIOError: return None
     except Exception:
@@ -51,6 +53,7 @@ try:
     control=int(sys.argv[3])
     status=int(sys.argv[4])
     os.set_blocking(control,False)
+    control_nonblocking=True
     os.set_blocking(status,False)
     if os.environ.get('EXOCORTEX_REMOTE_SAMPLE_PUBLICATION') is not None:
         inherited=os.environ.get('EXOCORTEX_REMOTE_SAMPLE_LOCK_FD','')
@@ -124,7 +127,7 @@ if status_failed and status is not None:
 try:
     if parent is not None and deadline is not None:
         while not control_lost and os.getppid()==parent and time.monotonic()<deadline+1.0:
-            if not control_failed and control is not None:
+            if control_nonblocking and not control_failed and control is not None:
                 try:
                     part=read_control()
                     if part==b'': break

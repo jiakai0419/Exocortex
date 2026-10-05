@@ -22,6 +22,7 @@ mode = request.get("mode", "guardian")
 assert mode in ("guardian", "anchor", "cache_gate"), "unknown fixture mode"
 calls, operations, spawns, frames = [], [], [], []
 handlers, descriptors, nonblocking = {}, {}, {}
+blocking_attempts = []
 state = {"elapsed": 0.0, "cleanup": False, "payload_sent": False,
          "go": False, "terminal": False, "next_fd": 40, "sleep_count": 0,
          "parent_reads": 0, "status_reads": 0, "control_reads": 0}
@@ -29,13 +30,14 @@ primary = scenario.get("primary")
 cleanup = scenario.get("cleanup")
 private = "SYNTHETIC_PRIVATE_PATH_BODY_TOKEN"
 namespace = {}
-cache_operations, cache_files, cache_handles, cache_counts = [], {}, {}, {}
+cache_operations, cache_files, cache_handles, cache_counts, cache_positions = [], {}, {}, {}, {}
 cache_result, cache_exception = None, None
 cache_token = "11111111-2222-4333-8444-555555555555"
 cache_contract = {"version": 1, "attemptId": cache_token,
                   "stagePath": "/synthetic/cache/.live-probe." + cache_token + ".pending",
                   "cachePath": "/synthetic/cache/live-probe.json",
-                  "lockPath": "/synthetic/cache/remote-sample/live-probe.lock"}
+                  "lockPath": "/synthetic/cache/remote-sample/live-probe.lock",
+                  "statePath": "/synthetic/cache/remote-sample/" + "a" * 64 + ".json"}
 cache_state = {"next_fd": 400, "committed": False, "discarded": False, "prepared": False}
 CLEANUP_STAGES = {"group_kill", "child_reap", "capture_drain", "capture_close", "watch_close", "control_close"}
 
@@ -88,7 +90,9 @@ def cache_path(path, dir_fd=None):
 
 def cache_role(path):
     if path == "/synthetic/cache": return "directory"
+    if path == "/synthetic/cache/remote-sample": return "state_directory"
     if path == cache_contract["lockPath"]: return "lock"
+    if re.fullmatch(r"/synthetic/cache/remote-sample/[a-f0-9]{64}\.json", path): return "state"
     if path.endswith(".pending"): return "stage"
     if path.endswith(".attempting"): return "marker"
     if path.endswith("live-probe.json"): return "target"
@@ -138,7 +142,17 @@ def cache_open(path, flags, permissions=0o777, *, dir_fd=None):
     fd = cache_state["next_fd"]
     cache_state["next_fd"] += 1
     cache_handles[fd] = node
+    cache_positions[fd] = 0
     return fd
+
+
+def cache_read(fd, count):
+    node = cache_handles[fd]
+    cache_record("read", node["role"], fd=fd, count=count)
+    start = cache_positions.get(fd, 0)
+    data = bytes(node["content"][start:start + count])
+    cache_positions[fd] = start + len(data)
+    return data
 
 
 def cache_write(fd, data):
@@ -184,11 +198,19 @@ def cache_allow_commit():
 
 
 cache_node("/synthetic/cache", "directory", permissions=0o700, directory=True)
+cache_node("/synthetic/cache/remote-sample", "state_directory", permissions=0o700, directory=True)
 cache_handles[200] = cache_node(cache_contract["lockPath"], "lock")
+if "cache_schedule" in scenario or "cache_state_raw" in scenario or scenario.get("cache_not_due"):
+    now_ms = scenario.get("wall_now_ms", 1800000000000)
+    schedule = scenario.get("cache_schedule", {"kind": "lark_im_remote_sample_schedule/v1", "database_key": "a" * 64,
+        "account_key": None, "written_at": now_ms, "next_due": now_ms + 900000, "failures": 0, "rotation": 0,
+        "observations": {}, "last_outcome": "ok", "cooldowns": {}, "blocked_reason": None})
+    raw = scenario.get("cache_state_raw", json.dumps(schedule))
+    cache_node("/synthetic/cache/remote-sample/" + "a" * 64 + ".json", "state", raw.encode("utf-8"))
 if not scenario.get("cache_missing_stage"):
     cache_node(cache_contract["stagePath"], "stage", b'{"synthetic":true,"kind":"prepared"}\n')
 if not scenario.get("cache_missing_target"):
-    cache_node(cache_contract["cachePath"], "target", b'{"synthetic":true,"kind":"old"}\n')
+    cache_node(cache_contract["cachePath"], "target", scenario.get("cache_target_raw", '{"synthetic":true,"kind":"old"}\n').encode("utf-8"))
 
 
 def visit(name, is_cleanup=False):
@@ -237,6 +259,8 @@ def make_pipe(role):
     buffer = bytearray()
     descriptors[read_fd] = {"role": role, "end": "read", "buffer": buffer, "closed": False, "peer": write_fd}
     descriptors[write_fd] = {"role": role, "end": "write", "buffer": buffer, "closed": False, "peer": read_fd}
+    nonblocking[str(read_fd)] = False
+    nonblocking[str(write_fd)] = False
     return read_fd, write_fd
 
 
@@ -343,6 +367,8 @@ def popen(args, **kwargs):
 
 
 def read(fd, count):
+    if fd in cache_handles:
+        return cache_read(fd, count)
     if fd == 17:
         stage = "capture_drain" if state["cleanup"] else "capture_read"
         operations.append({"op": "read", "stage": stage, "args": [fd, count]})
@@ -358,6 +384,10 @@ def read(fd, count):
                 else b'{"outcome":"ok","synthetic":true}')[:count]
     item = descriptors[fd]
     role = item["role"]
+    if not nonblocking.get(str(fd), False):
+        calls.append("blocking_read_forbidden")
+        operations.append({"op": "blocking_read_forbidden", "fd": fd, "role": role})
+        raise FakeFixtureLimit("control read on blocking fixture descriptor")
     syscall("read", "control_read" if mode == "guardian" else "anchor_control_read", [fd, count])
     state[role + "_reads"] += 1
     if item["buffer"]:
@@ -417,6 +447,7 @@ def close(fd):
         node = cache_handles[fd]
         cache_record("close", node["role"], fd=fd)
         del cache_handles[fd]
+        cache_positions.pop(fd, None)
         return
     # close_control classifies even setup closes as independent cleanup errors.
     # Do not let these closes imply that the process group has been signalled.
@@ -437,8 +468,19 @@ def killpg(pid, number):
 
 def set_blocking(fd, blocking):
     stage = "anchor_setup" if mode == "anchor" else "capture_nonblocking" if fd == 17 else "control_nonblocking"
-    syscall("set_blocking", stage, [fd, blocking], False)
+    before = nonblocking.setdefault(str(fd), False)
+    attempt = {"fd": fd, "requested_nonblocking": not blocking, "before": before, "after": before, "succeeded": False}
+    blocking_attempts.append(attempt)
+    try:
+        syscall("set_blocking", stage, [fd, blocking], False)
+        fail_fd = scenario.get("set_blocking_fail_fd")
+        if fail_fd == fd or isinstance(fail_fd, list) and fd in fail_fd:
+            raise OSError(scenario.get("set_blocking_fail_errno", errno.EPERM), private)
+    except Exception as error:
+        attempt["errno"] = getattr(error, "errno", None)
+        raise
     nonblocking[str(fd)] = not blocking
+    attempt.update({"after": not blocking, "succeeded": True})
     if scenario.get("signal_stop") and fd == 17 and 15 in handlers:
         handlers[15](15, None)
 
@@ -528,7 +570,8 @@ fake_os = types.SimpleNamespace(environ=fake_environ,
     O_EXCL=128, O_NOFOLLOW=262144, O_NONBLOCK=2048, O_DIRECTORY=65536)
 fake_signal = types.SimpleNamespace(SIGTERM=15, SIGINT=2, SIGKILL=9, SIG_DFL=0, SIG_IGN=1, signal=signal_handler)
 fake_subprocess = types.SimpleNamespace(Popen=popen, PIPE=-1, DEVNULL=-3, TimeoutExpired=FakeTimeoutExpired)
-fake_time = types.SimpleNamespace(monotonic=lambda: state["elapsed"], sleep=sleep)
+fake_time = types.SimpleNamespace(monotonic=lambda: state["elapsed"],
+    time=lambda: scenario.get("wall_now_ms", 1800000000000) / 1000.0 + state["elapsed"], sleep=sleep)
 replacement = {"os": fake_os, "signal": fake_signal, "subprocess": fake_subprocess,
                "sys": fake_sys, "time": fake_time}
 # Reject dependencies before execution. Even a new nested import must use a
@@ -571,7 +614,7 @@ except BaseException as error:
 
 print(json.dumps({"exit_code": exit_code, "uncaught": uncaught, "stdout": out_bytes.getvalue().decode(),
     "stderr": err_bytes.getvalue().decode(), "calls": calls, "operations": operations, "spawns": spawns,
-    "frames": frames, "nonblocking": nonblocking, "fake_elapsed_ms": state["elapsed"] * 1000,
+    "frames": frames, "nonblocking": nonblocking, "blocking_attempts": blocking_attempts, "fake_elapsed_ms": state["elapsed"] * 1000,
     "pipe_closed": {str(fd): item["closed"] for fd, item in descriptors.items()},
     "go_sent": state["go"], "killed": state.get("killed", False),
     "cache_result": cache_result, "cache_exception": cache_exception, "cache_operations": cache_operations,

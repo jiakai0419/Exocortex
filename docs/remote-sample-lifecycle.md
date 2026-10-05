@@ -48,7 +48,10 @@ anchor's expected SIGKILL is cleanup evidence, not the worker's exit code.
 One absolute monotonic deadline covers startup, handshake and work. Output is
 limited to 64 KiB, and control frames have a separate small bound. Caller exit,
 signal, deadline and protocol failure all enter the same single cleanup path.
-Cleanup failures remain separate from the first primary failure. EPERM is never
+Cleanup failures remain separate from the first primary failure. A confirmed
+unexpected anchor return code remains primary `anchor_lost` even if capture
+close also fails; a missing return code remains unknown. Anchor parking reads
+the control pipe only after its nonblocking setup has succeeded. EPERM is never
 retried, ignored or converted to proof that cleanup succeeded.
 
 The guardian is the only process permitted to terminate the group. The anchor
@@ -67,8 +70,16 @@ log directory, so different database identities cannot concurrently replace the
 same cache. There is no second lock or scheduler. The wrapper execs its current
 Python interpreter; it does not assume `execv` searches PATH.
 
-After validating the inherited lock, the guardian writes a durable unavailable
-`attempting` marker before it creates pipes or starts the anchor. The worker
+After validating the inherited lock, the guardian rechecks the latest schedule
+file before touching the visible cache. A bounded stable read checks the schedule
+identity and due-time header; the worker remains the full state validator for
+actual attempts. A newly not-due result exits without a marker, worker, API call
+or cache write, preserving current cache bytes and TTL. This header-only skip
+does not certify the full state schema or the cache as healthy. This closes the race
+where another attempt finishes after the parent precheck but before this lock is
+acquired. Missing or still-due state proceeds to a durable unavailable
+`attempting` marker before pipes or anchor startup; a malformed due header or unstable file
+fails before the marker. No prior cache file is restored afterward. The worker
 writes the existing bounded private cache format to one attempt-specific UUID
 stage, which status never reads. Its internal completion code is 0 only after a
 complete stage write, 3 for a deliberate busy/not-due skip without a stage, and
@@ -115,6 +126,19 @@ not change sampling, schedule intervals, account binding or status presentation.
 | Output flush or deadline fails near final commit | New deferred-publication boundary | All failure checks precede final rename |
 | Duplicate terminal frame arrives in a separate read | New completion protocol | Successful cleanup must finish with empty status EOF |
 
+## Review counterexamples retained
+
+The designated review supplied these cases after the initial self-review passed.
+They remain explicit regression cases; the earlier tests are retained.
+
+| Counterexample | Why initial tests/self-review missed it | Added assertion |
+| --- | --- | --- |
+| B passes parent due precheck, A commits healthy evidence, B takes the lock and worker returns not_due | Marker ordering and worker skip were tested separately; the changed state between parent check and lock acquisition was absent | Lock-held due preflight preserves A's exact cache and TTL and never starts worker |
+| DONE(0), anchor reap returns 0, capture close fails | Anchor abnormal exit and cleanup failure were separate test cases; the shared success guard was mistaken for independent evidence capture | Primary anchor_lost and cleanup capture_close both survive; unknown anchor return does not invent primary evidence |
+| Nonblocking setup of control fd fails, then anchor parks with an empty open pipe | Fake reads always returned EAGAIN and did not model whether the flag was successfully set | Fake rejects every read of a blocking control fd; setup failure performs no such read |
+| Worker and anchor exit while outer guardian remains alive | Acceptance tracked process.ppid after adding anchor, which now named the anchor rather than the guardian | Test-only self-recorded outer guardian PID must also exit in fast, descendant and caller-loss cases |
+| Lock-owner and reap wording describe the prior process layout | Review focused on the new lifecycle document and did not reconcile the older design notes | Both documents distinguish guardian lock lifetime, DONE worker result and later anchor reap |
+
 ## Acceptance boundary
 
 Only static checks and OS-mocked state-machine tests are authorized in this
@@ -141,6 +165,7 @@ version. The minimum future acceptance matrix is:
 
 Each case must use temporary synthetic files and identities, no remote API,
 production service or business database. Observe only those test-owned PIDs and
-files. Stop at the first unexpected error without retries or changes to
+files, and separately require the outer guardian, anchor, worker and any CLI
+descendant to exit in every cleanup case. Stop at the first unexpected error without retries or changes to
 permissions or execution context. Guardian crash/SIGKILL is a documented
 unsupported cleanup guarantee, not a passing case in this matrix.
