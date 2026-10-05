@@ -133,6 +133,8 @@ finally:
         except Exception as error: failure('watch_close',error,True)
 if overflow: failure('output_limit')
 if stopping: failure('signal_stop')
+# Confirmed child failure is independent of cleanup; a timed-out reap is unknown.
+if child is not None and child.returncode is not None and child.returncode!=0: failure('child_exit')
 if primary is None and cleanup is None and (not exited or child is None or child.returncode!=0): failure('child_exit')
 failed=primary is not None or cleanup is not None
 if capture:

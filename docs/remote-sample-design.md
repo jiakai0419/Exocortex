@@ -78,6 +78,8 @@ The five-second foreground lease budget and each helper's remaining timeout must
 
 The guardian emits only a versioned `guardian_diagnostic` with a first primary error and a first cleanup error, each limited to a fixed stage and an integer errno (or null). Raw exception strings, stack traces, paths, process identifiers, arguments, environment values and child output do not enter this diagnostic. The two errors remain distinct so a cleanup failure cannot erase the original failure. No permission error triggers a retry, alternate interpreter, alternate watcher or relaxed process-group cleanup. Reaping after successful termination is bounded; if termination fails and exit was not observed, the guardian does not wait indefinitely.
 
+When no earlier primary error exists, a confirmed nonzero child return code supplies primary `child_exit` evidence even when cleanup also fails. A reap timeout leaves the return code unknown and does not establish `child_exit`; the first cleanup failure remains independently available.
+
 The synchronous wrapper validates this structure and manual cache-writing/no-cache checks preserve it through the public report projection. A diagnostic is failure evidence and cannot accompany a healthy result. This small candidate does not add a new background diagnostics file or connect ignored background stderr to worker logs; background guardian-stage persistence remains unimplemented.
 
 If the output channel itself fails, the guardian does not retry publication; the caller may only retain the generic `guardian_result` fallback, without the original publication errno. These stage codes identify where the observed failure occurred; they do not establish whether sandbox, TCC, or another host policy caused it.

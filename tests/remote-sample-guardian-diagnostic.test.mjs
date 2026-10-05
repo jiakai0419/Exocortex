@@ -70,6 +70,30 @@ test('mock guardian retains the first cleanup error when later cleanup also fail
   for (const step of ['group_kill', 'capture_drain', 'watch_close']) assert.equal(observed.calls.filter((value) => value === step).length, 1);
 });
 
+test('mock guardian preserves confirmed nonzero child exit independently of cleanup errors', () => {
+  for (const cleanup of [null, 'watch_close', 'group_kill', 'capture_drain']) {
+    const observed = mockGuardian({ child_returncode: 7, cleanup });
+    assert.equal(observed.exit_code, 2);
+    assert.deepEqual(JSON.parse(observed.stdout).guardian_diagnostic, {
+      version: 1, primary: { stage: 'child_exit', errno: null }, cleanup: cleanup ? { stage: cleanup, errno: 1 } : null,
+    });
+    assert.equal(observed.calls.filter((value) => value === 'child_reap').length, 1);
+    assert.equal(observed.calls.includes('wait_timeout_bounded'), true);
+  }
+});
+
+test('mock guardian never infers child exit from an unknown return code after reap timeout', () => {
+  for (const cleanup of [null, 'watch_close', 'group_kill', 'capture_drain']) {
+    // The configured return code is not observed because the fake reap times out.
+    const observed = mockGuardian({ child_returncode: 7, reap_timeout: true, cleanup });
+    assert.equal(observed.exit_code, 2);
+    assert.deepEqual(JSON.parse(observed.stdout).guardian_diagnostic, { version: 1, primary: null,
+      cleanup: cleanup === 'group_kill' ? { stage: 'group_kill', errno: 1 } : { stage: 'child_reap', errno: null } });
+    assert.equal(observed.calls.filter((value) => value === 'child_reap').length, 1);
+    assert.equal(observed.calls.includes('wait_timeout_bounded'), true);
+  }
+});
+
 test('mock guardian keeps deadline, overflow, parent loss, signal and child exit distinct', () => {
   for (const [scenario, stage] of [[{ deadline: true }, 'deadline'], [{ overflow: true }, 'output_limit'],
     [{ parent_exit: true }, 'parent_exit'], [{ signal_stop: true }, 'signal_stop'], [{ child_returncode: 7 }, 'child_exit']]) {
