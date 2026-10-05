@@ -36,6 +36,8 @@
 | 原生 `at.userID`、`<at id>` | `nativeRef`，先走显式附件桥；有附件但无可用桥时保持未知 |
 | 旧格式无附件的裸 literal | 只作 exact alias 兼容，且必须唯一对应一个身份与命名空间；碰到多 namespace 或冲突即未知，不靠 `ou_` 前缀挑一个 |
 
+显式卡片节点 `tag: "at_all"` 表达全员提及，按原位置输出 `@所有人`，沿用节点已有的 `type` / `property` 包装规则；无需姓名、mentions 或附件桥。它经过同一节点、深度与输出预算，不能清除兄弟节点的未知结构、缺名或链接诊断。普通正文中的 `at_all`、typed ID 值 `all`、`<at id="all">` 及附件键 `all` 不因此获得全员语义，仍按原有文本或身份规则处理。历史卡片从 raw 只读重投影即可恢复此节点：`display.card` 的文字及解析状态可改善，JSON 字段和版本 3 合同不变，已存 body/raw/hash/source version/canonical 不回写；搜索仍使用已存 body。
+
 sender 的兼容输入范围是有限的：接受 `sender.id` 配合显式 `id_type`、直接 `open_id/user_id/union_id/app_id`、`sender.sender_id` 对象里的同名 typed 槽，以及旧字符串 `sender_id`。actor 始终是非空字符串或缺失，按 `id → open_id → sender_id.open_id → sender_id.user_id → sender_id.union_id → 字符串 sender_id → user_id → union_id → app_id → sender_id.app_id` 的固定顺序选择；选择与声明的 namespace 必须一致。这个顺序保留原先有效字符串槽的优先级，SQL 与 JS 用组合测试校验一致。对象、数组或其他非字符串 typed 值，以及没有任何支持的 typed ID 的 `sender_id` 对象，均为不可信身份，不能直接供名或联网。IDless 消息仍可保留自身明确姓名，但没有可继承或查询的身份；无类型或未知类型的标量 ID 不授权 open-ID 查询。这是本地兼容输入合同，不表示每个形状都已在当前远端 API 观测到。
 
 所有明确 ID 槽构成同一条源消息的 alias 集合。直接姓名、远端候选与已存姓名若等于其中任何 ID，均为 unknown；原消息明确给出的 alias 即使未出现在远端响应中也有效。先做这项校验，再决定是否查询成员 fallback，不能用回显值计为 resolved 或抑制补全。共享正向缓存也不能把本次已知的 ID 回显当作成功；真实姓名、显式 clear 和同版本改进的既有规则保持。历史 sender-only 仍只修可信匹配的 open-ID 姓名，不隐式迁移错误 actor 或增加 user/union-ID 远端查询通道。

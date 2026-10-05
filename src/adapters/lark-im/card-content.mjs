@@ -766,6 +766,8 @@ function renderCardContent(content, mentions = [], options = {}) {
       const tag = read(value, "tag") ?? read(value, "type") ?? read(payload, "tag") ?? read(payload, "type") ?? "";
       if (tag === "at") {
         emit(mention(nodeMention(payload)));
+      } else if (tag === "at_all") {
+        emit("@所有人");
       } else if (TEXT_TAGS.has(tag)) {
         if (!textSlots(payload, depth)) mark("unsupported_card_structure");
       } else if (tag === "button" || tag === "a" || tag === "link") {
