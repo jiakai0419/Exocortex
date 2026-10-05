@@ -46,6 +46,7 @@ function publicBackup(value) {
 }
 /** @param {JsonObject} live */
 function liveReady(live) {
+  if (Object.hasOwn(live, "guardian_diagnostic")) return false;
   const start = Date.parse(String(live.window?.start || ""));
   const end = Date.parse(String(live.window?.end || ""));
   return live.ok === true && live.status === "healthy" && Number.isSafeInteger(live.probe?.remote_messages_checked) && live.probe.remote_messages_checked > 0 &&
@@ -134,16 +135,18 @@ async function collectCheckReport(options, context, deps = {}) {
           manualAttempt = (deps.runManualRemoteSample || runManualRemoteSample)({ db: plan.db, logDir: plan.logDir }, {
             nowMs: context.now, collectorOptions: { startMs: plan.startMs, endMs: plan.endMs, hotChats: plan.hotChats, messagesPerChat: plan.messagesPerChat },
           });
-          return manualAttempt.report || { schema_version: 3, ok: false, status: manualAttempt.outcome === "failed" ? "unavailable" : "inconclusive",
-            reason: manualAttempt.reason, checked_at: observed(), window: { start: plan.start, end: plan.end }, probe: {}, findings: {}, binding: { state: "unverified" } };
+          const report = manualAttempt.report || { schema_version: 3, ok: false, status: manualAttempt.outcome === "failed" ? "unavailable" : "inconclusive",
+            reason: manualAttempt.reason, checked_at: observed(), window: { start: plan.start, end: plan.end }, probe: {}, findings: {}, binding: { state: "unverified" },
+          };
+          return Object.hasOwn(manualAttempt, "guardian_diagnostic") ? { ...report, guardian_diagnostic: manualAttempt.guardian_diagnostic } : report;
         }
         remoteResult = (deps.collectRemoteSample || runReadOnlyRemoteSample)(plan.db, { ...plan, env: context.env }, { now: context.now });
-        return remoteResult.report;
+        return Object.hasOwn(remoteResult, "guardian_diagnostic") ? { ...remoteResult.report, guardian_diagnostic: remoteResult.guardian_diagnostic } : remoteResult.report;
       }, liveReady, (value) => value.schema_version === 3 ? publicRemoteReport(value)
         : plan.unsafeDetails ? value : sanitizeLagReportForPublicOutput(value));
     }
   }
-  if (remoteResult?.outcome === "failed" || manualAttempt?.outcome === "failed") checks.live.status = "unavailable";
+  if (remoteResult?.outcome === "failed" || manualAttempt?.outcome === "failed" || live && Object.hasOwn(live, "guardian_diagnostic")) checks.live.status = "unavailable";
   let cache = { status: manualAttempt ? manualAttempt.cacheWritten ? "written" : "skipped" : "not_requested" };
   if (plan.writeLiveCache && !manualAttempt) {
     cache = { status: "skipped" };

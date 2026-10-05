@@ -10,7 +10,7 @@ import { TRANSPORT_OPERATIONS } from "../../adapters/lark-im/transport.mjs";
 import { liveProbeContext } from "../../diagnostics/live-probe-cache.mjs";
 import { invalidateRemoteSampleCache, publicRemoteReport } from "../../diagnostics/remote-sample-cache.mjs";
 import { readStableJsonFile } from "../../diagnostics/private-json-file.mjs";
-import { REMOTE_SAMPLE_GUARDIAN, REMOTE_SAMPLE_TIMEOUT_MS, runGuardedRemoteSampleProcess } from "./remote-sample-process.mjs";
+import { REMOTE_SAMPLE_GUARDIAN, REMOTE_SAMPLE_TIMEOUT_MS, runGuardedRemoteSampleProcess, safeGuardianDiagnostic } from "./remote-sample-process.mjs";
 
 export { REMOTE_SAMPLE_GUARDIAN, REMOTE_SAMPLE_TIMEOUT_MS };
 export const REMOTE_SAMPLE_MAX_BACKOFF_MS = 6 * 60 * 60_000;
@@ -238,7 +238,11 @@ export function createRemoteSampleController(opts, deps = {}) {
 /** The parent only reads the state and starts a bounded child when due.
  * @param {ScheduleOptions} opts */
 export function runScheduledRemoteSample(opts, deps = {}) {
-  const failed = (reason) => { invalidateAttempt(opts, deps, reason); return result("failed", reason); };
+  const failed = (reason, diagnostic = null) => {
+    invalidateAttempt(opts, deps, reason);
+    const safe = safeGuardianDiagnostic(diagnostic);
+    return { ...result("failed", reason), ...(safe ? { guardian_diagnostic: safe } : {}) };
+  };
   try {
     const interval = intervalMs(opts);
     if (interval === 0) return result("disabled", "disabled");
@@ -259,9 +263,10 @@ export function runScheduledRemoteSample(opts, deps = {}) {
       input: JSON.stringify({ db: resolve(opts.db), logDir: resolve(opts.logDir), remoteSampleIntervalSeconds: interval / 1000, cooldownsByOperation: cooldowns,
         collectorOptions: boundedCollectorOptions(deps.collectorOptions), returnReport: deps.returnReport === true }),
     }, deps);
-    if (child.error || child.signal) return failed("sample_process_failed");
+    if (child.guardian_diagnostic || child.error || child.signal) return failed("sample_process_failed", child.guardian_diagnostic);
     let output;
     try { output = JSON.parse(String(child.stdout || "")); } catch { return failed("sample_process_failed"); }
+    if (output?.report && Object.hasOwn(output.report, "guardian_diagnostic")) return failed("sample_process_failed", output.report.guardian_diagnostic);
     if (child.status !== 0 || !["ok", "busy", "not_due", "failed"].includes(output?.outcome)) return failed("sample_process_failed");
     const reasons = new Set(["sampled", "sample_failed", "scheduler_busy", "sync_busy", "not_due", "state_invalid", "database_unavailable", "state_write_failed", "database_changed", "scheduler_unavailable", "cache_write_failed"]);
     if (!reasons.has(output.reason)) return failed("sample_process_failed");

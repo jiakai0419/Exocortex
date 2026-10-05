@@ -9,7 +9,8 @@ import { tryAcquireLarkApiLease, readSharedLarkCooldown, writeSharedLarkCooldown
 import { readRemoteAccountBinding } from './remote-account-binding.mjs';
 import { inspectRemoteSampleSnapshot } from './remote-sample-coverage.mjs';
 import { SAMPLE_POLICY, digest, epoch, selectSampleChats, evaluateSample } from './remote-sample-core.mjs';
-import { runGuardedRemoteSampleProcess } from '../runtime/worker/remote-sample-process.mjs';
+import { runGuardedRemoteSampleProcess, safeGuardianDiagnostic } from '../runtime/worker/remote-sample-process.mjs';
+import { publicRemoteReport } from './remote-sample-cache.mjs';
 export { writeRemoteSampleCache } from './remote-sample-cache.mjs';
 const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
@@ -206,14 +207,23 @@ export function runReadOnlyRemoteSample(db, options = {}, deps = {}) {
     { input: JSON.stringify({ mode: 'read_only', db, options: { startMs: options.startMs, endMs: options.endMs,
       hotChats: options.hotChats, messagesPerChat: options.messagesPerChat } }),
       env: options.env || process.env }, deps);
-  if (!result.error && !result.signal && result.status === 0) {
+  const diagnostic = safeGuardianDiagnostic(result.guardian_diagnostic);
+  if (!diagnostic && !result.error && !result.signal && result.status === 0) {
     try {
       const parsed = JSON.parse(String(result.stdout));
-      if (['ok','busy','failed'].includes(parsed.outcome) && parsed.report?.schema_version === 3) return parsed;
+      if (['ok','busy','failed'].includes(parsed.outcome) && parsed.report?.schema_version === 3) {
+        if (Object.hasOwn(parsed.report, 'guardian_diagnostic')) {
+          const report = publicRemoteReport(parsed.report);
+          return { outcome: 'failed', report, ...(report.guardian_diagnostic ? { guardian_diagnostic: report.guardian_diagnostic } : {}) };
+        }
+        return parsed;
+      }
     } catch { /* No raw parser/output excerpts. */ }
   }
   const end = Math.floor((at - SAMPLE_POLICY.stableBufferMs) / 60000) * 60000;
-  return { outcome: 'failed', report: { schema_version: 3, ok: false, status: 'unavailable', reason: 'sample_process_failed',
+  return { outcome: 'failed', ...(diagnostic ? { guardian_diagnostic: diagnostic } : {}),
+    report: { schema_version: 3, ok: false, status: 'unavailable', reason: 'sample_process_failed',
+    ...(diagnostic ? { guardian_diagnostic: diagnostic } : {}),
     checked_at: new Date(at).toISOString(), window: { start: new Date(end - SAMPLE_POLICY.windowMs).toISOString(), end: new Date(end).toISOString() },
     probe: {}, findings: {}, binding: {state:'unverified'} } };
 }
