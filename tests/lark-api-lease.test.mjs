@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { acquireSyncLarkApiLease, tryAcquireLarkApiLease } from "../src/runtime/lark-api-lease.mjs";
 import { createLarkCliRunner, createTransportState } from "../src/adapters/lark-im/transport.mjs";
+import { startOwnedProcess, waitUntil } from "./helpers/owned-process.mjs";
 
 function fixture(t) {
   const root = mkdtempSync(join(tmpdir(), "exocortex-kernel-lease-synthetic-"));
@@ -125,39 +126,84 @@ test("real concurrent kernel contenders never enter the synthetic critical secti
   assert.deepEqual(readdirSync(deps.directory), ["api.lock"]);
 });
 
-test("killing the real owner releases its kernel lease without process inspection", { timeout: 10000 }, async (t) => {
-  const deps = fixture(t);
-  const moduleUrl = new URL("../src/runtime/lark-api-lease.mjs", import.meta.url).href;
-  const child = spawn(process.execPath, ["--input-type=module", "-e", `
-    import { tryAcquireLarkApiLease } from ${JSON.stringify(moduleUrl)};
-    const lease = tryAcquireLarkApiLease({role:'sync'}, {directory:process.argv[1]});
-    process.stdout.write(lease.state);
-    setInterval(() => {}, 1000);`, deps.directory]);
-  t.after(() => { if (child.exitCode === null) child.kill("SIGKILL"); });
-  const state = await new Promise((resolve, reject) => {
-    child.stdout.once("data", (data) => resolve(String(data))); child.once("error", reject);
-  });
-  assert.equal(state, "acquired");
-  assert.equal(tryAcquireLarkApiLease({ role: "probe" }, deps).state, "busy");
-  const exited = new Promise((resolve) => child.once("exit", resolve)); child.kill("SIGKILL"); await exited;
-  const recovered = tryAcquireLarkApiLease({ role: "probe" }, deps);
-  assert.equal(recovered.state, "acquired"); recovered.release();
-});
+let ownedProcessFailure = null;
+async function ownedLeaseCase(t, run) {
+  if (ownedProcessFailure) { t.skip("a prior owned-process failure stopped subsequent real lease cases"); return; }
+  const deadline = performance.now() + 10000;
+  let root, owner, completed = false;
+  try {
+    root = mkdtempSync(join(tmpdir(), "exocortex-owned-lease-synthetic-"));
+    const deps = { root, directory: join(root, "lease") };
+    await run({ deps, deadline, start(code, stdio) {
+      assert.equal(owner, undefined, "each case owns one child and one signal slot");
+      assert.ok(performance.now() < deadline, "do not spawn after the absolute case deadline");
+      owner = startOwnedProcess(process.execPath, ["--input-type=module", "-e", code, deps.directory],
+        { deadline, cwd: root, stdio, detached: false, maxBytes: 4096 });
+      let output = "", finished = false;
+      owner.child.stdout.on("data", data => { output += String(data); });
+      owner.result.then(() => { finished = true; });
+      return { ...owner, async ready(expected) {
+        await waitUntil(() => output === expected || finished, deadline - 2000, "synthetic_lease_ready");
+        assert.equal(output, expected, "the synthetic child must acquire or inherit its descriptor");
+      } };
+    } });
+    assert.ok(performance.now() < deadline, "the 20-second fallback cannot count as accepted cleanup");
+    completed = true;
+  } catch (error) {
+    ownedProcessFailure = error;
+    owner?.stop("owned_lease_assertion_failed");
+    if (owner) await owner.result;
+    t.diagnostic(`Synthetic fixture retained at ${root || 'fixture setup did not finish'}; process cleanup is unconfirmed. No signal retry or alternate target was used.`);
+    throw error;
+  } finally {
+    if (completed) rmSync(root, { recursive: true, force: true });
+  }
+}
 
-test("an inherited request descriptor retains the lease after the Node owner closes", { timeout: 10000 }, async (t) => {
-  const deps = fixture(t), lease = tryAcquireLarkApiLease({ role: "sync" }, deps);
-  assert.equal(lease.state, "acquired");
-  const child = spawn(process.execPath, ["-e", "process.stdout.write('ready');setInterval(()=>{},1000)"], { stdio: lease.stdio });
-  t.after(() => { lease.release(); if (child.exitCode === null) child.kill("SIGKILL"); });
-  await new Promise((resolve, reject) => { child.stdout.once("data", resolve); child.once("error", reject); });
-  lease.release();
-  assert.equal(tryAcquireLarkApiLease({ role: "probe" }, deps).state, "busy");
-  const exited = new Promise((resolve) => child.once("exit", resolve)); child.kill("SIGKILL"); await exited;
-  const next = tryAcquireLarkApiLease({ role: "probe" }, deps);
-  assert.equal(next.state, "acquired"); next.release();
-});
+async function killOwnedLeaseProcess(owner) {
+  assert.equal(owner.signalOnce("SIGKILL"), true, "terminate only the direct owned child, once");
+  const result = await owner.result;
+  assert.equal(result.failure, null, "the child must close within the same absolute case deadline");
+  assert.equal(result.signalError, null, "a refused signal must not be retried");
+  assert.equal(result.signal, "SIGKILL");
+  assert.equal(result.stderr.toString(), "");
+}
+
+test("killing the real owner releases its kernel lease without process inspection", { timeout: 11000, concurrency: false }, async (t) => ownedLeaseCase(t, async ({ deps, deadline, start }) => {
+  const moduleUrl = new URL("../src/runtime/lark-api-lease.mjs", import.meta.url).href;
+  const owner = start(`
+    import { tryAcquireLarkApiLease } from ${JSON.stringify(moduleUrl)};
+    setTimeout(() => process.exit(2), 20000);
+    const lease = tryAcquireLarkApiLease({role:'sync'}, {directory:process.argv[1]});
+    process.stdout.write(lease.state);`);
+  await owner.ready("acquired");
+  const contender = tryAcquireLarkApiLease({ role: "probe", monotonicDeadlineMs: deadline }, deps);
+  try { assert.equal(contender.state, "busy"); } finally { contender.release(); }
+  await killOwnedLeaseProcess(owner);
+  const recovered = tryAcquireLarkApiLease({ role: "probe", monotonicDeadlineMs: deadline }, deps);
+  try { assert.equal(recovered.state, "acquired"); } finally { recovered.release(); }
+}));
+
+test("an inherited request descriptor retains the lease after the Node owner closes", { timeout: 11000, concurrency: false }, async (t) => ownedLeaseCase(t, async ({ deps, deadline, start }) => {
+  const lease = tryAcquireLarkApiLease({ role: "sync", monotonicDeadlineMs: deadline }, deps);
+  let released = false;
+  try {
+    assert.equal(lease.state, "acquired");
+    assert.ok(Array.isArray(lease.stdio) && Number.isSafeInteger(lease.stdio[3]));
+    const owner = start(`import{fstatSync}from'node:fs';setTimeout(()=>process.exit(2),20000);
+      if(!fstatSync(3).isFile())process.exit(2);process.stdout.write('ready');`, ["ignore", "pipe", "pipe", lease.stdio[3]]);
+    await owner.ready("ready");
+    released = true; lease.release();
+    const contender = tryAcquireLarkApiLease({ role: "probe", monotonicDeadlineMs: deadline }, deps);
+    try { assert.equal(contender.state, "busy"); } finally { contender.release(); }
+    await killOwnedLeaseProcess(owner);
+    const next = tryAcquireLarkApiLease({ role: "probe", monotonicDeadlineMs: deadline }, deps);
+    try { assert.equal(next.state, "acquired"); } finally { next.release(); }
+  } finally { if (!released) lease.release(); }
+}));
 
 test("the real transport inherits the acquired descriptor into its synthetic command", (t) => {
+  if (ownedProcessFailure) { t.skip("a prior owned-process failure stopped subsequent real lease cases"); return; }
   const deps = fixture(t), lease = tryAcquireLarkApiLease({ role: "sync" }, deps);
   try {
     assert.equal(lease.state, "acquired");

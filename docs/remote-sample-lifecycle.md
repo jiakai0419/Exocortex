@@ -1,7 +1,7 @@
 # Remote sample process lifetime
 
 This isolated candidate changes per-attempt supervision, not scheduling. Production
-activation and actual OS lifecycle acceptance remain a separate review gate.
+activation remains a separate review gate; synthetic OS acceptance is recorded below.
 
 ## Alternatives and decision
 
@@ -141,16 +141,51 @@ They remain explicit regression cases; the earlier tests are retained.
 
 ## Acceptance boundary
 
-Only static checks and OS-mocked state-machine tests are authorized in this
-iteration. They cover very fast worker exit with code 0 and 7, retained live
+The initial iteration used static checks and OS-mocked state-machine tests.
+Those cover very fast worker exit with code 0 and 7, retained live
 descendants, startup/completion ordering, control EOF and malformed frames,
 caller exit, shared deadlines, output bounds and cleanup failures. Fixtures are
 invented; no real trace, host paths or business identifiers belong in Git.
 
-Actual process groups, signal delivery and lock release remain unverified until
-independent review authorizes a bounded synthetic acceptance run. Do not infer
-runtime acceptance from the mocks or from source analysis on another kernel
-version. The minimum future acceptance matrix is:
+An independently reviewed bounded synthetic run has since passed eight cases:
+both public entries with fast exit 0/7, a descendant retaining lock/output
+descriptors, and the shared deadline. All recorded test processes exited and
+the four descendant/deadline cases reacquired their private API lock. The two
+successful cache publications contain valid inconclusive evidence, not a
+healthy remote sample. This establishes only that first-stage matrix.
+
+The subsequent isolated run passed eight additional lifecycle cases: overflow
+and caller TERM/KILL/HUP through both public entries. Four real cache cases also
+passed: worker startup failure invalidates a healthy synthetic seed, a missing
+stage cannot publish success, a stale same-database parent precheck preserves
+the newer cache bytes/TTL/mtime, and different database identities contend on
+one cache lock. Each cache case required all recorded processes to exit and
+both the private API lock and the exact scheduler lock to be acquired again.
+These fixtures do not call a business API or open a business database.
+
+The complete `node tools/verify.mjs` entry (also used by `npm run verify`) passed
+build, typecheck, syntax, all 2,774 tests without skips, and the independent clean
+generated-file comparison. An initial outer-runner umask override made seven
+existing synthetic file-mode assertions fail; preserving the caller's original
+umask fixed that harness mistake without changing product code or those
+assertions. The enclosing temporary directory remains private.
+
+The reusable test process helper has one signal slot shared by injected signals,
+watchdogs and failure cleanup. A refused signal cannot trigger another attempt.
+The new process/cache matrices use ten-second absolute case deadlines and
+later fixture fallback exits, retain failed evidence, and stop later cases after
+the first failure. Mock regressions cover refusal, competing stop paths and late
+successful closes. Existing lease, scheduler and WAL tests now share that same
+single-attempt rule where their prior cleanup callbacks could send a second
+signal. This is not a claim that every unrelated legacy test failure path has
+been redesigned: an outer verification timeout reports cleanup as unconfirmed.
+
+Further isolated synthetic OS acceptance and complete verification are now
+authorized. Historical Python PermissionError output came from an executed
+program, not an approval denial; it does not establish a platform prohibition.
+Any actual tool denial still stops the corresponding action without retries or
+an alternate execution environment. Do not infer runtime acceptance from mocks
+or source analysis on another kernel version. The complete matrix is:
 
 1. Fast no-descendant worker exit 0 and 7: preserve result, finite cleanup, no
    residual group, no EPERM suppression.

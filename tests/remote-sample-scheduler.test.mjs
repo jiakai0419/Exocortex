@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
-import { once } from 'node:events';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -15,14 +14,19 @@ import { createRemoteSamplePublication } from '../src/runtime/worker/remote-samp
 import { parseArgs, runWorker } from '../src/runtime/worker/worker.mjs';
 import { parseWorkerProgramArguments, validateWorkerOptions, workerProgramArguments } from '../src/runtime/worker/options.mjs';
 import { parseRouteOptions } from '../src/cli/registry.mjs';
+import { startOwnedProcess, waitUntil as waitForCondition } from './helpers/owned-process.mjs';
 
 const START = Date.parse('2030-01-01T12:00:00Z');
 const OBS_KEY = 'a'.repeat(64);
 const ACCOUNT = 'b'.repeat(64);
 const observation = (now = START) => ({ kind: 'missing', first_seen: now, last_seen: now, run_finished: 0, target: now - 3_600_000 });
-function fixture(t) {
+function fixture(t, { preserveOnFailure = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'exo-synthetic-schedule-'));
-  t.after(() => rmSync(dir, { force: true, recursive: true }));
+  let passed = !preserveOnFailure;
+  t.after(() => {
+    if (passed) rmSync(dir, { force: true, recursive: true });
+    else t.diagnostic(`Failed synthetic fixture retained: ${dir}`);
+  });
   const db = join(dir, 'invented.sqlite'); writeFileSync(db, 'synthetic identity only', { mode: 0o600 });
   const key = activityDatabaseKey(db); const paths = remoteSamplePaths(dir, key);
   const opts = { db, logDir: dir, remoteSampleIntervalSeconds: 900, publication: createRemoteSamplePublication(dir, key) };
@@ -33,7 +37,40 @@ function fixture(t) {
     writeCache: path => { assert.equal(path, opts.publication.stagePath); caches++; return {}; } };
   return { opts, key, paths, deps, result, setNow: value => { now = value; }, now: () => now,
     calls: () => calls, caches: () => caches, options: () => latestOptions,
+    markPassed: () => { passed = true; },
     state: () => readRemoteSampleState(paths.state, key, now).state };
+}
+
+function remainingCaseMs(deadline, maximum = 2000) {
+  const remaining = Math.floor(deadline - performance.now());
+  assert.ok(remaining > 0, 'synthetic case deadline exceeded');
+  return Math.min(maximum, remaining);
+}
+
+function ownCaseProcess(t, command, args, deadline, cleanupSignal = 'SIGTERM') {
+  remainingCaseMs(deadline);
+  const owner = startOwnedProcess(command, args, { deadline });
+  // Give a guardian time to run its own group cleanup before the helper's
+  // watchdog. Mark this as failure even if cleanup then exits successfully.
+  const guardianWatchdog = cleanupSignal === 'SIGTERM' ? setTimeout(() => {
+    owner.signalOnce('SIGTERM');
+    owner.stop('synthetic_guardian_watchdog');
+  }, Math.max(0, deadline - performance.now() - 3000)) : null;
+  owner.result.then(() => clearTimeout(guardianWatchdog));
+  t.after(async () => {
+    // Body, watchdog and cleanup all share the helper's single signal slot.
+    clearTimeout(guardianWatchdog);
+    owner.signalOnce(cleanupSignal);
+    await owner.result;
+  });
+  return owner;
+}
+
+function assertOwnedResult(result, { code = 0, signal = null } = {}) {
+  assert.equal(result.failure, null, 'owned process watchdog or execution failed');
+  assert.equal(result.signalError, null, 'owned process signal failed');
+  assert.equal(result.code, code);
+  assert.equal(result.signal, signal);
 }
 
 test('interval default, supported range, disable and service serialization agree', () => {
@@ -254,27 +291,33 @@ test('worker passes diagnostic endpoint cooldown to the next sync cycle', () => 
   assert.equal(ok, true); assert.equal(calls, 2);
 });
 
-test('kernel lock excludes another worker and releases automatically on SIGKILL', async t => {
-  const f = fixture(t); const lock = join(f.opts.logDir, 'synthetic.lock');
+test('kernel lock excludes another worker and releases automatically on SIGKILL', { timeout: 20_000 }, async t => {
+  const deadline = performance.now() + 10_000;
+  const f = fixture(t, { preserveOnFailure: true }); const lock = join(f.opts.logDir, 'synthetic.lock');
   const script = join(f.opts.logDir, 'hold.mjs');
-  writeFileSync(script, "import{fstatSync}from'node:fs';process.stdout.write(String(fstatSync(Number(process.env.EXOCORTEX_REMOTE_SAMPLE_LOCK_FD)).isFile())+'\\n');setInterval(()=>{},1000);\n");
+  writeFileSync(script, "import{fstatSync}from'node:fs';process.stdout.write(String(fstatSync(Number(process.env.EXOCORTEX_REMOTE_SAMPLE_LOCK_FD)).isFile())+'\\n');setTimeout(()=>process.exit(2),20000);\n");
   // The wrapper execs the same Python interpreter. This small Python program
   // then execs the synthetic Node owner without dropping its inherited fd.
   const execNode = 'import os,sys;os.execv(sys.argv[1],sys.argv[1:])';
   const args = ['-c', REMOTE_SAMPLE_LOCK_WRAPPER, lock, 'python3', '-c', execNode, process.execPath, script];
-  const child = spawn('python3', args, { stdio: ['ignore', 'pipe', 'pipe'] });
-  t.after(() => child.kill('SIGKILL'));
-  const deadline = setTimeout(() => child.kill('SIGKILL'), 5_000);
+  const owner = ownCaseProcess(t, 'python3', args, deadline, 'SIGKILL');
+  let output = '';
+  owner.child.stdout.on('data', chunk => { output += String(chunk); });
+  const watchdog = setTimeout(() => owner.stop('synthetic_lock_watchdog'), 5_000);
+  t.after(() => clearTimeout(watchdog));
   try {
-    const [chunk] = await once(child.stdout, 'data'); assert.match(String(chunk), /true/);
+    await waitForCondition(() => output.includes('true'), deadline, 'synthetic_lock_ready');
     const contender = ['-c', REMOTE_SAMPLE_LOCK_WRAPPER, lock, 'python3', '-c', execNode, process.execPath, '-e', 'process.stdout.write("acquired")'];
-    const competing = spawnSync('python3', contender, { encoding: 'utf8', timeout: 2000 });
+    const competing = spawnSync('python3', contender, { encoding: 'utf8', timeout: remainingCaseMs(deadline) });
     assert.equal(competing.status, 0); assert.equal(JSON.parse(competing.stdout).reason, 'scheduler_busy');
-    const finished = once(child, 'close'); child.kill('SIGKILL'); await finished;
-    const restarted = spawnSync('python3', contender, { encoding: 'utf8', timeout: 2000 });
+    assert.equal(owner.signalOnce('SIGKILL'), true, 'the test body must own the only termination attempt');
+    assertOwnedResult(await owner.result, { code: null, signal: 'SIGKILL' });
+    const restarted = spawnSync('python3', contender, { encoding: 'utf8', timeout: remainingCaseMs(deadline) });
     assert.equal(restarted.status, 0); assert.equal(restarted.stdout, 'acquired');
     assert.equal(statSync(lock).mode & 0o777, 0o600);
-  } finally { clearTimeout(deadline); }
+    remainingCaseMs(deadline);
+    f.markPassed();
+  } finally { clearTimeout(watchdog); }
 });
 
 test('a parent observing killed child cannot overwrite cache outside the guardian-held lock', t => {
@@ -376,7 +419,7 @@ function alive(pid) { try { process.kill(pid, 0); return true; } catch (e) { if 
 function blockedProbe(f) {
   const script = join(f.opts.logDir, 'synthetic-blocked-probe.mjs');
   const ready = join(f.opts.logDir, 'synthetic-ready.json');
-  writeFileSync(script, `import{writeFileSync}from'node:fs';writeFileSync(${JSON.stringify(ready)},JSON.stringify({pid:process.pid,parent:process.ppid}),{mode:0o600});setInterval(()=>{},1000);\n`);
+  writeFileSync(script, `import{writeFileSync}from'node:fs';writeFileSync(${JSON.stringify(ready)},JSON.stringify({pid:process.pid,parent:process.ppid}),{mode:0o600});setTimeout(()=>process.exit(2),20000);\n`);
   return { script, ready };
 }
 
@@ -408,31 +451,32 @@ test('background start returns before a blocked probe and explicit stop kills it
   await waitUntil(() => !alive(child.pid));
 });
 
-test('guardian enforces its deadline independently of the worker event loop', async t => {
-  const f = fixture(t); const probe = blockedProbe(f); const before = Date.now();
-  const guardian = spawn('python3', ['-c', REMOTE_SAMPLE_LOCK_WRAPPER, join(f.opts.logDir, 'synthetic-deadline.lock'), 'python3',
-    '-c', REMOTE_SAMPLE_GUARDIAN, String(process.pid), '600', process.execPath, probe.script], { stdio: 'ignore', detached: true });
-  t.after(() => guardian.kill('SIGTERM'));
-  const closed = once(guardian, 'close');
-  await waitUntil(() => existsSync(probe.ready));
+test('guardian enforces its deadline independently of the worker event loop', { timeout: 20_000 }, async t => {
+  const deadline = performance.now() + 10_000;
+  const f = fixture(t, { preserveOnFailure: true }); const probe = blockedProbe(f); const before = Date.now();
+  const guardian = ownCaseProcess(t, 'python3', ['-c', REMOTE_SAMPLE_LOCK_WRAPPER, join(f.opts.logDir, 'synthetic-deadline.lock'), 'python3',
+    '-c', REMOTE_SAMPLE_GUARDIAN, String(process.pid), '600', process.execPath, probe.script], deadline);
+  await waitForCondition(() => existsSync(probe.ready), deadline, 'synthetic_probe_ready');
   const child = JSON.parse(readFileSync(probe.ready, 'utf8'));
   // This blocks Node's loop: the separate supervisor must still enforce time.
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 800);
-  await closed;
+  assertOwnedResult(await guardian.result, { code: 2 });
   assert.ok(Date.now() - before < 3000); assert.equal(alive(child.pid), false);
+  f.markPassed();
 });
 
-test('guardian observes parent exit and removes an unfinished probe without waiting sixty seconds', async t => {
-  const f = fixture(t); const probe = blockedProbe(f); const launcher = join(f.opts.logDir, 'synthetic-parent.mjs');
+test('guardian observes parent exit and removes an unfinished probe without waiting sixty seconds', { timeout: 20_000 }, async t => {
+  const deadline = performance.now() + 10_000;
+  const f = fixture(t, { preserveOnFailure: true }); const probe = blockedProbe(f); const launcher = join(f.opts.logDir, 'synthetic-parent.mjs');
   writeFileSync(launcher, `import{spawn}from'node:child_process';import{existsSync}from'node:fs';
     const guardian=spawn('python3',['-c',${JSON.stringify(REMOTE_SAMPLE_LOCK_WRAPPER)},${JSON.stringify(join(f.opts.logDir, 'parent-exit.lock'))},'python3',
       '-c',${JSON.stringify(REMOTE_SAMPLE_GUARDIAN)},String(process.pid),'60000',process.execPath,${JSON.stringify(probe.script)}],{stdio:'ignore',detached:true});
     guardian.unref();const timer=setInterval(()=>{if(existsSync(${JSON.stringify(probe.ready)})){clearInterval(timer);process.exit(0)}},10);setTimeout(()=>process.exit(2),2000).unref();\n`);
-  const parent = spawn(process.execPath, [launcher], { stdio: 'ignore' });
-  t.after(() => parent.kill('SIGKILL'));
-  const [code] = await once(parent, 'close'); assert.equal(code, 0);
+  const parent = ownCaseProcess(t, process.execPath, [launcher], deadline, 'SIGKILL');
+  assertOwnedResult(await parent.result);
   const child = JSON.parse(readFileSync(probe.ready, 'utf8'));
-  await waitUntil(() => !alive(child.pid));
+  await waitForCondition(() => !alive(child.pid), deadline, 'synthetic_probe_exit');
+  f.markPassed();
 });
 
 test('controller suppresses duplicate launches and stops its one owned job', () => {
@@ -474,20 +518,20 @@ test('worker finally stops the asynchronous diagnostic on sync exceptions', () =
   assert.equal(stopped, 1);
 });
 
-test('guardian removes a spawned CLI descendant when the probe leader exits', async t => {
-  const f = fixture(t); const script = join(f.opts.logDir, 'synthetic-descendant.mjs');
+test('guardian removes a spawned CLI descendant when the probe leader exits', { timeout: 20_000 }, async t => {
+  const deadline = performance.now() + 10_000;
+  const f = fixture(t, { preserveOnFailure: true }); const script = join(f.opts.logDir, 'synthetic-descendant.mjs');
   const ready = join(f.opts.logDir, 'synthetic-descendant.json');
   writeFileSync(script, `import{spawn}from'node:child_process';import{writeFileSync}from'node:fs';
-    const descendant=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});
+    const descendant=spawn(process.execPath,['-e','setTimeout(()=>process.exit(2),20000)'],{stdio:'ignore'});
     writeFileSync(${JSON.stringify(ready)},JSON.stringify({pid:descendant.pid}),{mode:0o600});
     descendant.unref();setTimeout(()=>process.exit(0),100);\n`);
-  const guardian = spawn('python3', ['-c', REMOTE_SAMPLE_LOCK_WRAPPER, join(f.opts.logDir, 'synthetic-descendant.lock'), 'python3',
-    '-c', REMOTE_SAMPLE_GUARDIAN, String(process.pid), '2000', process.execPath, script], { stdio: 'ignore', detached: true });
-  t.after(() => guardian.kill('SIGTERM'));
-  const closed = once(guardian, 'close');
-  await waitUntil(() => existsSync(ready));
+  const guardian = ownCaseProcess(t, 'python3', ['-c', REMOTE_SAMPLE_LOCK_WRAPPER, join(f.opts.logDir, 'synthetic-descendant.lock'), 'python3',
+    '-c', REMOTE_SAMPLE_GUARDIAN, String(process.pid), '2000', process.execPath, script], deadline);
+  await waitForCondition(() => existsSync(ready), deadline, 'synthetic_descendant_ready');
   const descendant = JSON.parse(readFileSync(ready, 'utf8'));
   assert.equal(alive(descendant.pid), true);
-  await closed;
-  await waitUntil(() => !alive(descendant.pid));
+  assertOwnedResult(await guardian.result);
+  await waitForCondition(() => !alive(descendant.pid), deadline, 'synthetic_descendant_exit');
+  f.markPassed();
 });

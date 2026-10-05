@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -16,10 +16,11 @@ import { collectCheckReport } from "../src/diagnostics/check-report.mjs";
 import { createCommandContext } from "../src/cli/context.mjs";
 import { executeSyncRepair } from "../src/maintenance/repair.mjs";
 import { parseRouteOptions } from "../src/cli/registry.mjs";
+import { startOwnedProcess, waitUntil } from "./helpers/owned-process.mjs";
 
-function fixture(t, journalMode = "DELETE") {
+function fixture(t, journalMode = "DELETE", evidence = {}) {
   const dir = mkdtempSync(join(tmpdir(), "exocortex-readonly-"));
-  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  t.after(() => { if (!evidence.preserve) rmSync(dir, { recursive: true, force: true }); });
   const db = join(dir, "test.sqlite");
   ensureInitialized(db);
   const journal = spawnSync("sqlite3", [db, `PRAGMA journal_mode=${journalMode};`], { encoding: "utf8" });
@@ -202,34 +203,36 @@ test("WAL-header diagnostics stay read-only with missing coordination files", as
 });
 
 test("WAL diagnostics see committed frames and preserve existing WAL and business evidence", { timeout: 30_000 }, async (t) => {
-  const { dir, db } = fixture(t, "WAL");
+  const deadline = performance.now() + 25_000;
+  const evidence = { preserve: true };
+  const { dir, db } = fixture(t, "WAL", evidence);
   seedStaleState(db);
   chmodSync(dir, 0o755);
   chmodSync(db, 0o644);
   const markerQuery = "SELECT json_extract(config_json, '$.synthetic_wal_evidence') AS value FROM sources WHERE id='lark.im';";
   assert.deepEqual(readOnlySqliteJson(db, markerQuery, "read initial synthetic marker"), [{ value: null }]);
   const mainBeforeWriter = sha256(readFileSync(db));
-  const writer = spawn("python3", ["-u", "-c", `
-import sqlite3, sys
+  const readyPath = join(dir, "writer-ready"), releasePath = join(dir, "writer-release");
+  const owner = startOwnedProcess("python3", ["-u", "-c", `
+import os, sqlite3, sys, time
 con = sqlite3.connect(sys.argv[1])
 con.execute('PRAGMA wal_autocheckpoint=0')
 con.execute("UPDATE sources SET config_json=json_set(config_json, '$.synthetic_wal_evidence', 1) WHERE id='lark.im'")
 con.commit()
-print('ready', flush=True)
-sys.stdin.read()
+with open(sys.argv[2], 'x') as marker: marker.write('ready')
+# This synthetic fallback is later than the entire acceptance deadline.
+# The only signal owner is the Node helper; the fixture never self-signals.
+fallback = time.monotonic() + 35
+while not os.path.exists(sys.argv[3]):
+    if time.monotonic() >= fallback:
+        con.close()
+        sys.exit(98)
+    time.sleep(0.01)
 con.close()
-`, db], { stdio: ["pipe", "pipe", "pipe"] });
-  const closed = new Promise((resolve) => writer.once("close", resolve));
-  let stderr = "";
-  writer.stderr.on("data", (chunk) => { stderr += chunk; });
+`, db, readyPath, releasePath], { deadline, cwd: dir });
+  let failure = null;
   try {
-    await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { writer.kill(); reject(new Error("synthetic WAL writer did not become ready")); }, 10_000);
-      const finish = (error) => { clearTimeout(timer); error ? reject(error) : resolve(); };
-      writer.once("error", finish);
-      writer.once("exit", () => finish(new Error(`synthetic WAL writer exited before readiness: ${stderr}`)));
-      writer.stdout.once("data", (chunk) => finish(String(chunk).trim() === "ready" ? null : new Error("unexpected synthetic WAL writer output")));
-    });
+    await waitUntil(() => existsSync(readyPath), Math.min(deadline, performance.now() + 10_000), "synthetic_wal_writer_ready");
     const before = snapshot(dir, db);
     assert.ok(before.wal?.size > 0, "fixture must have committed WAL frames");
     assert.equal(before.sha256, mainBeforeWriter, "synthetic marker must exist only in uncheckpointed WAL frames");
@@ -239,12 +242,24 @@ con.close()
     assertWritesRejected(db);
     assert.equal(businessSnapshot(db), businessBefore);
     assertWalUnchanged(before, snapshot(dir, db), db);
-  } finally {
-    writer.stdin.end();
-    const shutdownTimer = setTimeout(() => writer.kill("SIGKILL"), 5_000);
-    try { assert.equal(await closed, 0, stderr); }
-    finally { clearTimeout(shutdownTimer); }
+  } catch (error) { failure = error; }
+  try { writeFileSync(releasePath, "release", { mode: 0o600, flag: "wx" }); }
+  catch (error) { failure ||= error; }
+  if (failure) owner.stop("synthetic_wal_diagnostics_failed");
+  const result = await owner.result;
+  try {
+    assert.equal(result.failure, null, `synthetic writer failed: ${result.failure}`);
+    assert.equal(result.signalError, null, "signal refusal must fail without retry");
+    assert.equal(result.signalAttempted, false, "successful diagnostics require natural writer closure");
+    assert.equal(result.signal, null);
+    assert.equal(result.code, 0, result.stderr.toString());
+    assert.ok(performance.now() < deadline, "fallback closure cannot make the test pass");
+  } catch (error) { failure ||= error; }
+  if (failure) {
+    t.diagnostic(`Synthetic WAL evidence retained: ${dir}; no signal retry or alternate target was used.`);
+    throw failure;
   }
+  evidence.preserve = false;
 });
 
 test("repair only calls recovery after an explicit apply flag", () => {
