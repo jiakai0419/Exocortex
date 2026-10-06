@@ -24,6 +24,14 @@ npm run verify
 
 缺失声明、陈旧内容、孤立生成文件都应使 build:check 失败；Git 中 dist 干净不等于输出正确。普通 build 不负责移除不再生成的孤立文件，删除源模块时同时处理对应旧生成物。不要在运行中的 checkout 执行会构建 dist 的任务。
 
+### macOS CI
+
+唯一完整 CI job `Check and test` 使用标准 `macos-26` ARM64 runner，保留 Node.js 22、`npm ci` 和完整 `npm run verify`，不另设 Linux 全量矩阵。测试仍最多四个文件并行，job 上限仍为 10 分钟，不因平台跳过测试。
+
+CI 通过临时命令目录明确选择 `/usr/bin/python3` 与 `/usr/bin/sqlite3`，不遮蔽 `setup-node` 提供的 Node。预检输出系统、架构及依赖路径和版本，确认 Python 3.9+、`fcntl.flock`/非阻塞 FD、Python SQLite 的 JSON/schema 查询，以及 SQLite CLI 3.35+ 的 JSON 输出、JSON 函数、MATERIALIZED、RETURNING 和只读参数；数据库检查仅用 `:memory:`。系统依赖缺失或能力不符会失败，不自动升级系统工具。
+
+完整测试使用合成数据、临时文件和测试自有进程；CI 不配置业务凭据、不调用真实飞书 API、不读取个人数据库。macOS 上的进程、锁、权限和 SQLite 回归不等于用户机器的实际验收：现有 launchd/Keychain 测试仍使用模拟，真实 LaunchAgent、登录权限和账号关联按 Operations 单独验收。
+
 ## Four development and research entrypoints
 
 | 可执行文件 | 能力 |

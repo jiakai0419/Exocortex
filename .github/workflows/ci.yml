@@ -14,8 +14,10 @@ permissions:
 jobs:
   test:
     name: Check and test
-    runs-on: ubuntu-latest
+    runs-on: macos-26
     timeout-minutes: 10
+    env:
+      EXOCORTEX_SYNTHETIC_PYTHON: /usr/bin/python3
 
     steps:
       - name: Checkout
@@ -25,11 +27,46 @@ jobs:
         uses: actions/setup-node@v5
         with:
           node-version: "22"
+          architecture: arm64
 
-      - name: Install system dependencies
+      - name: Select and verify macOS dependencies
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y sqlite3 python3
+          dependency_bin="$(mktemp -d "$RUNNER_TEMP/exocortex-deps.XXXXXX")"
+          ln -s /usr/bin/python3 "$dependency_bin/python3"
+          ln -s /usr/bin/sqlite3 "$dependency_bin/sqlite3"
+          printf '%s\n' "$dependency_bin" >> "$GITHUB_PATH"
+          export PATH="$dependency_bin:$PATH"
+          sw_vers
+          uname -m
+          node -e 'const assert = require("node:assert/strict"); assert.equal(process.platform, "darwin"); assert.equal(process.arch, "arm64"); assert.equal(process.versions.node.split(".")[0], "22"); console.log("Node:", process.version, process.arch, process.execPath);'
+          python3 - <<'PY'
+          import fcntl, json, os, platform, shutil, sqlite3, subprocess, sys
+
+          assert sys.version_info >= (3, 9), "Python 3.9+ is required by the synthetic tests"
+          assert platform.machine() == "arm64"
+          for name in ("python3", "sqlite3"):
+              path = shutil.which(name)
+              assert path and os.path.realpath(path) == os.path.realpath("/usr/bin/" + name), path
+          assert callable(fcntl.flock) and callable(os.set_blocking)
+          with sqlite3.connect(":memory:") as connection:
+              assert connection.execute("SELECT json_extract('{\"ready\":1}', '$.ready')").fetchone() == (1,)
+              assert connection.execute("SELECT count(*) FROM sqlite_schema").fetchone() == (0,)
+          sql = """
+          CREATE TABLE ci_probe(value INTEGER);
+          WITH input AS MATERIALIZED (SELECT json_extract('{"value":1}', '$.value') AS value)
+          INSERT INTO ci_probe SELECT value FROM input RETURNING value;
+          """
+          result = subprocess.run(["sqlite3", "-batch", "-bail", "-json", ":memory:", sql], check=True, capture_output=True, text=True)
+          assert json.loads(result.stdout) == [{"value": 1}]
+          readonly = subprocess.run(["sqlite3", "-readonly", "-json", ":memory:", "SELECT 1 AS ready"], check=True, capture_output=True, text=True)
+          assert json.loads(readonly.stdout) == [{"ready": 1}]
+          version = subprocess.check_output(["sqlite3", "--version"], text=True).strip()
+          assert tuple(map(int, version.split()[0].split("."))) >= (3, 35, 0)
+          print("Python:", sys.version.split()[0], sys.executable)
+          print("Python SQLite:", sqlite3.sqlite_version)
+          print("SQLite CLI:", os.path.realpath(shutil.which("sqlite3")), version)
+          PY
 
       - name: Install npm dependencies
         run: npm ci
