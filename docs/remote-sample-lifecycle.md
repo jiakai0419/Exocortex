@@ -1,7 +1,8 @@
 # Remote sample process lifetime
 
-This isolated candidate changes per-attempt supervision, not scheduling. Production
-activation remains a separate review gate; synthetic OS acceptance is recorded below.
+This document describes per-attempt supervision, not scheduling. Source verification
+and historical synthetic acceptance are recorded separately below; neither establishes
+deployment or real-account acceptance on any particular host.
 
 ## Alternatives and decision
 
@@ -139,7 +140,24 @@ They remain explicit regression cases; the earlier tests are retained.
 | Worker and anchor exit while outer guardian remains alive | Acceptance tracked process.ppid after adding anchor, which now named the anchor rather than the guardian | Test-only self-recorded outer guardian PID must also exit in fast, descendant and caller-loss cases |
 | Lock-owner and reap wording describe the prior process layout | Review focused on the new lifecycle document and did not reconcile the older design notes | Both documents distinguish guardian lock lifetime, DONE worker result and later anchor reap |
 
+## Source verification baseline
+
+At source revision `01c663d4a622d29af234837845deca68581ff4bd`,
+[CI run 37328197860](https://github.com/jiakai0419/Exocortex/actions/runs/37328197860)
+passed build, typecheck, syntax, all 2,786 tests with no failures or skips, and the
+independent generated-file comparison. This is a fixed repository-verification
+record, not a claim about later revisions or host deployment. The verification
+procedure remains in [Development](development.md#prerequisites-and-verification).
+
 ## Acceptance boundary
+
+### Historical acceptance record
+
+The expanded acceptance record below was added in commit
+`ffaee2ec7c2a0675f600b7ea09a01c4abe17b99c`. The 2,774-test count describes that
+recorded run, not the source-verification baseline above or deployment acceptance.
+This commit identifies the document history; it does not establish the checkout
+SHA used for that historical run.
 
 The initial iteration used static checks and OS-mocked state-machine tests.
 Those cover very fast worker exit with code 0 and 7, retained live
@@ -180,9 +198,11 @@ single-attempt rule where their prior cleanup callbacks could send a second
 signal. This is not a claim that every unrelated legacy test failure path has
 been redesigned: an outer verification timeout reports cleanup as unconfirmed.
 
-Further isolated synthetic OS acceptance and complete verification are now
-authorized. Historical Python PermissionError output came from an executed
-program, not an approval denial; it does not establish a platform prohibition.
+At the time of that review, further isolated synthetic OS acceptance and complete
+verification were authorized. That historical authorization is not an instruction
+to repeat acceptance or change a running service. Historical Python PermissionError
+output came from an executed program, not an approval denial; it does not establish
+a platform prohibition.
 Any actual tool denial still stops the corresponding action without retries or
 an alternate execution environment. Do not infer runtime acceptance from mocks
 or source analysis on another kernel version. The complete matrix is:

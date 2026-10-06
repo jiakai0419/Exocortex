@@ -83,7 +83,7 @@
 | maintenance-check 默认重启 | 开发 verify 与 service restart / check --wait 分开；check 无任何服务变更 |
 | enrich 默认写、dry-run 才预览 | enrich 默认预览，只有 `--apply` 提交；records/scopes 必须显式选一，均无 all |
 | compact 直接写 | 默认预览，`--apply` 才执行实际回收 |
-| lag 的较大默认样本 | live 默认 chat-pages=5、hot-chats=5、messages-per-chat=3；原需 20×5 的自动化显式传参 |
+| lag 的较大默认样本 | `check --live` 默认最多 5 个已发现会话，每会话最多 2 页 × 20 条；`--hot-chats` 收紧会话总数，`--messages-per-chat` 收紧每页条数；`--chat-pages` 仅兼容，不触发远端目录扫描。详见 [Remote sample](operations.md#remote-sample) |
 | live 与缓存写入容易混淆 | `check --live` 默认不写；`--write-live-cache` 只在 live 模式可用，TTL 不充当采样时窗 |
 | 脚本间默认路径依赖 cwd | 默认 DB/log/backup 按安装 root；显式相对路径按 cwd；内部 worker 使用同一规则 |
 | coverage Python 的错误与未完成均为 2 | 公共 check 结构化区分：条件不满足/证据不足为 2，参数/依赖/读取失败为 1 |
