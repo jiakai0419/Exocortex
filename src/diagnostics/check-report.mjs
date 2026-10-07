@@ -6,10 +6,8 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { readDatabaseEvidence, verifyBackupEvidence } from "../storage/sqlite/maintenance.mjs";
 import { buildStatus, sanitizeStatusReportForPublicOutput } from "./sync-status-report.mjs";
 import { collectQualityReport, hasQualityIssues, sanitizeQualityReportForPublicOutput } from "./lark-im-quality-report.mjs";
-import { runReadOnlyRemoteSample, writeRemoteSampleCache } from "./remote-sample.mjs";
+import { runReadOnlyRemoteSample } from "./remote-sample.mjs";
 import { publicRemoteReport } from "./remote-sample-cache.mjs";
-import { sanitizeLagReportForPublicOutput } from "./lark-im-lag-core.mjs";
-import { liveProbeContext, writeLiveProbeCache } from "./live-probe-cache.mjs";
 import { collectStatusEvidence } from "./status-report.mjs";
 import { createCheckPlan } from "./check-plan.mjs";
 import { evaluateWaitState, isLocalReady } from "./service-wait-state.mjs";
@@ -117,7 +115,6 @@ async function collectCheckReport(options, context, deps = {}) {
     else await collect("backup", () => (deps.verifyBackupEvidence || verifyBackupEvidence)({ db: plan.db, backupDir: plan.backupDir, backup: plan.backup, latest: plan.latestBackup }, { now: () => new Date(context.now()), cwd: context.cwd }), (value) => value.ok === true, publicBackup);
   }
   let live = null;
-  let cacheBefore = null;
   let remoteResult = /** @type {any} */ (null);
   let manualAttempt = /** @type {any} */ (null);
   if (plan.live) {
@@ -128,9 +125,7 @@ async function collectCheckReport(options, context, deps = {}) {
       checks.live = { status: "skipped", observed_at: observed(), reason: waitFailed ? "wait_not_passed" : "dependency_or_local_read_failed" };
       issues.push({ code: !dependencies.live ? "live_dependency_unavailable" : "live_skipped", check: "live" });
     } else {
-      if (plan.writeLiveCache) cacheBefore = (deps.liveProbeContext || liveProbeContext)(plan.db);
       live = await collect("live", () => {
-        if (deps.collectLagReport) return deps.collectLagReport(plan.db, plan);
         if (plan.writeLiveCache) {
           manualAttempt = (deps.runManualRemoteSample || runManualRemoteSample)({ db: plan.db, logDir: plan.logDir }, {
             nowMs: context.now, collectorOptions: { startMs: plan.startMs, endMs: plan.endMs, hotChats: plan.hotChats, messagesPerChat: plan.messagesPerChat },
@@ -142,28 +137,12 @@ async function collectCheckReport(options, context, deps = {}) {
         }
         remoteResult = (deps.collectRemoteSample || runReadOnlyRemoteSample)(plan.db, { ...plan, env: context.env }, { now: context.now });
         return Object.hasOwn(remoteResult, "guardian_diagnostic") ? { ...remoteResult.report, guardian_diagnostic: remoteResult.guardian_diagnostic } : remoteResult.report;
-      }, liveReady, (value) => value.schema_version === 3 ? publicRemoteReport(value)
-        : plan.unsafeDetails ? value : sanitizeLagReportForPublicOutput(value));
+      }, liveReady, publicRemoteReport);
     }
   }
   if (remoteResult?.outcome === "failed" || manualAttempt?.outcome === "failed" || live && Object.hasOwn(live, "guardian_diagnostic")) checks.live.status = "unavailable";
-  let cache = { status: manualAttempt ? manualAttempt.cacheWritten ? "written" : "skipped" : "not_requested" };
-  if (plan.writeLiveCache && !manualAttempt) {
-    cache = { status: "skipped" };
-    if (live) {
-      const cacheAfter = (deps.liveProbeContext || liveProbeContext)(plan.db);
-      if (!cacheBefore || !cacheAfter || cacheBefore.database_key !== cacheAfter.database_key) issues.push({ code: "cache_context_unavailable", check: "live" });
-      else {
-        try {
-          if (remoteResult) (deps.writeRemoteSampleCache || writeRemoteSampleCache)(resolve(plan.logDir, "live-probe.json"), remoteResult);
-          else (deps.writeLiveProbeCache || writeLiveProbeCache)(resolve(plan.logDir, "live-probe.json"), { live, checked_at: checks.live.observed_at, cache_context: cacheAfter });
-          cache = { status: "written" };
-        }
-        catch { cache = { status: "failed" }; issues.push({ code: "cache_write_failed", check: "live" }); }
-      }
-    }
-  }
-  const hardFailure = Object.values(checks).some((item) => ["failed", "unavailable"].includes(item.status)) || plan.live && !dependencies.live || ["failed"].includes(cache.status) || issues.some((issue) => issue.code === "cache_context_unavailable");
+  const cache = { status: plan.writeLiveCache ? manualAttempt?.cacheWritten ? "written" : "skipped" : "not_requested" };
+  const hardFailure = Object.values(checks).some((item) => ["failed", "unavailable"].includes(item.status)) || plan.live && !dependencies.live;
   const ok = !hardFailure && Object.values(checks).every((item) => ["passed", "not_requested"].includes(item.status));
   return { schema_version: 1, privacy: plan.unsafeDetails ? "private" : "public-safe", ok, started_at: new Date(plan.calledAt).toISOString(), observed_at: observed(), checks, cache, issues,
     exit_code: hardFailure ? 1 : ok ? 0 : 2 };

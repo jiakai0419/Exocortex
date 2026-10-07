@@ -180,6 +180,10 @@ function runStep(name, args, deps = {}) {
   const outputSummary = compactSummary(summary);
   let failureDetail = stderr.trim();
   if (processFailed && !failureDetail) failureDetail = "worker step terminated with a process error or signal";
+  if (!failureDetail && !processFailed && result.status !== 0 && summary?.schema_version === 1 && summary.ok === false &&
+      ["invalid_arguments", "execution_failed"].includes(summary.error?.code) && typeof summary.error?.message === "string") {
+    failureDetail = summary.error.message.trim();
+  }
   if (result.status === 0 && !validSummary && !failureDetail) {
     failureDetail = summary && typeof summary === "object"
       ? "worker step reported an unhealthy summary"

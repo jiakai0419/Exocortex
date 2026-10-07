@@ -12,6 +12,7 @@ import {
 import { isExhaustedLarkTransportFailure } from "./transport.mjs";
 import {
   acquireLock,
+  confirmInitialLarkAccountSql,
   createRun,
   failRun,
   commitLarkListRun,
@@ -875,6 +876,7 @@ WHERE source_id = ${deps.quoteSql(SOURCE_ID)}
       `
 BEGIN;
 ${runFenceGuardSql(scope, runId, now, deps)}
+${confirmInitialLarkAccountSql(now)}
 ${upserts}
 ${clearStaleHotSql}
 ${disableSql}

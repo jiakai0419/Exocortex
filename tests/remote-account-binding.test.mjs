@@ -15,7 +15,9 @@ function fixture(t) {
     const result = spawnSync("sqlite3", [db], { encoding: "utf8", input });
     assert.equal(result.status, 0, result.stderr);
   };
-  sql(`CREATE TABLE records(source_id TEXT, direction TEXT, actor_id TEXT, canonical_json TEXT);
+  sql(`CREATE TABLE sources(id TEXT, config_json TEXT);
+    INSERT INTO sources VALUES('lark.im','{}');
+    CREATE TABLE records(source_id TEXT, direction TEXT, actor_id TEXT, canonical_json TEXT);
     CREATE TABLE sync_runs(source_id TEXT);
     CREATE TABLE sync_scopes(source_id TEXT, cursor_json TEXT);`);
   return { db, sql, sidecar: `${db}.remote-account-binding.json` };
@@ -114,6 +116,7 @@ test("CLI acquires before initialization/API, refuses contention and always rele
       stdout: { write() {} }, stderr: { write() {} }, deps: {
         tryAcquireLarkApiLease: () => { calls.push("acquire"); return { state: "acquired", release() { calls.push("release"); } }; },
         readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
+        reserveSyncAccountBinding: () => false,
       ensureInitialized: () => calls.push("initialize"), ensureSourceInitialSyncStart: (_db, _source, ms) => ms,
         captureRemoteAccountBinding: () => null,
         getSelfProfile: () => { calls.push("profile"); if (fail) throw new Error("synthetic failure"); return { open_id: self, name: "Synthetic" }; },
@@ -127,6 +130,7 @@ test("CLI acquires before initialization/API, refuses contention and always rele
     stdout: { write() {} }, stderr: { write() {} }, deps: {
       tryAcquireLarkApiLease: () => ({ state: "busy", release() {} }),
       readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
+      reserveSyncAccountBinding: () => false,
       ensureInitialized: () => assert.fail("busy lease must precede all initialization and API work"),
     },
   });
@@ -134,13 +138,14 @@ test("CLI acquires before initialization/API, refuses contention and always rele
 });
 
 test("sync persists new binding only after an actual successful non-skipped run", () => {
-  for (const result of [{ ok: true }, { ok: false }, { ok: true, skipped: true }, { skipped: true }]) {
+  for (const result of [{ ok: true }, { ok: false }, { ok: false, list_complete: true }, { ok: true, skipped: true }, { skipped: true }]) {
     const observed = [];
     const before = { database_key: "a".repeat(64), empty: true };
     runLarkImSyncCli(["--scope", "sent"], {
       stdout: { write() {} }, stderr: { write() {} }, deps: {
-        readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
-      ensureInitialized: () => {}, ensureSourceInitialSyncStart: (_db, _source, ms) => ms,
+        readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound", database_key: before.database_key }),
+        reserveSyncAccountBinding: () => false,
+        ensureInitialized: () => {}, ensureSourceInitialSyncStart: (_db, _source, ms) => ms,
         captureRemoteAccountBinding: (options) => { assert.equal(options.emptyOnly, true); return before; },
         getSelfProfile: () => ({ open_id: self, name: "Synthetic" }),
         syncRunner: { syncSent: () => result },
@@ -150,7 +155,7 @@ test("sync persists new binding only after an actual successful non-skipped run"
     assert.equal(observed.length, 1);
     assert.equal(observed[0].before, before);
     assert.equal(observed[0].selfOpenId, self);
-    assert.equal(observed[0].successful, result.ok === true && result.skipped !== true);
+    assert.equal(observed[0].successful, (result.ok === true || result.list_complete === true) && result.skipped !== true);
   }
 });
 

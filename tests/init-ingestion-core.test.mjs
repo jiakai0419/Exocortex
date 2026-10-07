@@ -119,8 +119,13 @@ test("initializer reports a readable sqlite3 ENOENT and removes its serializatio
   });
 
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /sqlite3 executable not found \(ENOENT\)/);
-  assert.doesNotMatch(result.stderr, /Cannot read properties/);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    schema_version: 1,
+    ok: false,
+    error: { code: "execution_failed", message: "sqlite3 executable not found (ENOENT); install SQLite and ensure sqlite3 is on PATH" },
+  });
+  assert.equal(result.stderr, "");
+  assert.doesNotMatch(result.stdout + result.stderr, /Cannot read properties/);
   assert.equal(existsSync(`${dbPath}.init.lock`), false);
 });
 

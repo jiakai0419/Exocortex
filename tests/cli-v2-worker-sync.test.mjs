@@ -20,6 +20,7 @@ function sync(argv, results, ctx = context()) {
   const code = runSyncCommand(parsed.options, { ...ctx, provided: parsed.provided,
     stdout: { write: (text) => { stdout += text; } }, stderr: { write: (text) => { stderr += text; } },
     deps: { readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
+      reserveSyncAccountBinding: () => false,
       ensureInitialized() {}, ensureSourceInitialSyncStart: (_db, _source, value) => value,
       resetTransportStats() {}, getTransportStats: () => ({ calls: 0 }),
       getSelfProfile: () => ({ open_id: "synthetic-user", name: "Synthetic User" }),
@@ -166,6 +167,7 @@ for (const stage of ["initialize", "baseline", "profile", "sync"]) {
     const ctx = context();
     const parsed = parseRouteOptions("sync", ["--scope", "sent"], { context: ctx });
     const deps = { readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
+      reserveSyncAccountBinding: () => false,
       ensureInitialized() {}, ensureSourceInitialSyncStart: (_db, _source, value) => value,
       getSelfProfile: () => ({ open_id: "ou_invented_profile", name: "Invented Profile" }),
       syncRunner: { syncSent: () => ({ ok: true }) }, resetTransportStats() {}, getTransportStats: () => ({ calls: 0 }) };
@@ -176,8 +178,9 @@ for (const stage of ["initialize", "baseline", "profile", "sync"]) {
     const code = runSyncCommand(parsed.options, { ...ctx, provided: parsed.provided, deps,
       stdout: { write: (text) => { stdout += text; } }, stderr: { write: (text) => { stderr += text; } } });
     assert.equal(code, 1);
-    assert.equal(stdout, "");
-    assert.doesNotMatch(stderr, /SYNTHETIC_PRIVATE|private-path|INVENTED_TOKEN/);
-    assert.equal(stderr, "sync failed\n");
+    assert.deepEqual(JSON.parse(stdout), { schema_version: 1, ok: false,
+      error: { code: "execution_failed", message: "sync failed" } });
+    assert.doesNotMatch(stdout + stderr, /SYNTHETIC_PRIVATE|private-path|INVENTED_TOKEN/);
+    assert.equal(stderr, "");
   });
 }

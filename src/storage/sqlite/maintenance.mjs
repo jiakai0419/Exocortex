@@ -1,6 +1,8 @@
 // @ts-check
 
 import { spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
+import { tmpdir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import {
   existsSync,
@@ -69,7 +71,7 @@ const DURABLE_BACKUP_TABLES = ["sources", "sync_scopes", "records", "sync_runs"]
  * @property {(path: string | number, data: string, options?: JsonObject) => void=} writeFileSync
  * @property {(path: string, options?: JsonObject) => void=} rmSync
  * @property {(existingPath: string, newPath: string) => void=} linkSync
- * @property {(cmd: string, args: string[], options: JsonObject) => {status: number | null, stdout?: string, stderr?: string, error?: NodeJS.ErrnoException}=} spawnSync
+ * @property {(cmd: string, args: string[], options: JsonObject) => {status: number | null, stdout?: string, stderr?: string, error?: NodeJS.ErrnoException, signal?: string | null}=} spawnSync
  * @property {() => Date=} now
  * @property {(dbPath: string, options: JsonObject) => {acquired: boolean, reason?: string, active_sync_locks?: number, lock_owner?: string | null}=} acquireMaintenanceLock
  * @property {(dbPath: string, owner: string) => void=} releaseMaintenanceLock
@@ -212,6 +214,45 @@ function firstCell(rows) {
   return Object.values(row)[0];
 }
 
+/** SQLite discards CHECK expressions for read-only source schemas. Restore a
+ * consistent snapshot from an OS-read-only source into a private disk copy,
+ * where CHECK expressions survive without keeping the whole database in RAM.
+ * Never substitute a plain source filename: .restore would open it writable.
+ * @param {string} dbPath @param {SqliteMaintenanceDeps} deps
+ */
+function readIntegrityCheck(dbPath, deps) {
+  const source = pathToFileURL(resolve(dbPath));
+  source.search = "?mode=ro";
+  const temporary = mkdtempSync(resolve(tmpdir(), "exocortex-integrity-"));
+  try {
+    const snapshot = resolve(temporary, "snapshot.sqlite");
+    closeSync(openSync(snapshot, "wx", 0o600));
+    return checkIntegritySnapshot(snapshot, deps, source.href);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+}
+
+/** Only private, operation-owned snapshots may use a writable file handle.
+ * Query-only protects this connection; the source URI, when present, is ro.
+ * @param {string} snapshot @param {SqliteMaintenanceDeps} deps @param {string|null} [sourceUri]
+ */
+function checkIntegritySnapshot(snapshot, deps, sourceUri = null) {
+  const restore = sourceUri ? `.restore ${JSON.stringify(sourceUri)}\n` : "";
+  const result = (deps.spawnSync || spawnSync)("sqlite3", ["-batch", "-bail", "-json", snapshot], {
+    input: `.timeout 5000\nPRAGMA cache_size=-2048;\nPRAGMA cache_spill=ON;\n${restore}PRAGMA query_only=ON;\nPRAGMA quick_check;\n`,
+    encoding: "utf8", maxBuffer: 1024 * 1024, timeout: 30_000, killSignal: "SIGKILL",
+  });
+  if (result.status !== 0 || result.error || result.signal) throw sqliteFailure(result, "integrity snapshot check");
+  let rows;
+  try { rows = JSON.parse(String(result.stdout || "")); }
+  catch { throw new Error("integrity snapshot check returned invalid JSON"); }
+  if (!Array.isArray(rows) || !rows.length || rows.some(row => typeof row?.quick_check !== "string")) {
+    throw new Error("integrity snapshot check returned invalid evidence");
+  }
+  return rows.length === 1 && rows[0].quick_check === "ok" ? "ok" : "failed";
+}
+
 /**
  * @param {string} cwd
  * @param {string} path
@@ -227,13 +268,14 @@ function publicPath(cwd, path) {
 /**
  * @param {string} dbPath
  * @param {SqliteMaintenanceDeps} [deps]
+ * @param {{ownedSnapshot?: boolean}} [options] Only the exclusive, newly created backup staging file qualifies.
  */
-function databaseCheck(dbPath, deps = {}) {
+function databaseCheck(dbPath, deps = {}, options = {}) {
   const fileExists = deps.existsSync || existsSync;
   const fileStat = deps.statSync || statSync;
   if (!fileExists(dbPath)) throw new Error("database not found");
 
-  const quickCheck = String(firstCell(sqliteJson(dbPath, "PRAGMA quick_check;", "quick check", deps)) || "");
+  const quickCheck = options.ownedSnapshot ? checkIntegritySnapshot(dbPath, deps) : readIntegrityCheck(dbPath, deps);
   const foreignKeyIssues = sqliteJson(dbPath, "PRAGMA foreign_key_check;", "foreign key check", deps);
   const existingRows = sqliteJson(
     dbPath,
@@ -639,7 +681,8 @@ function executeSqliteMaintenance(opts, deps = {}) {
       const stagingPath = mkdtempSync(resolve(directory, ".exocortex-backup-"));
       staging = { path: stagingPath, identity: lstatSync(stagingPath), backupPath: resolve(stagingPath, name) };
       backupDatabase(dbPath, staging.backupPath, deps);
-      const backupCheck = databaseCheck(staging.backupPath, deps);
+      // This operation already owns a private consistent snapshot; do not copy it again.
+      const backupCheck = databaseCheck(staging.backupPath, deps, { ownedSnapshot: true });
       const countsMatch = compareCounts(source.counts, backupCheck.counts, DURABLE_BACKUP_TABLES);
       const manifest = writeBackupManifest(staging.backupPath, backupCheck, createdAt.toISOString(), deps, sourceIdentity.id);
       let manifestVerification = verifyBackupManifest(staging.backupPath, backupCheck, deps, sourceIdentity.id);

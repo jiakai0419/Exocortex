@@ -173,6 +173,7 @@ test("sync CLI emits real stage observations without changing JSON stdout; help 
       resetTransportStats() {}, getTransportStats: () => ({ calls: 0 }), resolvePath: (path) => path,
       ensureInitialized() {}, ensureSourceInitialSyncStart: (_db, _source, value) => value,
       readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
+      reserveSyncAccountBinding: () => false,
       getSelfProfile: () => ({ open_id: "invented-self", name: "Invented Operator" }),
       syncRunner: { syncSent: () => ({ ok: true }), syncDiscovery: () => ({ ok: true }), syncReceived: () => [] },
     } };

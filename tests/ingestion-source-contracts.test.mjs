@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import * as store from "../dist/storage/sqlite/ingestion-store.js";
-import { loadExistingRecords } from "../src/diagnostics/lark-im-lag-report.mjs";
+import { inspectRemoteSampleSnapshot } from "../src/diagnostics/remote-sample-coverage.mjs";
+import { compareSampleMessage } from "../src/diagnostics/remote-sample-core.mjs";
 import { buildStatus } from "../src/diagnostics/sync-status-report.mjs";
 import { loadMessages } from "../src/diagnostics/messages-report.mjs";
 
@@ -63,7 +64,13 @@ test("messages projection includes only the Lark message source and type", (t) =
   write(db, lark, [record(lark, { record_type: "lark.im.message", external_id: "synthetic-lark-message" }),
     record(lark, { record_type: "synthetic.other-type", external_id: "synthetic-lark-nonmessage" })]);
   assert.deepEqual(loadMessages(db, { direction: "all", limit: 30, search: "" }).map((row) => row.external_id), ["synthetic-lark-message"]);
-  assert.deepEqual([...loadExistingRecords(db, ["synthetic-shared-id", "synthetic-lark-message", "synthetic-lark-nonmessage"]).keys()], ["synthetic-lark-message"]);
+  const targets = ["synthetic-shared-id", "synthetic-lark-message", "synthetic-lark-nonmessage"].map((message_id, index) => ({
+    key: String(index + 1).repeat(64), scope_id: "lark.im.received.chat.synthetic-container", message_id, created_ms: T,
+  }));
+  const sampled = inspectRemoteSampleSnapshot(db, targets).records;
+  assert.deepEqual([...sampled.keys()].sort(), ["synthetic-lark-message", "synthetic-lark-nonmessage"]);
+  assert.equal(compareSampleMessage({ message_id: "synthetic-lark-nonmessage", chat_id: "synthetic-container" },
+    sampled.get("synthetic-lark-nonmessage")).kind, "identity_conflict", "another record type cannot satisfy a sampled message");
   assert.equal(buildStatus(db).records.total, 3, "generic record totals intentionally include every source/type");
 });
 

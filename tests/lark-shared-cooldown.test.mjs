@@ -117,3 +117,57 @@ test("transport publishes rate reset for the next process and refuses unavailabl
     readSharedCooldown: () => ({ state: "unavailable", untilMs: null }), spawn: () => assert.fail("unavailable store spawned") });
   assert.throws(() => broken(["contact", "+get-user"]), /shared_cooldown_unavailable/);
 });
+
+test("transport publishes and inherits epoch cooldowns across independent monotonic clocks", (t) => {
+  const deps = fixture(t);
+  let wall = nowMs, elapsed = 0, calls = 0;
+  const run = createLarkCliRunner({ clock: () => wall, monotonicClock: () => elapsed,
+    state: createTransportState(),
+    readSharedCooldown: (options) => readSharedLarkCooldown(options, deps),
+    writeSharedCooldown: (options) => writeSharedLarkCooldown(options, deps),
+    spawn: () => {
+      calls++; elapsed += 1000; wall -= 600000;
+      return { status: 1, stderr: '{"code":99991400,"headers":{"x-ogw-ratelimit-reset":"10"}}', stdout: "" };
+    } });
+  assert.throws(() => run(["api", "GET", "/open-apis/im/v1/messages"]), /kind=rate_limited/);
+  const untilMs = wall + 10000;
+  assert.equal(readSharedLarkCooldown({ operation, nowMs: wall }, deps).untilMs, untilMs);
+  const sleeps = [];
+  let nextElapsed = 700;
+  const next = createLarkCliRunner({ clock: () => wall, monotonicClock: () => nextElapsed,
+    state: createTransportState(), readSharedCooldown: (options) => readSharedLarkCooldown(options, deps),
+    sleep: ms => { sleeps.push(ms); nextElapsed += ms; wall += ms; },
+    spawn: () => { calls++; return { status: 0, stdout: '{"ok":true}', stderr: "" }; } });
+  assert.deepEqual(next(["api", "GET", "/open-apis/im/v1/messages"], { retryBudgetMs: 11000 }), { ok: true });
+  assert.deepEqual(sleeps, [10000]);
+  assert.equal(calls, 2);
+  assert.equal(wall, untilMs);
+});
+
+for (const change of ["wall_rollback", "shared_extension"]) {
+  test(`transport retains epoch cooldown and defers when ${change} exceeds remaining monotonic budget`, (t) => {
+    const deps = fixture(t);
+    let wall = nowMs, elapsed = 0, calls = 0;
+    const sleeps = [];
+    let untilMs = wall + 10000;
+    assert.equal(writeSharedLarkCooldown({ operation, nowMs: wall, untilMs }, deps), true);
+    const state = createTransportState();
+    const run = createLarkCliRunner({ clock: () => wall, monotonicClock: () => elapsed, state,
+      readSharedCooldown: (options) => readSharedLarkCooldown(options, deps),
+      sleep: ms => {
+        sleeps.push(ms); elapsed += ms; wall += ms;
+        if (change === "wall_rollback") wall -= 600000;
+        else {
+          untilMs = wall + 30000;
+          assert.equal(writeSharedLarkCooldown({ operation, nowMs: wall, untilMs }, deps), true);
+        }
+      },
+      spawn: () => { calls++; return { status: 0, stdout: '{"ok":true}', stderr: "" }; } });
+    assert.throws(() => run(["api", "GET", "/open-apis/im/v1/messages"], { retryBudgetMs: 30000 }), /retry_exhausted=1/);
+    assert.equal(calls, 0);
+    assert.deepEqual(sleeps, [10000]);
+    assert.equal(elapsed, 10000);
+    assert.equal(state.cooldowns.get(operation), untilMs);
+    assert.equal(readSharedLarkCooldown({ operation, nowMs: wall }, deps).untilMs, untilMs);
+  });
+}

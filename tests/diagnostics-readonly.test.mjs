@@ -10,7 +10,7 @@ import { readOnlySqliteJson } from "../src/storage/sqlite/readonly-query.mjs";
 import { buildStatus } from "../src/diagnostics/sync-status-report.mjs";
 import { collectQualityReport } from "../src/diagnostics/lark-im-quality-report.mjs";
 import { loadMessages } from "../src/diagnostics/messages-report.mjs";
-import { collectLagReport } from "../src/diagnostics/lark-im-lag-report.mjs";
+import { collectRemoteSample } from "../src/diagnostics/remote-sample.mjs";
 import { buildServiceStatusReport } from "../src/diagnostics/lark-im-service-report.mjs";
 import { collectCheckReport } from "../src/diagnostics/check-report.mjs";
 import { createCommandContext } from "../src/cli/context.mjs";
@@ -94,17 +94,18 @@ async function exerciseDiagnostics(dir, db) {
   assert.equal(status.current_activity.reason, "unverified_sync_history");
   collectQualityReport(db);
   assert.deepEqual(loadMessages(db, { db, direction: "all", limit: 2, search: "" }), []);
-  const lag = collectLagReport(db, { startMs: 0, endMs: 1000, hotChats: 1, messagesPerChat: 1 }, {
-    getSelfOpenId: () => "synthetic-self", fetchHotChats: () => [],
-    fetchRecentChatMessages: () => { throw new Error("must not be called"); },
+  const at = Date.parse("2030-01-03T12:00:00Z");
+  const sample = collectRemoteSample(db, {}, { now: () => at,
+    api: { deadline: at + 55000, count: () => 0, call: () => assert.fail("empty inventory must not call remote API") },
   });
-  assert.equal(lag.status, "inconclusive");
+  assert.equal(sample.report.status, "inconclusive");
+  assert.equal(sample.report.reason, "no_eligible_chats");
   const report = await collectCheckReport({ db, live: false, logDir: dir }, createCommandContext({
     root: dir, cwd: dir, now: () => Date.parse("2030-01-03T12:00:00Z"),
   }), {
-    collectLagReport: () => { throw new Error("default check must not read remote data"); },
+    collectRemoteSample: () => { throw new Error("default check must not read remote data"); },
     collectStatusEvidence: () => { throw new Error("default check must not inspect or change service state"); },
-    writeLiveProbeCache: () => { throw new Error("default check must not write a cache"); },
+    runManualRemoteSample: () => { throw new Error("default check must not write a cache"); },
   });
   assert.equal(report.checks.sync.status, "incomplete");
   assert.equal(report.checks.sync.evidence.health, "unknown");

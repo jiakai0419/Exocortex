@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 export const PROJECT_ROOT = fileURLToPath(new URL("../../", import.meta.url));
+const PUBLIC_ERROR_REASONS = new Set(["dependency_unavailable", "read_timeout", "read_failed", "invalid_response"]);
 export class CliUsageError extends Error {
     constructor(message) { super(message); this.name = "CliUsageError"; }
 }
@@ -10,8 +11,20 @@ export class CliExecutionError extends Error {
     constructor(message, reason) {
         super(message);
         this.name = "CliExecutionError";
-        this.reason = ["dependency_unavailable", "read_timeout", "read_failed", "invalid_response"].includes(reason || "") ? reason : undefined;
+        this.reason = PUBLIC_ERROR_REASONS.has(reason || "") ? reason : undefined;
     }
+}
+/** Write only a locally constructed or already sanitized public message.
+ * @param {{stdout:{write:(text:string)=>unknown}, stderr:{write:(text:string)=>unknown}}} streams
+ * @param {{format?:string, code:"invalid_arguments"|"execution_failed", message:string, reason?:string, textPrefix?:string}} error
+ */
+export function writeCliError(streams, { format, code, message, reason, textPrefix = "" }) {
+    if (format === "json") {
+        streams.stdout.write(`${JSON.stringify({ schema_version: 1, ok: false, error: { code, message,
+                ...(PUBLIC_ERROR_REASONS.has(reason || "") ? { reason } : {}) } })}\n`);
+    }
+    else
+        streams.stderr.write(`${textPrefix}${message}\n`);
 }
 /** One invocation captures its clock and path roots before any work starts. */
 export function createCommandContext(overrides = {}) {

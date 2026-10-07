@@ -31,6 +31,7 @@ test("sync CLI preserves recovered transport pressure in its successful JSON", (
       resetTransportStats: () => { resets++; }, getTransportStats: () => transport,
       getSelfProfile: () => ({ open_id: "ou_synthetic", name: "Synthetic" }),
       readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
+      reserveSyncAccountBinding: () => false,
       ensureInitialized: () => {}, ensureSourceInitialSyncStart: (_db, _source, ms) => ms,
       syncRunner: { syncDiscovery: () => ({ ok: true }) },
     },
@@ -51,15 +52,16 @@ test("sync CLI emits aggregate transport pressure when profile loading fails", (
     deps: {
       resetTransportStats: () => {}, getTransportStats: () => transport,
       readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
+      reserveSyncAccountBinding: () => false,
       ensureInitialized: () => {}, ensureSourceInitialSyncStart: (_db, _source, ms) => ms,
       getSelfProfile: () => { throw new Error("kind=rate_limited code=99991400"); },
     },
   });
   assert.equal(exitCode, 1);
-  assert.equal(stdout.text(), "");
-  const lines = stderr.text().trim().split("\n");
-  assert.match(lines[0], /kind=rate_limited/);
-  assert.deepEqual(JSON.parse(lines[1]), { type: "lark_transport_summary", transport });
+  const error = JSON.parse(stdout.text()).error;
+  assert.equal(error.code, "execution_failed");
+  assert.match(error.message, /kind=rate_limited/);
+  assert.deepEqual(JSON.parse(stderr.text()), { type: "lark_transport_summary", transport });
 });
 
 test("lark im sync command renders help without touching dependencies", () => {
@@ -70,6 +72,7 @@ test("lark im sync command renders help without touching dependencies", () => {
     stderr: stderr.stream,
     deps: {
       readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
+      reserveSyncAccountBinding: () => false,
       ensureInitialized: () => {
         throw new Error("should not initialize");
       },
@@ -105,6 +108,7 @@ test("lark im sync command executes sent scope through injected deps", () => {
       deps: {
         resolvePath: (dbPath) => `/abs/${dbPath}`,
         readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
+        reserveSyncAccountBinding: () => false,
       ensureInitialized: (dbPath) => calls.push(["init", dbPath]),
         ensureSourceInitialSyncStart: (dbPath, sourceId, startMs, options) => {
           calls.push(["baseline", dbPath, sourceId, startMs, options.explicit]);
@@ -146,7 +150,7 @@ test("lark im sync command executes sent scope through injected deps", () => {
   ]);
 });
 
-test("lark im sync command returns nonzero and stderr on dependency errors", () => {
+test("lark im sync command returns nonzero and safe JSON on dependency errors", () => {
   const stdout = memoryWriter();
   const stderr = memoryWriter();
   const exitCode = runLarkImSyncCli(["--scope", "sent"], {
@@ -154,6 +158,7 @@ test("lark im sync command returns nonzero and stderr on dependency errors", () 
     stderr: stderr.stream,
     deps: {
       readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
+      reserveSyncAccountBinding: () => false,
       ensureInitialized: () => {},
       ensureSourceInitialSyncStart: (_dbPath, _sourceId, startMs) => startMs,
       getSelfProfile: () => ({ open_id: "", name: "" }),
@@ -161,8 +166,9 @@ test("lark im sync command returns nonzero and stderr on dependency errors", () 
   });
 
   assert.equal(exitCode, 1);
-  assert.equal(stdout.text(), "");
-  assert.match(stderr.text(), /could not resolve current Lark user open_id/);
+  assert.equal(stderr.text(), "");
+  assert.deepEqual(JSON.parse(stdout.text()), { schema_version: 1, ok: false,
+    error: { code: "execution_failed", message: "could not resolve current Lark user open_id" } });
 });
 
 test("lark im sync command parseArgs keeps explicit end stable", () => {
@@ -184,6 +190,115 @@ test("lark im sync command parseArgs keeps explicit end stable", () => {
   assert.equal(opts.startMs, Date.parse("2026-06-18T08:00:00Z"));
   assert.equal(opts.endMs, Date.parse("2026-06-18T08:10:00Z"));
 });
+
+const invalidCalendarEnds = [
+  "2030-02-31T01:00:00Z",
+  "2030-02-29T01:00Z",
+  "2032-02-30T01:00:00.123+08:00",
+  "2030-04-31T01:00:00-0200",
+  "2030-02-31t01:00:00z",
+  "2030-06-18T24:00:00Z",
+  "2030-02-31T01:00:00.123",
+  "2030-02-31",
+  " 2030-02-31 ",
+  "2030-02-31  01:00",
+  "2030-02-31\t01:00",
+  "2030-02-31\n01:00",
+  "2030-02-31 1:2",
+  "2030-02-31 1:2:3",
+  "2030-2-31 1:2",
+  "2030-02-31 01:00 UTC",
+  "2030-02-31 01:00 GMT+0800",
+  "2030-02-31 (local) 01:00",
+  "2030-02-31,01:00",
+  "2030-02-28  24:00",
+  "2030-02-28\t24:00",
+  "2030-02-28 24:00 UTC",
+  "2030-02-28,24:00",
+];
+
+test("explicit end rejects normalized calendar dates and overflowing clocks", () => {
+  for (const value of invalidCalendarEnds) {
+    assert.throws(() => parseArgs(["--start", "2020-01-01T00:00:00Z", "--end", value]),
+      /end is not a valid calendar timestamp/, value);
+  }
+});
+
+test("explicit end retains valid epoch, zoned and local time interpretations", () => {
+  const epoch = Date.parse("2030-03-01T01:00:00Z");
+  const cases = [
+    [String(epoch / 1000), epoch],
+    [String(epoch), epoch],
+    ["2032-02-29T01:02:03.123+08:00", Date.parse("2032-02-28T17:02:03.123Z")],
+    ["2030-02-28T23:30:00-02:00", Date.parse("2030-03-01T01:30:00Z")],
+    ["2030-03-01T01:00Z", epoch],
+    ["2030-03-01T09:00:00+0800", epoch],
+    ["2030-03-01 01:00", new Date(2030, 2, 1, 1, 0).getTime()],
+    ["2030-03-01  01:00", new Date(2030, 2, 1, 1, 0).getTime()],
+    ["2030-03-01\t01:00", new Date(2030, 2, 1, 1, 0).getTime()],
+    ["2030-03-01\n01:00", new Date(2030, 2, 1, 1, 0).getTime()],
+    ["2030-03-01 1:2", new Date(2030, 2, 1, 1, 2).getTime()],
+    ["2030-03-01 1:2:3", new Date(2030, 2, 1, 1, 2, 3).getTime()],
+    ["2030-3-1 1:2", new Date(2030, 2, 1, 1, 2).getTime()],
+    ["2030-03-01 01:00 UTC", epoch],
+    ["2030-03-01 09:00 GMT+0800", epoch],
+    ["2030-03-01 (local) 01:00", new Date(2030, 2, 1, 1, 0).getTime()],
+    ["2030-03-01,01:00", new Date(2030, 2, 1, 1, 0).getTime()],
+    ["2030-03-01T01:00:00", new Date(2030, 2, 1, 1, 0).getTime()],
+    ["2030-03-01T01:00:00.123", new Date(2030, 2, 1, 1, 0, 0, 123).getTime()],
+    ["2030-03-01", Date.parse("2030-03-01T00:00:00Z")],
+  ];
+  for (const [value, expected] of cases) {
+    const opts = parseArgs(["--start", "2020-01-01T00:00:00Z", "--end", value]);
+    assert.equal(opts.endMs, expected, value);
+    assert.equal(opts.endExplicit, true);
+    const stdout = memoryWriter();
+    const stderr = memoryWriter();
+    let leases = 0;
+    const code = runLarkImSyncCli(["--start", "2020-01-01T00:00:00Z", "--end", value], {
+      stdout: stdout.stream, stderr: stderr.stream,
+      deps: {
+        resetTransportStats() {}, getTransportStats: () => ({ calls: 0 }),
+        tryAcquireLarkApiLease: () => { leases++; return { state: "busy", release() {} }; },
+        ensureInitialized: () => assert.fail("busy lease must prevent storage access"),
+        getSelfProfile: () => assert.fail("busy lease must prevent profile access"),
+      },
+    });
+    assert.equal(code, 1, value);
+    assert.equal(leases, 1, value);
+    assert.deepEqual(JSON.parse(stdout.text()), { schema_version: 1, ok: false,
+      error: { code: "execution_failed", message: "sync skipped: Lark API is busy" } }, value);
+    assert.equal(stderr.text(), "", value);
+  }
+});
+
+for (const end of invalidCalendarEnds) {
+  test(`invalid end ${JSON.stringify(end)} is rejected before lease, storage, account or runner effects`, () => {
+    const stdout = memoryWriter();
+    const stderr = memoryWriter();
+    const calls = [];
+    const unexpected = (name) => () => { calls.push(name); throw new Error("unexpected synthetic effect"); };
+    const code = runLarkImSyncCli([
+      "--scope", "sent", "--start", "2030-02-28T00:00:00Z", "--end", end,
+    ], {
+      stdout: stdout.stream, stderr: stderr.stream,
+      deps: {
+        resetTransportStats() {}, getTransportStats: () => ({ calls: 0 }),
+        tryAcquireLarkApiLease: unexpected("lease"), ensureInitialized: unexpected("initialize"),
+        captureRemoteAccountBinding: unexpected("capture binding"),
+        readRemoteAccountBinding: unexpected("read binding"),
+        ensureSourceInitialSyncStart: unexpected("baseline"), getSelfProfile: unexpected("profile"),
+        recordSuccessfulSyncBinding: unexpected("write binding"),
+        syncRunner: { syncSent: unexpected("sent") },
+      },
+    });
+    assert.equal(code, 1);
+    assert.deepEqual(calls, []);
+    assert.deepEqual(JSON.parse(stdout.text()), { schema_version: 1, ok: false,
+      error: { code: "invalid_arguments", message: "end is not a valid calendar timestamp" } });
+    assert.equal(stderr.text(), "");
+  });
+}
 
 test("lark im sync command distinguishes a default start from an explicit baseline", () => {
   const opts = parseArgs([]);
@@ -235,6 +350,7 @@ test("lark im sync command checks the account before baseline mutation and resol
   const summary = executeLarkImSync(opts, {
     resolvePath: () => "/fake/baseline.sqlite",
     readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
+    reserveSyncAccountBinding: () => false,
       ensureInitialized: () => calls.push("init"),
     ensureSourceInitialSyncStart: (dbPath, sourceId, startMs, options) => {
       assert.equal(dbPath, "/fake/baseline.sqlite");
@@ -283,6 +399,7 @@ test("lark im sync command rejects an unusable baseline after account validation
     deps: {
       resolvePath: () => "/fake/legacy.sqlite",
       readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
+      reserveSyncAccountBinding: () => false,
       ensureInitialized: () => calls.push("init"),
       ensureSourceInitialSyncStart: () => {
         calls.push("baseline");
@@ -299,8 +416,9 @@ test("lark im sync command rejects an unusable baseline after account validation
   });
 
   assert.equal(exitCode, 1);
-  assert.equal(stdout.text(), "");
-  assert.equal(stderr.text(), "sync failed\n");
+  assert.equal(stderr.text(), "");
+  assert.deepEqual(JSON.parse(stdout.text()), { schema_version: 1, ok: false,
+    error: { code: "execution_failed", message: "sync failed" } });
   assert.deepEqual(calls, ["init", "self", "baseline"]);
 });
 
@@ -310,6 +428,7 @@ test("discovery-only commands validate the current profile before persisting the
   const summary = executeLarkImSync(opts, {
     resolvePath: () => "/fake/discovery.sqlite",
     readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
+    reserveSyncAccountBinding: () => false,
       ensureInitialized: () => calls.push("init"),
     ensureSourceInitialSyncStart: (_dbPath, sourceId, candidateMs, options) => {
       assert.equal(sourceId, "lark.im");
@@ -342,6 +461,7 @@ test("details-only CLI has a capped positive batch limit and never dispatches li
   const summary = executeLarkImSync(opts, {
     resolvePath: (value) => value,
     readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
+    reserveSyncAccountBinding: () => false,
       ensureInitialized: () => {},
     ensureSourceInitialSyncStart: (_db, _source, value) => value,
     getSelfProfile: () => ({ open_id: "invented-self", name: "Invented Self" }),

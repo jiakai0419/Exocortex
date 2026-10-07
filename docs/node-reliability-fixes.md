@@ -180,3 +180,9 @@ unknown inspection and public-output sentinels; `lark-im-install-rollback.test.m
 covers loaded/absent with existing/missing files, permissions, lint-before-stop,
 rollback inspection/bootout/bootstrap/kickstart and cleanup failures. Existing
 service start/stop/uninstall and independent foreground activity tests remain.
+
+## Initial account association and bounded replay admission
+
+The previous command-level sidecar publication required an entirely successful first command. A first `all` command could commit discovery and received facts after a sent failure, then permanently fall into legacy-unbound compatibility. A separate counterexample showed bounded replay ignoring a valid sidecar: another account could insert its own sent facts and make the original account conflict on its next normal sync.
+
+New-source account reservation precedes runs; confirmation shares the first list/discovery transaction. Pending evidence blocks account changes without claiming successful collection. The sidecar remains compatible evidence, while a failed or interrupted publication cannot remove the database's association. Replay uses the same admission decision as sync. Synthetic regressions preserve both original public CLI sequences and test rollback, interruption, missing/corrupt binding evidence, and same-account/legacy controls.

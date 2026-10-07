@@ -19,6 +19,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { plain } from "../dist/terminal/index.js";
@@ -238,7 +239,8 @@ test("a failed new backup is discarded without pruning the last verified backup"
       cwd: dir,
       now: () => new Date("2027-01-16T08:00:00.000Z"),
       spawnSync: (cmd, args, options) => {
-        const candidatePath = String(args.at(-1) || "");
+        const restore = String(options.input || "").match(/^\.restore (.+)$/m);
+        const candidatePath = restore ? fileURLToPath(JSON.parse(restore[1])) : String(args.at(-1) || "");
         if (
           args.includes("-json") &&
           candidatePath.startsWith(backupDir) &&
@@ -352,11 +354,13 @@ test("maintenance CLI renders preview text/json and safe errors", (t) => {
     if (format === "json") assert.equal(JSON.parse(stdout.text()).dry_run,true);
     else assert.match(plain(stdout.text()),/SQLite maintenance OK/);
   }
-  const error=memoryWriter();
-  const context=createCommandContext({ root:dir, cwd:dir, stdout:memoryWriter().stream, stderr:error.stream });
+  const error=memoryWriter(), output=memoryWriter();
+  const context=createCommandContext({ root:dir, cwd:dir, stdout:output.stream, stderr:error.stream });
   assert.equal(runMaintenanceCommand({ action:"compact", db:join(dir,"PRIVATE-SENTINEL","missing.sqlite"), format:"json" },context),1);
-  assert.doesNotMatch(error.text(),/PRIVATE-SENTINEL|missing\.sqlite/);
-  assert.match(error.text(),/database not found/);
+  assert.equal(error.text(),"");
+  assert.doesNotMatch(output.text(),/PRIVATE-SENTINEL|missing\.sqlite/);
+  assert.deepEqual(JSON.parse(output.text()), { schema_version:1, ok:false,
+    error:{ code:"execution_failed", message:"database not found" } });
 });
 
 test("sqlite maintenance reports a readable missing sqlite3 error", () => {
@@ -555,11 +559,25 @@ test("legacy backup explicit verify and read-only maintenance leave file and dir
     const report = executeSqliteMaintenance(fixtureOptions(args), {
       cwd: dir,
       chmodSync() { assert.fail("read-only maintenance must not chmod"); },
-      spawnSync(cmd, cliArgs, opts) { spawned.push(cliArgs); return spawnSync(cmd, cliArgs, opts); },
+      spawnSync(cmd, cliArgs, opts) {
+        const destination = cliArgs.at(-1);
+        spawned.push({ args: cliArgs, input: opts.input,
+          privateMode: cliArgs.includes("-readonly") ? null : statSync(destination).mode & 0o777 });
+        return spawnSync(cmd, cliArgs, opts);
+      },
     });
     assert.equal(report.ok, true);
     assert.ok(spawned.length);
-    assert.ok(spawned.every((args) => args.includes("-readonly")));
+    for (const { args, input, privateMode } of spawned) {
+      if (args.includes("-readonly")) continue;
+      assert.notEqual(args.at(-1), dbPath); assert.notEqual(args.at(-1), legacy);
+      assert.equal(privateMode, 0o600);
+      assert.equal(existsSync(args.at(-1)), false, "temporary snapshot is removed on return");
+      const restore = input.match(/^\.restore (.+)$/m);
+      assert.ok(restore, "source access must use a restore URI");
+      assert.equal(new URL(JSON.parse(restore[1])).search, "?mode=ro");
+      assert.match(input, /PRAGMA query_only=ON;/);
+    }
   }
   for (const [path, bytes] of before) {
     assert.deepEqual(readFileSync(path), bytes);

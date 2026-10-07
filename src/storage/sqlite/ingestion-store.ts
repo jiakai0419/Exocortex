@@ -1,3 +1,4 @@
+import { INITIAL_ACCOUNT_KIND, reserveInitialLarkAccount, confirmInitialLarkAccountSql } from "./lark-account-binding.js";
 import { initializeDatabase } from "./initialize.js";
 import type { JsonObject, SyncScope, StoredRecord, WriteEffects, InitialSyncStartOptions } from "./ingestion-types.js";
 import { quoteSql, sqlJson, sqliteExec, sqliteQuery, secureDatabasePaths } from "./sqlite-executor.js";
@@ -300,6 +301,9 @@ function failRecordRun(
 const succeedMessageRun = succeedRecordRun;
 
 export {
+  INITIAL_ACCOUNT_KIND,
+  reserveInitialLarkAccount,
+  confirmInitialLarkAccountSql,
   DEFAULT_HARD_LEASE_SECONDS,
   acquireLock,
   acquireMaintenanceLock,

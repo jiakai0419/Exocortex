@@ -49,7 +49,7 @@ npm ci
 npm run verify
 ```
 
-`verify` 完成 build、typecheck、syntax、全量测试与干净生成物对照，不启停服务。它会写当前 `dist`，不可用于运行中的 checkout。`npm run build:check` 只在临时目录构建并比较完整输出文件集合和内容，不改当前 `dist`。详细开发任务、研究工具及内部 worker 见 [Development](docs/development.md)。真实运行和部署另按 [Operations](docs/operations.md) 验收。
+`verify` 先检查当前生成物，再完成 build、typecheck、syntax 和全量测试，不启停服务。缺失或陈旧输出会在 build 覆盖前失败；修改源码后先显式 `npm run build`，源码与生成物一起提交。它会写当前 `dist`，不可用于运行中的 checkout。`npm run build:check` 只在临时目录构建并比较完整输出文件集合和内容，不改当前 `dist`。详细开发任务、研究工具及内部 worker 见 [Development](docs/development.md)。真实运行和部署另按 [Operations](docs/operations.md) 验收。
 
 ## Node Behavior
 

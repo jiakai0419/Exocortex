@@ -11,7 +11,7 @@ npm ci
 npm run verify
 ```
 
-`tools/verify.mjs` 顺序执行一次普通 TypeScript build、typecheck、语法发现、全部 Node 测试文件（最多四个文件并行，含 Python 覆盖测试），最后独立临时构建并比较完整 dist 文件集合与内容。普通 build 写当前 dist，最后的对照不改当前 dist；任一步失败停止。它不控制服务、不写真实数据库、不做真实账号验收。
+`tools/verify.mjs` 首先独立临时构建，与当前 dist 的完整文件集合及内容比较；通过后才顺序执行一次普通 TypeScript build、typecheck、语法发现、全部 Node 测试文件（最多四个文件并行，含 Python 覆盖测试）。生成物检查不改当前 dist，缺失或陈旧输出会在普通 build 写入前失败，不能靠验证过程自动修复而通过。一次完整 verify 共进行一次临时编译和一次普通 build，任一步失败停止。它不控制服务、不写真实数据库、不做真实账号验收。
 
 | npm 任务 | 用途与效果 |
 | --- | --- |
@@ -20,15 +20,15 @@ npm run verify
 | `npm run check` | 先 build，再运行源码语法发现 |
 | `npm test` | 先 build，再完整运行 tests/*.test.mjs，最多四个文件并行 |
 | `npm run build:check` | `tools/verify.mjs --generated-only`：临时干净构建、集合/字节比较，不修复当前 dist |
-| `npm run verify` | 组合以上必要检查，复用一次普通 build；生成物对照仍独立编译 |
+| `npm run verify` | 先独立临时编译并检查当前生成物，通过后执行一次普通 build 及类型、语法、全量测试 |
 
-缺失声明、陈旧内容、孤立生成文件都应使 build:check 失败；Git 中 dist 干净不等于输出正确。普通 build 不负责移除不再生成的孤立文件，删除源模块时同时处理对应旧生成物。不要在运行中的 checkout 执行会构建 dist 的任务。
+缺失声明、陈旧内容、孤立生成文件都应使 build:check 和 verify 失败，且保持当前 dist 不变；Git 中 dist 干净不等于输出正确。修改源码后先显式执行 `npm run build` 更新生成物，再执行 verify；源码与生成物一并提交。普通 build 不负责移除不再生成的孤立文件，删除源模块时同时处理对应旧生成物。不要在运行中的 checkout 执行会构建 dist 的任务。
 
 ### macOS CI
 
 唯一完整 CI job `Check and test` 使用标准 `macos-26` ARM64 runner，保留 Node.js 22、`npm ci` 和完整 `npm run verify`，不另设 Linux 全量矩阵。测试仍最多四个文件并行，job 上限仍为 10 分钟，不因平台跳过测试。
 
-CI 通过临时命令目录明确选择 `/usr/bin/python3` 与 `/usr/bin/sqlite3`，不遮蔽 `setup-node` 提供的 Node。预检输出系统、架构及依赖路径和版本，确认 Python 3.9+、`fcntl.flock`/非阻塞 FD、Python SQLite 的 JSON/schema 查询，以及 SQLite CLI 3.35+ 的 JSON 输出、JSON 函数、MATERIALIZED、RETURNING 和只读参数；数据库检查仅用 `:memory:`。系统依赖缺失或能力不符会失败，不自动升级系统工具。
+CI 通过临时命令目录明确选择 `/usr/bin/python3` 与 `/usr/bin/sqlite3`，不遮蔽 `setup-node` 提供的 Node。预检输出系统、架构及依赖路径和版本，确认 Python 3.9+、`fcntl.flock`/非阻塞 FD、Python SQLite 的 JSON/schema 查询，以及 SQLite CLI 3.35+ 的 JSON 输出、JSON 函数、MATERIALIZED、RETURNING 和只读参数。完整性能力使用从零生成的临时 CHECK 违规库，验证产品所用的只读源 URI、一致性恢复和临时库检查能识别违规，并确认源文件不变；其他数据库探测使用 `:memory:`。系统依赖缺失或能力不符会失败，不自动升级系统工具。
 
 完整测试使用合成数据、临时文件和测试自有进程；CI 不配置业务凭据、不调用真实飞书 API、不读取个人数据库。macOS 上的进程、锁、权限和 SQLite 回归不等于用户机器的实际验收：现有 launchd/Keychain 测试仍使用模拟，真实 LaunchAgent、登录权限和账号关联按 Operations 单独验收。
 
@@ -82,3 +82,5 @@ node bin/exocortex.mjs --help --all --format json
 机器 JSON 直接调用 Node，避免 npm 的前缀。不要通过枚举文件把模块和研究工具当成公共命令，也不要为已退役 wrapper 复制业务规则表。领域反例仍测试真实实现；CLI 测参数、接线、效果与输出。
 
 命令目录中的 Routes 和 Options 区块由 `src/development/command-docs.mjs` 的纯渲染函数从 registry 生成。catalog 测试逐字比较这两个区块，并检查组数和路由数；修改 summary、选项说明、默认值、约束、效果或输出级别而未同步文档时，完整 verify 必须失败。手写帮助示例与跨选项契约保留在生成区块之外；不新增可执行工具或公共路由。
+
+`check --live` 的测试夹具注入正式的一次性采样器或共享调度器，并使用 v3 报告。测试失败、未到期、缓存写入和隐私边界时，必须经过与产品相同的接线；不能为旧 fixture 保留另一套 collector/writer 分支。旧缓存读取兼容单独使用从零合成的 v1/v2 文件验证，不依赖已退役的写入器。

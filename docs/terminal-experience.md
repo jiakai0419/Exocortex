@@ -53,6 +53,18 @@ dist/terminal/index.js
 
 命令可以保留 JSON 输出，但 text 输出应尽量走共享渲染层。
 
+## 错误与检查输出契约
+
+显式 `--format json` 的异常退出使用统一的 `schema_version: 1`、`ok: false`、`error: { code, message }` 封装；参数解析与命令内纯参数校验使用 `invalid_arguments`，执行失败使用 `execution_failed`。已知安全原因可保留在 `error.reason`，不输出原始依赖错误、远端 stderr、消息内容或路径。`sync` 的默认 JSON 模式也遵守此契约。成功结果及已有业务报告的 JSON 结构和退出码保持不变；文本错误继续写 stderr，transport 诊断仍只在 stderr。
+
+worker 在子命令非零退出且没有 stderr 原因时，从已识别的错误封装提取 message 写入原有失败日志字段，避免结构化输出使排错信息消失；进程错误或信号优先，未知封装不解释为公开错误。
+
+`sync` 和 `maintenance replay` 遇到 API 租约忙碌或不可用时均属于执行失败；有效命令无需改写参数，应保留具体租约原因及 `execution_failed` 分类。
+
+`check --live` 文本在非健康样本时展示公开白名单中的具体原因，例如账号冲突、API 正忙、无可抽样会话或调度尚未到期；不以通用 `live_incomplete` 取代已有原因。身份冲突与未解决的历史观察等额外计数仅在非零时显示，不增加正常屏幕噪声。不添加通用操作提示，不改动检查的 JSON 证据、采样、缓存调度或退出码。纯合成回归必须同时验证文本保留异常原因、JSON 保留原字段，以及未知原因和私有哨兵不会泄露。
+
+公开 live 文本只渲染 v3 的安全采样证据，不再调用旧 v2 lag renderer。`--unsafe-details` 不绕过 v3 的 `publicRemoteReport` 脱敏；此兼容选项不新增私有详情字段。
+
 ## 改造范围
 
 面向人的命令使用共享渲染层：

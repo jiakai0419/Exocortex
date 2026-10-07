@@ -41,7 +41,8 @@ jobs:
           uname -m
           node -e 'const assert = require("node:assert/strict"); assert.equal(process.platform, "darwin"); assert.equal(process.arch, "arm64"); assert.equal(process.versions.node.split(".")[0], "22"); console.log("Node:", process.version, process.arch, process.execPath);'
           python3 - <<'PY'
-          import fcntl, json, os, platform, shutil, sqlite3, subprocess, sys
+          import fcntl, json, os, platform, shutil, sqlite3, subprocess, sys, tempfile
+          from pathlib import Path
 
           assert sys.version_info >= (3, 9), "Python 3.9+ is required by the synthetic tests"
           assert platform.machine() == "arm64"
@@ -61,6 +62,23 @@ jobs:
           assert json.loads(result.stdout) == [{"value": 1}]
           readonly = subprocess.run(["sqlite3", "-readonly", "-json", ":memory:", "SELECT 1 AS ready"], check=True, capture_output=True, text=True)
           assert json.loads(readonly.stdout) == [{"ready": 1}]
+          # An OS-read-only schema can omit CHECK expressions. Validate the
+          # same ro-source/private-snapshot path used by database checks.
+          with tempfile.TemporaryDirectory(prefix="exocortex-integrity-probe-") as directory:
+              source = Path(directory) / 'invented ?#".sqlite'
+              snapshot = Path(directory) / "snapshot.sqlite"
+              with sqlite3.connect(source) as connection:
+                  connection.executescript("CREATE TABLE probe(value INTEGER CHECK(value IN (0, 1))); PRAGMA ignore_check_constraints=ON; INSERT INTO probe VALUES(2);")
+              before = source.read_bytes()
+              snapshot.touch(mode=0o600)
+              sql = ("PRAGMA cache_size=-2048;\nPRAGMA cache_spill=ON;\n.restore "
+                     + json.dumps(source.as_uri() + "?mode=ro")
+                     + "\nPRAGMA query_only=ON;\nPRAGMA quick_check;\n")
+              checked = subprocess.run(["sqlite3", "-batch", "-bail", "-json", str(snapshot)],
+                                       input=sql, check=True, capture_output=True, text=True, timeout=30)
+              assert any("CHECK constraint failed" in row["quick_check"] for row in json.loads(checked.stdout))
+              assert source.read_bytes() == before
+              assert snapshot.stat().st_mode & 0o777 == 0o600
           version = subprocess.check_output(["sqlite3", "--version"], text=True).strip()
           assert tuple(map(int, version.split()[0].split("."))) >= (3, 35, 0)
           print("Python:", sys.version.split()[0], sys.executable)

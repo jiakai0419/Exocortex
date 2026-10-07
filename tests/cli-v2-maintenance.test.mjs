@@ -112,3 +112,22 @@ test("a database without the required schema reports execution failure before an
     }
   }
 });
+
+for (const state of ["busy", "unavailable", "acquired"]) {
+  test(`replay holds the shared API lease through admission and releases ${state} results`, () => {
+    for (const fail of [false, true]) {
+      const events = [], stdout = io(), stderr = io();
+      const parsed = parseRouteOptions("maintenance.replay", ["--db", "/synthetic/account-lease.sqlite",
+        "--scope-id", "lark.im.received.chat.synthetic", "--start", "2026-01-01T00:00:00Z", "--end", "2026-01-01T01:00:00Z"]);
+      const context = createCommandContext({ stdout, stderr, deps: {
+        tryAcquireLarkApiLease(options) { events.push("acquire"); assert.equal(options.role, "sync");
+          return { state, release() { events.push("release"); } }; },
+        executeLarkImReplay() { events.push("replay"); if (fail) throw new Error("invented replay failure"); return { ok: true }; },
+      } });
+      const code = runMaintenanceCommand(parsed.options, { ...context, provided: parsed.provided });
+      assert.equal(code, state === "acquired" && !fail ? 0 : 1);
+      assert.deepEqual(events, state === "acquired" ? ["acquire", "replay", "release"] : ["acquire", "release"]);
+      if (state !== "acquired") assert.match(stderr.text(), /replay skipped: Lark API/);
+    }
+  });
+}

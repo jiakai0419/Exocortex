@@ -93,7 +93,7 @@ test("unsupported routes and effects fail before any handler is loaded", async (
     ["service", "install", "--once"], ["service", "start", "--db", "synthetic.sqlite"],
     ["maintenance", "enrich"], ["maintenance", "enrich", "--target", "all"],
     ["maintenance", "replay", "--scope-id", "synthetic.a", "--start", "2040-01-01T00:00:00Z", "--end", "2040-01-02T00:00:00Z"],
-    ["maintenance", "compact", "--dry-run"], ["--apply"], ["sync", "--format", "text"],
+    ["maintenance", "compact", "--dry-run"], ["--apply"],
     ["maintenance", "compact", "--db", "-h", "--apply"],
     ["maintenance", "compact", "--db", "-h", "--apply", "--all"],
     ["service.start"], ["maintenance.compact", "--apply"],

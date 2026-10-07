@@ -1,13 +1,17 @@
 #!/usr/bin/env node
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { CliExecutionError, CliUsageError, createCommandContext } from "../src/cli/context.mjs";
+import { CliExecutionError, CliUsageError, createCommandContext, writeCliError } from "../src/cli/context.mjs";
 import { parseInvocation, renderHelp } from "../src/cli/registry.mjs";
 
 export async function runCli(argv, overrides = {}) {
   const context = createCommandContext(overrides);
+  // Parsing can fail before the route's default format is available.
+  let format = argv.some((value, index) => value === "--format" && argv[index + 1] === "json")
+    || argv[0] === "sync" && (!argv[1] || argv[1].startsWith("-")) ? "json" : "text";
   try {
     const invocation = parseInvocation(argv, { context });
+    format = invocation.options.format;
     if (invocation.help) {
       context.stdout.write(renderHelp(invocation));
       return 0;
@@ -25,10 +29,8 @@ export async function runCli(argv, overrides = {}) {
   } catch (error) {
     const usage = error instanceof CliUsageError;
     const message = usage || error instanceof CliExecutionError ? error.message : "Unable to complete command; check its required dependencies and local evidence.";
-    if (argv.some((value, index) => value === "--format" && argv[index + 1] === "json")) {
-      context.stdout.write(`${JSON.stringify({ schema_version: 1, ok: false, error: { code: usage ? "invalid_arguments" : "execution_failed", message,
-        ...(error instanceof CliExecutionError && error.reason ? { reason: error.reason } : {}) } })}\n`);
-    } else context.stderr.write(`Error: ${message}\n`);
+    writeCliError(context, { format, code: usage ? "invalid_arguments" : "execution_failed", message,
+      reason: error instanceof CliExecutionError ? error.reason : undefined, textPrefix: "Error: " });
     return 1;
   }
 }

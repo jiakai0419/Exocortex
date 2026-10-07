@@ -21,6 +21,13 @@ const FIXTURE_EPOCH = Date.UTC(2042, 1, 3, 4, 5, 6);
 const CONCURRENT_AT = new Date(FIXTURE_EPOCH + 86_400_000).toISOString();
 const SAFE_PATH = [...new Set([dirname(process.execPath), "/usr/bin", "/bin"])].join(":");
 
+function assertJsonExecutionError(result, message) {
+  assert.deepEqual(JSON.parse(result.stdout), {
+    schema_version: 1, ok: false, error: { code: "execution_failed", message },
+  });
+  assert.equal(result.stderr, "");
+}
+
 function syntheticRecord({ key = "calibration", ordinal = 0, room = LAB.room,
   sender = { id: LAB.self.open_id, name: LAB.self.name, sender_type: "user" },
   msgType = "text", content, ...overrides } = {}) {
@@ -524,7 +531,7 @@ test("dry-run on a missing path creates neither database nor parent directory", 
   const missingParent = join(dir, "missing");
   const result = runEnrichment({ dir, dbPath: join(missingParent, "bench.sqlite"), fakeLarkCli: "/usr/bin/false" }, ["--dry-run"]);
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /database not found/);
+  assertJsonExecutionError(result, "database not found");
   assert.equal(existsSync(missingParent), false);
 });
 
@@ -535,7 +542,7 @@ test("a failed commit rolls back all enrichment and releases its maintenance loc
   const before = readRecords(fixture.dbPath);
   const result = runEnrichment(fixture);
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /record enrichment failed/);
+  assertJsonExecutionError(result, "record enrichment failed");
   assert.doesNotMatch(result.stderr + result.stdout, /SYNTHETIC_PRIVATE_SQL_BODY|private-fixture|CREATE TRIGGER|RAISE/);
   assert.deepEqual(readRecords(fixture.dbPath), before);
   assert.deepEqual(maintenanceLocks(fixture.dbPath), []);
@@ -548,7 +555,7 @@ test("an active sync lock blocks only the commit and remains untouched", (t) => 
   const before = readRecords(fixture.dbPath);
   const result = runEnrichment(fixture);
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /active sync lock/);
+  assertJsonExecutionError(result, "maintenance lock unavailable: 1 active sync lock(s); retry shortly");
   assert.deepEqual(readRecords(fixture.dbPath), before);
   assert.equal(sqliteJson(fixture.dbPath, "SELECT count(*) AS count FROM sync_locks;", "read sync lock")[0].count, 1);
   assert.deepEqual(maintenanceLocks(fixture.dbPath), []);
@@ -1087,7 +1094,7 @@ process.exit(1);
     const before = readRecords(fixture.dbPath);
     const result = runEnrichment(fixture);
     assert.equal(result.status, 1);
-    assert.equal(result.stderr, "record enrichment failed\n");
+    assertJsonExecutionError(result, "record enrichment failed");
     assert.doesNotMatch(result.stdout + result.stderr, /SYNTHETIC_PRIVATE|INVENTED_SECRET|synthetic\.invalid|998877665544/);
     assert.deepEqual(readRecords(fixture.dbPath), before);
     assert.deepEqual(maintenanceLocks(fixture.dbPath), []);

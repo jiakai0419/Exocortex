@@ -10,13 +10,15 @@ export function testFiles(projectRoot) {
     .map((entry) => `tests/${entry.name}`).sort();
 }
 
-/** One checkout build; the final independent clean build checks the output set. */
+/** Check the existing output before one checkout build can repair it. */
 export function verify(projectRoot, { generatedOnly = false, spawn = spawnSync,
   generatedCheck = checkGeneratedFiles } = {}) {
   if (generatedOnly) return generatedCheck(projectRoot);
   const compiler = join(projectRoot, "node_modules/typescript/bin/tsc");
   const tests = testFiles(projectRoot);
   if (!tests.length) throw new Error("No tests matched tests/*.test.mjs");
+  const generatedStatus = generatedCheck(projectRoot);
+  if (generatedStatus !== 0) return generatedStatus;
   const steps = [
     [compiler, "-p", "tsconfig.build.json"],
     [compiler, "-p", "tsconfig.json"],
@@ -27,5 +29,5 @@ export function verify(projectRoot, { generatedOnly = false, spawn = spawnSync,
     const result = spawn(process.execPath, args, { cwd: projectRoot, stdio: "inherit" });
     if (result.error || result.signal || result.status !== 0) return result.status || 1;
   }
-  return generatedCheck(projectRoot);
+  return 0;
 }

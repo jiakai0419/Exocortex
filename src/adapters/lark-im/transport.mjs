@@ -23,7 +23,8 @@ import { getLarkApiLeaseStdio, readSharedLarkCooldown, writeSharedLarkCooldown }
  * @property {number=} timeoutMs
  * @property {(cmd: string, args: string[], options: {encoding: BufferEncoding, maxBuffer: number, timeout: number, killSignal: NodeJS.Signals}) => SpawnResult} [spawn]
  * @property {(ms: number) => void} [sleep]
- * @property {() => number} [clock]
+ * @property {() => number} [clock] Epoch milliseconds for durable operation cooldowns.
+ * @property {() => number} [monotonicClock] Elapsed milliseconds for operation budgets and ordinary backoff.
  * @property {TransportState=} state
  * @property {typeof readSharedLarkCooldown=} readSharedCooldown
  * @property {typeof writeSharedLarkCooldown=} writeSharedCooldown
@@ -332,6 +333,7 @@ function positiveInteger(value, fallback) {
 /** @param {TransportDeps} [deps] @returns {LarkRunner} */
 function createLarkCliRunner({
   bin = process.env.LARK_CLI || "lark-cli", spawn = spawnSync, sleep = sleepMs, clock = Date.now,
+  monotonicClock = () => performance.now(),
   state = defaultTransportState, timeoutMs: defaultTimeoutMs = DEFAULT_LARK_CLI_TIMEOUT_MS,
   readSharedCooldown = spawn === spawnSync ? readSharedLarkCooldown : undefined,
   writeSharedCooldown = spawn === spawnSync ? writeSharedLarkCooldown : undefined,
@@ -346,14 +348,20 @@ function createLarkCliRunner({
     const requestedTimeoutMs = positiveInteger(options.timeoutMs, positiveInteger(defaultTimeoutMs, DEFAULT_LARK_CLI_TIMEOUT_MS));
     const budgetMs = positiveInteger(options.retryBudgetMs, DEFAULT_LARK_RETRY_BUDGET_MS);
     const maxBuffer = Math.min(MAX_LARK_BUFFER_BYTES, positiveInteger(options.maxBufferBytes, MAX_LARK_BUFFER_BYTES));
-    let lastNow = clock();
-    if (!Number.isFinite(lastNow)) lastNow = Date.now();
-    const deadline = lastNow + budgetMs;
-    const now = () => { const value = clock(); if (Number.isFinite(value)) lastNow = Math.max(lastNow, value); return lastNow; };
+    const wallNow = () => { const value = clock(); return Number.isFinite(value) ? value : Date.now(); };
+    const now = () => {
+      const value = monotonicClock();
+      if (!Number.isFinite(value)) throw new Error(`lark-cli failed: kind=unknown reason=clock_unavailable operation=${operation}`);
+      return value;
+    };
+    // Epoch cooldowns may cross processes; elapsed deadlines must not follow
+    // wall-clock corrections or treat a requested sleep as proof time passed.
+    const started = now();
+    const deadline = started + budgetMs;
     /** @type {SpawnResult | null} */
     let lastResult = null;
     let lastTimeoutMs = requestedTimeoutMs;
-    let nextAttemptAt = lastNow;
+    let nextAttemptAt = started;
     /** @param {boolean} budgetExhausted */
     const fail = (budgetExhausted) => {
       if (budgetExhausted) counters.exhausted += 1;
@@ -364,18 +372,17 @@ function createLarkCliRunner({
       // A best-effort caller may swallow an earlier error. Cooling this operation
       // remains mandatory, while unrelated operations can proceed immediately.
       while (true) {
-        const shared = readSharedCooldown?.({ operation, nowMs: now() });
+        const shared = readSharedCooldown?.({ operation, nowMs: wallNow() });
         if (shared?.state === "unavailable") throw new Error(`lark-cli failed: kind=unknown reason=shared_cooldown_unavailable operation=${operation}`);
         if (shared?.state === "cooldown") state.cooldowns.set(operation, Math.max(state.cooldowns.get(operation) || 0, Number(shared.untilMs)));
-        const target = Math.max(nextAttemptAt, state.cooldowns.get(operation) || 0);
-        const waitMs = Math.max(0, target - now());
-        if (target >= deadline || now() >= deadline) return fail(true);
+        const current = now();
+        const waitMs = Math.max(0, nextAttemptAt - current, (state.cooldowns.get(operation) || 0) - wallNow());
+        if (current >= deadline || waitMs >= deadline - current) return fail(true);
         if (waitMs <= 0) break;
         sleep(waitMs);
         counters.wait_ms += waitMs;
         // Re-read after waiting: another process may have lengthened the
         // operation cooldown. Never launch from a stale ready decision.
-        lastNow = Math.max(lastNow, target);
       }
       const remaining = Math.floor(deadline - now());
       if (remaining <= 0) return fail(true);
@@ -393,7 +400,7 @@ function createLarkCliRunner({
       lastResult = result;
       if (result.status === 0) {
         state.rateStreaks.delete(operation);
-        if ((state.cooldowns.get(operation) || 0) <= now()) state.cooldowns.delete(operation);
+        if ((state.cooldowns.get(operation) || 0) <= wallNow()) state.cooldowns.delete(operation);
         return parseJson(result.stdout || "");
       }
       const failure = classifyLarkFailure(spawnFailureText(result));
@@ -405,9 +412,10 @@ function createLarkCliRunner({
         const delay = failure.retry_after_ms ?? Math.min(120_000, FALLBACK_RATE_LIMIT_DELAY_MS * 2 ** (streak - 1));
         if (failure.retry_after_ms === null) counters.retry_after_unknown += 1;
         else counters.max_retry_after_ms = Math.max(counters.max_retry_after_ms, failure.retry_after_ms);
-        const until = Math.min(Number.MAX_SAFE_INTEGER, now() + delay);
+        const wall = wallNow();
+        const until = Math.min(Number.MAX_SAFE_INTEGER, wall + delay);
         state.cooldowns.set(operation, Math.max(state.cooldowns.get(operation) || 0, until));
-        if (writeSharedCooldown && until > now() && !writeSharedCooldown({ operation, untilMs: until, nowMs: now() })) {
+        if (writeSharedCooldown && until > wall && !writeSharedCooldown({ operation, untilMs: until, nowMs: wall })) {
           throw new Error(`lark-cli failed: kind=rate_limited reason=shared_cooldown_unavailable operation=${operation}`);
         }
       }

@@ -6,6 +6,7 @@ import { fetchChatMessages, getSelfProfile } from "../adapters/lark-im/adapter.m
 import { chatId, chatScopeId } from "../adapters/lark-im/core.mjs";
 import { prepareChatWindowRecords } from "../adapters/lark-im/sync-runner.mjs";
 import { readOnlySqliteJson } from "../storage/sqlite/readonly-query.mjs";
+import { readRemoteAccountBinding, accountBindingAdmissionError } from "../diagnostics/remote-account-binding.mjs";
 import { publicDiagnosticError } from "../diagnostics/public-safe.mjs";
 import {
   commitBoundedReplayRecords,
@@ -84,15 +85,11 @@ function executeLarkImReplay(opts, deps = {}) {
     if (config.unsupported_reason) throw new ReplayInputError("selected replay scope is unsupported");
     return /** @type {ReplayScope} */ ({ ...row, config });
   });
-  // Existing sent records are only an identity consistency check. An actual
-  // profile read supplies the self identity; names or IDs are never guessed.
-  const priorSelfIds = readOnlySqliteJson(dbPath,
-    "SELECT DISTINCT actor_id FROM records WHERE source_id='lark.im' AND direction='sent' AND actor_id LIKE 'ou_%' LIMIT 2;",
-    "read replay identity evidence");
   const fetchOpts = { pageSize: 50, chatPageSize: 100, chatTypes: "group,p2p", maxPages: 40, retries: 2, retryDelayMs: 1000 };
   const self = (deps.getSelfProfile || getSelfProfile)(fetchOpts);
   if (!self || typeof self.open_id !== "string" || !self.open_id.startsWith("ou_")) throw new ReplayInputError("self identity could not be verified");
-  if (priorSelfIds.some((row) => row.actor_id !== self.open_id)) throw new ReplayInputError("self identity conflicts with this database");
+  const admissionError = accountBindingAdmissionError(readRemoteAccountBinding({ db: dbPath, selfOpenId: self.open_id }));
+  if (admissionError) throw new ReplayInputError(admissionError);
   const selfHash = createHash("sha256").update(self.open_id).digest("hex");
   const planId = createHash("sha256").update(JSON.stringify({ kind: "bounded_replay/v1", scopes: [...opts.scopeIds].sort(),
     baseline, start: opts.startMs, end: opts.endMs, self: selfHash })).digest("hex");
@@ -142,4 +139,4 @@ function executeLarkImReplay(opts, deps = {}) {
 }
 
 
-export { executeLarkImReplay, validateReplayOptions, parseReplayTime, safeReplayError };
+export { executeLarkImReplay, validateReplayOptions, parseReplayTime, safeReplayError, ReplayInputError };

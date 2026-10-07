@@ -5,6 +5,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+function assertJsonExecutionError(result, message) {
+  assert.deepEqual(JSON.parse(result.stdout), {
+    schema_version: 1, ok: false, error: { code: "execution_failed", message },
+  });
+  assert.equal(result.stderr, "");
+}
+
 function sqlValue(value) {
   return value === null || value === undefined ? "NULL" : `'${String(value).replaceAll("'", "''")}'`;
 }
@@ -288,7 +295,7 @@ test("scope dry-run cannot create a missing database or parent directory", (t) =
   const missingParent = join(f.dir, "missing");
   const result = run({ ...f, dbPath: join(missingParent, "shape.sqlite") }, ["--dry-run"]);
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /database not found/);
+  assertJsonExecutionError(result, "database not found");
   assert.equal(existsSync(missingParent), false);
 });
 
@@ -299,7 +306,7 @@ test("failed scope commit rolls back and releases its own lock", (t) => {
   const before = scopes(f.dbPath);
   const result = run(f);
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /scope enrichment failed/);
+  assertJsonExecutionError(result, "scope enrichment failed");
   assert.doesNotMatch(result.stderr + result.stdout, /SYNTHETIC_PRIVATE_SQL_BODY|private-fixture|CREATE TRIGGER|RAISE/);
   assert.deepEqual(scopes(f.dbPath), before);
   assert.deepEqual(locks(f.dbPath), []);
@@ -310,7 +317,7 @@ test("scope commit respects a sync lock acquired during network lookup", (t) => 
   const before = scopes(f.dbPath);
   const result = run(f);
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /active sync lock/);
+  assertJsonExecutionError(result, "maintenance lock unavailable: 1 active sync lock(s); retry shortly");
   assert.deepEqual(scopes(f.dbPath), before);
   assert.equal(sqlite(f.dbPath, "SELECT count(*) AS count FROM sync_locks;", true)[0].count, 1);
   assert.deepEqual(locks(f.dbPath), []);
@@ -342,8 +349,8 @@ process.exit(result.status ?? 1);
     chmodSync(path, 0o755);
     const result = run(f, [], { PATH: `${f.dir}:${process.env.PATH}` });
     assert.equal(result.status, 1);
-    assert.match(result.stderr, /scope enrichment failed/);
-    assert.doesNotMatch(result.stderr, /CHECK constraint|INSERT INTO|maintenance_locks|other-owner/);
+    assertJsonExecutionError(result, "scope enrichment failed");
+    assert.doesNotMatch(result.stdout + result.stderr, /CHECK constraint|INSERT INTO|maintenance_locks|other-owner/);
     assert.deepEqual(scopes(f.dbPath), before);
     const remaining = locks(f.dbPath);
     if (replacement) {
@@ -367,7 +374,7 @@ process.exit(1);
   chmodSync(path, 0o700);
   const result = run(f, ["--dry-run"], { PATH: `${f.dir}:${process.env.PATH}` });
   assert.equal(result.status, 1);
-  assert.equal(result.stderr, "scope enrichment failed\n");
+  assertJsonExecutionError(result, "scope enrichment failed");
   assert.doesNotMatch(result.stdout + result.stderr, /SYNTHETIC_PRIVATE|private-fixture|SELECT secret/);
   assert.deepEqual(readFileSync(f.dbPath), beforeBytes);
   assert.deepEqual(scopes(f.dbPath), before);

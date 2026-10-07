@@ -1,6 +1,6 @@
 // @ts-check
 import { resolve } from "node:path";
-import { CliExecutionError } from "./context.mjs";
+import { CliExecutionError, CliUsageError, writeCliError } from "./context.mjs";
 import { publicDiagnosticError } from "../diagnostics/public-safe.mjs";
 import { ACTIVITY_GRACE_MS, createActivityWriter } from "../diagnostics/lark-im-activity-evidence.mjs";
 import { writeLog } from "../runtime/worker/log.mjs";
@@ -23,7 +23,12 @@ export function runSyncCommand(options, context) {
   let activity;
   let apiLease;
   try {
-    const opts = normalizeSyncOptions(options, { now: () => context.startedAtMs ?? now(), provided: context.provided });
+    let opts;
+    try { opts = normalizeSyncOptions(options, { now: () => context.startedAtMs ?? now(), provided: context.provided }); }
+    catch (error) {
+      if (error instanceof CliExecutionError) throw new CliUsageError(error.message);
+      throw error;
+    }
     // Dependency-injected harnesses own their lease stub, as they do activity
     // writers. The public CLI always takes the real cross-process lease.
     const acquire = deps?.tryAcquireLarkApiLease || (!deps ? acquireSyncLarkApiLease : undefined);
@@ -44,10 +49,12 @@ export function runSyncCommand(options, context) {
     return summary.ok ? 0 : summary.partial ? 2 : 1;
   } catch (error) {
     const failure = classifyLarkFailure(error);
-    const message = error instanceof CliExecutionError ? error.message
+    const message = error instanceof CliUsageError || error instanceof CliExecutionError ? error.message
       : failure.kind !== "unknown" ? `sync failed: kind=${failure.kind}${failure.code === null ? "" : ` code=${failure.code}`}`
       : publicDiagnosticError(error, "sync failed").message;
-    stderr.write(`${message}\n`);
+    writeCliError({ stdout, stderr }, { format: options.format ?? "json",
+      code: error instanceof CliUsageError ? "invalid_arguments" : "execution_failed", message,
+      reason: error instanceof CliExecutionError ? error.reason : undefined });
     const transport = readTransport();
     if (transport.calls > 0) stderr.write(`${JSON.stringify({ type: "lark_transport_summary", transport })}\n`);
     return 1;

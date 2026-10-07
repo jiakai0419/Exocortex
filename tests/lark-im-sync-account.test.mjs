@@ -71,7 +71,8 @@ for (const scope of ["sent", "received", "details", "discover", "all"]) {
     const result = await invoke(f, scope, { ensureSourceInitialSyncStart: (...args) => {
       baselineCalls++; return ensureSourceInitialSyncStart(...args);
     } });
-    assert.equal(result.code, 1); assert.equal(result.stdout, ""); assert.match(result.stderr, /account conflicts/);
+    assert.equal(result.code, 1); assert.equal(result.stderr, "");
+    assert.equal(result.summary.error.code, "execution_failed"); assert.match(result.summary.error.message, /account conflicts/);
     assert.equal(baselineCalls, 0); assert.equal(f.profileCalls, profiles + 1); assert.equal(f.apiCalls, calls);
     assert.deepEqual(snapshot(f), before);
   });
@@ -114,7 +115,8 @@ for (const mutation of ["corrupt", "wrong_database"]) {
     writeFileSync(f.sidecar, mutation === "corrupt" ? "not JSON" : JSON.stringify(value));
     const before = snapshot(f), calls = f.apiCalls;
     const result = await invoke(f, "discover", { ensureSourceInitialSyncStart: () => assert.fail("binding failure must precede baseline mutation") });
-    assert.equal(result.code, 1); assert.match(result.stderr, /binding cannot be verified/);
+    assert.equal(result.code, 1); assert.equal(result.stderr, "");
+    assert.equal(result.summary.error.code, "execution_failed"); assert.match(result.summary.error.message, /binding cannot be verified/);
     assert.deepEqual(snapshot(f), before); assert.equal(f.apiCalls, calls);
   });
 }
@@ -135,7 +137,8 @@ test("an empty but already bound source rejects another account before baseline 
     before: captureRemoteAccountBinding({ db: f.db }), successful: true }), true);
   const before = snapshot(f); f.profile = B;
   const result = await invoke(f, "discover", { ensureSourceInitialSyncStart: () => assert.fail("present binding must precede baseline") });
-  assert.equal(result.code, 1); assert.match(result.stderr, /account conflicts/);
+  assert.equal(result.code, 1); assert.equal(result.stderr, "");
+  assert.equal(result.summary.error.code, "execution_failed"); assert.match(result.summary.error.message, /account conflicts/);
   assert.deepEqual(snapshot(f), before); assert.equal(f.apiCalls, 0);
 });
 

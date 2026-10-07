@@ -409,7 +409,7 @@ test('read-only and manual cache-writing entry points preserve safe diagnostics 
 });
 
 test('check report fallback exposes diagnostic and never marks a diagnosed report passed', async () => {
-  const f = fixture(); delete f.deps.collectLagReport;
+  const f = fixture();
   f.deps.runManualRemoteSample = () => ({ outcome: 'failed', reason: 'sample_process_failed', guardian_diagnostic: diagnostic() });
   const failed = await collectCheckReport(options({ live: true, writeLiveCache: true }), f.context, f.deps);
   assert.equal(failed.checks.live.status, 'unavailable');
@@ -418,13 +418,13 @@ test('check report fallback exposes diagnostic and never marks a diagnosed repor
     binding: { state: 'verified', evidence: 'single_sent_actor' },
     window: { start: new Date(at - 86400000).toISOString(), end: new Date(at - 600000).toISOString() },
     probe: { remote_messages_checked: 1, probe_errors: 0 } };
-  const baseline = fixture(); delete baseline.deps.collectLagReport;
+  const baseline = fixture();
   baseline.deps.collectRemoteSample = () => ({ outcome: 'ok', report: healthy });
   const passed = await collectCheckReport(options({ live: true }), baseline.context, baseline.deps);
   assert.equal(passed.checks.live.status, 'passed');
   assert.equal(passed.exit_code, 0);
   for (const value of [diagnostic(), { ...diagnostic(), message: privateToken }]) {
-    const g = fixture(); delete g.deps.collectLagReport;
+    const g = fixture();
     g.deps.collectRemoteSample = () => ({ outcome: 'ok', report: { ...healthy, guardian_diagnostic: value } });
     const result = await collectCheckReport(options({ live: true }), g.context, g.deps);
     assert.notEqual(result.checks.live.status, 'passed');

@@ -5,7 +5,7 @@ import { createCheckPlan } from "../src/diagnostics/check-plan.mjs";
 import { evaluateWaitState } from "../src/diagnostics/service-wait-state.mjs";
 import { runCheckCommand } from "../src/cli/check-command.mjs";
 import { parseRouteOptions } from "../src/cli/registry.mjs";
-import { at, sync, quality, live, options, fixture, waitEvidence } from "./helpers/check-fixture.mjs";
+import { at, sync, quality, live, liveResult, options, fixture, waitEvidence } from "./helpers/check-fixture.mjs";
 
 test("default check collects exactly three direct local reports, each with an observation time", async () => {
   let time = at;
@@ -47,22 +47,22 @@ test("dependency plan blocks remote access while still inspecting an explicit ba
   assert.deepEqual(f.calls, ["backup"]); assert.doesNotMatch(JSON.stringify(result), /PRIVATE|existing-copy/);
 });
 for (const overrides of [{ probe: { remote_messages_checked: 0, probe_errors: 0 } }, { probe: { remote_messages_checked: 1, probe_errors: 1 } }, { missing_count: 1 }, { window: {} }, { status: "unavailable", ok: false }, { status: "inconclusive", ok: false }]) test(`live rejects insufficient evidence ${JSON.stringify(overrides)}`, async () => {
-  const f = fixture(); f.deps.collectLagReport = () => live(overrides);
+  const f = fixture(); f.deps.collectRemoteSample = () => liveResult(live(overrides));
   const result = await collectCheckReport(options({ live: true }), f.context, f.deps);
   assert.equal(result.exit_code, 2); assert.equal(result.checks.live.status, "incomplete");
 });
 test("live defaults use bounded discovered chats and a frozen stable 24-hour window without cache access", async () => {
   const f = fixture(); let received;
-  f.deps.collectLagReport = (_db, plan) => { received = plan; return live(); };
-  f.deps.liveProbeContext = () => { throw new Error("cache must not be inspected"); };
+  f.deps.collectRemoteSample = (_db, plan) => { received = plan; return liveResult(); };
+  f.deps.runManualRemoteSample = () => { throw new Error("cache scheduler must not be called"); };
   assert.equal((await collectCheckReport(options({ live: true }), f.context, f.deps)).exit_code, 0);
   assert.deepEqual([received.chatPages, received.hotChats, received.messagesPerChat], [5, 5, 20]);
   assert.equal(received.endMs, Math.floor((at - 600000) / 60000) * 60000); assert.equal(received.startMs, received.endMs - 86400000);
 });
-test("all extensions run in fixed order; wait rechecks final readiness and cache writes last", async () => {
+test("all extensions run in fixed order; wait rechecks final readiness before the cache scheduler", async () => {
   const f = fixture(); f.deps.collectStatusEvidence = () => { f.calls.push("wait"); return waitEvidence(at); };
   const result = await collectCheckReport(options({ wait: true, live: true, writeLiveCache: true, through: "2030-01-01T00:00:00Z", backup: "/tmp/copy.sqlite" }), f.context, f.deps);
-  assert.equal(result.exit_code, 0); assert.deepEqual(f.calls, ["wait", "database", "sync", "quality", "coverage", "backup", "live", "cache"]);
+  assert.equal(result.exit_code, 0); assert.deepEqual(f.calls, ["wait", "database", "sync", "quality", "coverage", "backup", "live-cache"]);
 });
 test("wait failure still collects local, coverage and backup, skipping live and cache", async () => {
   const f = fixture(); f.deps.collectStatusEvidence = () => waitEvidence(at, { service: { status: "absent" } });
@@ -97,24 +97,41 @@ test("wait timeout is bounded and retains a fresh final local result", async () 
   const report = await collectCheckReport(options({ wait: true, timeoutSeconds: 2, pollSeconds: 5 }), f.context, f.deps);
   assert.equal(time, at + 2000); assert.equal(report.exit_code, 2); assert.equal(report.checks.wait.evidence.reason, "wait_timeout"); assert.equal(report.checks.sync.status, "passed");
 });
-test("safe nested output drops private markers; only explicit unsafe live makes entire output private", async () => {
+test("v3 nested output drops private markers, including when private mode is explicitly labeled", async () => {
   const f = fixture(); const marker = "PRIVATE_INVENTED_SENTINEL";
   f.deps.buildStatus = () => sync({ db_path: marker, runs: { recent: [{ error_message: marker, scope_id: marker }] } });
   f.deps.collectQualityReport = () => ({ ...quality(), latest_records: [{ body: marker }] });
-  f.deps.collectLagReport = () => live({ latest_remote: { body: marker, message_id: marker } });
+  f.deps.collectRemoteSample = () => liveResult(live({ latest_remote: { body: marker, message_id: marker } }));
   assert.doesNotMatch(JSON.stringify(await collectCheckReport(options({ live: true }), f.context, f.deps)), new RegExp(marker));
   const privateReport = await collectCheckReport(options({ live: true, unsafeDetails: true }), f.context, f.deps);
-  assert.equal(privateReport.privacy, "private"); assert.match(JSON.stringify(privateReport), new RegExp(marker));
+  assert.equal(privateReport.privacy, "private"); assert.doesNotMatch(JSON.stringify(privateReport), new RegExp(marker));
 });
-test("cache requires stable database identity and reports failed writes", async () => {
-  const f = fixture(); let generation = 0;
-  f.deps.liveProbeContext = () => ({ database_key: String(generation++) });
-  assert.equal((await collectCheckReport(options({ live: true, writeLiveCache: true }), f.context, f.deps)).exit_code, 1);
-  assert.ok(!f.calls.includes("cache"));
-  f.deps.liveProbeContext = () => ({ database_key: "same" });
-  f.deps.writeLiveProbeCache = () => { throw new Error("PRIVATE_CACHE_FAILURE"); };
+test("cache failures come from the shared scheduler and never invoke the one-shot collector", async () => {
+  const f = fixture();
+  f.deps.collectRemoteSample = () => assert.fail("cache check bypassed scheduler");
+  f.deps.runManualRemoteSample = () => liveResult(live({ ok: false, status: "unavailable", reason: "cache_write_failed" }),
+    { outcome: "failed", cacheWritten: false });
   const report = await collectCheckReport(options({ live: true, writeLiveCache: true }), f.context, f.deps);
-  assert.equal(report.exit_code, 1); assert.equal(report.cache.status, "failed"); assert.doesNotMatch(JSON.stringify(report), /PRIVATE_CACHE_FAILURE/);
+  assert.equal(report.exit_code, 1); assert.equal(report.cache.status, "skipped");
+  assert.equal(report.checks.live.evidence.reason, "cache_write_failed");
+  f.deps.runManualRemoteSample = () => { throw new Error("PRIVATE_CACHE_FAILURE"); };
+  const failed = await collectCheckReport(options({ live: true, writeLiveCache: true }), f.context, f.deps);
+  assert.equal(failed.exit_code, 1); assert.equal(failed.cache.status, "skipped");
+  assert.doesNotMatch(JSON.stringify(failed), /PRIVATE_CACHE_FAILURE/);
+});
+
+// Regression: the default fixture used to short-circuit both real execution
+// boundaries, letting failed and not-due attempts look passed and written.
+test("default fixture exercises collector failure and scheduler not-due through the production branches", async () => {
+  const f = fixture(); let collectorCalls = 0; let schedulerCalls = 0;
+  f.deps.collectRemoteSample = () => { collectorCalls++; return liveResult(live({ ok: false, status: "unavailable", reason: "api_unavailable" }), { outcome: "failed" }); };
+  f.deps.runManualRemoteSample = () => { schedulerCalls++; return { outcome: "not_due", reason: "not_due" }; };
+  const read = await collectCheckReport(options({ live: true }), f.context, f.deps);
+  const write = await collectCheckReport(options({ live: true, writeLiveCache: true }), f.context, f.deps);
+  assert.equal(collectorCalls, 1); assert.equal(schedulerCalls, 1);
+  assert.equal(read.exit_code, 1); assert.equal(write.exit_code, 2);
+  assert.equal(write.cache.status, "skipped");
+  assert.equal(write.checks.live.evidence.reason, "not_due");
 });
 test("domain validates mode combinations and time windows before dependencies", async () => {
   for (const [opts, flags] of [[{ backup: "/tmp/a", latestBackup: true }, []], [{ unsafeDetails: true }, []], [{ writeLiveCache: true }, []], [{}, ["--start"]], [{}, ["--lines"]], [{}, ["--timeout-seconds"]], [{}, ["--backup-dir"]], [{}, ["--log-dir"]], [{ live: true, start: "2030-01-02" }, []], [{ live: true, start: "2030-01-02T12:00:00Z" }, []]]) {
@@ -127,15 +144,17 @@ test("domain validates mode combinations and time windows before dependencies", 
   assert.throws(() => parseRouteOptions("check", ["--hot-chats", "20junk"]), /integer/);
 });
 
-test("explicit unsafe live preserves private missing/latest/error details in text; ordinary text remains safe", async () => {
+test("v3 sample text exposes bounded findings without raw missing/latest/error payloads", async () => {
   const marker = "PRIVATE_EXPLICIT_LIVE_TEXT";
   for (const unsafeDetails of [false, true]) {
-    const f = fixture(); f.deps.collectLagReport = () => live({ status: "delayed", ok: false, missing_count: 1,
+    const f = fixture(); f.deps.collectRemoteSample = () => liveResult(live({ status: "delayed", ok: false, missing_count: 1,
+      findings: { missing: 1, suspected_missing: 1 },
       latest_remote: { body: marker, chat_name: marker, sender_name: marker },
-      missing: [{ body: marker, chat_name: marker, sender_name: marker }], probe_errors: [{ chat_name: marker, error: marker }], unsupported_chats: [] });
+      missing: [{ body: marker }], probe_errors: [{ error: marker }] }));
     assert.equal(await runCheckCommand(options({ live: true, unsafeDetails, format: "text" }), f.context, f.deps), 2);
-    if (unsafeDetails) { assert.match(f.output(), /PRIVATE/); assert.match(f.output(), new RegExp(marker)); assert.match(f.output(), /Missing/); }
-    else assert.doesNotMatch(f.output(), new RegExp(marker));
+    assert.doesNotMatch(f.output(), new RegExp(marker));
+    assert.match(f.output(), /1 suspected/);
+    if (unsafeDetails) assert.match(f.output(), /PRIVATE/);
   }
 });
 
@@ -145,7 +164,7 @@ for (const field of ["through", "start", "end"]) test(`${field} rejects normaliz
     let touched = false;
     const stop = () => { touched = true; throw new Error("EVIDENCE_OR_EFFECT_TOUCHED"); };
     const f = fixture({ startedAtMs: Date.parse("2036-01-01T00:00:00Z"), now: () => Date.parse("2036-01-01T00:00:00Z"), provided: new Set([`--${field}`]) });
-    const deps = Object.fromEntries(["checkDependencies", "collectStatusEvidence", "sleep", "readDatabaseEvidence", "buildStatus", "collectQualityReport", "collectLagReport", "inspectCoverage", "verifyBackupEvidence", "liveProbeContext", "writeLiveProbeCache"].map((key) => [key, stop]));
+    const deps = Object.fromEntries(["checkDependencies", "collectStatusEvidence", "sleep", "readDatabaseEvidence", "buildStatus", "collectQualityReport", "collectRemoteSample", "inspectCoverage", "verifyBackupEvidence", "runManualRemoteSample"].map((key) => [key, stop]));
     await assert.rejects(collectCheckReport(options({ wait: true, live: true, writeLiveCache: true, start: "2030-01-01T00:00:00Z", end: "2030-03-03T00:00:00Z", [field]: value }), f.context, deps),
       (error) => error.name === "CliUsageError" && error.message === `--${field} requires a valid ISO timestamp with an explicit timezone`, `${field}=${value}`);
     assert.equal(touched, false, `${field}=${value}`);

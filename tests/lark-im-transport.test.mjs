@@ -22,20 +22,23 @@ const rate = (seconds, extras = {}) => fail({
 
 function harness(results, { initial = EPOCH, state = createTransportState(), ...deps } = {}) {
   let now = initial;
+  let elapsed = 0;
+  const advance = (ms) => { now += ms; elapsed += ms; };
+  const shiftWallClock = (ms) => { now += ms; };
   const calls = [];
   const sleeps = [];
   const run = createLarkCliRunner({
-    bin: "fake-lark-cli", state, clock: () => now,
-    sleep(ms) { sleeps.push(ms); now += ms; },
+    bin: "fake-lark-cli", state, clock: () => now, monotonicClock: () => elapsed,
+    sleep(ms) { sleeps.push(ms); advance(ms); },
     spawn(cmd, args, options) {
-      calls.push({ cmd, args, options, at: now });
+      calls.push({ cmd, args, options, at: now, elapsed });
       const result = results[Math.min(calls.length - 1, results.length - 1)];
-      return typeof result === "function" ? result({ advance: (ms) => { now += ms; }, options }) : result;
+      return typeof result === "function" ? result({ advance, shiftWallClock, options }) : result;
     },
     ...deps,
   });
   return { run, state, calls, sleeps, stats: () => getTransportStats(state, now), now: () => now,
-    advance(ms) { now += ms; } };
+    elapsed: () => elapsed, advance, shiftWallClock };
 }
 
 function throwsSafe(fn, expected) {
@@ -315,6 +318,44 @@ test("default total budget is 180 seconds and cannot be evaded by repeated trans
   assert.deepEqual(h.calls.map((call) => call.options.timeout), [120000, 60000]);
   assert.equal(h.now() - EPOCH, DEFAULT_LARK_RETRY_BUDGET_MS);
 });
+
+for (const wallShiftMs of [0, -10_000, -600_000, 600_000]) {
+  test(`attempts and backoff retain the 180 second budget after a ${wallShiftMs}ms wall-clock shift`, () => {
+    let attempts = 0;
+    const h = harness([({ advance, shiftWallClock, options }) => {
+      advance(options.timeout);
+      if (++attempts === 1) shiftWallClock(wallShiftMs);
+      return fail("ETIMEDOUT");
+    }]);
+    throwsSafe(() => h.run(HISTORY, { retries: 4, retryDelayMs: 2000 }), /kind=network_timeout.*retry_exhausted=1/);
+    assert.equal(h.elapsed(), DEFAULT_LARK_RETRY_BUDGET_MS);
+    assert.deepEqual(h.calls.map((call) => call.options.timeout), [120000, 58000]);
+    assert.deepEqual(h.calls.map((call) => call.elapsed), [0, 122000]);
+    assert.deepEqual(h.sleeps, [2000]);
+    assert.equal(h.stats().timeouts, 2);
+    assert.equal(h.stats().exhausted, 1);
+  });
+}
+
+for (const wallShiftMs of [-600_000, 600_000]) {
+  test(`ordinary exponential backoff survives a ${wallShiftMs}ms wall-clock shift during each sleep`, () => {
+    const pauses = [];
+    const h = harness([fail("ECONNRESET"), fail("ECONNRESET"), ok()], {
+      sleep(ms) {
+        pauses.push(ms);
+        h.advance(ms);
+        h.shiftWallClock(wallShiftMs);
+      },
+    });
+    assert.deepEqual(h.run(HISTORY, { retries: 2, retryDelayMs: 2000 }), { ok: true });
+    assert.equal(h.elapsed(), 6000);
+    assert.deepEqual(pauses, [2000, 4000]);
+    assert.deepEqual(h.calls.map((call) => call.elapsed), [0, 2000, 6000]);
+    assert.equal(h.stats().wait_ms, 6000);
+    assert.equal(h.stats().retries, 2);
+    assert.equal(h.stats().exhausted, 0);
+  });
+}
 
 test("retry count has a finite hard cap even with a zero reset header", () => {
   const h = harness([rate(0)]);

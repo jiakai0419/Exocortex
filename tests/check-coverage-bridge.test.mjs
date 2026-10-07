@@ -22,19 +22,28 @@ for (const result of [
 
 // The old doctor no longer has JSON child commands. The actual remaining
 // process boundaries (coverage Python and remote CLI) keep these counterexamples.
-import { runLark } from "../src/diagnostics/lark-im-lag-report.mjs";
+import { createSampleApi } from "../src/diagnostics/remote-sample.mjs";
+function sampleApi(result, env = {}) {
+  return createSampleApi("/synthetic/db", { env }, {
+    now: () => at, tryAcquireLease: () => ({ state: "acquired", release() {} }), spawnSync: result,
+  });
+}
 for (const failure of [{ status: 1 }, { status: 2 }, { status: null, signal: "SIGKILL" }, { status: 0, error: new Error("PRIVATE_FAILURE") }, { status: 0, signal: "SIGTERM" }]) {
   test(`live transport rejects successful-looking stdout after ${JSON.stringify(failure)}`, () => {
-    assert.throws(() => runLark(["synthetic"], { env: { LARK_CLI: "/tmp/invented-cli" }, spawnSync: () => ({ status: 0, stdout: '{"ok":true,"open_id":"ou_invented"}', stderr: "PRIVATE_SENTINEL", ...failure }) }), (error) => !/PRIVATE|ou_invented/.test(error.message));
+    const api = sampleApi(() => ({ status: 0, stdout: '{"code":0,"data":{"open_id":"ou_invented"}}', stderr: "PRIVATE_SENTINEL", ...failure }));
+    assert.throws(() => api.call("/open-apis/authen/v1/user_info"), (error) => !/PRIVATE|ou_invented/.test(error.message));
   });
 }
-for (const [stderr, message] of [["keychain not initialized\nPRIVATE_SENTINEL", /keychain not initialized/], ['{"error":{"code":231203}} PRIVATE_SENTINEL', /reason=restricted_mode code=231203/]]) {
-  test(`live transport retains finite diagnostic classification ${message}`, () => {
-    assert.throws(() => runLark([], { spawnSync: () => ({ status: 1, stdout: "", stderr }) }), (error) => message.test(error.message) && !/PRIVATE_SENTINEL/.test(error.message));
+for (const [stderr, reason] of [["keychain not initialized\nPRIVATE_SENTINEL", "api_unavailable"], ['{"error":{"code":231203}} PRIVATE_SENTINEL', "restricted_mode"]]) {
+  test(`live transport retains finite diagnostic classification ${reason}`, () => {
+    const api = sampleApi(() => ({ status: 1, stdout: "", stderr }));
+    assert.throws(() => api.call("/open-apis/im/v1/messages"), (error) => error.reason === reason && !/PRIVATE_SENTINEL/.test(error.message));
   });
 }
-test("live transport forwards invocation environment and preserves its existing bounded request budget", () => {
+test("live transport forwards invocation environment and the current bounded request budget", () => {
   const env = { LARK_CLI: "/tmp/invented-cli", PATH: "/tmp/invented-bin" }; let call;
-  assert.deepEqual(runLark(["synthetic"], { env, spawnSync: (cmd, args, options) => { call = { cmd, args, options }; return { status: 0, stdout: '{"ok":true}', stderr: "" }; } }), { ok: true });
-  assert.equal(call.cmd, env.LARK_CLI); assert.equal(call.options.env, env); assert.equal(call.options.timeout, 120000); assert.equal(call.options.maxBuffer, 100 * 1024 * 1024); assert.equal(call.options.killSignal, "SIGKILL");
+  const api = sampleApi((cmd, args, options) => { call = { cmd, args, options }; return { status: 0, stdout: '{"code":0,"data":{}}', stderr: "" }; }, env);
+  assert.deepEqual(api.call("/open-apis/im/v1/messages"), { code: 0, data: {} });
+  assert.equal(call.cmd, env.LARK_CLI); assert.equal(call.options.env, env); assert.equal(call.options.timeout, 4000);
+  assert.equal(call.options.maxBuffer, 2 * 1024 * 1024); assert.equal(call.options.killSignal, "SIGKILL");
 });

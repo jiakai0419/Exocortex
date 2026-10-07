@@ -6,7 +6,7 @@ import { collectCheckReport } from "../src/diagnostics/check-report.mjs";
 import { runCheckCommand } from "../src/cli/check-command.mjs";
 import { parseRouteOptions } from "../src/cli/registry.mjs";
 import { probeService } from "../src/runtime/service/launchd.mjs";
-import { fixture, options, sync, live, waitEvidence } from "./helpers/check-fixture.mjs";
+import { fixture, options, sync, live, liveResult, waitEvidence } from "./helpers/check-fixture.mjs";
 
 function forbidEffects(f) {
   for (const key of ["run", "spawnSync", "start", "stop", "restart", "install", "build", "writeFileSync", "chmodSync"]) {
@@ -43,7 +43,7 @@ test("local read failure does not build or restart, and blocks live/cache while 
   assert.doesNotMatch(JSON.stringify(report), /PRIVATE_READ_SENTINEL/);
 });
 for (const format of ["text", "json"]) {
-  for (const collector of ["readDatabaseEvidence", "buildStatus", "collectQualityReport", "collectLagReport", "collectStatusEvidence"]) {
+  for (const collector of ["readDatabaseEvidence", "buildStatus", "collectQualityReport", "collectRemoteSample", "collectStatusEvidence"]) {
     test(`check ${collector} ${format} excludes arbitrary failure stdout/stderr`, async () => {
       const f = forbidEffects(fixture());
       f.deps.collectStatusEvidence = () => waitEvidence(f.context.startedAtMs);
@@ -56,7 +56,7 @@ for (const format of ["text", "json"]) {
 }
 test("live public projection excludes arbitrary enum/findings/path fields", async () => {
   const f = forbidEffects(fixture());
-  f.deps.collectLagReport = () => live({ status: "PRIVATE_SENTINEL", reason: "PRIVATE_SENTINEL", missing_count: "PRIVATE_SENTINEL", stderr: "PRIVATE_SENTINEL", findings: ["PRIVATE_SENTINEL"], db_path: "PRIVATE_SENTINEL" });
+  f.deps.collectRemoteSample = () => liveResult(live({ status: "PRIVATE_SENTINEL", reason: "PRIVATE_SENTINEL", missing_count: "PRIVATE_SENTINEL", stderr: "PRIVATE_SENTINEL", findings: ["PRIVATE_SENTINEL"], db_path: "PRIVATE_SENTINEL" }));
   const report = await collectCheckReport(options({ live: true }), f.context, f.deps);
   assert.equal(report.ok, false);
   assert.equal(report.exit_code, 2);

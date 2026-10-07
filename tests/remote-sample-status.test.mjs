@@ -38,7 +38,7 @@ test('suspected, confirmed, pending, unavailable and expired remain distinct on 
 });
 
 test('manual cache-writing check shares scheduler and respects not_due without directly invoking collector',async()=>{
-  const f=fixture();delete f.deps.collectLagReport;let scheduler=0;
+  const f=fixture();let scheduler=0;
   f.deps.runManualRemoteSample=(opts,deps)=>{scheduler++;assert.equal(opts.db,'/tmp/invented.sqlite');assert.ok(deps.collectorOptions.endMs);return{outcome:'not_due',reason:'not_due'}};
   f.deps.collectRemoteSample=()=>assert.fail('bypassed shared scheduler');
   const result=await collectCheckReport(options({live:true,writeLiveCache:true}),f.context,f.deps);

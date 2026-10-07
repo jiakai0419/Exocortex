@@ -6,7 +6,7 @@ import { createSyncRunner } from "./sync-runner.mjs";
 import { localIsoFromMs, parseLarkTimeMs, SOURCE_ID } from "./core.mjs";
 import { SYNC_DEFAULTS } from "./sync-options.mjs";
 import { ensureInitialized, ensureSourceInitialSyncStart, validateInitialSyncStartMs } from "../../../dist/storage/sqlite/ingestion-store.js";
-import { captureRemoteAccountBinding, readRemoteAccountBinding, recordSuccessfulSyncBinding } from "../../diagnostics/remote-account-binding.mjs";
+import { captureRemoteAccountBinding, readRemoteAccountBinding, recordSuccessfulSyncBinding, accountBindingAdmissionError, reserveSyncAccountBinding } from "../../diagnostics/remote-account-binding.mjs";
 
 /**
  * @typedef {"all" | "sent" | "discover" | "received" | "details"} SyncScopeOption
@@ -66,6 +66,7 @@ import { captureRemoteAccountBinding, readRemoteAccountBinding, recordSuccessful
  * @property {typeof import("../../runtime/lark-api-lease.mjs").tryAcquireLarkApiLease=} tryAcquireLarkApiLease
  * @property {typeof captureRemoteAccountBinding=} captureRemoteAccountBinding
  * @property {typeof readRemoteAccountBinding=} readRemoteAccountBinding
+ * @property {typeof reserveSyncAccountBinding=} reserveSyncAccountBinding
  * @property {typeof recordSuccessfulSyncBinding=} recordSuccessfulSyncBinding
  *
  * @typedef {object} CliIo
@@ -74,9 +75,29 @@ import { captureRemoteAccountBinding, readRemoteAccountBinding, recordSuccessful
  * @property {LarkImSyncCommandDeps=} deps
  */
 
+/** Validate the written wall clock without changing epoch or legacy end formats.
+ * @param {unknown} value @param {string} name
+ */
+function validateCalendarTime(value, name) {
+  // Validate the date prefix even when Date.parse accepts a legacy time suffix.
+  const match = String(value).trim().match(/^(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)(?:[Tt\s,]+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/);
+  if (!match) return;
+  const [, year, month, day, hour = "0", minute = "0", second = "0"] = match;
+  const expected = [Number(year), Number(month), Number(day), Number(hour), Number(minute), Number(second)];
+  const wall = new Date(0);
+  wall.setUTCFullYear(expected[0], expected[1] - 1, expected[2]);
+  wall.setUTCHours(expected[3], expected[4], expected[5], 0);
+  const actual = [wall.getUTCFullYear(), wall.getUTCMonth() + 1, wall.getUTCDate(),
+    wall.getUTCHours(), wall.getUTCMinutes(), wall.getUTCSeconds()];
+  if (!expected.every((part, index) => part === actual[index])) {
+    throw new CliExecutionError(`${name} is not a valid calendar timestamp`);
+  }
+}
+
 function parseTimeMs(value, name) {
   const parsed = parseLarkTimeMs(value);
   if (!Number.isFinite(parsed)) throw new CliExecutionError(`${name} is not a valid time`);
+  validateCalendarTime(value, name);
   return parsed;
 }
 
@@ -88,15 +109,13 @@ function defaultStartIso(now) {
 function parseInitialStartMs(value) {
   const match = value.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,3}))?(Z|([+-])(\d{2}):(\d{2}))$/);
   if (!match) throw new CliExecutionError("--start must be an ISO timestamp with an explicit timezone (Z or +/-HH:mm)");
-  const [, local, fraction = "", zone, sign, hour = "0", minute = "0"] = match;
-  if (Number(hour) > 23 || Number(minute) > 59) throw new CliExecutionError("--start has an invalid timezone offset");
+  const hour = Number(match[5] || 0);
+  const minute = Number(match[6] || 0);
+  if (hour > 23 || minute > 59) throw new CliExecutionError("--start has an invalid timezone offset");
   let parsed;
   try { parsed = validateInitialSyncStartMs(Date.parse(value)); }
   catch { throw new CliExecutionError("--start is outside the supported millisecond range"); }
-  const offset = zone === "Z" ? 0 : (sign === "-" ? -1 : 1) * (Number(hour) * 60 + Number(minute)) * 60_000;
-  if (new Date(parsed + offset).toISOString() !== `${local}.${fraction.padEnd(3, "0")}Z`) {
-    throw new CliExecutionError("--start is not a valid calendar timestamp");
-  }
+  validateCalendarTime(value, "--start");
   return parsed;
 }
 
@@ -139,22 +158,23 @@ function executeLarkImSync(opts, deps = {}) {
   );
   // A proven fresh source may retain collection intent across authentication
   // failure and midnight. Existing or uncertain account evidence cannot.
-  let baseline = bindingBefore?.empty === true && bindingBefore.binding_absent === true ? resolveBaseline() : null;
+  let baseline = bindingBefore?.empty === true && bindingBefore.binding_absent === true && !bindingBefore.initial_account ? resolveBaseline() : null;
 
   // Discovery can create and disable scopes, so it needs the same account
   // boundary as message and detail writes.
   const selfProfile = loadSelfProfile(opts);
   if (!selfProfile?.open_id) throw new CliExecutionError("could not resolve current Lark user open_id");
   const binding = (deps.readRemoteAccountBinding || readRemoteAccountBinding)({ db: dbPath, selfOpenId: selfProfile.open_id });
-  if (binding.state === "conflict") {
-    throw new CliExecutionError("sync account conflicts with this database; use the matching account or a separate database");
-  }
-  if (binding.state !== "verified" && !(binding.state === "unverified" && binding.reason === "account_database_unbound")) {
-    throw new CliExecutionError("sync account binding cannot be verified; inspect the existing database binding before retrying");
+  const admissionError = accountBindingAdmissionError(binding);
+  if (admissionError) throw new CliExecutionError(admissionError);
+  if (binding.database_key !== bindingBefore?.database_key) {
+    throw new CliExecutionError("Lark account database changed during admission; retry with a stable database");
   }
   baseline ??= resolveBaseline();
   opts = { ...opts, startMs: baseline, start: new Date(baseline).toISOString() };
   if (opts.endMs < baseline) throw new CliExecutionError("--end must be after the persisted initial sync baseline");
+
+  (deps.reserveSyncAccountBinding || reserveSyncAccountBinding)({ db: dbPath, selfOpenId: selfProfile.open_id, before: bindingBefore });
 
   /** @type {JsonObject & {sent: RunResult | null, discovery: RunResult | null, received: RunResult[]}} */
   const summary = {
@@ -205,8 +225,8 @@ function executeLarkImSync(opts, deps = {}) {
 
   (deps.recordSuccessfulSyncBinding || recordSuccessfulSyncBinding)({
     db: dbPath, selfOpenId: selfProfile.open_id, before: bindingBefore,
-    successful: summary.ok === true && [summary.sent, summary.discovery, ...summary.received, ...(summary.details || [])]
-      .some((run) => run?.ok === true && run.skipped !== true),
+    successful: [summary.sent, summary.discovery, ...summary.received, ...(summary.details || [])]
+      .some((run) => (run?.ok === true || run?.list_complete === true) && run.skipped !== true),
   });
   return summary;
 }

@@ -1,3 +1,4 @@
+import { confirmInitialLarkAccountSql } from "./lark-account-binding.js";
 import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { resolve } from "node:path";
@@ -301,6 +302,7 @@ function commitLarkListRun(dbPath: string, scope: SyncScope, runId: number, reco
   if (!Number.isSafeInteger(initialStart)) throw new Error("Lark list coverage requires an initial sync start");
   const now = new Date().toISOString();
   const mutationSql = `
+    ${confirmInitialLarkAccountSql(now)}
     ${fullCursorMs == null ? `INSERT INTO __lark_guard SELECT CASE WHEN EXISTS (
       SELECT 1 FROM sources WHERE id = ${quoteSql(scope.source_id)}
         AND json_extract(config_json, '$.initial_sync_start_ms') = ${initialStart}) THEN 1 ELSE 0 END;` : ""}

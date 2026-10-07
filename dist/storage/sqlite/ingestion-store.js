@@ -1,3 +1,4 @@
+import { INITIAL_ACCOUNT_KIND, reserveInitialLarkAccount, confirmInitialLarkAccountSql } from "./lark-account-binding.js";
 import { initializeDatabase } from "./initialize.js";
 import { quoteSql, sqlJson, sqliteExec, sqliteQuery, secureDatabasePaths } from "./sqlite-executor.js";
 import { DEFAULT_HARD_LEASE_SECONDS, RUN_FENCE_METADATA_KEY, scopeCursorJson, validateRecordCursor, cursorCanAdvanceSql, checkedRunId, runFenceGuardSql } from "./sync-run-fence.js";
@@ -244,4 +245,4 @@ function failRecordRun(dbPath, scope, runId, records, scannedCount, error, metad
     return finishRecordRun(dbPath, scope, runId, records, scannedCount, null, metadata, error);
 }
 const succeedMessageRun = succeedRecordRun;
-export { DEFAULT_HARD_LEASE_SECONDS, acquireLock, acquireMaintenanceLock, commitBoundedReplayRecords, commitLarkListRun, finishLarkDetailRun, readLarkListProgress, readPendingLarkDetails, normalizeBoundedReplayRecords, createRun, ensureInitialized, ensureSourceInitialSyncStart, failRun, failRecordRun, isMaintenanceLocked, encodeSourceVersion, normalizeExternalVersion, normalizeStoredRecords, ownerPid, ownerStartedAtMs, defaultOwnerState, recoverStaleSyncState, runFenceGuardSql, quoteSql, readScope, releaseLock, releaseMaintenanceLock, secureDatabasePaths, sqlJson, sqliteExec, sqliteQuery, succeedMessageRun, succeedRecordRun, upsertRecordsSql, validateInitialSyncStartMs, };
+export { INITIAL_ACCOUNT_KIND, reserveInitialLarkAccount, confirmInitialLarkAccountSql, DEFAULT_HARD_LEASE_SECONDS, acquireLock, acquireMaintenanceLock, commitBoundedReplayRecords, commitLarkListRun, finishLarkDetailRun, readLarkListProgress, readPendingLarkDetails, normalizeBoundedReplayRecords, createRun, ensureInitialized, ensureSourceInitialSyncStart, failRun, failRecordRun, isMaintenanceLocked, encodeSourceVersion, normalizeExternalVersion, normalizeStoredRecords, ownerPid, ownerStartedAtMs, defaultOwnerState, recoverStaleSyncState, runFenceGuardSql, quoteSql, readScope, releaseLock, releaseMaintenanceLock, secureDatabasePaths, sqlJson, sqliteExec, sqliteQuery, succeedMessageRun, succeedRecordRun, upsertRecordsSql, validateInitialSyncStartMs, };

@@ -27,7 +27,7 @@ test("status read failure returns 1 and retains independent service evidence", a
   assert.equal(code, 1); assert.equal(JSON.parse(f.output()).service.status, "absent");
 });
 test("status default excludes detail and never needs remote or cache writes", async () => {
-  const f = fixture(); const code = await runStatusCommand(options(), f.context, { ...deps(), collectLagReport: () => assert.fail("remote"), writeLiveProbeCache: () => assert.fail("cache") });
+  const f = fixture(); const code = await runStatusCommand(options(), f.context, { ...deps(), collectRemoteSample: () => assert.fail("remote"), runManualRemoteSample: () => assert.fail("cache") });
   assert.equal(code, 0); assert.equal(JSON.parse(f.output()).detail, undefined);
   await assert.rejects(runStatusCommand(options(), { ...f.context, provided: new Set(["--lines"]) }, deps()), /requires --logs/);
 });
