@@ -103,6 +103,13 @@ type LarkDetailOutcome = {
   retry_at?: string;
 };
 
+type PendingLarkDetail = JsonObject & {
+  message_id: string;
+  fingerprint: string;
+  raw_root: JsonObject;
+  raw: JsonObject;
+};
+
 type LarkProgressEffects = WriteEffects & {
   pending_details: number;
   full_cursor_promoted: boolean;
@@ -133,7 +140,7 @@ function readLarkListProgress(dbPath: string, scope: SyncScope) {
 
 /** Only due debt is returned; completed descriptors are durable replay receipts. */
 function readPendingLarkDetails(dbPath: string, scope: SyncScope,
-  { limit = 8, now = new Date() }: { limit?: number; now?: Date | string } = {}) {
+  { limit = 8, now = new Date() }: { limit?: number; now?: Date | string } = {}): PendingLarkDetail[] {
   requireLarkScope(scope);
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new Error("detail retry limit must be between 1 and 100");
   const date = now instanceof Date ? now : new Date(now);
@@ -142,7 +149,7 @@ function readPendingLarkDetails(dbPath: string, scope: SyncScope,
     `SELECT * FROM lark_im_detail_tasks WHERE scope_id = ${quoteSql(scope.id)}
        AND status = 'pending' AND retry_at <= ${quoteSql(date.toISOString())}
      ORDER BY retry_at, occurred_at_ms, message_id LIMIT ${limit};`, "read pending Lark details")
-    .map((row) => ({ ...row, raw_root: JSON.parse(row.raw_root_json), raw: JSON.parse(row.raw_root_json) }));
+    .map((row) => ({ ...row, raw_root: JSON.parse(row.raw_root_json), raw: JSON.parse(row.raw_root_json) }) as PendingLarkDetail);
 }
 
 function stableJson(value: any): string {

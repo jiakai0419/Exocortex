@@ -3,7 +3,7 @@ import type { JsonObject, SyncScope, StoredRecord, WriteEffects, InitialSyncStar
 import { quoteSql, sqlJson, sqliteExec, sqliteQuery, secureDatabasePaths } from "./sqlite-executor.js";
 import { DEFAULT_HARD_LEASE_SECONDS, RUN_FENCE_METADATA_KEY, scopeCursorJson, validateRecordCursor, cursorCanAdvanceSql, checkedRunId, runFenceGuardSql } from "./sync-run-fence.js";
 import { DEFAULT_SYNC_LOCK_OWNER, acquireLock, acquireMaintenanceLock, releaseLock, releaseMaintenanceLock, isMaintenanceLocked, recoverStaleSyncState, ownerPid, ownerStartedAtMs, defaultOwnerState } from "./sync-locks.js";
-import { encodeSourceVersion, normalizeStoredRecords, normalizeBoundedReplayRecords, normalizeExternalVersion, recordWritesSql, existingRecordMap, countWriteEffects, upsertRecordsSql } from "./record-storage.js";
+import { encodeSourceVersion, normalizeStoredRecords, normalizeBoundedReplayRecords, normalizeExternalVersion, recordWritesSql, upsertRecordsSql } from "./record-storage.js";
 import { larkRunMetadataEntriesSql, commitBoundedReplayRecords, commitLarkListRun, finishLarkDetailRun, readLarkListProgress, readPendingLarkDetails } from "./lark-ingestion.js";
 const DEFAULT_IMPLICIT_RUN_LOCK_SECONDS = 10 * 60;
 
@@ -303,7 +303,6 @@ export {
   DEFAULT_HARD_LEASE_SECONDS,
   acquireLock,
   acquireMaintenanceLock,
-  countWriteEffects,
   commitBoundedReplayRecords,
   commitLarkListRun,
   finishLarkDetailRun,
@@ -313,7 +312,6 @@ export {
   createRun,
   ensureInitialized,
   ensureSourceInitialSyncStart,
-  existingRecordMap,
   failRun,
   failRecordRun,
   isMaintenanceLocked,

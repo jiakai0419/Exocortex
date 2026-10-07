@@ -2,7 +2,7 @@ import { initializeDatabase } from "./initialize.js";
 import { quoteSql, sqlJson, sqliteExec, sqliteQuery, secureDatabasePaths } from "./sqlite-executor.js";
 import { DEFAULT_HARD_LEASE_SECONDS, RUN_FENCE_METADATA_KEY, scopeCursorJson, validateRecordCursor, cursorCanAdvanceSql, checkedRunId, runFenceGuardSql } from "./sync-run-fence.js";
 import { DEFAULT_SYNC_LOCK_OWNER, acquireLock, acquireMaintenanceLock, releaseLock, releaseMaintenanceLock, isMaintenanceLocked, recoverStaleSyncState, ownerPid, ownerStartedAtMs, defaultOwnerState } from "./sync-locks.js";
-import { encodeSourceVersion, normalizeStoredRecords, normalizeBoundedReplayRecords, normalizeExternalVersion, recordWritesSql, existingRecordMap, countWriteEffects, upsertRecordsSql } from "./record-storage.js";
+import { encodeSourceVersion, normalizeStoredRecords, normalizeBoundedReplayRecords, normalizeExternalVersion, recordWritesSql, upsertRecordsSql } from "./record-storage.js";
 import { larkRunMetadataEntriesSql, commitBoundedReplayRecords, commitLarkListRun, finishLarkDetailRun, readLarkListProgress, readPendingLarkDetails } from "./lark-ingestion.js";
 const DEFAULT_IMPLICIT_RUN_LOCK_SECONDS = 10 * 60;
 const ensureInitialized = initializeDatabase;
@@ -244,4 +244,4 @@ function failRecordRun(dbPath, scope, runId, records, scannedCount, error, metad
     return finishRecordRun(dbPath, scope, runId, records, scannedCount, null, metadata, error);
 }
 const succeedMessageRun = succeedRecordRun;
-export { DEFAULT_HARD_LEASE_SECONDS, acquireLock, acquireMaintenanceLock, countWriteEffects, commitBoundedReplayRecords, commitLarkListRun, finishLarkDetailRun, readLarkListProgress, readPendingLarkDetails, normalizeBoundedReplayRecords, createRun, ensureInitialized, ensureSourceInitialSyncStart, existingRecordMap, failRun, failRecordRun, isMaintenanceLocked, encodeSourceVersion, normalizeExternalVersion, normalizeStoredRecords, ownerPid, ownerStartedAtMs, defaultOwnerState, recoverStaleSyncState, runFenceGuardSql, quoteSql, readScope, releaseLock, releaseMaintenanceLock, secureDatabasePaths, sqlJson, sqliteExec, sqliteQuery, succeedMessageRun, succeedRecordRun, upsertRecordsSql, validateInitialSyncStartMs, };
+export { DEFAULT_HARD_LEASE_SECONDS, acquireLock, acquireMaintenanceLock, commitBoundedReplayRecords, commitLarkListRun, finishLarkDetailRun, readLarkListProgress, readPendingLarkDetails, normalizeBoundedReplayRecords, createRun, ensureInitialized, ensureSourceInitialSyncStart, failRun, failRecordRun, isMaintenanceLocked, encodeSourceVersion, normalizeExternalVersion, normalizeStoredRecords, ownerPid, ownerStartedAtMs, defaultOwnerState, recoverStaleSyncState, runFenceGuardSql, quoteSql, readScope, releaseLock, releaseMaintenanceLock, secureDatabasePaths, sqlJson, sqliteExec, sqliteQuery, succeedMessageRun, succeedRecordRun, upsertRecordsSql, validateInitialSyncStartMs, };

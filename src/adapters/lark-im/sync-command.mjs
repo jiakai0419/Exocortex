@@ -58,8 +58,8 @@ import { captureRemoteAccountBinding, readRemoteAccountBinding, recordSuccessful
  * @property {(dbPath: string) => void=} ensureInitialized
  * @property {(dbPath: string, sourceId: string, candidateStartMs: number, options?: {explicit?: boolean, endMs?: number}) => number=} ensureSourceInitialSyncStart
  * @property {(opts: SyncOptions) => SelfProfile=} getSelfProfile
- * @property {any=} syncRunner
- * @property {Partial<Record<string, any>>=} syncRunnerDeps
+ * @property {Partial<Pick<import("./sync-runner.mjs").SyncRunner, "syncSent" | "syncDiscovery" | "syncReceived" | "retryDetails">>=} syncRunner
+ * @property {Partial<import("./sync-runner.mjs").SyncRunnerDeps>=} syncRunnerDeps
  * @property {(dbPath: string) => string=} resolvePath
  * @property {() => JsonObject=} getTransportStats
  * @property {() => void=} resetTransportStats
@@ -130,7 +130,8 @@ function executeLarkImSync(opts, deps = {}) {
   const dbPath = (deps.resolvePath || resolve)(opts.db);
   const initialize = deps.ensureInitialized || ensureInitialized;
   const loadSelfProfile = deps.getSelfProfile || getSelfProfile;
-  const runner = deps.syncRunner || createSyncRunner(deps.syncRunnerDeps || {});
+  // Injected runners may implement just the requested scope, as before.
+  const runner = /** @type {import("./sync-runner.mjs").SyncRunner} */ (deps.syncRunner || createSyncRunner(deps.syncRunnerDeps || {}));
   initialize(dbPath);
   const bindingBefore = (deps.captureRemoteAccountBinding || captureRemoteAccountBinding)({ db: dbPath, emptyOnly: true, includeSidecar: true });
   const resolveBaseline = () => (deps.ensureSourceInitialSyncStart || ensureSourceInitialSyncStart)(

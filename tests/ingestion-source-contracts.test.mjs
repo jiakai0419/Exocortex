@@ -142,6 +142,23 @@ test("large revisions remain ordered and equal-version projection updates remain
   assert.equal(write(db, scope, [record(scope, { external_version: "900719925474099312345", canonical_json: '{"projection":"invented refresh"}' })]).updated, 1);
 });
 
+test("committed effects apply version guards even when hashes suggest the opposite", (t) => {
+  const { db, scope } = fixture(t);
+  write(db, scope, [record(scope, { external_version: "2" })]);
+  const rejected = write(db, scope, [record(scope, {
+    external_version: "1", content_hash: "synthetic-older-hash", body: "Invented older content",
+  })]);
+  assert.deepEqual(rejected, { inserted: 0, updated: 0, duplicate: 1 });
+  assert.equal(rows(db)[0].external_version, "2");
+  assert.equal(rows(db)[0].body, "Invented original body");
+  const accepted = write(db, scope, [record(scope, { external_version: "3" })]);
+  assert.deepEqual(accepted, { inserted: 0, updated: 1, duplicate: 0 });
+  assert.equal(rows(db)[0].external_version, "3");
+  assert.equal(rows(db)[0].content_hash, "synthetic-hash-a");
+  assert.deepEqual(store.sqliteQuery(db, `SELECT inserted_count, updated_count, duplicate_count
+    FROM sync_runs ORDER BY id DESC LIMIT 1;`), [{ inserted_count: 0, updated_count: 1, duplicate_count: 0 }]);
+});
+
 test("a source cannot attach its record to another source's scope", (t) => {
   const { db, scope } = fixture(t);
   assert.throws(() => write(db, scope, [record(scope, { first_seen_scope_id: "lark.im.sent_by_me" })]), /CHECK constraint/);

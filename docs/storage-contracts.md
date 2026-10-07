@@ -41,6 +41,10 @@ Runtime consumers import the compiled facade `dist/storage/sqlite/ingestion-stor
 
 SQL fragment helpers do not open nested transactions. Their caller composes guards and effects in a single write transaction. Generic runs for a second source neither read Lark progress tables nor inject Lark chat/list metadata. Name projection merging applies only when both source and record type are the Lark message type. This is a finite dispatch boundary, not a plugin framework.
 
+Write-effect counts come only from the transaction that applies the version, identity and projection guards. There is no public preflight hash-only counter: a changed hash on an older revision is not an update, while a newer revision with the same hash can be. Callers use the effects returned by the commit operation.
+
+The sync runner's injectable dependencies have the same finite keys and function contracts as its default implementations. Partial overrides remain supported; omitted dependencies retain their defaults. Command-level injected runners may implement only the requested scope's methods. Compile-time regression probes reject misspelled dependency keys, non-function overrides and invalid commit results at both entry points. This is a checked internal boundary, not runtime validation of arbitrary plugins.
+
 SQLite reads through the write store retain its existing private-path behavior. Read-only diagnostics use `readonly-query.mjs`; consolidating subprocess code does not turn those reads into write-store calls.
 
 ## Source versions

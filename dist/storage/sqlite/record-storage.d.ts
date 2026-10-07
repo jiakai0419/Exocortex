@@ -1,5 +1,4 @@
-import type { StoredRecord, WriteEffects } from "./ingestion-types.js";
-declare function existingRecordMap(dbPath: string, sourceId: string, records: StoredRecord[]): Map<any, any>;
+import type { StoredRecord } from "./ingestion-types.js";
 /** Encode adapter evidence without inferring ordering from a token's spelling.
  * Decimal revisions are ordered; opaque tokens retain exact string identity. */
 declare function encodeSourceVersion(value: {
@@ -18,6 +17,5 @@ declare function versionCanReplaceSql(existingAlias: string, incomingAlias: stri
 declare function upsertRecordsSql(records: StoredRecord[], options?: {
     strictVersionIncrease?: boolean;
 }): string;
-declare function countWriteEffects(dbPath: string, sourceId: string, records: StoredRecord[]): WriteEffects;
 declare function recordWritesSql(normalizedRecords: StoredRecord[], now: string): string;
-export { encodeSourceVersion, existingRecordMap, normalizeExternalVersion, normalizeStoredRecords, normalizeBoundedReplayRecords, numericVersionSql, versionCanReplaceSql, upsertRecordsSql, recordWritesSql, countWriteEffects };
+export { encodeSourceVersion, normalizeExternalVersion, normalizeStoredRecords, normalizeBoundedReplayRecords, numericVersionSql, versionCanReplaceSql, upsertRecordsSql, recordWritesSql };

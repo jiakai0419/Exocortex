@@ -82,7 +82,8 @@ import {
  *   source_enabled?: number,
  *   config?: JsonObject,
  *   cursor?: JsonObject | null,
- *   cursor_json?: string | null
+ *   cursor_json?: string | null,
+ *   cursor_updated_at?: string | null
  * }} ScopeRow
  *
  * @typedef {{open_id: string, name: string}} SelfProfile
@@ -105,7 +106,7 @@ import {
  * @property {string} page_token
  * @property {boolean=} hot
  *
- * @typedef {Record<string, any>} SyncRunnerDeps
+ * @typedef {typeof defaultDeps} SyncRunnerDeps
  *
  * @typedef {object} SyncRunner
  * @property {(dbPath: string, mode?: ReceivedMode) => ScopeRow[]} listReceivedScopes
@@ -123,7 +124,6 @@ import {
  * @property {(dbPath: string, opts: SyncOptions, selfProfile: SelfProfile) => RunResult[]} retryDetails
  */
 
-/** @type {SyncRunnerDeps} */
 const defaultDeps = {
   acquireLock,
   buildPeopleContext,

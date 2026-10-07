@@ -16,6 +16,12 @@ type LarkDetailOutcome = {
     error?: Error;
     retry_at?: string;
 };
+type PendingLarkDetail = JsonObject & {
+    message_id: string;
+    fingerprint: string;
+    raw_root: JsonObject;
+    raw: JsonObject;
+};
 type LarkProgressEffects = WriteEffects & {
     pending_details: number;
     full_cursor_promoted: boolean;
@@ -29,10 +35,7 @@ declare function readLarkListProgress(dbPath: string, scope: SyncScope): {
 declare function readPendingLarkDetails(dbPath: string, scope: SyncScope, { limit, now }?: {
     limit?: number;
     now?: Date | string;
-}): {
-    raw_root: any;
-    raw: any;
-}[];
+}): PendingLarkDetail[];
 /** Call only after the complete list window has passed pagination validation. */
 declare function commitLarkListRun(dbPath: string, scope: SyncScope, runId: number, records: StoredRecord[], rawMergeRoots: JsonObject[], scannedCount: number, listCursor: JsonObject, metadata: JsonObject): LarkProgressEffects;
 /** A complete detail response replaces content; failed attempts only reschedule debt. */

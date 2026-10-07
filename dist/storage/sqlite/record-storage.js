@@ -1,15 +1,5 @@
-import { sqliteQuery, quoteSql } from "./sqlite-executor.js";
+import { quoteSql } from "./sqlite-executor.js";
 import { mergeLarkNameProjectionSql } from "./lark-name-projection.js";
-function existingRecordMap(dbPath, sourceId, records) {
-    if (records.length === 0)
-        return new Map();
-    const ids = records.map((record) => quoteSql(record.external_id)).join(", ");
-    const rows = sqliteQuery(dbPath, `SELECT external_id, content_hash
-     FROM records
-     WHERE source_id = ${quoteSql(sourceId)}
-       AND external_id IN (${ids});`, "read existing records");
-    return new Map(rows.map((row) => [row.external_id, row.content_hash]));
-}
 /** Encode adapter evidence without inferring ordering from a token's spelling.
  * Decimal revisions are ordered; opaque tokens retain exact string identity. */
 function encodeSourceVersion(value) {
@@ -244,22 +234,6 @@ WHERE ${options.strictVersionIncrease ? strictlyNewerVersionSql("records", "excl
 `)
         .join("\n");
 }
-function countWriteEffects(dbPath, sourceId, records) {
-    const normalized = normalizeStoredRecords(records, sourceId);
-    const existing = existingRecordMap(dbPath, sourceId, normalized);
-    let inserted = 0;
-    let updated = 0;
-    let duplicate = 0;
-    for (const record of normalized) {
-        if (!existing.has(record.external_id))
-            inserted += 1;
-        else if (existing.get(record.external_id) !== record.content_hash)
-            updated += 1;
-        else
-            duplicate += 1;
-    }
-    return { inserted, updated, duplicate };
-}
 function incomingRecordsSql(records) {
     const inserts = records
         .map((record) => `INSERT INTO __incoming_records (
@@ -346,4 +320,4 @@ ${incomingRecordsSql(normalizedRecords)}
       AND ${recordDiffSql("records", "excluded")};
 `;
 }
-export { encodeSourceVersion, existingRecordMap, normalizeExternalVersion, normalizeStoredRecords, normalizeBoundedReplayRecords, numericVersionSql, versionCanReplaceSql, upsertRecordsSql, recordWritesSql, countWriteEffects };
+export { encodeSourceVersion, normalizeExternalVersion, normalizeStoredRecords, normalizeBoundedReplayRecords, numericVersionSql, versionCanReplaceSql, upsertRecordsSql, recordWritesSql };

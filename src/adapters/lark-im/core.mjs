@@ -66,7 +66,7 @@ import {
  * @property {Map<string, NameValue>=} app_fallbacks
  * @property {Map<string, NameValue>=} chat_members
  * @property {Map<string, NameValue>=} contacts
- * @property {{open_id?: string, name?: string}=} self
+ * @property {{open_id?: string, name?: string} | null=} self
  *
  * @typedef {object} ScopeConfig
  * @property {string=} chat_id
