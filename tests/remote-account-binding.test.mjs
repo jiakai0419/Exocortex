@@ -22,6 +22,24 @@ function fixture(t) {
 }
 const self = "ou_synthetic_self";
 
+test("optional sidecar capture distinguishes absence, presence and unavailable evidence", (t) => {
+  const f = fixture(t);
+  assert.equal(Object.hasOwn(captureRemoteAccountBinding(f), "binding_absent"), false);
+  assert.equal(captureRemoteAccountBinding({ ...f, emptyOnly: true, includeSidecar: true }).binding_absent, true);
+  assert.equal(recordSuccessfulSyncBinding({ ...f, selfOpenId: self, before: captureRemoteAccountBinding(f), successful: true }), true);
+  assert.equal(captureRemoteAccountBinding({ ...f, emptyOnly: true, includeSidecar: true }).binding_absent, false);
+  writeFileSync(f.sidecar, "not JSON");
+  assert.equal(captureRemoteAccountBinding({ ...f, emptyOnly: true, includeSidecar: true }), null);
+});
+
+test("sidecar absence capture rechecks database identity after the sidecar read", (t) => {
+  const f = fixture(t); let checks = 0;
+  assert.equal(captureRemoteAccountBinding({ ...f, emptyOnly: true, includeSidecar: true }, {
+    databaseKey: () => ++checks < 3 ? "a".repeat(64) : "b".repeat(64),
+  }), null);
+  assert.equal(checks, 3);
+});
+
 test("a current profile alone cannot bind an existing received-only database", (t) => {
   const f = fixture(t); f.sql("INSERT INTO records VALUES('lark.im','received','ou_synthetic_other',NULL);");
   const before = captureRemoteAccountBinding(f);
@@ -95,7 +113,8 @@ test("CLI acquires before initialization/API, refuses contention and always rele
     const code = runLarkImSyncCli(["--scope", "sent"], {
       stdout: { write() {} }, stderr: { write() {} }, deps: {
         tryAcquireLarkApiLease: () => { calls.push("acquire"); return { state: "acquired", release() { calls.push("release"); } }; },
-        ensureInitialized: () => calls.push("initialize"), ensureSourceInitialSyncStart: (_db, _source, ms) => ms,
+        readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
+      ensureInitialized: () => calls.push("initialize"), ensureSourceInitialSyncStart: (_db, _source, ms) => ms,
         captureRemoteAccountBinding: () => null,
         getSelfProfile: () => { calls.push("profile"); if (fail) throw new Error("synthetic failure"); return { open_id: self, name: "Synthetic" }; },
         syncRunner: { syncSent: () => { calls.push("sync"); return { ok: true }; } },
@@ -107,6 +126,7 @@ test("CLI acquires before initialization/API, refuses contention and always rele
   const code = runLarkImSyncCli(["--scope", "sent"], {
     stdout: { write() {} }, stderr: { write() {} }, deps: {
       tryAcquireLarkApiLease: () => ({ state: "busy", release() {} }),
+      readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
       ensureInitialized: () => assert.fail("busy lease must precede all initialization and API work"),
     },
   });
@@ -119,7 +139,8 @@ test("sync persists new binding only after an actual successful non-skipped run"
     const before = { database_key: "a".repeat(64), empty: true };
     runLarkImSyncCli(["--scope", "sent"], {
       stdout: { write() {} }, stderr: { write() {} }, deps: {
-        ensureInitialized: () => {}, ensureSourceInitialSyncStart: (_db, _source, ms) => ms,
+        readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
+      ensureInitialized: () => {}, ensureSourceInitialSyncStart: (_db, _source, ms) => ms,
         captureRemoteAccountBinding: (options) => { assert.equal(options.emptyOnly, true); return before; },
         getSelfProfile: () => ({ open_id: self, name: "Synthetic" }),
         syncRunner: { syncSent: () => result },

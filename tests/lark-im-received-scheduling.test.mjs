@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createSyncRunner } from "../src/adapters/lark-im/sync-runner.mjs";
-import { ensureInitialized, quoteSql, sqliteExec, sqliteQuery } from "../dist/storage/sqlite/ingestion-store.js";
+import { ensureInitialized, ensureSourceInitialSyncStart, quoteSql, readScope, sqliteExec, sqliteQuery } from "../dist/storage/sqlite/ingestion-store.js";
 
 const NOW = Date.parse("2026-06-18T08:00:00Z");
 const iso = (ms) => new Date(ms).toISOString();
@@ -18,6 +18,37 @@ function row(n, cursor = true, extra = {}) {
     cursor_updated_at: cursor ? iso(NOW - 600_000) : null,
     created_at: iso(NOW - 600_000), ...extra,
   };
+}
+
+for (const pendingFails of [false, true]) {
+  test(`batch one reaches pending work after restart, including failed pending attempts: ${pendingFails}`, t => {
+    const dir = mkdtempSync(join(tmpdir(), "exocortex-fair-one-"));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const db = join(dir, "synthetic.sqlite"), start = NOW - 600_000;
+    ensureInitialized(db); ensureSourceInitialSyncStart(db, "lark.im", start, { explicit: true });
+    const rows = [row(0), row(1, false)];
+    sqliteExec(db, rows.map(r => `INSERT INTO sync_scopes(id,source_id,name,config_json,cursor_json,created_at)
+      VALUES(${quoteSql(r.id)},'lark.im',${quoteSql(r.id)},${quoteSql(r.config_json)},${quoteSql(r.cursor_json)},${quoteSql(r.created_at)});`).join("\n"));
+    const visited = [];
+    for (let cycle = 0; cycle < 8; cycle++) {
+      const runner = createSyncRunner({
+        fetchChatMessageList: chat => {
+          visited.push(chat);
+          if (pendingFails && chat === "oc_fixture_1") throw new Error("invented retryable list shape failure");
+          return { messages: [], detailRoots: [], pages: 1 };
+        }, buildPeopleContext: () => ({}),
+      });
+      const result = runner.syncReceived(db, { startMs: start, endMs: NOW, endExplicit: true,
+        receivedMode: "catchup", receivedScopesPerRun: 1, lockTtlSeconds: 600 }, { open_id: "ou_synthetic_self", name: "Invented" });
+      assert.equal(result.length, 1);
+    }
+    assert.deepEqual(visited.slice(0, 2), ["oc_fixture_0", "oc_fixture_1"]);
+    assert.equal(visited.filter(id => id === "oc_fixture_0").length, 4);
+    assert.equal(visited.filter(id => id === "oc_fixture_1").length, 4);
+    assert.equal(readScope(db, rows[1].id).cursor === null, pendingFails);
+    const runs = sqliteQuery(db, "SELECT scope_id,COUNT(*) AS count FROM sync_runs WHERE scope_id LIKE 'lark.im.received.chat.%' GROUP BY scope_id;");
+    assert.deepEqual(runs.map(r => r.count), [4, 4]);
+  });
 }
 
 test("persisted attempts rotate all 20 hot scopes across four batches and restart, including failure", () => {

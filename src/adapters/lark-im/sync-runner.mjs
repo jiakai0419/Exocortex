@@ -374,7 +374,7 @@ function runFenceGuardSql(scope, runId, finishedAtIso, deps) {
  * @param {number} [limit] @param {number} [deadline]
  * @returns {RunResult}
  */
-function retryScopeDetails(dbPath, opts, scope, selfProfile, deps, limit = 1,
+function retryScopeDetails(dbPath, opts, scope, selfProfile, deps, limit = 5,
   deadline = deps.nowMs() + Math.min(30_000, opts.detailBudgetMs ?? 30_000)) {
   if (deps.nowMs() >= deadline) return { ok: false, skipped: true, reason: "detail_budget_exhausted", detail_attempts: 0 };
   const due = deps.readPendingLarkDetails(dbPath, scope, { limit, now: deps.nowIso() });
@@ -469,8 +469,8 @@ function syncListedScope(dbPath, opts, scopeId, selfProfile, direction, deps) {
       scanned, records: records.length, ...effects };
   }, deps);
   if (!listed.list_complete || !listed.pending_details) return listed;
-  // One automatic attempt per successful scope listing. Failures are persisted
-  // with backoff; an explicit details-only invocation can process a larger batch.
+  // Up to five due roots share the existing 30-second automatic retry budget.
+  // Failures retain backoff; explicit details-only work has its own batch limit.
   const retry = retryScopeDetails(dbPath, opts, deps.readScope(dbPath, scopeId), selfProfile, deps);
   const pending = retry.pending_details ?? listed.pending_details;
   return { ...listed, ok: pending === 0, details_complete: pending === 0, incomplete: pending > 0,
@@ -1004,6 +1004,11 @@ function syncReceived(dbPath, opts, selfProfile, deps = defaultDeps) {
   ];
   const indices = queues.map(() => 0);
   const laneAttempts = queues.map(() => 0);
+  // Persisted attempts choose the first/spare place even for batches of one.
+  // Keep this tie preference for the whole batch so locked places refill from
+  // their own lane before unused capacity is borrowed.
+  const firstLane = queues.length === 2 && queues[0].length && queues[1].length &&
+    scopeAttemptTime(queues[1][0]) < scopeAttemptTime(queues[0][0]) ? 1 : 0;
   const scanLimit = Math.max(limit * 3, limit + 20);
   /** @type {RunResult[]} */
   const results = [];
@@ -1012,7 +1017,8 @@ function syncReceived(dbPath, opts, selfProfile, deps = defaultDeps) {
     const available = queues.map((_, lane) => lane).filter((lane) =>
       indices[lane] < queues[lane].length && indices[lane] < scanLimit);
     if (!available.length) break;
-    const lane = available.sort((a, b) => laneAttempts[a] - laneAttempts[b] || a - b)[0];
+    const lane = available.sort((a, b) => laneAttempts[a] - laneAttempts[b] ||
+      (firstLane === 0 ? a - b : b - a))[0];
     const scope = queues[lane][indices[lane]++];
     const result = syncReceivedScope(dbPath, opts, scope, selfProfile, deps);
     results.push(result);

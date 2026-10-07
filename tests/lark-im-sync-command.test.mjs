@@ -29,6 +29,8 @@ test("sync CLI preserves recovered transport pressure in its successful JSON", (
     stdout: stdout.stream, stderr: stderr.stream,
     deps: {
       resetTransportStats: () => { resets++; }, getTransportStats: () => transport,
+      getSelfProfile: () => ({ open_id: "ou_synthetic", name: "Synthetic" }),
+      readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
       ensureInitialized: () => {}, ensureSourceInitialSyncStart: (_db, _source, ms) => ms,
       syncRunner: { syncDiscovery: () => ({ ok: true }) },
     },
@@ -48,6 +50,7 @@ test("sync CLI emits aggregate transport pressure when profile loading fails", (
     stdout: stdout.stream, stderr: stderr.stream,
     deps: {
       resetTransportStats: () => {}, getTransportStats: () => transport,
+      readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
       ensureInitialized: () => {}, ensureSourceInitialSyncStart: (_db, _source, ms) => ms,
       getSelfProfile: () => { throw new Error("kind=rate_limited code=99991400"); },
     },
@@ -66,6 +69,7 @@ test("lark im sync command renders help without touching dependencies", () => {
     stdout: stdout.stream,
     stderr: stderr.stream,
     deps: {
+      readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
       ensureInitialized: () => {
         throw new Error("should not initialize");
       },
@@ -100,7 +104,8 @@ test("lark im sync command executes sent scope through injected deps", () => {
       stderr: stderr.stream,
       deps: {
         resolvePath: (dbPath) => `/abs/${dbPath}`,
-        ensureInitialized: (dbPath) => calls.push(["init", dbPath]),
+        readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
+      ensureInitialized: (dbPath) => calls.push(["init", dbPath]),
         ensureSourceInitialSyncStart: (dbPath, sourceId, startMs, options) => {
           calls.push(["baseline", dbPath, sourceId, startMs, options.explicit]);
           return startMs;
@@ -135,8 +140,8 @@ test("lark im sync command executes sent scope through injected deps", () => {
   assert.deepEqual(summary.received, []);
   assert.deepEqual(calls, [
     ["init", "/abs/custom.sqlite"],
-    ["baseline", "/abs/custom.sqlite", "lark.im", Date.parse("2026-06-18T08:00:00Z"), true],
     ["self"],
+    ["baseline", "/abs/custom.sqlite", "lark.im", Date.parse("2026-06-18T08:00:00Z"), true],
     ["sent", "/abs/custom.sqlite", "sent", "ou_self"],
   ]);
 });
@@ -148,6 +153,7 @@ test("lark im sync command returns nonzero and stderr on dependency errors", () 
     stdout: stdout.stream,
     stderr: stderr.stream,
     deps: {
+      readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
       ensureInitialized: () => {},
       ensureSourceInitialSyncStart: (_dbPath, _sourceId, startMs) => startMs,
       getSelfProfile: () => ({ open_id: "", name: "" }),
@@ -211,7 +217,7 @@ test("explicit start rejects ambiguous or normalized timestamps", () => {
   }
 });
 
-test("lark im sync command resolves the persisted baseline before profiles and every runner", () => {
+test("lark im sync command checks the account before baseline mutation and resolves it before every runner", () => {
   const baselineMs = Date.parse("2026-06-18T00:00:00Z");
   const candidateMs = Date.parse("2026-06-19T00:00:00Z");
   const opts = {
@@ -228,7 +234,8 @@ test("lark im sync command resolves the persisted baseline before profiles and e
   };
   const summary = executeLarkImSync(opts, {
     resolvePath: () => "/fake/baseline.sqlite",
-    ensureInitialized: () => calls.push("init"),
+    readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
+      ensureInitialized: () => calls.push("init"),
     ensureSourceInitialSyncStart: (dbPath, sourceId, startMs, options) => {
       assert.equal(dbPath, "/fake/baseline.sqlite");
       assert.equal(sourceId, "lark.im");
@@ -239,7 +246,8 @@ test("lark im sync command resolves the persisted baseline before profiles and e
       return baselineMs;
     },
     getSelfProfile: (effectiveOpts) => {
-      checkBaseline("self", effectiveOpts);
+      assert.equal(effectiveOpts.startMs, candidateMs);
+      calls.push("self");
       return { open_id: "ou_synthetic", name: "Synthetic" };
     },
     syncRunner: {
@@ -262,10 +270,10 @@ test("lark im sync command resolves the persisted baseline before profiles and e
   assert.equal(summary.initial_sync_start_ms, baselineMs);
   assert.equal(summary.initial_sync_start, new Date(baselineMs).toISOString());
   assert.equal(Date.parse(summary.window.start), baselineMs);
-  assert.deepEqual(calls, ["init", "baseline", "self", "sent", "discovery", "received"]);
+  assert.deepEqual(calls, ["init", "self", "baseline", "sent", "discovery", "received"]);
 });
 
-test("lark im sync command fails closed before fetching a profile or running a scope", () => {
+test("lark im sync command rejects an unusable baseline after account validation without running a scope", () => {
   const stdout = memoryWriter();
   const stderr = memoryWriter();
   const calls = [];
@@ -274,6 +282,7 @@ test("lark im sync command fails closed before fetching a profile or running a s
     stderr: stderr.stream,
     deps: {
       resolvePath: () => "/fake/legacy.sqlite",
+      readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
       ensureInitialized: () => calls.push("init"),
       ensureSourceInitialSyncStart: () => {
         calls.push("baseline");
@@ -281,7 +290,7 @@ test("lark im sync command fails closed before fetching a profile or running a s
       },
       getSelfProfile: () => {
         calls.push("self");
-        throw new Error("must not read the real account");
+        return { open_id: "ou_synthetic", name: "Synthetic" };
       },
       syncRunner: {
         syncSent: () => calls.push("sent"),
@@ -292,15 +301,16 @@ test("lark im sync command fails closed before fetching a profile or running a s
   assert.equal(exitCode, 1);
   assert.equal(stdout.text(), "");
   assert.equal(stderr.text(), "sync failed\n");
-  assert.deepEqual(calls, ["init", "baseline"]);
+  assert.deepEqual(calls, ["init", "self", "baseline"]);
 });
 
-test("discovery-only commands persist the source baseline without fetching a profile", () => {
+test("discovery-only commands validate the current profile before persisting the source baseline", () => {
   const calls = [];
   const opts = parseArgs(["--scope", "discover"]);
   const summary = executeLarkImSync(opts, {
     resolvePath: () => "/fake/discovery.sqlite",
-    ensureInitialized: () => calls.push("init"),
+    readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
+      ensureInitialized: () => calls.push("init"),
     ensureSourceInitialSyncStart: (_dbPath, sourceId, candidateMs, options) => {
       assert.equal(sourceId, "lark.im");
       assert.equal(options.explicit, false);
@@ -308,7 +318,8 @@ test("discovery-only commands persist the source baseline without fetching a pro
       return candidateMs;
     },
     getSelfProfile: () => {
-      throw new Error("discovery does not need a profile");
+      calls.push("self");
+      return { open_id: "ou_synthetic", name: "Synthetic" };
     },
     syncRunner: {
       syncDiscovery: () => {
@@ -319,7 +330,7 @@ test("discovery-only commands persist the source baseline without fetching a pro
   });
 
   assert.equal(summary.ok, true);
-  assert.deepEqual(calls, ["init", "baseline", "discover"]);
+  assert.deepEqual(calls, ["init", "self", "baseline", "discover"]);
 });
 
 test("details-only CLI has a capped positive batch limit and never dispatches list scopes", () => {
@@ -330,7 +341,8 @@ test("details-only CLI has a capped positive batch limit and never dispatches li
   const called = [];
   const summary = executeLarkImSync(opts, {
     resolvePath: (value) => value,
-    ensureInitialized: () => {},
+    readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
+      ensureInitialized: () => {},
     ensureSourceInitialSyncStart: (_db, _source, value) => value,
     getSelfProfile: () => ({ open_id: "invented-self", name: "Invented Self" }),
     syncRunner: {

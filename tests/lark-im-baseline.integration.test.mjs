@@ -134,7 +134,7 @@ test("an implicit start with an older explicit end resolves the saved baseline b
   ensureSourceInitialSyncStart(savedDb, SOURCE, DAY_ONE);
   const calls = [];
   const deps = {
-    getSelfProfile: () => { throw new Error("discovery must not resolve the real account"); },
+    getSelfProfile: () => ({ open_id: "ou_synthetic_self", name: "Synthetic" }),
     syncRunner: { syncDiscovery: () => { calls.push("discovery"); return { ok: true }; } },
   };
   const options = (dbPath) => ({
@@ -155,7 +155,7 @@ test("equivalent explicit timezones preserve millisecond baseline precision in s
   const dbPath = tempDb(t);
   const preciseMs = DAY_ONE + 123;
   const deps = {
-    getSelfProfile: () => { throw new Error("discovery must not resolve the real account"); },
+    getSelfProfile: () => ({ open_id: "ou_synthetic_self", name: "Synthetic" }),
     syncRunner: { syncDiscovery: () => ({ ok: true }) },
   };
   for (const start of ["2026-06-18T08:00:00.123+08:00", "2026-06-18T00:00:00.123Z"]) {

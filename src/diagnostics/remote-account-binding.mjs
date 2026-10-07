@@ -36,7 +36,7 @@ function bindingPath(db) { return `${realpathSync(resolve(db))}.remote-account-b
 /** Snapshot before any sync mutation. Only an initialized, empty source with
  * no runs or cursors may acquire a new binding from a later successful sync.
  * The query and all probe paths are read-only; identifiers stay in memory.
- * @param {{db: string, emptyOnly?: boolean}} options @param {BindingDeps} [deps] */
+ * @param {{db: string, emptyOnly?: boolean, includeSidecar?: boolean}} options @param {BindingDeps} [deps] */
 function captureRemoteAccountBinding(options, deps = {}) {
   try {
     const key = (deps.databaseKey || activityDatabaseKey)(options.db);
@@ -46,9 +46,11 @@ function captureRemoteAccountBinding(options, deps = {}) {
     const row = rows[0];
     if (!["records", "runs", "cursors", "sent_records", "sent_actors", "invalid_actors", "identity_conflicts"]
       .every((field) => Number.isSafeInteger(row[field]) && row[field] >= 0)) return null;
+    const sidecar = options.includeSidecar ? { binding_absent: readSidecar(options.db, (deps.now || Date.now)()) === null } : {};
+    if (options.includeSidecar && (deps.databaseKey || activityDatabaseKey)(options.db) !== key) return null;
     return { database_key: key, empty: row.records === 0 && row.runs === 0 && row.cursors === 0,
       sent_records: row.sent_records, sent_actors: row.sent_actors, sent_actor: row.sent_actor,
-      conflict: row.invalid_actors > 0 || row.identity_conflicts > 0 || row.sent_actors > 1 };
+      conflict: row.invalid_actors > 0 || row.identity_conflicts > 0 || row.sent_actors > 1, ...sidecar };
   } catch { return null; }
 }
 

@@ -207,7 +207,7 @@ test("independent detail retry continues to a healthy root after another root re
   const target = START + 8 * MINUTE;
   const initial = makeRunner((args) => {
     if (args[2] === "/open-apis/im/v1/messages") return page([blockedRoot, healthyRoot, ordinary]);
-    assert.equal(args[2], `/open-apis/im/v1/messages/${blockedRoot.message_id}`);
+    assert.ok([blockedRoot, healthyRoot].some(root => args[2] === `/open-apis/im/v1/messages/${root.message_id}`));
     throw new Error("lark-cli failed: kind=restricted_mode");
   });
   sync(initial, dbPath, options(target), "received");
@@ -231,6 +231,95 @@ test("independent detail retry continues to a healthy root after another root re
   assert.deepEqual(storedIds(dbPath), [healthyRoot.message_id, ordinary.message_id].sort());
   assert.equal(readLarkListProgress(dbPath, readScope(dbPath, RECEIVED_SCOPE)).cursor.created_at_ms, target);
   assert.equal(readScope(dbPath, RECEIVED_SCOPE).cursor, null);
+});
+
+for (const direction of ["received", "sent"]) {
+  test(`${direction}: automatic batches keep up with two healthy roots per listing across restarts`, t => {
+    const dbPath = database(t), all = [];
+    let detailCalls = 0;
+    for (let cycle = 0; cycle < 6; cycle++) {
+      all.push(...[0, 1].map(i => merged(`healthy_batch_${cycle}_${i}`, START + (cycle * 2 + i) * MINUTE + 1000)));
+      const runner = makeRunner(args => {
+        if (args[2].endsWith("/mget")) {
+          const ids = JSON.parse(args[args.indexOf("--params") + 1]).message_ids;
+          return page(ids.map(id => all.find(root => root.message_id === id)));
+        }
+        if (args[2] === "/open-apis/im/v1/messages" || args[2].endsWith("/search")) {
+          const { start, end } = listBounds(args);
+          const roots = all.filter(root => Number(root.create_time) >= start && Number(root.create_time) <= end);
+          return page(args[2].endsWith("/search") ? roots.map(root => ({ meta_data: { message_id: root.message_id } })) : roots);
+        }
+        const root = all.find(root => args[2] === `/open-apis/im/v1/messages/${root.message_id}`);
+        assert.ok(root); detailCalls++;
+        return page([root, raw(`${root.message_id}_child`, START - MINUTE, { upper_message_id: root.message_id })]);
+      });
+      const target = START + (cycle + 1) * 2 * MINUTE;
+      const result = sync(runner, dbPath, options(target), direction);
+      assert.equal(result.ok, true); assert.equal(result.pending_details, 0);
+      assert.equal(result.detail_retry.detail_attempts, 2);
+      assert.equal(readScope(dbPath, scopeId(direction)).cursor.created_at_ms, target);
+    }
+    assert.equal(detailCalls, 12); assert.equal(storedIds(dbPath).length, 12);
+  });
+}
+
+test("automatic detail batches cap attempts at five and finish the remainder on the next listing", t => {
+  const dbPath = database(t), roots = Array.from({ length: 7 }, (_, i) => merged(`cap_${i}`, START + i * 1000));
+  let detailCalls = 0;
+  const runner = makeRunner(args => {
+    if (args[2] === "/open-apis/im/v1/messages") return page(roots);
+    const root = roots.find(root => args[2] === `/open-apis/im/v1/messages/${root.message_id}`);
+    assert.ok(root); detailCalls++;
+    return page([root, raw(`${root.message_id}_child`, START - MINUTE, { upper_message_id: root.message_id })]);
+  });
+  const first = sync(runner, dbPath, options(START + MINUTE), "received");
+  assert.equal(first.detail_retry.detail_attempts, 5); assert.equal(detailCalls, 5); assert.equal(first.pending_details, 2);
+  assert.equal(readScope(dbPath, RECEIVED_SCOPE).cursor, null);
+  const second = sync(runner, dbPath, options(START + 2 * MINUTE), "received");
+  assert.equal(second.detail_retry.detail_attempts, 2); assert.equal(detailCalls, 7); assert.equal(second.pending_details, 0);
+  assert.equal(readScope(dbPath, RECEIVED_SCOPE).cursor.created_at_ms, START + 2 * MINUTE);
+});
+
+test("automatic details share one 30-second budget and preserve unattempted work", t => {
+  const dbPath = database(t), roots = Array.from({ length: 5 }, (_, i) => merged(`deadline_${i}`, START + i * 1000));
+  let clock = 0;
+  const budgets = [];
+  const runner = makeRunner((args, request) => {
+    if (args[2] === "/open-apis/im/v1/messages") return page(roots);
+    const root = roots.find(root => args[2] === `/open-apis/im/v1/messages/${root.message_id}`);
+    assert.ok(root); budgets.push(request.retryBudgetMs);
+    const elapsed = Math.min(11_000, request.timeoutMs); clock += elapsed;
+    if (elapsed < 11_000) throw new Error("lark-cli failed: kind=network_timeout retry_exhausted=1");
+    return page([root, raw(`${root.message_id}_child`, START - MINUTE, { upper_message_id: root.message_id })]);
+  }, { clock: () => clock });
+  const result = sync(runner, dbPath, options(START + MINUTE), "received");
+  assert.deepEqual(budgets, [30_000, 19_000, 8_000]); assert.equal(clock, 30_000);
+  assert.equal(result.detail_retry.detail_attempts, 3); assert.equal(result.pending_details, 3);
+  const after = tasks(dbPath, RECEIVED_SCOPE);
+  assert.deepEqual(after.map(task => [task.status, task.attempt_count]),
+    [["complete", 1], ["complete", 1], ["pending", 1], ["pending", 0], ["pending", 0]]);
+  assert.equal(readLarkListProgress(dbPath, readScope(dbPath, RECEIVED_SCOPE)).cursor.created_at_ms, START + MINUTE);
+  assert.equal(readScope(dbPath, RECEIVED_SCOPE).cursor, null);
+});
+
+test("automatic detail batches finish healthy siblings and retain a denied root's backoff", t => {
+  const dbPath = database(t), roots = [0, 1, 2].map(i => merged(`sibling_${i}`, START + i * 1000));
+  let detailCalls = 0;
+  const runner = makeRunner(args => {
+    if (args[2] === "/open-apis/im/v1/messages") return page(roots);
+    const root = roots.find(root => args[2] === `/open-apis/im/v1/messages/${root.message_id}`);
+    assert.ok(root); detailCalls++;
+    if (root === roots[0]) throw new Error("lark-cli failed: kind=permission_denied");
+    return page([root, raw(`${root.message_id}_child`, START - MINUTE, { upper_message_id: root.message_id })]);
+  });
+  const first = sync(runner, dbPath, options(START + MINUTE), "received");
+  assert.equal(first.detail_retry.detail_attempts, 3); assert.equal(first.pending_details, 1);
+  assert.deepEqual(storedIds(dbPath), roots.slice(1).map(root => root.message_id));
+  const receipt = tasks(dbPath, RECEIVED_SCOPE)[0];
+  const second = sync(runner, dbPath, options(START + 2 * MINUTE), "received");
+  assert.equal(detailCalls, 3); assert.equal(second.pending_details, 1);
+  assert.equal(second.detail_retry.reason, "details_not_due");
+  assert.deepEqual(tasks(dbPath, RECEIVED_SCOPE)[0], receipt);
 });
 
 test("a denied edited boundary root preserves its prior expansion while ordinary records advance, then repair updates it", (t) => {

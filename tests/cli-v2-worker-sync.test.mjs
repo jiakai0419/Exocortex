@@ -19,7 +19,8 @@ function sync(argv, results, ctx = context()) {
   const parsed = parseRouteOptions("sync", argv, { context: ctx });
   const code = runSyncCommand(parsed.options, { ...ctx, provided: parsed.provided,
     stdout: { write: (text) => { stdout += text; } }, stderr: { write: (text) => { stderr += text; } },
-    deps: { ensureInitialized() {}, ensureSourceInitialSyncStart: (_db, _source, value) => value,
+    deps: { readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
+      ensureInitialized() {}, ensureSourceInitialSyncStart: (_db, _source, value) => value,
       resetTransportStats() {}, getTransportStats: () => ({ calls: 0 }),
       getSelfProfile: () => ({ open_id: "synthetic-user", name: "Synthetic User" }),
       syncRunner: { syncSent: () => results.sent, syncDiscovery: () => results.discovery,
@@ -164,7 +165,8 @@ for (const stage of ["initialize", "baseline", "profile", "sync"]) {
     const fail = () => { throw new Error(privateText); };
     const ctx = context();
     const parsed = parseRouteOptions("sync", ["--scope", "sent"], { context: ctx });
-    const deps = { ensureInitialized() {}, ensureSourceInitialSyncStart: (_db, _source, value) => value,
+    const deps = { readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
+      ensureInitialized() {}, ensureSourceInitialSyncStart: (_db, _source, value) => value,
       getSelfProfile: () => ({ open_id: "ou_invented_profile", name: "Invented Profile" }),
       syncRunner: { syncSent: () => ({ ok: true }) }, resetTransportStats() {}, getTransportStats: () => ({ calls: 0 }) };
     if (stage === "initialize") deps.ensureInitialized = fail;

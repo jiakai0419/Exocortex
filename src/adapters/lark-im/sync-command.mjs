@@ -6,7 +6,7 @@ import { createSyncRunner } from "./sync-runner.mjs";
 import { localIsoFromMs, parseLarkTimeMs, SOURCE_ID } from "./core.mjs";
 import { SYNC_DEFAULTS } from "./sync-options.mjs";
 import { ensureInitialized, ensureSourceInitialSyncStart, validateInitialSyncStartMs } from "../../../dist/storage/sqlite/ingestion-store.js";
-import { captureRemoteAccountBinding, recordSuccessfulSyncBinding } from "../../diagnostics/remote-account-binding.mjs";
+import { captureRemoteAccountBinding, readRemoteAccountBinding, recordSuccessfulSyncBinding } from "../../diagnostics/remote-account-binding.mjs";
 
 /**
  * @typedef {"all" | "sent" | "discover" | "received" | "details"} SyncScopeOption
@@ -65,6 +65,7 @@ import { captureRemoteAccountBinding, recordSuccessfulSyncBinding } from "../../
  * @property {() => void=} resetTransportStats
  * @property {typeof import("../../runtime/lark-api-lease.mjs").tryAcquireLarkApiLease=} tryAcquireLarkApiLease
  * @property {typeof captureRemoteAccountBinding=} captureRemoteAccountBinding
+ * @property {typeof readRemoteAccountBinding=} readRemoteAccountBinding
  * @property {typeof recordSuccessfulSyncBinding=} recordSuccessfulSyncBinding
  *
  * @typedef {object} CliIo
@@ -131,19 +132,28 @@ function executeLarkImSync(opts, deps = {}) {
   const loadSelfProfile = deps.getSelfProfile || getSelfProfile;
   const runner = deps.syncRunner || createSyncRunner(deps.syncRunnerDeps || {});
   initialize(dbPath);
-  const bindingBefore = (deps.captureRemoteAccountBinding || captureRemoteAccountBinding)({ db: dbPath, emptyOnly: true });
-  const baseline = (deps.ensureSourceInitialSyncStart || ensureSourceInitialSyncStart)(
+  const bindingBefore = (deps.captureRemoteAccountBinding || captureRemoteAccountBinding)({ db: dbPath, emptyOnly: true, includeSidecar: true });
+  const resolveBaseline = () => (deps.ensureSourceInitialSyncStart || ensureSourceInitialSyncStart)(
     dbPath, SOURCE_ID, opts.startMs, { explicit: opts.startExplicit, endMs: opts.endMs },
   );
+  // A proven fresh source may retain collection intent across authentication
+  // failure and midnight. Existing or uncertain account evidence cannot.
+  let baseline = bindingBefore?.empty === true && bindingBefore.binding_absent === true ? resolveBaseline() : null;
+
+  // Discovery can create and disable scopes, so it needs the same account
+  // boundary as message and detail writes.
+  const selfProfile = loadSelfProfile(opts);
+  if (!selfProfile?.open_id) throw new CliExecutionError("could not resolve current Lark user open_id");
+  const binding = (deps.readRemoteAccountBinding || readRemoteAccountBinding)({ db: dbPath, selfOpenId: selfProfile.open_id });
+  if (binding.state === "conflict") {
+    throw new CliExecutionError("sync account conflicts with this database; use the matching account or a separate database");
+  }
+  if (binding.state !== "verified" && !(binding.state === "unverified" && binding.reason === "account_database_unbound")) {
+    throw new CliExecutionError("sync account binding cannot be verified; inspect the existing database binding before retrying");
+  }
+  baseline ??= resolveBaseline();
   opts = { ...opts, startMs: baseline, start: new Date(baseline).toISOString() };
   if (opts.endMs < baseline) throw new CliExecutionError("--end must be after the persisted initial sync baseline");
-
-  const needsSelfProfile = opts.scope === "all" || opts.scope === "sent" || opts.scope === "received" || opts.scope === "details";
-  const selfProfile = /** @type {SelfProfile | null} */ (needsSelfProfile ? loadSelfProfile(opts) : null);
-  if (needsSelfProfile && !selfProfile?.open_id) {
-    throw new CliExecutionError("could not resolve current Lark user open_id");
-  }
-  const requiredSelfProfile = needsSelfProfile ? /** @type {SelfProfile} */ (selfProfile) : null;
 
   /** @type {JsonObject & {sent: RunResult | null, discovery: RunResult | null, received: RunResult[]}} */
   const summary = {
@@ -162,7 +172,7 @@ function executeLarkImSync(opts, deps = {}) {
 
   if (opts.scope === "all" || opts.scope === "sent") {
     deps.activity?.update("sync", { step: "sent", durationMs: 5000 });
-    summary.sent = runner.syncSent(dbPath, opts, requiredSelfProfile);
+    summary.sent = runner.syncSent(dbPath, opts, selfProfile);
   }
   if (opts.scope === "all" || opts.scope === "discover") {
     deps.activity?.update("sync", { step: "discover", durationMs: 5000 });
@@ -170,12 +180,12 @@ function executeLarkImSync(opts, deps = {}) {
   }
   if (opts.scope === "all" || opts.scope === "received") {
     deps.activity?.update("sync", { step: "received", durationMs: 5000 });
-    summary.received = runner.syncReceived(dbPath, opts, requiredSelfProfile);
+    summary.received = runner.syncReceived(dbPath, opts, selfProfile);
   }
 
   if (opts.scope === "details") {
     deps.activity?.update("sync", { step: "details", durationMs: 5000 });
-    summary.details = runner.retryDetails(dbPath, opts, requiredSelfProfile);
+    summary.details = runner.retryDetails(dbPath, opts, selfProfile);
   }
 
   const failures = [
@@ -192,9 +202,9 @@ function executeLarkImSync(opts, deps = {}) {
     summary.partial = summary.incomplete || runs.some((run) => run.ok === true || run.list_complete === true);
   }
 
-  if (selfProfile) (deps.recordSuccessfulSyncBinding || recordSuccessfulSyncBinding)({
+  (deps.recordSuccessfulSyncBinding || recordSuccessfulSyncBinding)({
     db: dbPath, selfOpenId: selfProfile.open_id, before: bindingBefore,
-    successful: summary.ok === true && [summary.sent, ...summary.received, ...(summary.details || [])]
+    successful: summary.ok === true && [summary.sent, summary.discovery, ...summary.received, ...(summary.details || [])]
       .some((run) => run?.ok === true && run.skipped !== true),
   });
   return summary;
