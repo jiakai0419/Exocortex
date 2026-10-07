@@ -49,6 +49,21 @@ Unavailable, positive or malformed evidence is never converted into normal zero.
 Unbound log failures remain detail-only diagnostic facts with their source stated;
 they cannot lower or raise the selected database's health, even if recent and explicit.
 
+### Remote sample text contract
+
+Text first respects the public freshness validity state. An unknown, expired,
+invalid-time or unbound sample says why it is not verified; retained difference
+counts cannot become current confirmed findings. Valid samples show every nonzero
+actionable finding together: confirmed/suspected missing, awaiting sync, older
+versions, static-content differences, message identity conflicts and unresolved
+prior observations. Account binding and message identity are separate facts.
+The default healthy sample remains one compact row. Nonzero local-newer,
+expired-observation and observation-overflow counts remain explicit too.
+A healthy detail result says Matched, never unknown merely because its optional
+reason is absent. JSON keys and values remain unchanged. Acceptance covers the
+actual cache-validator-to-text path, default/detail at 40 and 96 columns, mixed
+findings, invalid times, unverified binding and normal/legacy samples.
+
 ### Progress contract
 
 Default progress is limited to known facts: initial conversation discovery not

@@ -9,7 +9,11 @@ export class CliUsageError extends Error {
 
 /** A deliberately public message constructed locally, never remote stderr. */
 export class CliExecutionError extends Error {
-  constructor(message) { super(message); this.name = "CliExecutionError"; }
+  /** @param {string} message @param {string} [reason] */
+  constructor(message, reason) {
+    super(message); this.name = "CliExecutionError";
+    this.reason = ["dependency_unavailable", "read_timeout", "read_failed", "invalid_response"].includes(reason || "") ? reason : undefined;
+  }
 }
 
 /** One invocation captures its clock and path roots before any work starts. */

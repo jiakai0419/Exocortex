@@ -31,7 +31,7 @@ export const GROUPS = Object.freeze([
 export const COMMANDS = Object.freeze([
   route("messages", "Read local messages newest message time first, including original private JSON. Cards are captured API snapshots and may differ from the current client state. JSON retains card rendering status and diagnostics.", [db, format,
     option("--direction", "direction", "enum", "Message direction.", { choices: ["all", "sent", "received"], default: "all" }),
-    positive("--limit", "limit", 30, "Maximum messages."), text("--search", "search", "Search message body.", { default: "" }),
+    positive("--limit", "limit", 30, "Maximum messages."), text("--search", "search", "Search stored body with SQLite LIKE: % matches any sequence; _ matches one character. Input is wrapped in %; backslash is literal.", { default: "" }),
   ], ["local-read"], "private"),
   route("status", "Observe service, health, activity and freshness without live requests.", [db, format, logDir,
     bool("--detail", "detail", "Include safe sync progress details."),

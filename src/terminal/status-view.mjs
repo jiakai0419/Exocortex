@@ -23,7 +23,34 @@ const HEALTH = Object.freeze({ service_state_unavailable: "background service st
   catchup_pending: "local catch-up work remains", health_unavailable: "local health evidence could not be established" });
 const FRESHNESS = Object.freeze({ no_cached_probe: "no cached remote sample", legacy_evidence: "cached sample lacks database binding",
   context_mismatch: "cached sample belongs to a different database or source", invalid_timestamp: "cached sample has invalid times", expired: "cached sample expired",
-  no_usable_sample: "cached sample has no usable messages or time window", inconclusive: "cached sample did not establish freshness" });
+  no_usable_sample: "cached sample has no usable messages or time window", inconclusive: "cached sample did not establish freshness",
+  invalid_evidence: "cached sample evidence is invalid", account_unverified: "account association is unverified",
+  account_mismatch: "account association conflicts", identity_unavailable: "account identity is unavailable",
+  account_changed: "account changed during sampling", database_changed: "database changed during sampling",
+  context_changed: "sample context changed", context_unavailable: "sample context is unavailable",
+  rate_cooldown: "waiting for rate-limit cooldown", rate_limited: "remote requests were rate limited",
+  shared_cooldown_unavailable: "shared cooldown evidence is unavailable", sync_busy: "synchronization is using the API",
+  lease_unavailable: "sample API reservation is unavailable", not_due: "next sample is not due", attempting: "sample attempt in progress",
+  state_invalid: "sample scheduler state is invalid", scheduler_unavailable: "sample scheduler is unavailable",
+  invalid_interval: "sample interval is invalid", database_unavailable: "sample database is unavailable",
+  cache_write_failed: "sample cache could not be saved", state_write_failed: "sample scheduler state could not be saved",
+  sample_process_failed: "sample process failed", sample_failed: "sample attempt failed",
+  no_eligible_chats: "no eligible discovered chats", no_usable_remote_messages: "no usable remote messages",
+  confirmed_missing: "sample has confirmed missing messages", source_difference: "sample has source differences",
+  suspected_missing: "sample has suspected missing messages", sync_pending: "sample messages await sync",
+  unresolved_observations: "prior sample findings remain unresolved", partial_sample: "sample is incomplete",
+  request_budget: "sample request budget reached", time_budget: "sample time budget reached",
+  inventory_budget: "sample inventory budget reached", invalid_page: "sample page evidence is invalid",
+  restricted_mode: "sample access is restricted", request_timeout: "sample request timed out",
+  keychain_unavailable: "sample credentials are unavailable", api_unavailable: "sample API is unavailable" });
+const INVALID_SAMPLE_REASONS = new Set(["expired", "invalid_timestamp", "invalid_evidence", "context_mismatch", "legacy_evidence",
+  "account_unverified", "account_mismatch", "identity_unavailable", "account_changed", "database_changed", "context_changed", "context_unavailable"]);
+const SAMPLE_DIFFERENCES = [
+  ["confirmed_missing", "confirmed missing"], ["stale_version", "older versions"], ["content_mismatch", "content differences"],
+  ["identity_conflict", "message identity conflicts"], ["suspected_missing", "suspected missing"], ["pending_sync", "awaiting sync"],
+];
+const SAMPLE_UNCERTAINTIES = [["unresolved_prior", "prior findings unresolved"], ["local_newer", "newer local versions"],
+  ["expired_observations", "expired observations"], ["observation_overflow", "observations beyond retained capacity"]];
 const FAILURE = Object.freeze({ command_unavailable: "Required command unavailable", internal_error: "Internal error", network_error: "Network error", network_timeout: "Network timeout", service_unavailable: "Service unavailable", spawn_error: "Could not start sync command", permission_denied: "Permission denied", rate_limited: "Rate limited", timeout: "Timed out", transient: "Temporary service error",
   authentication: "Authentication failed", auth: "Authentication failed", invalid_request: "Invalid request", unavailable: "Service unavailable", unknown: "Unclassified failure" });
 /** @param {unknown} value */
@@ -119,20 +146,35 @@ export function renderStatusText(report, options = {}) {
   }
   if (freshness.scope === "discovered_chats_rotating") {
     const f = freshness.findings || {};
-    const result = freshness.reason === "expired" ? "Expired" : freshness.result === "healthy" && freshness.status === "sampled" ? "Sample matched"
-      : f.confirmed_missing > 0 ? `${number(f.confirmed_missing)} confirmed missing`
-      : f.stale_version > 0 || f.content_mismatch > 0 ? `${number(f.stale_version)} older versions · ${number(f.content_mismatch)} content differences`
-      : f.suspected_missing > 0 ? `${number(f.suspected_missing)} suspected missing`
-      : f.pending_sync > 0 ? `${number(f.pending_sync)} awaiting sync`
-      : f.unresolved_prior > 0 ? `${number(f.unresolved_prior)} prior findings unresolved` : "Not verified";
+    // Retained counters do not override the validator's rejected evidence.
+    // Inconclusive observations remain explicit without asserting a confirmed difference.
+    const bound = freshness.auth_identity === "verified_at_check" && freshness.binding?.state === "verified";
+    const usable = bound && !INVALID_SAMPLE_REASONS.has(freshness.reason);
+    const comparisonAvailable = usable && (["sampled", "behind"].includes(freshness.status) || freshness.result === "inconclusive");
+    const matched = usable && freshness.result === "healthy" && freshness.status === "sampled";
+    const differenceReason = ["confirmed_missing", "source_difference", "suspected_missing", "sync_pending"].includes(freshness.reason);
+    const reasonKey = !bound && (differenceReason || freshness.reason === "unknown" || freshness.reason === "unresolved_observations")
+      ? freshness.binding?.state === "conflict" ? "account_mismatch" : "account_unverified"
+      : freshness.status === "unknown" && differenceReason ? "inconclusive" : freshness.reason;
+    const reason = FRESHNESS[reasonKey] || "sample evidence unavailable";
+    const findingsText = (fields) => fields.filter(([key]) => countValid(f[key]) && f[key] > 0)
+      .map(([key, label]) => `${number(f[key])} ${label}`).join(" · ");
+    const differences = usable && freshness.status === "behind" ? findingsText(SAMPLE_DIFFERENCES) : "";
+    const uncertainties = usable ? findingsText(SAMPLE_UNCERTAINTIES) : "";
+    const findings = [differences, uncertainties].filter(Boolean).join(" · ");
+    const result = matched ? "Sample matched" : freshness.reason === "expired" ? "Expired · cached sample expired"
+      : usable && freshness.status === "behind" && findings ? findings
+      : `Not verified · ${reason}${uncertainties ? ` · ${uncertainties}` : ""}`;
     screen.row("Remote sample", `${result} · ${number(freshness.sample_count)} messages / ${number(freshness.chat_count)} discovered chats · checked ${stamp(freshness.checked_at)}`);
     if (detailed) {
       screen.row("Sample window", range(freshness.window?.start, freshness.window?.end));
       screen.row("Sample coverage", `${number(freshness.sample?.hot_chats)} hot + ${number(freshness.sample?.fair_chats)} rotating · ${number(freshness.sample?.eligible_chats)} eligible chats · ${number(freshness.sample?.truncated_chats)} truncated`);
-      screen.row("Sample content", `${number(f.content_equal)} static bodies matched · ${number(f.content_unverified)} unverified`);
-      screen.row("Sample identity", freshness.binding?.state === "verified" ? `Matched at check · ${freshness.binding?.evidence === "single_sent_actor" ? "stored sent identity" : "initial empty database binding"}` : "Account association unverified");
+      screen.row("Sample content", comparisonAvailable ? `${number(f.content_equal)} static bodies matched · ${number(f.content_unverified)} unverified` : `Not verified · ${reason}`);
+      screen.row("Sample identity", usable ? `Matched at check · ${freshness.binding?.evidence === "single_sent_actor" ? "stored sent identity" : "initial empty database binding"}` : "Account association unverified");
       screen.row("Sample limits", "Discovered chat creation window; thread-only replies and client dynamic cards unverified");
-      screen.row("Sample result", `${freshness.reason || "matched"} · expires ${stamp(freshness.expires_at)}`);
+      const resultLabel = usable && freshness.status === "behind"
+        ? freshness.result === "needs_attention" ? "Needs attention" : "Delayed" : "Not verified";
+      screen.row("Sample result", `${matched ? "Matched" : `${resultLabel} · ${reason}`} · expires ${stamp(freshness.expires_at)}`);
     }
   } else if (freshness.status === "sampled" || freshness.status === "behind") {
     screen.row("Remote sample", `${freshness.status === "sampled" ? "Sample matched" : "Sample has missing messages"} · ${number(freshness.sample_count)} messages · checked ${stamp(freshness.checked_at)}`);

@@ -25,7 +25,7 @@ function remote(overrides = {}) {
   // conserved, truncated chats have a second page, and the complete 24-hour
   // creation window ends at least ten minutes before this synthetic check.
   const expired = overrides.reason === "expired";
-  const checkedOffset = expired ? -31 * 60_000 : -60_000;
+  const checkedOffset = overrides.checkedOffset ?? (expired ? -31 * 60_000 : -60_000);
   const endOffset = checkedOffset - 10 * 60_000;
   const findings = { present: 12, missing: 0, pending_sync: 0, suspected_missing: 0, confirmed_missing: 0,
     stale_version: 0, content_mismatch: 0, identity_conflict: 0, local_newer: 0, content_equal: 10,
@@ -188,7 +188,8 @@ test("combined detail keeps normal detail counts, runtime scope and bounded remo
     assert.match(progress, /Sample identity Matched at check · stored sent identity/);
     assert.match(progress, /Sample limits Discovered chat creation window; thread-only replies and client dynamic cards unverified/);
     assert.match(progress, /Sample window .* Sample coverage/);
-    assert.match(progress, /Sample result unknown · expires/);
+    assert.match(progress, /Sample result Matched · expires/);
+    assert.doesNotMatch(progress, /Sample result unknown/);
     assert.equal(occurrences(output, "Message details"), 1);
     assert.equal(occurrences(output, "Remote sample"), 1);
     assert.doesNotMatch(output, /^Problems$/m);
@@ -219,5 +220,79 @@ test("legacy freshness JSON stays exact; rotating samples only extend the review
     assert.match(section(output, "Messages & progress"), /Remote sample Sample matched · 5 messages · checked/);
     assert.doesNotMatch(output, /discovered chats|Sample coverage|Sample content|Sample identity/);
     if (detail) assert.match(section(output, "Messages & progress"), /Recent active-chat sample only; current remote account identity is unverified/);
+  }
+});
+
+test("valid mixed findings remain complete in default and detail without changing public JSON", () => {
+  const findings = { confirmed_missing: 1, suspected_missing: 1, pending_sync: 1,
+    stale_version: 2, content_mismatch: 1, identity_conflict: 1, unresolved_prior: 2 };
+  for (const detail of [false, true]) {
+    const report = project({ detail, freshness: remote({ result: "needs_attention", reason: "confirmed_missing", findings }) });
+    assert.equal(report.freshness.status, "behind");
+    for (const [key, value] of Object.entries(findings)) assert.equal(report.freshness.findings[key], value);
+    for (const columns of [40, 96]) {
+      const output = render(report, columns), progress = section(output, "Messages & progress");
+      for (const text of ["1 confirmed missing", "1 suspected missing", "1 awaiting sync", "2 older versions",
+        "1 content differences", "1 message identity conflicts", "2 prior findings unresolved"]) assert.ok(progress.includes(text), text);
+      assert.equal(occurrences(output, "Remote sample"), 1);
+      assert.doesNotMatch(progress, /Sample matched/);
+    }
+  }
+});
+
+test("message identity conflicts remain distinct from the verified account association", () => {
+  for (const detail of [false, true]) {
+    const report = project({ detail, freshness: remote({ result: "needs_attention", reason: "source_difference", findings: { identity_conflict: 1 } }) });
+    assert.equal(report.freshness.status, "behind");
+    assert.equal(report.freshness.binding.state, "verified");
+    for (const columns of [40, 96]) {
+      const progress = section(render(report, columns), "Messages & progress");
+      assert.match(progress, /Remote sample 1 message identity conflicts/);
+      assert.doesNotMatch(progress, /Remote sample Not verified|Sample matched/);
+      if (detail) assert.match(progress, /Sample identity Matched at check/);
+    }
+  }
+});
+
+test("rejected sample evidence cannot promote retained differences or body matches", () => {
+  const findings = { confirmed_missing: 1, stale_version: 1, identity_conflict: 1 };
+  const scenarios = [
+    [{ result: "needs_attention", reason: "confirmed_missing", checkedOffset: 60_000, findings }, "invalid_timestamp", /cached sample has invalid times/],
+    [{ reason: "expired", findings }, "expired", /Expired/],
+    [{ result: "needs_attention", reason: "confirmed_missing", binding: { state: "unverified" }, findings }, "confirmed_missing", /account association is unverified/],
+    [{ result: "needs_attention", reason: "source_difference", binding: { state: "conflict" }, findings }, "source_difference", /account association conflicts/],
+    [{ corrupt: true }, "invalid_evidence", /cached sample evidence is invalid/],
+  ];
+  for (const [input, reason, expected] of scenarios) for (const detail of [false, true]) {
+    const report = project({ detail, freshness: remote(input) });
+    assert.equal(report.freshness.status, "unknown");
+    assert.equal(report.freshness.reason, reason);
+    if (!input.corrupt) assert.equal(report.freshness.findings.confirmed_missing, 1, "retain machine evidence unchanged");
+    for (const columns of [40, 96]) {
+      const progress = section(render(report, columns), "Messages & progress");
+      assert.match(progress, expected);
+      assert.doesNotMatch(progress, /1 confirmed missing|1 older versions|1 message identity conflicts|static bodies matched|Sample matched|Matched at check/);
+    }
+  }
+});
+
+test("inconclusive and cooldown reasons stay explicit while healthy samples stay compact", () => {
+  for (const detail of [false, true]) for (const columns of [40, 96]) {
+    const inconclusive = project({ detail, freshness: remote({ result: "inconclusive", reason: "unresolved_observations",
+      findings: { unresolved_prior: 2, local_newer: 1, expired_observations: 3, observation_overflow: 4 } }) });
+    assert.equal(inconclusive.freshness.status, "unknown");
+    const progress = section(render(inconclusive, columns), "Messages & progress");
+    for (const text of ["Not verified", "2 prior findings unresolved", "1 newer local versions", "3 expired observations", "4 observations beyond retained capacity"]) assert.ok(progress.includes(text), text);
+    const cooldown = project({ detail, freshness: remote({ result: "unavailable", reason: "rate_cooldown", binding: { state: "unverified" } }) });
+    assert.match(section(render(cooldown, columns), "Messages & progress"), /Not verified · waiting for rate-limit cooldown/);
+    const failed = project({ detail, freshness: remote({ result: "unavailable", reason: "sample_failed" }) });
+    const failedProgress = section(render(failed, columns), "Messages & progress");
+    assert.match(failedProgress, /Not verified · sample attempt failed/);
+    assert.doesNotMatch(failedProgress, /static bodies matched|Sample matched/);
+    if (detail) assert.match(failedProgress, /Sample identity Matched at check/, "account binding alone cannot validate the comparison");
+    const healthy = section(render(project({ detail }), columns), "Messages & progress");
+    assert.match(healthy, /Sample matched/);
+    assert.doesNotMatch(healthy, /0 confirmed|0 older|0 message identity|Sample result unknown/);
+    if (detail) assert.match(healthy, /Sample result Matched/);
   }
 });

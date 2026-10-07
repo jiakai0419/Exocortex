@@ -80,3 +80,5 @@ node bin/exocortex.mjs --help --all --format json
 ```
 
 机器 JSON 直接调用 Node，避免 npm 的前缀。不要通过枚举文件把模块和研究工具当成公共命令，也不要为已退役 wrapper 复制业务规则表。领域反例仍测试真实实现；CLI 测参数、接线、效果与输出。
+
+命令目录中的 Routes 和 Options 区块由 `src/development/command-docs.mjs` 的纯渲染函数从 registry 生成。catalog 测试逐字比较这两个区块，并检查组数和路由数；修改 summary、选项说明、默认值、约束、效果或输出级别而未同步文档时，完整 verify 必须失败。手写帮助示例与跨选项契约保留在生成区块之外；不新增可执行工具或公共路由。

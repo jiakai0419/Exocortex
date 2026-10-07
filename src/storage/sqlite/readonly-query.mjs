@@ -3,6 +3,12 @@
 import { spawnSync } from "node:child_process";
 import { resolve } from "node:path";
 
+/** A local category; callers must not publish the diagnostic message or label. */
+export class SqliteReadError extends Error {
+  /** @param {"dependency_unavailable" | "read_timeout" | "read_failed" | "invalid_response"} reason @param {string} message */
+  constructor(reason, message) { super(message); this.name = "SqliteReadError"; this.reason = reason; }
+}
+
 /**
  * Read an existing database without initialization, recovery or permission
  * repair. The SQLite connection itself rejects writes and missing databases.
@@ -25,10 +31,10 @@ function readOnlySqliteJson(dbPath, sql, label, deps = {}) {
   });
   if (result.status !== 0 || result.error) {
     const error = /** @type {NodeJS.ErrnoException | undefined} */ (result.error);
-    if (error?.code === "ENOENT") throw new Error("required dependency unavailable");
-    if (error?.code === "ETIMEDOUT" || result.signal === "SIGKILL") throw new Error(`${label} timed out`);
+    if (error?.code === "ENOENT") throw new SqliteReadError("dependency_unavailable", "required dependency unavailable");
+    if (error?.code === "ETIMEDOUT" || result.signal === "SIGKILL") throw new SqliteReadError("read_timeout", `${label} timed out`);
     // SQLite stderr can include private paths, SQL literals and record content.
-    throw new Error(`${label} failed`);
+    throw new SqliteReadError("read_failed", `${label} failed`);
   }
   const output = String(result.stdout || "").trim();
   if (!output) return [];
@@ -36,7 +42,7 @@ function readOnlySqliteJson(dbPath, sql, label, deps = {}) {
     const rows = JSON.parse(output);
     if (Array.isArray(rows)) return rows;
   } catch { /* Never include parser excerpts from private query results. */ }
-  throw new Error(`${label} returned invalid JSON`);
+  throw new SqliteReadError("invalid_response", `${label} returned invalid JSON`);
 }
 
 export { readOnlySqliteJson };

@@ -8,9 +8,10 @@
 
 ## Routes
 
+<!-- BEGIN GENERATED routes -->
 | 命令 | 能力 | 默认效果 | 默认输出级别 |
 | --- | --- | --- | --- |
-| `messages` | Read recent messages, including original private JSON. Cards are captured API snapshots and may differ from the current client state. | local-read | `private` |
+| `messages` | Read local messages newest message time first, including original private JSON. Cards are captured API snapshots and may differ from the current client state. JSON retains card rendering status and diagnostics. | local-read | `private` |
 | `status` | Observe service, health, activity and freshness without live requests. | local-read | `public-safe` |
 | `check` | Collect database, sync and quality evidence and requested extensions. | local-read | `public-safe` |
 | `sync` | Run one bounded pass, preserving message and detail-debt contracts. | remote-read, database-write, activity-write | `public-safe` |
@@ -26,6 +27,7 @@
 | `maintenance replay` | Preview replay of explicit scopes and a fixed interval. | local-read, remote-read | `public-safe` |
 | `maintenance prune-runs` | Preview run-history retention; applying can remove coverage evidence. | local-read | `public-safe` |
 | `maintenance compact` | Preview database compaction; --apply permits the write. | local-read | `public-safe` |
+<!-- END GENERATED routes -->
 
 ## Help and machine discovery
 
@@ -41,9 +43,10 @@ node bin/exocortex.mjs --help --all --format json
 
 ## Options and explicit modes
 
+<!-- BEGIN GENERATED options -->
 ### messages
 
-Read recent messages, including original private JSON. Cards are captured API snapshots and may differ from the current client state.
+Read local messages newest message time first, including original private JSON. Cards are captured API snapshots and may differ from the current client state. JSON retains card rendering status and diagnostics.
 
 默认效果：`local-read`；输出：`private`。
 
@@ -53,7 +56,7 @@ Read recent messages, including original private JSON. Cards are captured API sn
 | `--format` | text/json | `text` | — | Output format. |
 | `--direction` | all/sent/received | `all` | — | Message direction. |
 | `--limit` | integer | `30` | ≥ 1 | Maximum messages. |
-| `--search` | string | `空字符串` | — | Search message body. |
+| `--search` | string | `空字符串` | — | Search stored body with SQLite LIKE: % matches any sequence; _ matches one character. Input is wrapped in %; backslash is literal. |
 
 ### status
 
@@ -158,12 +161,12 @@ Install configuration without starting the worker.
 | `--step-timeout-seconds` | integer | `600` | — | Hard timeout for each child step. |
 | `--log-max-bytes` | integer | `10485760` | — | Rotate worker.jsonl at this size. |
 | `--log-keep-files` | integer | `5` | — | Rotated worker logs to keep. |
-| `--remote-sample-interval-seconds` | integer | `900` | 0 或 900–1800 | Sample after successful cycles; 0 disables. |
 | `--retention-every-cycles` | integer | `1440` | — | Apply run retention every N cycles. |
 | `--adaptive-fair` | boolean | `false` | — | Adapt the fair scope batch; not an HTTP rate limiter. |
 | `--adaptive-fair-min` | integer | `10` | — | Minimum adaptive fair batch. |
 | `--adaptive-fair-max` | integer | `50` | — | Maximum adaptive fair batch. |
 | `--adaptive-target-cycle-seconds` | integer | `90` | — | Target work plus interval duration. |
+| `--remote-sample-interval-seconds` | integer | `900` | ≥ 0；≤ 1800 | Bounded remote sample interval (900–1800 seconds; 0 disables). |
 | `--format` | text/json | `text` | — | Output format. |
 
 ### service start
@@ -320,6 +323,7 @@ Preview database compaction; --apply permits the write.
 | `--db` | path | `data/exocortex.sqlite` | — | Database; default relative to installation root, explicit relative paths to cwd. |
 | `--format` | text/json | `text` | — | Output format. |
 | `--apply` | boolean | `false` | — | Commit the planned change; otherwise preview. |
+<!-- END GENERATED options -->
 
 ## Cross-option and result contracts
 

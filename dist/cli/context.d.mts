@@ -19,5 +19,7 @@ export class CliUsageError extends Error {
 }
 /** A deliberately public message constructed locally, never remote stderr. */
 export class CliExecutionError extends Error {
-    constructor(message: any);
+    /** @param {string} message @param {string} [reason] */
+    constructor(message: string, reason?: string);
+    reason: string | undefined;
 }

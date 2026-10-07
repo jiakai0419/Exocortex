@@ -62,6 +62,12 @@ node bin/exocortex.mjs status
 npm run help -- --all
 ```
 
+## Message search and read errors
+
+`messages --search` 保留 SQLite LIKE 模式语义：在输入两端加 `%`，输入中的 `%` 匹配任意长度、`_` 匹配一个字符；反斜杠是普通字符，没有额外转义约定。默认 SQLite LIKE 对 ASCII 大小写不敏感，对非 ASCII 字符不做完整大小写折叠。单引号按 SQL 字面量处理。空搜索不筛选，方向筛选、按消息时间倒序和 limit 规则不变；这不是默认字面子串搜索。
+
+messages 的本地读取失败仍退出 1。已确认的 SQLite 依赖缺失、查询超时、读取失败或无效查询响应分别给出固定说明与下一步；不推测读取失败一定是 schema 损坏。未知异常保持通用错误。JSON 保留 `execution_failed`，这些已分类错误增量提供有限 `error.reason`；stdout/stderr 不输出原始异常、路径、SQL、数据库内容或子进程 stderr。
+
 ## Status Model
 
 `status` 的主状态分成四层，避免把进程、同步、实时活动和远端对照混在一起。
@@ -74,7 +80,8 @@ npm run help -- --all
 
 ```text
 RUNNING  LaunchAgent 已加载，worker 进程活着。
-STOPPED  LaunchAgent 未加载，或已加载但 worker 进程没起来。
+LOADED   LaunchAgent 已加载，但当前运行进程尚未验证。
+STOPPED  LaunchAgent 未加载。
 ```
 
 另有 `UNKNOWN`：无法确认 launchd 状态。只有成功的 `launchctl print` 或明确的 service-not-found 结果才能判定加载或未加载；权限错误、命令启动失败和其他异常不能当作 STOPPED。细节里继续展示 LaunchAgent loaded、PID 和 last exit。

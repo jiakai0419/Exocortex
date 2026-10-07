@@ -26,7 +26,8 @@ export async function runCli(argv, overrides = {}) {
     const usage = error instanceof CliUsageError;
     const message = usage || error instanceof CliExecutionError ? error.message : "Unable to complete command; check its required dependencies and local evidence.";
     if (argv.some((value, index) => value === "--format" && argv[index + 1] === "json")) {
-      context.stdout.write(`${JSON.stringify({ schema_version: 1, ok: false, error: { code: usage ? "invalid_arguments" : "execution_failed", message } })}\n`);
+      context.stdout.write(`${JSON.stringify({ schema_version: 1, ok: false, error: { code: usage ? "invalid_arguments" : "execution_failed", message,
+        ...(error instanceof CliExecutionError && error.reason ? { reason: error.reason } : {}) } })}\n`);
     } else context.stderr.write(`Error: ${message}\n`);
     return 1;
   }
