@@ -59,6 +59,106 @@ function inspectActivityProcesses(pids, run = spawnSync) {
   return result;
 }
 
+/** Three PPID edges cover both direct steps and worker -> guardian -> anchor
+ * -> sync. Share the existing 32-process budget, discover at most two layers,
+ * then recheck every node of the expanded paths together. Missing evidence
+ * never establishes independence. PID 1 is the only non-worker boundary.
+ * @param {Record<string, any>[]} events
+ * @param {unknown[]} workerEvents
+ * @param {ReturnType<typeof inspectActivityProcesses>} initial
+ * @param {typeof inspectActivityProcesses} [inspect]
+ * @param {number} [beforeInspectionMs]
+ */
+function collectActivityAncestors(events, workerEvents, initial, inspect = inspectActivityProcesses, beforeInspectionMs = Date.now()) {
+  const processes = new Map([...initial].slice(0, MAX_ACTIVITY_INSTANCES));
+  const workerPids = workerEvents.filter(validateActivityEventShape)
+    .filter((event) => /** @type {Record<string, any>} */ (event).role === "worker")
+    .map((event) => Number(/** @type {Record<string, any>} */ (event).pid));
+  const workerIdentities = collectWorkerParentIdentities(workerEvents, workerPids);
+  const children = events.filter((event) => event.role === "sync").slice(0, MAX_ACTIVITY_INSTANCES);
+  /** @param {number} pid */
+  function trace(pid) {
+    const pids = [];
+    for (let depth = 0; depth <= 3; depth += 1) {
+      if (!Number.isSafeInteger(pid) || pid <= 1 || pids.includes(pid)) break;
+      pids.push(pid);
+      const row = processes.get(pid);
+      if (!row) return { pids, complete: false, missing: pid };
+      const possibleWorker = [...(workerIdentities.get(pid) || [])]
+        .some((start) => compareActivityProcessStarts(start, row?.started_at_ms) !== "different");
+      if (depth > 0 && possibleWorker) return { pids, complete: Boolean(row), worker: pid };
+      if (row.state !== "alive" || !Number.isSafeInteger(row.started_at_ms) || Number(row.started_at_ms) <= 0) break;
+      if (depth === 3) break;
+      if (row.ppid === 1) return { pids, complete: true, worker: null };
+      pid = Number(row.ppid);
+    }
+    return { pids, complete: false };
+  }
+  for (let depth = 0; depth < 2; depth += 1) {
+    const missing = [...new Set(children.flatMap((child) => {
+      const path = trace(child.pid);
+      return path.missing ? [path.missing] : [];
+    }))].slice(0, Math.max(0, MAX_ACTIVITY_INSTANCES - processes.size));
+    if (!missing.length) break;
+    let observed;
+    try { observed = inspect(missing); } catch { observed = new Map(); }
+    for (const pid of missing) processes.set(pid, observed.get(pid) || { state: "unknown", started_at_ms: null });
+  }
+  const paths = new Map(children.map((child) => [Number(child.pid), trace(Number(child.pid))]));
+  // Direct children and direct PID-1 foreground work retain the original
+  // single observation. Every expanded path needs a coherent second sample.
+  const expanded = [...paths.values()].filter((path) => path.complete
+    && (path.pids.length > 2 || path.pids.some((pid) => !initial.has(pid))));
+  const requested = [...new Set(expanded.flatMap((path) => path.pids))]
+    .filter((pid) => processes.has(pid)).slice(0, MAX_ACTIVITY_INSTANCES);
+  let rechecked = /** @type {ReturnType<typeof inspectActivityProcesses>} */ (new Map());
+  if (requested.length) {
+    try { rechecked = inspect(requested); } catch { /* remain unknown */ }
+  }
+  const ancestry = new Map([...paths].map(([pid, path]) => {
+    const needsRecheck = path.pids.length > 2 || path.pids.some((id) => !initial.has(id));
+    const stable = !needsRecheck || path.pids.every((id) => {
+      const before = processes.get(id), after = rechecked.get(id);
+      return before?.state === "alive" && after?.state === "alive"
+        && compareActivityProcessStarts(before.started_at_ms, after.started_at_ms) === "same"
+        && before.ppid === after.ppid;
+    });
+    return [pid, { ...path, stable, before_inspection_ms: beforeInspectionMs }];
+  }));
+  return { processes, ancestry };
+}
+
+/** Validate all starts and edges, including both event-bound endpoints.
+ * Every process start bucket must end before the first sample: equal-second
+ * PID reuse during discovery cannot then impersonate an earlier observation.
+ * The child's initial phase may be in its start bucket; only the separately
+ * verified worker phase proves activity. Foreground phases retain their own
+ * bucket/freshness checks. Two consistent reads are not an atomic snapshot.
+ * @param {Record<string, any>} child
+ * @param {Record<string, any> | undefined} path
+ * @param {ReturnType<typeof inspectActivityProcesses>} processes
+ */
+function verifyActivityAncestry(child, path, processes) {
+  if (!path?.complete || !path.stable || !Array.isArray(path.pids) || path.pids[0] !== child.pid
+    || path.pids.length < 1 || path.pids.length > 4 || new Set(path.pids).size !== path.pids.length) return false;
+  const childStart = processes.get(child.pid)?.started_at_ms;
+  const updated = Date.parse(child.updated_at);
+  if (compareActivityProcessStarts(child.process_started_at_ms, childStart) !== "same"
+    || !Number.isFinite(path.before_inspection_ms) || updated < Number(childStart)
+    || updated > path.before_inspection_ms) return false;
+  for (let index = 0; index < path.pids.length; index += 1) {
+    const row = processes.get(path.pids[index]);
+    if (row?.state !== "alive" || !Number.isSafeInteger(row.started_at_ms) || Number(row.started_at_ms) <= 0
+      || Number(row.started_at_ms) > Number(childStart)
+      || Number(row.started_at_ms) + 1000 > path.before_inspection_ms) return false;
+    if (index > 0) {
+      const descendant = processes.get(path.pids[index - 1]);
+      if (descendant?.ppid !== path.pids[index] || Number(row.started_at_ms) > Number(descendant?.started_at_ms)) return false;
+    }
+  }
+  return path.worker === path.pids.at(-1) || (path.worker === null && processes.get(path.pids.at(-1))?.ppid === 1);
+}
+
 /** @param {unknown} owner */
 function ownerIdentity(owner) {
   const match = typeof owner === "string" ? owner.match(/^pid:(\d+):started:(\d+)(?::|$)/) : null;
@@ -225,4 +325,4 @@ function databaseOnlyHealth(health) {
 
 export { databaseActivityEvidence, databaseOnlyHealth, ACTIVITY_GAP_MS, ACTIVITY_GRACE_MS, MAX_ACTIVITY_AGE_MS, activityDatabaseKey, createActivityWriter,
   inspectActivityProcesses, observeLockOwners, latestActivityEvents, evaluateActivityEvent, validateActivityEventShape,
-  compareActivityProcessStarts, collectWorkerParentIdentities };
+  compareActivityProcessStarts, collectWorkerParentIdentities, collectActivityAncestors, verifyActivityAncestry };

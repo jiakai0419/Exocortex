@@ -68,10 +68,11 @@ function fixture(t) {
         buildStatus: (path) => { assert.equal(path, db); return local; },
         readRecentWorkerEvents: () => ({ path: PRIVATE, exists: true, events, activity_integrity: true, truncated: false }),
         readLiveProbeCache: () => null, liveProbeContext: () => null,
-        inspectActivityProcesses: () => new Map([
+        inspectActivityProcesses: (pids) => new Map([
           [7701, { state: "alive", started_at_ms: NOW - 60_000, ppid: 1 }],
           [8802, { state: "alive", started_at_ms: NOW - 60_000, ppid: 2222 }],
-        ]),
+          [2222, { state: "alive", started_at_ms: NOW - 120_000, ppid: 1 }],
+        ].filter(([pid]) => pids.includes(pid))),
         sqliteJson: (path) => { assert.equal(path, db); return failedRows; },
       },
     });

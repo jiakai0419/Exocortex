@@ -14,7 +14,7 @@ import {
 } from "node:fs";
 import { resolve } from "node:path";
 import { summarizeWorkerEvents } from "../../dist/runtime/worker/lark-im-worker-core.js";
-import { activityDatabaseKey, inspectActivityProcesses, latestActivityEvents, evaluateActivityEvent, validateActivityEventShape, compareActivityProcessStarts, collectWorkerParentIdentities } from "./lark-im-activity-evidence.mjs";
+import { activityDatabaseKey, inspectActivityProcesses, latestActivityEvents, evaluateActivityEvent, validateActivityEventShape, compareActivityProcessStarts, collectWorkerParentIdentities, collectActivityAncestors, verifyActivityAncestry } from "./lark-im-activity-evidence.mjs";
 import { classifyLarkFailure } from "../adapters/lark-im/transport.mjs";
 import { readLiveProbeCache, liveProbeContext, DEFAULT_LIVE_PROBE_TTL_MS } from "./live-probe-cache.mjs";
 import { buildStatus } from "./sync-status-report.mjs";
@@ -425,15 +425,19 @@ function summarizeServiceActivity({ service, syncStatus, nowMs = Date.now(), act
   for (const child of children) {
     const ppid = processes.get(child.event.pid)?.ppid;
     const parent = child.event.parent_instance;
-    if (parent || workerPids.has(ppid)) {
-      if (!worker || parent !== worker.event.instance_id || ppid !== worker.event.pid
+    const ancestry = activityEvidence?.ancestry?.get(child.event.pid);
+    const hasWorkerAncestor = ancestry?.pids.slice(1).some((pid) => workerPids.has(pid));
+    const verifiedPath = verifyActivityAncestry(child.event, ancestry, processes);
+    const currentChild = ancestry ? verifiedPath && ancestry.worker === worker?.event.pid : ppid === worker?.event.pid;
+    if (parent || workerPids.has(ppid) || hasWorkerAncestor) {
+      if (!worker || parent !== worker.event.instance_id || !currentChild
         || worker.value.state !== "syncing") {
-        const belongsToCurrentWorker = worker && (parent === worker.event.instance_id || ppid === worker.event.pid);
+        const belongsToCurrentWorker = worker && (parent === worker.event.instance_id || ancestry?.pids.includes(worker.event.pid) || ppid === worker.event.pid);
         childEvidenceIssue = belongsToCurrentWorker
           ? { detail: "worker and child phase evidence disagree", reason: "worker_child_conflict" }
           : childEvidenceIssue || { detail: "a worker child has no verified current parent phase", reason: "worker_parent_unverified" };
       }
-    } else if (!Number.isSafeInteger(ppid) || ppid < 1) {
+    } else if (!Number.isSafeInteger(ppid) || ppid < 1 || (activityEvidence?.ancestry && (!verifiedPath || ancestry.worker !== null))) {
       childEvidenceIssue ||= { detail: "foreground process parent is unavailable", reason: "foreground_parent_unavailable" };
     } else independent.push(child);
   }
@@ -622,14 +626,16 @@ function buildServiceStatusReport(opts, deps = {}) {
   // after collection began. Evaluate all temporal evidence after those reads.
   const candidates = latestActivityEvents(workerLog.events, initialDatabaseKey, now());
   const serviceWorkerEvents = latestServiceWorkerEvents(workerLog.events, probe.pid);
-  const processes = (deps.inspectActivityProcesses || inspectActivityProcesses)([...new Set([
+  const inspect = deps.inspectActivityProcesses || inspectActivityProcesses;
+  const beforeInspectionMs = now();
+  const initialProcesses = inspect([...new Set([
     ...(serviceWorkerEvents.length > 0 && probe.pid !== null ? [probe.pid] : []), ...candidates.events.map((event) => Number(event.pid)),
   ])]);
-  const parentIdentities = collectWorkerParentIdentities(workerLog.events, candidates.events
-    .filter((event) => event.role === "sync").map((event) => processes.get(Number(event.pid))?.ppid));
+  const { processes, ancestry } = collectActivityAncestors(candidates.events, workerLog.events, initialProcesses, inspect, beforeInspectionMs);
+  const parentIdentities = collectWorkerParentIdentities(workerLog.events, [...ancestry.values()].flatMap((path) => path.pids.slice(1)));
   const finalDatabaseKey = activityDatabaseKey(opts.db || DEFAULT_DB);
   const nowMs = now();
-  const activityEvidence = { ...candidates, processes, service_worker_events: serviceWorkerEvents,
+  const activityEvidence = { ...candidates, processes, ancestry, service_worker_events: serviceWorkerEvents,
     parent_identities: parentIdentities, database_key: finalDatabaseKey,
     database_identity_stable: initialDatabaseKey !== null && initialDatabaseKey === finalDatabaseKey,
     integrity: workerLog.activity_integrity !== false && candidates.integrity !== false, observed_at: new Date(nowMs).toISOString() };
