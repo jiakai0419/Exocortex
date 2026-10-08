@@ -8,6 +8,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureInitialized, quoteSql, sqliteExec } from "../dist/storage/sqlite/ingestion-store.js";
 import { liveProbeContext } from "../src/diagnostics/live-probe-cache.mjs";
+import { prepareSidecarFixture } from "./helpers/sidecar-fixture.mjs";
 
 // Fresh fictional records: no screenshots, production rows or redacted originals.
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -71,6 +72,7 @@ function saveConfig(fixture, name = NAME) {
     context: { database_key: liveProbeContext(fixture.dbPath).database_key, source_id: "lark.im" },
     entries: [{ tenant_key: TENANT, chat_id: CHAT, app_id: APP, name, source: SOURCE }],
   }), { mode: 0o600 });
+  prepareSidecarFixture(fixture.configPath);
 }
 
 function query(dbPath, sql) {

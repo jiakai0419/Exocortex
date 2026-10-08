@@ -32,6 +32,8 @@ CI 通过临时命令目录明确选择 `/usr/bin/python3` 与 `/usr/bin/sqlite3
 
 完整测试使用合成数据、临时文件和测试自有进程；CI 不配置业务凭据、不调用真实飞书 API、不读取个人数据库。macOS 上的进程、锁、权限和 SQLite 回归不等于用户机器的实际验收：现有 launchd/Keychain 测试仍使用模拟，真实 LaunchAgent、登录权限和账号关联按 Operations 单独验收。
 
+本机 Documents 目录中的新合成文件可能在创建后才被赋予 Darwin `UF_TRACKED`（文档 ID 跟踪标志），同时改变 `ctime`。姓名侧车夹具在发布给读取命令前，使用测试专用 helper 同步设置这个标志并验证其他身份字段不变；失败即中止，不等待静默期或重试命令。生产读取器仍严格比较 `ctime`。真实权限往返修改、同长度内容改写后恢复 `mtime` 的回归必须拒绝旧的配置快照，不能用放宽元数据比较来消除测试波动。
+
 ## Four development and research entrypoints
 
 | 可执行文件 | 能力 |

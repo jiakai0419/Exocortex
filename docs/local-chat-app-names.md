@@ -81,6 +81,12 @@ safe configuration error, with no private values dumped. Copying or replacing
 the database invalidates its old file binding; review the intended scope before
 recreating that binding. The database binding is checked around message reading.
 
+The sidecar's identity and modification metadata, including `ctime`, must stay
+unchanged while reading and querying messages. A metadata-only change therefore
+also fails closed: unchanged size and `mtime` cannot distinguish it from a
+same-size content edit that restores `mtime`. The reader does not retry or relax
+this check; investigate the writer before reading the configuration again.
+
 There is no cache: removing an entry or the file revokes the mapping on the next
 read. Removing a mapping does not undo or change any stored name because no name
 was written to the database. This is a display repair for supported evidence,

@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { chmodSync, copyFileSync, linkSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, linkSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { liveProbeContext } from "../src/diagnostics/live-probe-cache.mjs";
 import { enrichRow } from "../src/diagnostics/messages-report.mjs";
 import { readLocalChatAppNames, applyLocalChatAppNames } from "../src/diagnostics/local-chat-app-names.mjs";
+import { prepareSidecarFixture } from "./helpers/sidecar-fixture.mjs";
+import { executeMessages } from "../src/cli/messages-command.mjs";
 
 // All identities, provenance references, clocks and prose were invented here.
 const TENANT = "synthetic-tenant-orbit";
@@ -26,7 +28,10 @@ function fixture(t) {
   const config = { kind: "lark_im_chat_app_names/v1", context: {
     database_key: liveProbeContext(dbPath).database_key, source_id: "lark.im",
   }, entries: [entry] };
-  const save = (value = config) => writeFileSync(configPath, JSON.stringify(value), { mode: 0o600 });
+  const save = (value = config) => {
+    writeFileSync(configPath, JSON.stringify(value), { mode: 0o600 });
+    prepareSidecarFixture(configPath);
+  };
   return { directory, dbPath, configPath, entry, config, save };
 }
 
@@ -307,3 +312,37 @@ test("config edits and deletion take effect next read; changes during a query fa
   safeError(() => applyLocalChatAppNames([message()], current), f, "local_chat_app_names_changed");
   assert.equal(readLocalChatAppNames(f.dbPath), null);
 });
+
+for (const change of ["permission round trip", "same-size content edit with restored mtime"]) {
+  test(`messages rejects ctime-only ${change} during its query`, (t) => {
+    const f = fixture(t); f.save();
+    // Whole-second timestamps can be restored exactly without floating-point rounding.
+    const stamp = Date.parse("2041-01-01T00:00:00.000Z") / 1000;
+    utimesSync(f.configPath, stamp, stamp);
+    const bytes = readFileSync(f.configPath);
+    const original = message();
+    let queried = false;
+    assert.throws(() => executeMessages({ db: f.dbPath }, { loadMessages: () => {
+      queried = true;
+      const before = statSync(f.configPath, { bigint: true });
+      if (change === "permission round trip") {
+        chmodSync(f.configPath, 0o400);
+        chmodSync(f.configPath, 0o600);
+        assert.deepEqual(readFileSync(f.configPath), bytes, "metadata can change without changing bytes");
+      } else {
+        f.entry.name = "Synthetic Paper Fox";
+        f.save();
+        utimesSync(f.configPath, stamp, stamp);
+        assert.notDeepEqual(readFileSync(f.configPath), bytes, "a real content edit can restore size and mtime");
+      }
+      const after = statSync(f.configPath, { bigint: true });
+      for (const key of ["dev", "ino", "mode", "uid", "nlink", "size", "mtimeNs"]) {
+        assert.equal(after[key], before[key], `${key} alone cannot detect this change`);
+      }
+      assert.notEqual(after.ctimeNs, before.ctimeNs, "the real filesystem mutation must change ctime");
+      return [original];
+    } }), { name: "CliExecutionError", message: "local chat app names: changed" });
+    assert.equal(queried, true, "the real reader must succeed before rejection at the query boundary");
+    assert.equal(Object.hasOwn(original.display, "sender_name_source"), false, "no local name was applied");
+  });
+}
