@@ -100,7 +100,7 @@ function assertCommittedDebtIsVisible(dbPath) {
   assert.equal(after.details.pending_count, 1);
   assert.equal(after.list_progress.oldest_cursor_ms, START + 3 * MINUTE);
   assert.equal(after.records.total, 2);
-  assert.equal(after.runs.by_status.failed, 2);
+  assert.equal(after.runs.by_status.failed, 1);
   assert.equal(after.health, "catching_up");
   const nowMs = Date.now();
   const workerSummary = { last_cycle: { cycle: 2, at: new Date(nowMs).toISOString(), started_at: new Date(nowMs - 1).toISOString(), complete: true, ok: true },

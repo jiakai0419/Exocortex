@@ -22,32 +22,35 @@ const iso = (offset = 0) => new Date(STATUS_SCREEN_NOW + offset).toISOString();
 const hash = (text) => createHash("sha256").update(text).digest("hex");
 
 // Generated only from invented status-screen fixtures, with TZ=UTC and NO_COLOR=1.
-// JSON hashes remain from 34f9698142fc479decd20968ab3002316278dcbd.
-// Detail hashes include the approved Command targets guidance and its wrapping.
-// Independent comparison of all 18 scenarios at four widths confirmed that
-// removing only that row leaves the prior detailed screens byte-identical.
+// JSON hashes include the approved read-only failed-run transition projection.
+// Compared against bf093e9 baseline status using all 18 invented scenarios:
+// only failure_runs actionable counters/transitions and their detailed run
+// counterparts were added; no existing JSON value changed.
+// Detail text additionally names its log source "Worker history source"; at
+// every tested width this is the only new text change, and default text is exact.
+// The earlier detail baseline incorporated Command targets guidance and wrapping.
 // Default hashes were regenerated from 6ffc3d5b047c73638b2a2f0450769e2c755ddff1
 // by removing its old four runtime rows and Message details row. The candidate
 // removes its paired runtime rows and the same detail row for comparison; an
 // otherwise empty Problems section is removed only after losing that detail row.
 // Hash input: scenarios.map(name => `${name}\n${rendered}`).join("\n---\n").
 // The test runner never invokes Git or reads operational data. Only the authorized
-// runtime layout and default detail-row placement are exempt; hashes protect all
-// other text, including
-// indentation, wrapping, headings, blank lines, diagnostics and final newline.
+// runtime layout and default detail-row placement are exempt from this baseline;
+// hashes protect all other text, including indentation, wrapping, headings,
+// blank lines, diagnostics and the final newline.
 const BASELINE_TEXT = {
   "default:96": "0739e9f515304cf03444c2700fe0390e4520bfe2c437bba5609f316668e3703a",
   "default:80": "7a6c4d40382234cbed7eff58844c122fa9a8a2f5bad9475243b9e1ecf2c3b710",
   "default:56": "bd2cd9d5a179d6450548b65d09b920a9500c2ea81d25db1cc051901a22a88dfb",
   "default:40": "f4104d27b98586065485d9e4d41374a60d0dbb2d75b625790933791996621474",
-  "detail:96": "bb60e775f5bd14ce824365e8c8d4fcb6848c1875b77603a07a404da3631f68e3",
-  "detail:80": "8e5aa0f015e2cf3928b96ef1d7ba22650019c43712b1b38f85388b580ae87f4e",
-  "detail:56": "94762ae1739fea49d128b3f419b6fcc731c3e4a0edfb850633c4adc3e005a184",
-  "detail:40": "b54851ec4a3eb34f0a8bd9d9ca447884daaf9d105cedb08cbd625052530565b5",
+  "detail:96": "96f275ac92493b11289a829977bc3df91a227d860a65097252e221f6003bde22",
+  "detail:80": "f8428b4b31c38e162e238b8a1bc9c8d4178973c2ac31b6f20dd7061c9d95cfe5",
+  "detail:56": "923ab902e79bad31eb069779a73c1118386cea0aea5105eb266b82914426acc9",
+  "detail:40": "48bb46a782b4316e7f437e16e2b58531d0d6356207481bf9027ff3116e3ce402",
 };
 const BASELINE_JSON = {
-  false: "dbfe1994f881cf37963be356f2acd33b63b09c161b59b3d29762a0fd430fef8c",
-  true: "21ccb36120f67708260f7032f10946571afea5cbb26e75bae6aefa8debac9aea",
+  false: "b5478d5d03fb34d6a84c7b002d5e78fd1ccc67cbeb6d0651c0f984de9c5bf517",
+  true: "b261a19be2aefdda84241702edcb8ed9f7351c9994952331280b8788a07e32b0",
 };
 
 function runtimeRows(text, detail = false) {
@@ -103,7 +106,7 @@ for (const detail of [false, true]) {
       assert.equal(hash(joined), BASELINE_TEXT[`${detail ? "detail" : "default"}:${columns}`], "all other text must match the fixed baseline byte for byte");
     });
   }
-  test(`runtime_stats is the sole public JSON addition (${detail ? "detail" : "default"})`, () => {
+  test(`public JSON preserves the approved projection outside runtime_stats (${detail ? "detail" : "default"})`, () => {
     const joined = STATUS_SCREEN_SCENARIOS.map((name) => {
       const { runtime_stats, ...existing } = statusScreenFixture(name, { detail });
       assert.equal(runtime_stats.scope, "current_worker_retained_log");

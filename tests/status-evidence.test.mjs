@@ -43,15 +43,18 @@ function serviceDeps(overrides = {}) {
 
 test("retained database failures use inclusive start-time boundaries and exclude future rows", (t) => {
   const db = join(temp(t), "synthetic.sqlite");
-  execFileSync("sqlite3", [db], { input: `CREATE TABLE sync_runs(id INTEGER PRIMARY KEY, status TEXT, started_at TEXT, error_message TEXT, error_type TEXT);
-    INSERT INTO sync_runs VALUES
+  execFileSync("sqlite3", [db], { input: `CREATE TABLE sync_runs(id INTEGER PRIMARY KEY, status TEXT, started_at TEXT, error_message TEXT, error_type TEXT,
+      source_id TEXT,scope_id TEXT,finished_at TEXT,cursor_before_json TEXT,cursor_after_json TEXT,metadata_json TEXT,
+      scanned_count INTEGER,inserted_count INTEGER,updated_count INTEGER,duplicate_count INTEGER);
+    INSERT INTO sync_runs(id,status,started_at,error_message,error_type) VALUES
       (1,'failed','${iso(now - day - 1)}','${marker}',NULL),
       (2,'failed','${iso(now - day)}','${marker}',NULL),
       (3,'failed','${iso(now)}','${marker}',NULL),
       (4,'failed','${iso(now + 1)}','${marker}',NULL),
       (5,'succeeded','${iso(now)}','${marker}',NULL);` });
   assert.deepEqual(collectRecentFailureKinds(db, now, day), {
-    failed_runs: 2, by_kind: [{ kind: "unknown", count: 2 }],
+    failed_runs: 2, by_kind: [{ kind: "unknown", count: 2 }], actionable_failed_runs: 2,
+    actionable_by_kind: [{ kind: "unknown", count: 2 }], transitions: { resolved: 0, unresolved: 0, unknown: 0 },
   });
 });
 

@@ -66,11 +66,20 @@ function publicStability(value) {
 function publicFailureRuns(value) {
   const failures = value || {};
   const available = failures.evidence === "available" && count(failures.failed_runs) !== null;
+  const transitions = failures.transitions || {};
+  const semantic = available && [transitions.resolved, transitions.unresolved, transitions.unknown,
+    failures.actionable_failed_runs].every((value) => count(value) !== null) &&
+    transitions.resolved + transitions.unresolved + transitions.unknown <= failures.failed_runs &&
+    failures.actionable_failed_runs === failures.failed_runs - transitions.resolved;
   return { source: choice(failures.source, ["retained_sync_runs"]), database_binding: choice(failures.database_binding, ["selected_database"]),
     time_basis: choice(failures.time_basis, ["started_at"]), evidence: available ? "available" : "unavailable",
     window_ms: count(failures.window_ms), window_started_at: publicTimestamp(failures.window_started_at),
     window_ended_at: publicTimestamp(failures.window_ended_at), failed_runs: available ? count(failures.failed_runs) : null,
-    by_kind: available ? publicCounts(failures.by_kind, "kind", publicFailureKind) : [] };
+    by_kind: available ? publicCounts(failures.by_kind, "kind", publicFailureKind) : [],
+    actionable_failed_runs: semantic ? failures.actionable_failed_runs : null,
+    actionable_by_kind: semantic ? publicCounts(failures.actionable_by_kind, "kind", publicFailureKind) : [],
+    transitions: { resolved: semantic ? transitions.resolved : null,
+      unresolved: semantic ? transitions.unresolved : null, unknown: semantic ? transitions.unknown : null } };
 }
 
 /** @param {JsonObject | undefined} value */

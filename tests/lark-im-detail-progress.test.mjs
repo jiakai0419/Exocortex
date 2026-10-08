@@ -158,7 +158,8 @@ for (const direction of ["received", "sent"]) {
     for (const run of sqliteQuery(dbPath,
       `SELECT status,metadata_json FROM sync_runs WHERE scope_id=${quoteSql(id)};`)) {
       const metadata = JSON.parse(run.metadata_json);
-      assert.equal(run.status, "failed");
+      assert.equal(run.status, metadata.lark_progress.phase === "list" ? "succeeded" : "failed");
+      assert.equal(metadata.lark_progress.outcome, metadata.lark_progress.phase === "list" ? "awaiting_details" : "attempt_failed");
       assert.equal(metadata.list_complete, true);
       assert.equal(metadata.window_complete, false);
       assert.equal(metadata.details_complete, false);

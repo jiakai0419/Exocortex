@@ -171,7 +171,7 @@ node bin/exocortex.mjs check --db /absolute/path/to/exocortex.sqlite \
 
 日志只读当前 `worker.jsonl` 最多 8 MiB、20,000 个非空行，不读轮转历史。达到回看左边界也不证明连续运行或无遗漏。数据库失败统计只计算保留的 `sync_runs` 中 `status=failed` 且开始时间位于其独立闭区间内的行，按安全类别聚合；查询失败显示不可用，不能说零失败。查询先冻结截止时间，活动仍在全部读取结束后验证有效期。JSON 中既有 `stability.failures.by_kind` 保留兼容语义，新 `failure_runs` 给出来源、时间基础和精确窗口。
 
-`Merge-forward details pending at run end`（JSON：`detail_incomplete`）表示该次运行结束时合并转发详情仍未完成，列表进度已保存。它来自已保存的内部错误类型，不代表当前仍有同样数量的待办，也不说明上游失败原因。详情重试成功后，当前 pending/due 可归零，历史失败仍按原窗口保留；无需为消除提示重写旧运行记录。
+`Merge-forward details pending at run end`（JSON：`detail_incomplete`）是已保存运行的历史分类，不代表当前仍有同样数量的待办，也不说明上游失败原因。新运行把列表提交成功、详情待补和实际详情尝试失败分开记录；仅有待办不会把成功的列表操作记成失败。旧版列表过渡若有同源、同 scope、同游标链的后继详情闭合证据，默认 `status` 不再把它列为当前问题，`status --detail` 仍保留原始失败数及已闭合过渡数。缺少或无法验证证据的旧记录、真正的详情失败与当前 pending/due 仍可见；不会为消除提示重写旧运行记录。运行数不等于消息数。
 
 detail 保留初始名单发现、活跃会话刷新成功时间、名单复核完成时间、消息源分母、详情最老欠账/下次重试、保留运行计数、预约异常和时间证据。名单完成只代表名单：hot/reconcile 读取未静音的群聊和私聊，不能据此断言这些会话的消息覆盖完整。正常预约不作为当前活动正判；过期预约不证明进程已死。
 
@@ -650,7 +650,7 @@ received 直接分页读取原生消息列表，显式请求 `only_thread_root_m
 
 正常同步分开提交列表覆盖与完整内容覆盖。完整 list/search/mget 分页返回普通消息和合并根；迁移 009 的 `lark_im_list_progress` 保存连续列表水位，`lark_im_detail_tasks` 保存每个根的原始描述、指纹、版本、尝试次数、下次重试时间及安全错误分类。普通消息、待办、列表水位与 run 元数据在同一租约和代际校验事务提交。列表本身不完整时全部不提交。详情失败不覆盖已入库的完整根，不禁用会话，也不回退列表水位；进程重启后继续从持久化水位读取普通消息。
 
-有欠账时 `sync_scopes.cursor_json`、完整覆盖窗口和最近成功标记不前进；部分 run 仅发出 `list_window_*`，并明确 `list_complete=true/details_complete=false/window_complete=false`。全部待办解决后，事务将完整游标推进到已经连续扫描的列表水位，并发出 `coverage_mode=list_checkpoint_and_details` 的闭合证据。目标时间及之前仍有当前待办时，覆盖检查不得凭历史成功报告完成。状态报告公开 `details` 和 `list_progress` 的汇总；pending details 使 health 保持 `catching_up`，Service 和 `check --wait` 同样拒绝完整健康结论。
+有欠账时 `sync_scopes.cursor_json`、完整覆盖窗口和最近成功标记不前进；部分 run 不发出完整窗口，并明确 `list_complete=true/details_complete=false/window_complete=false`。`sync_runs.status=succeeded` 表示本次操作成功，不能单独证明完整内容：store 生成的 `lark_progress` 同时记录 list/details 阶段、complete/awaiting_details/attempt_failed 结果及本次尝试计数。健康详情批次留下尚未尝试的其他任务时仍是操作成功；API、展开或版本保护导致实际任务失败时才记 failed。全部待办解决后，事务将完整游标推进到已经连续扫描的列表水位，并发出 `coverage_mode=list_checkpoint_and_details` 的闭合证据。目标时间及之前仍有当前待办时，覆盖检查不得凭历史成功报告完成。状态报告公开 `details` 和 `list_progress` 的汇总；pending details 使 health 保持 `catching_up`，Service 和 `check --wait` 同样拒绝完整健康结论。清理无变更成功运行时保留待补或证据不完整的阶段，已完整闭合的正常 no-op 仍遵守原保留规则。
 
 状态报告在同一只读 SQLite 快照内采集欠账、列表水位、records、scope、discovery、run 和 lock，Service health 与 `check --wait` 使用该一致报告。表结构预查只选择查询分支，最终快照再次核对结构与迁移标记；并发迁移或证据缺失时失败关闭，不把它解释为零欠账。报告是某一时点的快照，之后提交的写入会在下次报告中出现；不得拼接旧的零欠账与新提交的未完整水位。该诊断不初始化数据库、不执行恢复，也不修改业务数据。
 

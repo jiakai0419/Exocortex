@@ -316,7 +316,7 @@ function databaseCheck(dbPath, deps = {}, options = {}) {
 /**
  * Old success runs that changed no durable record are diagnostic noise, not
  * durable memory. Keep failures, running/cancelled runs, mutating successes,
- * and each scope's current success.
+ * each scope's current success, and incomplete or unverified two-phase work.
  * @param {string} dbPath
  * @param {string} cutoffAt
  * @param {boolean} dryRun
@@ -328,6 +328,29 @@ function pruneNoopSuccessfulRuns(dbPath, cutoffAt, dryRun, deps = {}) {
     AND r.started_at < ${quoteSql(cutoffAt)}
     AND r.inserted_count = 0
     AND r.updated_count = 0
+    AND CASE WHEN json_type(r.metadata_json, '$.lark_progress') IS NULL THEN 1 ELSE
+      json_type(r.metadata_json, '$.lark_progress') = 'object'
+      AND json_type(r.metadata_json, '$.lark_progress.version') = 'integer'
+      AND json_extract(r.metadata_json, '$.lark_progress.version') = 1
+      AND json_extract(r.metadata_json, '$.lark_progress.phase') IN ('list', 'details')
+      AND json_extract(r.metadata_json, '$.lark_progress.outcome') = 'complete'
+      AND json_type(r.metadata_json, '$.lark_progress.generation') = 'integer'
+      AND json_extract(r.metadata_json, '$.lark_progress.generation') BETWEEN 1 AND 9007199254740991
+      AND json_type(r.metadata_json, '$.lark_progress.attempted') = 'integer'
+      AND json_extract(r.metadata_json, '$.lark_progress.attempted') BETWEEN 0 AND 100
+      AND json_type(r.metadata_json, '$.lark_progress.completed') = 'integer'
+      AND json_extract(r.metadata_json, '$.lark_progress.completed') = json_extract(r.metadata_json, '$.lark_progress.attempted')
+      AND json_type(r.metadata_json, '$.lark_progress.failed') = 'integer'
+      AND json_extract(r.metadata_json, '$.lark_progress.failed') = 0
+      AND CASE json_extract(r.metadata_json, '$.lark_progress.phase') WHEN 'list'
+        THEN json_extract(r.metadata_json, '$.lark_progress.attempted') = 0
+        ELSE json_extract(r.metadata_json, '$.lark_progress.attempted') > 0 END
+      AND json_type(r.metadata_json, '$.details_complete') = 'true'
+      AND json_type(r.metadata_json, '$.window_complete') = 'true'
+      AND json_type(r.metadata_json, '$.list_complete') = 'true'
+      AND json_type(r.metadata_json, '$.pending_detail_count') = 'integer'
+      AND json_extract(r.metadata_json, '$.pending_detail_count') = 0
+    END
     AND NOT EXISTS (
       SELECT 1
       FROM sync_scopes s

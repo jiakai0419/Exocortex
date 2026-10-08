@@ -193,10 +193,16 @@ export function renderStatusText(report, options = {}) {
   if (leases.evidence === "available" && leases.abnormal_count > 0) problems.push(["Sync reservations", formatLeaseIssues(leases)]);
   if (leases.evidence !== "available") problems.push(["Sync reservations", "Reservation evidence unavailable"]);
   if (failureRuns.evidence !== "available" || !countValid(failureRuns.failed_runs)) problems.push(["Database failures", "Failed-run query unavailable; count is not known"]);
-  else if (failureRuns.failed_runs > 0) {
-    problems.push(["Database failures", `${number(failureRuns.failed_runs)} retained failed runs · started in last ${lookback(failureRuns.window_ms)}`]);
-    problems.push(["Failure window", range(failureRuns.window_started_at, failureRuns.window_ended_at)]);
-    for (const row of failureRuns.by_kind || []) problems.push(["Failure category", `${failure(row.kind)} · ${number(row.count)}`]);
+  else {
+    const actionable = countValid(failureRuns.actionable_failed_runs) ? failureRuns.actionable_failed_runs : failureRuns.failed_runs;
+    if (actionable > 0) {
+      problems.push(["Database failures", `${number(actionable)} retained failed runs${actionable < failureRuns.failed_runs ? " requiring attention" : ""} · started in last ${lookback(failureRuns.window_ms)}`]);
+      problems.push(["Failure window", range(failureRuns.window_started_at, failureRuns.window_ended_at)]);
+      for (const row of (countValid(failureRuns.actionable_failed_runs) ? failureRuns.actionable_by_kind : failureRuns.by_kind) || []) {
+        problems.push(["Failure category", `${failure(row.kind)} · ${number(row.count)}`]);
+      }
+      if (failureRuns.transitions?.unknown > 0) problems.push(["List transitions", `${number(failureRuns.transitions.unknown)} retained runs have insufficient closure evidence`]);
+    }
   }
   if (problems.length) {
     screen.heading("Problems");
@@ -205,7 +211,12 @@ export function renderStatusText(report, options = {}) {
 
   if (detailed) {
     screen.heading("Background history");
-    screen.row("History source", "Retained worker log; database association is not verified");
+    if (failureRuns.evidence === "available" && countValid(failureRuns.failed_runs) && failureRuns.transitions?.resolved > 0) {
+      screen.row("Database history", `${number(failureRuns.failed_runs)} retained failed runs · started in last ${lookback(failureRuns.window_ms)}`);
+      for (const row of failureRuns.by_kind || []) screen.row("Historical category", `${failure(row.kind)} · ${number(row.count)}`);
+      if (countValid(failureRuns.transitions?.resolved)) screen.row("Closed list stages", `${number(failureRuns.transitions.resolved)} legacy list runs have later detail closure evidence`);
+    }
+    screen.row("Worker history source", "Retained worker log; database association is not verified");
     screen.row("Worker window", `${lookback(stability.window_ms)} lookback · ${range(stability.window_started_at, stability.window_ended_at || report.observed_at)}`);
     const observation = stability.observation || {};
     const first = observation.current_window_first_event_at;

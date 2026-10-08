@@ -3,6 +3,8 @@
 import { readOnlySqliteJson } from "../storage/sqlite/readonly-query.mjs";
 
 import { classifySyncRunFailure } from "./sync-run-failure.mjs";
+import { runEvidenceSql, runProgress } from "./lark-run-progress.mjs";
+import { publicRunProgress } from "./sync-status-report.mjs";
 import {
   publicCommandFailureReason,
   publicErrorCode,
@@ -97,6 +99,7 @@ function sanitizeQualityReportForPublicOutput(report) {
         failure_kind: classification.kind,
         transient: classification.transient === true,
         error_code: publicErrorCode(classification.code),
+        ...publicRunProgress(row),
       };
     }),
   };
@@ -233,11 +236,7 @@ function collectQualityReport(dbPath, deps = {}) {
   );
   const recentFailures = queryJson(
     dbPath,
-    `SELECT error_type, error_message
-     FROM sync_runs
-     WHERE status = 'failed'
-     ORDER BY id DESC
-     LIMIT 5;`,
+    runEvidenceSql("r.status = 'failed'", { limit: 5 }) + ";",
     "recent failures",
   );
   const unsupportedReasons = queryJson(
@@ -272,6 +271,7 @@ function collectQualityReport(dbPath, deps = {}) {
         failure_kind: classification.kind,
         transient: classification.transient,
         error_code: classification.code,
+        ...runProgress(row),
       };
     }),
   });

@@ -438,6 +438,12 @@ test("service status recent failure kind aggregation is public-safe", () => {
 
   assert.deepEqual(kinds, {
     failed_runs: 4,
+    actionable_failed_runs: 4,
+    actionable_by_kind: [
+      { kind: "network_timeout", count: 1 }, { kind: "permission_denied", count: 1 },
+      { kind: "rate_limited", count: 1 }, { kind: "unknown", count: 1 },
+    ],
+    transitions: { resolved: 0, unresolved: 0, unknown: 0 },
     by_kind: [
       { kind: "network_timeout", count: 1 },
       { kind: "permission_denied", count: 1 },
@@ -466,7 +472,8 @@ test("service failure aggregation preserves shared classification priority and g
   for (const [error_message, kind] of cases) {
     const result = collectRecentFailureKinds("synthetic.sqlite", Date.parse("2026-06-20T12:00:00Z"), 3600000,
       { sqliteJson: () => [{ error_message }] });
-    assert.deepEqual(result, { failed_runs: 1, by_kind: [{ kind, count: 1 }] }, error_message);
+    assert.deepEqual(result, { failed_runs: 1, by_kind: [{ kind, count: 1 }], actionable_failed_runs: 1,
+      actionable_by_kind: [{ kind, count: 1 }], transitions: { resolved: 0, unresolved: 0, unknown: 0 } }, error_message);
   }
 });
 

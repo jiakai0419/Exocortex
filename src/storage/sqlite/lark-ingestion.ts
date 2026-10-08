@@ -219,7 +219,7 @@ function larkRunFenceSql(scope: SyncScope, runId: number, now: string) {
 
 /** Finish list or detail work using only durable coverage and debt as evidence. */
 function commitLarkProgress(dbPath: string, scope: SyncScope, runId: number, records: StoredRecord[],
-  scannedCount: number, metadata: JsonObject, mutationSql: string): LarkProgressEffects {
+  scannedCount: number, metadata: JsonObject, mutationSql: string, phase: "list" | "details"): LarkProgressEffects {
   requireLarkScope(scope);
   if (!Number.isSafeInteger(scannedCount) || scannedCount < 0) throw new Error("invalid Lark scanned count");
   const normalized = normalizeStoredRecords(records, scope.source_id);
@@ -229,37 +229,46 @@ function commitLarkProgress(dbPath: string, scope: SyncScope, runId: number, rec
   const safeMetadata = { ...metadata };
   for (const key of Object.keys(safeMetadata)) {
     if (key === RUN_FENCE_METADATA_KEY || key.startsWith("window_") ||
-        ["coverage_mode", "details_complete", "list_complete", "pending_detail_count"].includes(key)) delete safeMetadata[key];
+        ["coverage_mode", "details_complete", "list_complete", "pending_detail_count", "lark_progress"].includes(key)) delete safeMetadata[key];
   }
   const now = new Date().toISOString();
   const rows = sqliteQuery(dbPath, `
     BEGIN IMMEDIATE;
     ${larkRunFenceSql(scope, runId, now)}
+    CREATE TEMP TABLE __lark_attempts (failed INTEGER NOT NULL CHECK (failed IN (0, 1)));
     ${mutationSql}
     ${recordWritesSql(normalized, now)}
     CREATE TEMP TABLE __lark_finish AS
-      SELECT p.cursor_json, p.coverage_start_ms,
+      SELECT p.cursor_json, p.coverage_start_ms, p.generation,
         CAST(json_extract(p.cursor_json, '$.created_at_ms') AS INTEGER) AS end_ms,
+        (SELECT COUNT(*) FROM __lark_attempts) AS attempted,
+        (SELECT COALESCE(SUM(failed), 0) FROM __lark_attempts) AS failed,
         (SELECT COUNT(*) FROM lark_im_detail_tasks d WHERE d.scope_id = p.scope_id AND d.status = 'pending') AS pending
       FROM lark_im_list_progress p WHERE p.scope_id = ${quoteSql(scope.id)};
     INSERT INTO __lark_guard SELECT CASE WHEN EXISTS (SELECT 1 FROM __lark_finish)
       AND ${cursorCanAdvanceSql(quoteSql(scopeCursorJson(scope)), "(SELECT cursor_json FROM __lark_finish)")}
       THEN 1 ELSE 0 END;
     UPDATE sync_runs SET
-      status = CASE WHEN (SELECT pending FROM __lark_finish) = 0 THEN 'succeeded' ELSE 'failed' END,
+      status = CASE WHEN (SELECT failed FROM __lark_finish) = 0 THEN 'succeeded' ELSE 'failed' END,
       cursor_after_json = CASE WHEN (SELECT pending FROM __lark_finish) = 0 THEN (SELECT cursor_json FROM __lark_finish) ELSE NULL END,
-      error_type = CASE WHEN (SELECT pending FROM __lark_finish) > 0 THEN 'LarkDetailIncomplete' ELSE NULL END,
-      error_message = CASE WHEN (SELECT pending FROM __lark_finish) > 0 THEN 'List coverage saved; merge-forward details remain pending' ELSE NULL END,
+      error_type = CASE WHEN (SELECT failed FROM __lark_finish) > 0 THEN 'LarkDetailIncomplete' ELSE NULL END,
+      error_message = CASE WHEN (SELECT failed FROM __lark_finish) > 0 THEN 'Message detail attempts failed; merge-forward details remain pending' ELSE NULL END,
       finished_at = ${quoteSql(now)}, scanned_count = ${scannedCount},
       inserted_count = (SELECT inserted FROM __write_effects), updated_count = (SELECT updated FROM __write_effects),
       duplicate_count = (SELECT duplicate FROM __write_effects),
       metadata_json = json_patch(
         json_remove(COALESCE(metadata_json, '{}'), '$.window_start', '$.window_end', '$.window_start_ms', '$.window_end_ms',
-          '$.coverage_mode', '$.window_complete', '$.details_complete', '$.list_complete', '$.pending_detail_count'),
+          '$.coverage_mode', '$.window_complete', '$.details_complete', '$.list_complete', '$.pending_detail_count', '$.lark_progress'),
         json_patch(${sqlJson(safeMetadata)}, json_patch(
           json_object('list_complete', json('true'), 'details_complete', json(CASE WHEN (SELECT pending FROM __lark_finish) = 0 THEN 'true' ELSE 'false' END),
             'window_complete', json(CASE WHEN (SELECT pending FROM __lark_finish) = 0 THEN 'true' ELSE 'false' END),
-            'pending_detail_count', (SELECT pending FROM __lark_finish)),
+            'pending_detail_count', (SELECT pending FROM __lark_finish),
+            'lark_progress', json_object('version', 1, 'phase', ${quoteSql(phase)},
+              'outcome', CASE WHEN (SELECT failed FROM __lark_finish) > 0 THEN 'attempt_failed'
+                WHEN (SELECT pending FROM __lark_finish) > 0 THEN 'awaiting_details' ELSE 'complete' END,
+              'attempted', (SELECT attempted FROM __lark_finish),
+              'completed', (SELECT attempted - failed FROM __lark_finish),
+              'failed', (SELECT failed FROM __lark_finish), 'generation', (SELECT generation FROM __lark_finish))),
           CASE WHEN (SELECT pending FROM __lark_finish) = 0 THEN json_object(
             'coverage_mode', 'list_checkpoint_and_details', 'window_start_ms', (SELECT coverage_start_ms FROM __lark_finish),
             'window_end_ms', (SELECT end_ms FROM __lark_finish),
@@ -270,7 +279,7 @@ function commitLarkProgress(dbPath: string, scope: SyncScope, runId: number, rec
       cursor_json = CASE WHEN (SELECT pending FROM __lark_finish) = 0 THEN (SELECT cursor_json FROM __lark_finish) ELSE cursor_json END,
       cursor_updated_at = CASE WHEN (SELECT pending FROM __lark_finish) = 0 THEN ${quoteSql(now)} ELSE cursor_updated_at END,
       last_success_run_id = CASE WHEN (SELECT pending FROM __lark_finish) = 0 THEN ${runId} ELSE last_success_run_id END,
-      last_error_run_id = CASE WHEN (SELECT pending FROM __lark_finish) > 0 THEN ${runId} ELSE last_error_run_id END,
+      last_error_run_id = CASE WHEN (SELECT failed FROM __lark_finish) > 0 THEN ${runId} ELSE last_error_run_id END,
       updated_at = ${quoteSql(now)} WHERE id = ${quoteSql(scope.id)};
     UPDATE lark_im_list_progress SET
       anchor_cursor_json = (SELECT cursor_json FROM sync_scopes WHERE id = ${quoteSql(scope.id)}),
@@ -346,7 +355,7 @@ function commitLarkListRun(dbPath: string, scope: SyncScope, runId: number, reco
           AND NOT ${versionCanReplaceSql("lark_im_detail_tasks", "excluded")});
     `).join("\n")}
   `;
-  return commitLarkProgress(dbPath, scope, runId, records, scannedCount, metadata, mutationSql);
+  return commitLarkProgress(dbPath, scope, runId, records, scannedCount, metadata, mutationSql, "list");
 }
 
 /** A complete detail response replaces content; failed attempts only reschedule debt. */
@@ -400,6 +409,8 @@ function finishLarkDetailRun(dbPath: string, scope: SyncScope, runId: number, ou
         last_error_message = CASE WHEN ${completeSql} THEN NULL ELSE ${quoteSql(outcome.error
           ? String(outcome.error.message).slice(0, 4000) : "Detail response cannot replace the stored source version")} END,
         updated_at = ${quoteSql(now)}, completed_at = CASE WHEN ${completeSql} THEN ${quoteSql(now)} ELSE NULL END WHERE ${taskCondition};
+      INSERT INTO __lark_attempts SELECT status = 'pending' FROM lark_im_detail_tasks
+        WHERE scope_id = ${quoteSql(scope.id)} AND message_id = ${quoteSql(outcome.message_id)};
     `;
   });
   // Generation also advances on retries, so an older list run cannot overwrite
@@ -408,7 +419,7 @@ function finishLarkDetailRun(dbPath: string, scope: SyncScope, runId: number, ou
     UPDATE lark_im_list_progress SET generation = generation + 1, updated_at = ${quoteSql(now)}
       WHERE scope_id = ${quoteSql(scope.id)};`;
   return commitLarkProgress(dbPath, scope, runId, records, outcomes.length,
-    { ...metadata, detail_retry: true }, mutationSql);
+    { ...metadata, detail_retry: true }, mutationSql, "details");
 }
 
 

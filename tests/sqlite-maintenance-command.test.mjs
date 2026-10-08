@@ -108,6 +108,7 @@ function installSchema(dbPath) {
        source_id TEXT NOT NULL REFERENCES sources(id),
        scope_id TEXT NOT NULL REFERENCES sync_scopes(id),
        status TEXT NOT NULL DEFAULT 'succeeded',
+       metadata_json TEXT NOT NULL DEFAULT '{}',
        started_at TEXT NOT NULL DEFAULT '2027-01-15T08:00:00.000Z',
        scanned_count INTEGER NOT NULL DEFAULT 0,
        inserted_count INTEGER NOT NULL DEFAULT 0,
@@ -302,6 +303,31 @@ test("sqlite maintenance prune-runs only removes old succeeded no-op runs when a
   assert.equal(applied.prune.deleted_count, 2);
   assert.equal(applied.check.counts.sync_runs, 5);
   assert.deepEqual(remainingIds, [1, 3, 4, 6, 7]);
+});
+
+test("prune keeps awaiting and unverified stages while completed no-op stages remain eligible", (t) => {
+  const dir = tempDir(t);
+  const dbPath = join(dir, "synthetic-stages.sqlite");
+  installSchema(dbPath);
+  const complete = { lark_progress: { version: 1, phase: "details", outcome: "complete", attempted: 1, completed: 1, failed: 0, generation: 2 },
+    list_complete: true, details_complete: true, window_complete: true, pending_detail_count: 0 };
+  const awaiting = { ...complete, lark_progress: { ...complete.lark_progress, outcome: "awaiting_details" },
+    details_complete: false, window_complete: false, pending_detail_count: 1 };
+  const metadata = [awaiting, { ...complete, details_complete: "true" }, complete,
+    { ...complete, lark_progress: { version: "1", phase: "details", outcome: "complete" } },
+    ...[{ failed: 1 }, { attempted: "1" }, { completed: 0 }, { generation: 0 }, { generation: null },
+      { phase: "list" }, { attempted: 0, completed: 0 }, { attempted: 101, completed: 101 }]
+      .map((change) => ({ ...complete, lark_progress: { ...complete.lark_progress, ...change } }))];
+  sqliteExec(dbPath, metadata.map((value, index) => `INSERT INTO sync_runs(id,source_id,scope_id,started_at,metadata_json)
+    VALUES(${index + 2},'shape.source','shape.scope','2026-12-01T00:00:00.000Z','${JSON.stringify(value)}');`).join("\n"), "seed synthetic stages");
+  const deps = { cwd: dir, now: () => new Date("2027-01-15T08:00:00.000Z"),
+    acquireMaintenanceLock: () => ({ acquired: true }), releaseMaintenanceLock: () => {} };
+  const preview = executeSqliteMaintenance(fixtureOptions(["prune-runs", "--db", dbPath]), deps);
+  assert.equal(preview.prune.candidate_count, 1);
+  const applied = executeSqliteMaintenance(fixtureOptions(["prune-runs", "--apply", "--db", dbPath]), deps);
+  assert.equal(applied.prune.deleted_count, 1);
+  assert.deepEqual(sqliteJson(dbPath, "SELECT id FROM sync_runs ORDER BY id;", "retained synthetic stages").map((row) => row.id),
+    [1, ...metadata.map((_value, index) => index + 2).filter((id) => id !== 4)]);
 });
 
 test("sqlite maintenance prune-runs apply uses the maintenance lock", (t) => {

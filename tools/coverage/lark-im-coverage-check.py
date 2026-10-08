@@ -42,12 +42,17 @@ def successful_run_columns():
     metadata = "CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END"
     values = ('window_start', 'window_end', 'window_start_ms', 'window_end_ms',
               'window_complete', 'coverage_mode', 'list_complete', 'details_complete',
-              'pending_detail_count', 'skipped')
+              'pending_detail_count', 'skipped', 'lark_progress', 'list_window_start_ms', 'list_window_end_ms',
+              'initial_sync_start_ms')
     types = {'list_complete': 'list_complete_type', 'details_complete': 'details_complete_type',
+             'window_complete': 'window_complete_type',
              'pending_detail_count': 'pending_detail_count_type',
              'list_window_start_ms': 'list_window_start_type',
              'list_window_end_ms': 'list_window_end_type'}
-    return ', '.join(['r.status', 'r.cursor_before_json', 'r.cursor_after_json'] +
+    return ', '.join(['r.status', 'r.cursor_before_json', 'r.cursor_after_json',
+                     f"json_extract({metadata}, '$.__run_fence.list_generation') AS fence_generation",
+                     f"json_type({metadata}, '$.__run_fence.list_generation') AS fence_generation_type",
+                     f"json_extract({metadata}, '$.__run_fence.scope_config') AS fence_scope_config"] +
                      [f"json_extract({metadata}, '$.{key}') AS {key}" for key in values] +
                      [f"json_type({metadata}, '$.{key}') AS {alias}" for key, alias in types.items()])
 
@@ -112,6 +117,47 @@ def unsupported_class(reason):
     return 'ordinary' if reason is None else 'other_unsupported'
 
 
+def awaiting_detail_stage(run):
+    """Recognize only a valid committed stage, never a full-content interval."""
+    progress = parse_json(run['lark_progress'])
+    if not isinstance(progress, dict):
+        return False
+    counts = [progress.get(key) for key in ('attempted', 'completed', 'failed', 'generation')]
+    if (type(progress.get('version')) is not int or progress['version'] != 1
+            or progress.get('phase') not in ('list', 'details')
+            or progress.get('outcome') != 'awaiting_details'
+            or any(type(value) is not int or not 0 <= value <= MAX_SAFE_INTEGER for value in counts)):
+        return False
+    attempted, completed, failed, generation = counts
+    if (generation < 1 or failed != 0 or completed != attempted
+            or (progress['phase'] == 'list' and attempted != 0)
+            or (progress['phase'] == 'details' and not 1 <= attempted <= 100)):
+        return False
+    scope_config = parse_json(run['fence_scope_config'])
+    if (run['fence_generation_type'] != 'integer' or not 0 <= run['fence_generation'] < MAX_SAFE_INTEGER
+            or generation != run['fence_generation'] + 1
+            or not isinstance(scope_config, dict) or set(scope_config) != {'chat_id'}
+            or not (scope_config['chat_id'] is None or
+                    isinstance(scope_config['chat_id'], str) and bool(scope_config['chat_id']))):
+        return False
+    before_raw = run['cursor_before_json']
+    if before_raw is not None and before_raw.strip() != 'null' and cursor_ms(before_raw) is None:
+        return False
+    if progress['phase'] == 'list':
+        left, right = run['list_window_start_ms'], run['list_window_end_ms']
+        if (run['list_window_start_type'] != 'integer' or run['list_window_end_type'] != 'integer'
+                or integer_ms(left) is None or integer_ms(right) is None or right < left):
+            return False
+        anchor = cursor_ms(before_raw) if before_raw is not None and before_raw.strip() != 'null' else run['initial_sync_start_ms']
+        if type(anchor) is not int or integer_ms(anchor) is None or left < anchor:
+            return False
+    return (run['status'] == 'succeeded' and run['list_complete_type'] == 'true'
+            and run['details_complete_type'] == 'false' and run['window_complete_type'] == 'false'
+            and run['pending_detail_count_type'] == 'integer' and 0 < run['pending_detail_count'] <= MAX_SAFE_INTEGER
+            and run['coverage_mode'] is None and run['cursor_after_json'] is None
+            and all(run[key] is None for key in ('window_start', 'window_end', 'window_start_ms', 'window_end_ms')))
+
+
 def successful_interval(run):
     """Validate actual completed window against its before/after cursors.
 
@@ -123,6 +169,8 @@ def successful_interval(run):
         return None, 'not_succeeded'
     if run['skipped'] == 1:
         return None, 'skipped'
+    if awaiting_detail_stage(run):
+        return None, 'awaiting_details'
     if run['window_complete'] == 0 or run['details_complete'] == 0 or run['list_complete'] == 0:
         return None, 'incomplete_window'
     if run['coverage_mode'] == 'list_checkpoint_and_details':
@@ -308,6 +356,7 @@ def inspect_connection(con, target_ms):
     valid_run_counts = {key: 0 for key in enabled}
     invalid_run_counts = {key: 0 for key in enabled}
     evidence_counts = {'eligible_successful_runs': 0, 'invalid_successful_runs': 0,
+                       'awaiting_detail_stages_ignored': 0,
                        'skipped_successful_runs': 0, 'non_succeeded_runs_ignored': 0}
     invalid_reasons = {}
     # Read evidence/state only, not message contents or full metadata.
@@ -325,6 +374,8 @@ def inspect_connection(con, target_ms):
             evidence_counts['non_succeeded_runs_ignored'] += 1
         elif reason == 'skipped':
             evidence_counts['skipped_successful_runs'] += 1
+        elif reason == 'awaiting_details':
+            evidence_counts['awaiting_detail_stages_ignored'] += 1
         elif reason:
             evidence_counts['invalid_successful_runs'] += 1
             invalid_run_counts[run['scope_id']] += 1

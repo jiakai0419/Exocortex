@@ -16,6 +16,7 @@ import { resolve } from "node:path";
 import { summarizeWorkerEvents } from "../../dist/runtime/worker/lark-im-worker-core.js";
 import { activityDatabaseKey, inspectActivityProcesses, latestActivityEvents, evaluateActivityEvent, validateActivityEventShape, compareActivityProcessStarts, collectWorkerParentIdentities, collectActivityAncestors, verifyActivityAncestry } from "./lark-im-activity-evidence.mjs";
 import { classifySyncRunFailure } from "./sync-run-failure.mjs";
+import { runEvidenceSql, runProgress, transitionCounts } from "./lark-run-progress.mjs";
 import { readLiveProbeCache, liveProbeContext, DEFAULT_LIVE_PROBE_TTL_MS } from "./live-probe-cache.mjs";
 import { buildStatus } from "./sync-status-report.mjs";
 import { probeService, parseLaunchdState, classifyLaunchdPrint } from "../runtime/service/launchd.mjs";
@@ -285,22 +286,26 @@ function collectRecentFailureKinds(dbPath, nowMs, windowMs, deps = {}) {
   const windowStart = new Date(nowMs - windowMs).toISOString();
   const rows = query(
     dbPath,
-    `SELECT error_type, error_message
-     FROM sync_runs
-     WHERE status = 'failed'
-       AND started_at >= ${quoteSql(windowStart)}
-       AND started_at <= ${quoteSql(new Date(nowMs).toISOString())}
-     ORDER BY id DESC;`,
+    runEvidenceSql(`r.status = 'failed' AND r.started_at >= ${quoteSql(windowStart)}
+       AND r.started_at <= ${quoteSql(new Date(nowMs).toISOString())}`, { cutoffSql: String(nowMs) }) + ";",
     "read recent failed run kinds",
   );
   /** @type {Record<string, number>} */
   const byKind = {};
+  /** @type {Record<string, number>} */
+  const actionableByKind = {};
   for (const row of rows) {
     const kind = classifySyncRunFailure(row).kind;
     byKind[kind] = (byKind[kind] || 0) + 1;
+    if (runProgress(row).resolution !== "resolved") actionableByKind[kind] = (actionableByKind[kind] || 0) + 1;
   }
+  const transitions = transitionCounts(rows);
   return {
     failed_runs: rows.length,
+    actionable_failed_runs: rows.length - transitions.resolved,
+    actionable_by_kind: Object.entries(actionableByKind).map(([kind, count]) => ({ kind, count }))
+      .sort((a, b) => b.count - a.count || a.kind.localeCompare(b.kind)),
+    transitions,
     by_kind: Object.entries(byKind)
       .map(([kind, count]) => ({ kind, count }))
       .sort((a, b) => b.count - a.count || a.kind.localeCompare(b.kind)),

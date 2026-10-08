@@ -170,7 +170,7 @@ Problems
   Failure category       Unclassified failure · 1
 
 Background history
-  History source         Retained worker log; database association is not
+  Worker history source  Retained worker log; database association is not
                          verified
   Worker window          24h lookback · 2032-02-03 12:00–2032-02-04 12:00
   Log coverage           Partial window; earlier observations unavailable

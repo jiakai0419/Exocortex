@@ -5,6 +5,7 @@ import { databaseActivityEvidence, databaseOnlyHealth, observeLockOwners } from 
 import { readOnlySqliteJson } from "../storage/sqlite/readonly-query.mjs";
 
 import { classifySyncRunFailure } from "./sync-run-failure.mjs";
+import { runEvidenceSql, RUN_EVIDENCE_COLUMNS, runProgress, transitionCounts, TRANSITION_LIMIT, LEGACY_TRANSITION_SQL } from "./lark-run-progress.mjs";
 import {
   publicCommandFailureReason,
   publicErrorCode,
@@ -126,6 +127,14 @@ function publicHealthDetail(health, scopes, discoveryCursor, details, listProgre
   return "sync status unavailable";
 }
 
+/** @param {JsonObject} run */
+function publicRunProgress(run) {
+  if (!["list", "details", "unknown"].includes(run.phase) ||
+      !["complete", "awaiting_details", "attempt_failed"].includes(run.outcome) ||
+      !["resolved", "unresolved", "unknown", "not_applicable"].includes(run.resolution)) return {};
+  return { phase: run.phase, outcome: run.outcome, resolution: run.resolution };
+}
+
 /**
  * @param {JsonObject} report
  * @returns {JsonObject}
@@ -209,6 +218,9 @@ function sanitizeStatusReportForPublicOutput(report) {
     },
     runs: {
       by_status: byStatus,
+      actionable_failed_runs: publicCount(report?.runs?.actionable_failed_runs),
+      transitions: { resolved: publicCount(report?.runs?.transitions?.resolved),
+        unresolved: publicCount(report?.runs?.transitions?.unresolved), unknown: publicCount(report?.runs?.transitions?.unknown) },
       recent: (Array.isArray(report?.runs?.recent) ? report.runs.recent : []).map((run) => ({
         status: ["running", "succeeded", "failed", "cancelled"].includes(String(run.status))
           ? String(run.status)
@@ -222,6 +234,7 @@ function sanitizeStatusReportForPublicOutput(report) {
         failure_kind: run.status === "succeeded" ? "" : publicFailureKind(run.failure_kind),
         transient: run.transient === true,
         error_code: publicErrorCode(run.error_code),
+        ...publicRunProgress(run),
       })),
     },
     current_activity: databaseActivityEvidence(report?.locks, Number(report?.runs?.by_status?.running || 0)),
@@ -253,7 +266,7 @@ function readStatusSnapshot(dbPath, query) {
   const names = new Set(expectedSchema.map((row) => row.name));
   const present = Number(names.has("lark_im_list_progress")) + Number(names.has("lark_im_detail_tasks"));
   if (present === 1) throw new Error("message detail progress schema is incomplete");
-  /** @type {{label: string, columns: string[], sql: string}[]} */
+  /** @type {{label: string, columns: string[], sql: string, rowLimit?: number}[]} */
   const sections = [
     { label: "read detail progress schema", columns: ["name", "sql"], sql: DETAIL_SCHEMA_SQL },
     { label: "read detail progress migration", columns: ["version"], sql: names.has("schema_migrations")
@@ -270,7 +283,35 @@ function readStatusSnapshot(dbPath, query) {
          SUM(CASE WHEN id LIKE 'lark.im.received.chat.%' AND enabled = 1 AND cursor_json IS NULL THEN 1 ELSE 0 END) AS received_without_cursor,
          SUM(CASE WHEN enabled = 1 AND (id = 'lark.im.sent_by_me' OR id LIKE 'lark.im.received.chat.%') THEN 1 ELSE 0 END) AS message_enabled,
          SUM(CASE WHEN enabled = 1 AND (id = 'lark.im.sent_by_me' OR id LIKE 'lark.im.received.chat.%')
-           AND NOT EXISTS (SELECT 1 FROM sync_runs r WHERE r.id = sync_scopes.last_success_run_id AND r.scope_id = sync_scopes.id AND r.status = 'succeeded')
+           AND NOT EXISTS (SELECT 1 FROM sync_runs r WHERE r.id = sync_scopes.last_success_run_id AND r.scope_id = sync_scopes.id
+             AND r.source_id = sync_scopes.source_id AND r.status = 'succeeded'
+             AND (r.metadata_json IS NULL OR CASE WHEN json_valid(r.metadata_json) THEN
+               (json_type(r.metadata_json, '$.lark_progress') IS NULL
+                AND json_type(r.metadata_json, '$.details_complete') IS NULL)
+               OR (json_type(r.metadata_json, '$.details_complete') = 'true'
+                 AND json_type(r.metadata_json, '$.list_complete') = 'true'
+                 AND json_type(r.metadata_json, '$.window_complete') = 'true'
+                 AND json_type(r.metadata_json, '$.pending_detail_count') = 'integer'
+                 AND json_extract(r.metadata_json, '$.pending_detail_count') = 0
+                 AND (json_type(r.metadata_json, '$.lark_progress') IS NULL
+                   OR (json_type(r.metadata_json, '$.lark_progress') = 'object'
+                     AND json_type(r.metadata_json, '$.lark_progress.version') = 'integer'
+                     AND json_extract(r.metadata_json, '$.lark_progress.version') = 1
+                     AND json_extract(r.metadata_json, '$.lark_progress.outcome') = 'complete'
+                     AND json_type(r.metadata_json, '$.lark_progress.generation') = 'integer'
+                     AND json_type(r.metadata_json, '$.__run_fence.list_generation') = 'integer'
+                     AND json_extract(r.metadata_json, '$.__run_fence.list_generation') >= 0
+                     AND json_extract(r.metadata_json, '$.lark_progress.generation') = json_extract(r.metadata_json, '$.__run_fence.list_generation') + 1
+                     AND json_type(r.metadata_json, '$.lark_progress.failed') = 'integer'
+                     AND json_extract(r.metadata_json, '$.lark_progress.failed') = 0
+                     AND json_type(r.metadata_json, '$.lark_progress.attempted') = 'integer'
+                     AND json_type(r.metadata_json, '$.lark_progress.completed') = 'integer'
+                     AND json_extract(r.metadata_json, '$.lark_progress.attempted') = json_extract(r.metadata_json, '$.lark_progress.completed')
+                     AND ((json_extract(r.metadata_json, '$.lark_progress.phase') = 'list'
+                       AND json_extract(r.metadata_json, '$.lark_progress.attempted') = 0)
+                       OR (json_extract(r.metadata_json, '$.lark_progress.phase') = 'details'
+                         AND json_extract(r.metadata_json, '$.lark_progress.attempted') BETWEEN 1 AND 100)))))
+               ELSE 0 END))
            THEN 1 ELSE 0 END) AS message_without_success,
          SUM(CASE WHEN id LIKE 'lark.im.received.chat.%' AND json_extract(config_json, '$.unsupported_reason') IS NOT NULL THEN 1 ELSE 0 END) AS received_unsupported
        FROM sync_scopes` },
@@ -289,9 +330,12 @@ function readStatusSnapshot(dbPath, query) {
         FROM sync_scopes WHERE id = ${quoteSql(scopeId)} LIMIT 1` })),
     { label: "read run counts", columns: ["status", "count"],
       sql: "SELECT status, COUNT(*) AS count FROM sync_runs GROUP BY status ORDER BY status" },
-    { label: "read recent runs", columns: ["status", "started_at", "finished_at", "scanned_count", "inserted_count", "updated_count", "duplicate_count", "error_type", "error_message"],
-      sql: `SELECT status, started_at, finished_at, scanned_count, inserted_count, updated_count, duplicate_count, error_type, error_message
-        FROM sync_runs ORDER BY id DESC LIMIT 10` },
+    { label: "read recent runs", columns: [...RUN_EVIDENCE_COLUMNS, "evidence_cutoff_ms", "closure_candidates_json"],
+      sql: runEvidenceSql("1", { limit: 10 }), rowLimit: 10 },
+    { label: "read failed run transitions", columns: [...RUN_EVIDENCE_COLUMNS, "evidence_cutoff_ms", "closure_candidates_json"],
+      sql: runEvidenceSql(LEGACY_TRANSITION_SQL, { limit: TRANSITION_LIMIT }), rowLimit: TRANSITION_LIMIT },
+    { label: "read failed transition count", columns: ["count"],
+      sql: `SELECT COUNT(*) AS count FROM sync_runs r WHERE ${LEGACY_TRANSITION_SQL}` },
     { label: "read locks", columns: ["locked_at", "expires_at", "locked_by"],
       sql: "SELECT locked_at, expires_at, locked_by FROM sync_locks ORDER BY locked_at DESC" },
   ];
@@ -317,20 +361,38 @@ function readStatusSnapshot(dbPath, query) {
   // A single SELECT also gives all julianday('now') evaluations one clock value.
   // Tagged aggregate arrays preserve empty result sets without multiple CLI JSON
   // documents. Labels/columns/SQL are application constants, never caller SQL.
-  const sql = sections.map(({ label, columns, sql }) => `SELECT ${quoteSql(label)} AS section,
-    json_group_array(json_object(${columns.map((column) => `${quoteSql(column)}, ${column}`).join(", ")})) AS rows_json
-    FROM (${sql})`).join("\nUNION ALL\n") + ";";
+  // The CLI's JSON output is costly when it re-encodes a large aggregate text
+  // cell. Emit bounded run proofs one row at a time, retaining an explicit empty
+  // section. Each proof is computed once, within this same read snapshot.
+  const materialized = sections.flatMap((section, index) => section.rowLimit
+    ? [`status_section_${index} AS MATERIALIZED (${section.sql})`] : []);
+  const sql = `WITH ${materialized.join(",\n")}\n` + sections.map(({ label, columns, sql, rowLimit }, index) => {
+    const value = `json_object(${columns.map((column) => `${quoteSql(column)}, ${column}`).join(", ")})`;
+    return rowLimit ? `SELECT ${quoteSql(label)} AS section, json_array(${value}) AS rows_json
+      FROM (SELECT * FROM status_section_${index} ORDER BY id DESC)
+      UNION ALL SELECT ${quoteSql(label)} AS section, '[]' AS rows_json
+      WHERE NOT EXISTS (SELECT 1 FROM status_section_${index})`
+      : `SELECT ${quoteSql(label)} AS section, json_group_array(${value}) AS rows_json FROM (${sql})`;
+  }).join("\nUNION ALL\n") + ";";
   const rows = query(dbPath, sql, "read sync status snapshot");
   /** @type {Map<string, Row[]>} */
   const snapshot = new Map();
   const expectedLabels = new Set(sections.map((section) => section.label));
+  const rowLimits = new Map(sections.filter((section) => section.rowLimit).map((section) => [section.label, section.rowLimit]));
   for (const row of rows) {
     const values = parseMaybeJson(row.rows_json);
-    if (!expectedLabels.has(row.section) || snapshot.has(row.section) || !Array.isArray(values) ||
+    const prior = snapshot.get(row.section);
+    const rowLimit = rowLimits.get(row.section);
+    if (!expectedLabels.has(row.section) || (!rowLimit && prior) || !Array.isArray(values) ||
         values.some((value) => !value || typeof value !== "object" || Array.isArray(value))) {
       throw new Error("sync status snapshot returned invalid evidence");
     }
-    snapshot.set(row.section, values);
+    if (rowLimit && (values.length > 1 || (prior && (prior.length === 0 || values.length === 0)) ||
+        (prior?.length || 0) + values.length > rowLimit || values.some((value) =>
+          !Number.isSafeInteger(value.id) || value.id < 1 || prior?.some((previous) => previous.id === value.id)))) {
+      throw new Error("sync status snapshot returned invalid run evidence");
+    }
+    snapshot.set(row.section, prior ? [...prior, ...values] : values);
   }
   if (snapshot.size !== sections.length) throw new Error("sync status snapshot returned incomplete evidence");
   const schema = snapshot.get("read detail progress schema");
@@ -340,7 +402,7 @@ function readStatusSnapshot(dbPath, query) {
   if (present === 0 && snapshot.get("read detail progress migration")?.length) {
     throw new Error("message detail progress schema is incomplete");
   }
-  for (const label of ["read record totals", "read scope totals", ...(present === 2
+  for (const label of ["read record totals", "read scope totals", "read failed transition count", ...(present === 2
     ? ["read pending detail totals", "read list progress totals"] : [])]) {
     if (snapshot.get(label)?.length !== 1) throw new Error("sync status snapshot returned incomplete aggregate evidence");
   }
@@ -366,6 +428,10 @@ function buildStatus(dbPath, deps = {}) {
   const reconcileRow = first(rows("read reconcile scope"));
   const runCounts = rows("read run counts");
   const recentRuns = rows("read recent runs");
+  const transitionRows = rows("read failed run transitions");
+  const transitions = transitionCounts(transitionRows);
+  transitions.unknown += Math.max(0, Number(first(rows("read failed transition count")).count || 0) - transitionRows.length);
+  const actionableFailedRuns = Math.max(0, Number(countBy(runCounts, "status", "count").failed || 0) - transitions.resolved);
   const locks = observeLockOwners(rows("read locks"), deps.inspectActivityProcesses, deps.now);
 
   const discoveryCursor = parseMaybeJson(discoveryRow.cursor_json);
@@ -409,10 +475,13 @@ function buildStatus(dbPath, deps = {}) {
     },
     runs: {
       by_status: countBy(runCounts, "status", "count"),
+      actionable_failed_runs: actionableFailedRuns,
+      transitions,
       recent: recentRuns.map((run) => {
         const classification = classifySyncRunFailure(run);
         return {
           status: run.status,
+          ...runProgress(run),
           started_at: run.started_at,
           finished_at: run.finished_at,
           scanned_count: run.scanned_count,
@@ -426,7 +495,7 @@ function buildStatus(dbPath, deps = {}) {
       }),
     },
     locks,
-    health: summarizeHealth({ discoveryCursor, scopeCounts, locks, runCounts, details: detailProgress.details }),
+    health: summarizeHealth({ discoveryCursor, scopeCounts, locks, runCounts, details: detailProgress.details, actionableFailedRuns }),
   });
 }
 
@@ -434,4 +503,5 @@ export {
   buildStatus,
   sanitizeStatusReportForPublicOutput,
   sqliteJson,
+  publicRunProgress,
 };

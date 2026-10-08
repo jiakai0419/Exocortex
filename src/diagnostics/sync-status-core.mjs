@@ -15,6 +15,7 @@ import { databaseActivityEvidence } from "./lark-im-activity-evidence.mjs";
  * @property {Row[]} locks
  * @property {Row[]} runCounts
  * @property {{evidence?: string, pending_count?: number | null}=} details
+ * @property {number=} actionableFailedRuns
  *
  * @typedef {"unknown" | "syncing" | "catching_up" | "not_ready" | "needs_attention" | "ok_with_history" | "ok"} HealthState
  */
@@ -36,9 +37,10 @@ function countBy(rows, keyName, valueName) {
  * @param {HealthStateInput} input
  * @returns {HealthState}
  */
-function summarizeHealth({ discoveryCursor, scopeCounts, locks, runCounts, details }) {
+function summarizeHealth({ discoveryCursor, scopeCounts, locks, runCounts, details, actionableFailedRuns }) {
   const running = Number(countBy(runCounts, "status", "count").running || 0);
-  const failed = Number(countBy(runCounts, "status", "count").failed || 0);
+  const failed = typeof actionableFailedRuns === "number" && Number.isSafeInteger(actionableFailedRuns) && actionableFailedRuns >= 0
+    ? actionableFailedRuns : Number(countBy(runCounts, "status", "count").failed || 0);
   const succeeded = Number(countBy(runCounts, "status", "count").succeeded || 0);
   const receivedWithoutCursor = Number(scopeCounts.received_without_cursor || 0);
   if (details?.evidence === "unavailable") return "needs_attention";
@@ -53,8 +55,8 @@ function summarizeHealth({ discoveryCursor, scopeCounts, locks, runCounts, detai
 }
 
 /** @param {HealthStateInput} input */
-function healthDetail({ discoveryCursor, scopeCounts, locks, runCounts, details }) {
-  const health = summarizeHealth({ discoveryCursor, scopeCounts, locks, runCounts, details });
+function healthDetail({ discoveryCursor, scopeCounts, locks, runCounts, details, actionableFailedRuns }) {
+  const health = summarizeHealth({ discoveryCursor, scopeCounts, locks, runCounts, details, actionableFailedRuns });
   if (details?.evidence === "unavailable") return "message detail evidence is unavailable";
   if (Number(details?.pending_count || 0) > 0) return `${details?.pending_count} message details await retry; list progress does not prove full content`;
   if (health === "not_ready") return "initial discovery or successful message-scope evidence is missing";

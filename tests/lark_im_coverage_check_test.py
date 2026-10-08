@@ -236,6 +236,53 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual(out['coverage']['eligible_successful_runs'], 1)
         self.assertEqual(out['coverage']['scopes_without_eligible_successful_runs'], 1)
 
+    def test_valid_awaiting_stages_are_ignored_without_becoming_coverage_or_corruption(self):
+        self.detail_schema()
+        valid = {'window_start': None, 'window_end': None, 'list_complete': True,
+                 'list_window_start_ms': START, 'list_window_end_ms': END,
+                 'initial_sync_start_ms': START,
+                 '__run_fence': {'list_generation': 0, 'scope_config': {'chat_id': None}},
+                 'details_complete': False, 'window_complete': False, 'pending_detail_count': 1,
+                 'lark_progress': {'version': 1, 'phase': 'list', 'outcome': 'awaiting_details',
+                                   'attempted': 0, 'completed': 0, 'failed': 0, 'generation': 1}}
+        for phase, count in (('list', 0), ('details', 1)):
+            with self.subTest(phase=phase):
+                self.con.execute('DELETE FROM sync_runs WHERE scope_id=?', (RECEIVED,))
+                progress = {**valid['lark_progress'], 'phase': phase, 'attempted': count, 'completed': count}
+                self.run_window(RECEIVED, START, END, after=None, metadata={**valid, 'lark_progress': progress})
+                out = self.inspect()
+                self.assert_complete(out, False)
+                self.assertEqual(out['coverage']['awaiting_detail_stages_ignored'], 1)
+                self.assertEqual(out['coverage']['invalid_successful_runs'], 0)
+                self.assertEqual(out['coverage']['eligible_successful_runs'], 1)
+        variants = [{'details_complete': 0}, {'pending_detail_count': '1'}, {'window_complete': None},
+                    {'list_window_start_ms': True}, {'list_window_end_ms': START - 1},
+                    {'initial_sync_start_ms': START + 1},
+                    {'__run_fence': {'list_generation': True, 'scope_config': {'chat_id': None}}},
+                    {'__run_fence': {'list_generation': 1, 'scope_config': {'chat_id': None}}},
+                    {'__run_fence': {'list_generation': 0, 'scope_config': {'chat_id': 1}}},
+                    {'window_start': iso(START)}, {'coverage_mode': 'list_checkpoint_and_details'}]
+        variants += [{'lark_progress': {**valid['lark_progress'], **change}} for change in
+                     ({'version': True}, {'attempted': False}, {'completed': 1}, {'generation': 0},
+                      {'phase': 'unknown'}, {'failed': 1}, {'phase': 'details', 'attempted': 0})]
+        for change in variants:
+            with self.subTest(change=change):
+                self.con.execute('DELETE FROM sync_runs WHERE scope_id=?', (RECEIVED,))
+                self.run_window(RECEIVED, START, END, after=None, metadata={**valid, **change})
+                out = self.inspect()
+                self.assert_complete(out, False)
+                self.assertEqual(out['coverage']['awaiting_detail_stages_ignored'], 0)
+                self.assertEqual(out['coverage']['invalid_successful_runs'], 1)
+        for before in (json.dumps({'kind': 'unknown', 'created_at_ms': START}),
+                       json.dumps({'kind': 'time_message_cursor/v1', 'created_at_ms': '1'}),
+                       cursor(START + 1)):
+            with self.subTest(before=before):
+                self.con.execute('DELETE FROM sync_runs WHERE scope_id=?', (RECEIVED,))
+                self.run_window(RECEIVED, START, END, before=before, after=None, metadata=valid)
+                out = self.inspect()
+                self.assertEqual(out['coverage']['awaiting_detail_stages_ignored'], 0)
+                self.assertEqual(out['coverage']['invalid_successful_runs'], 1)
+
     def test_partial_markers_override_accidental_successful_full_window_fields(self):
         for payload in ({'details_complete': False}, {'window_complete': False},
                         {'list_complete': False}, {'list_window_start_ms': START},

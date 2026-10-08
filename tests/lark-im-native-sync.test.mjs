@@ -90,7 +90,7 @@ const nativePage = (items, has_more = false, page_token = "") => ({ ok: true,
   data: { items, has_more, page_token } });
 
 for (const direction of ["received", "sent"]) {
-  test(`${direction} detail denial saves ordinary pages as a failed run, keeps scope enabled and retries missing roots`, (t) => {
+  test(`${direction} detail denial preserves a successful list stage and failed detail attempt for retry`, (t) => {
     const dbPath = syntheticDatabase(t);
     const scopeId = direction === "sent" ? "lark.im.sent_by_me" : SCOPE;
     const root = rawMerge(40, START + 30_000);
@@ -131,7 +131,7 @@ for (const direction of ["received", "sent"]) {
     assert.deepEqual(sqliteQuery(dbPath, "SELECT external_id FROM records ORDER BY external_id;").map((row) => row.external_id),
       ordinary.map((item) => item.message_id));
     const run = sqliteQuery(dbPath, "SELECT status,cursor_after_json,metadata_json FROM sync_runs;")[0];
-    assert.equal(run.status, "failed");
+    assert.equal(run.status, "succeeded");
     const metadata = JSON.parse(run.metadata_json);
     assert.equal(metadata.window_complete, false);
     assert.equal(metadata.pages, 2);
@@ -143,7 +143,7 @@ for (const direction of ["received", "sent"]) {
     assert.equal(missing.status, "pending");
     assert.match(missing.last_error_message, /bot_user_out_of_chat/);
     assert.doesNotMatch(missing.last_error_message, /synthetic-private|om_fixture|oc_fixture/);
-    assert.equal(metadata.window_start, undefined, "failed attempts must not emit successful coverage-window keys");
+    assert.equal(metadata.window_start, undefined, "incomplete list stages must not emit full coverage-window keys");
     assert.doesNotMatch(run.metadata_json, /synthetic-private|om_fixture/);
     assert.equal(sqliteQuery(dbPath, "SELECT COUNT(*) AS n FROM sync_locks;")[0].n, 0);
 
@@ -159,7 +159,7 @@ for (const direction of ["received", "sent"]) {
     assert.equal(recovered.duplicate, 0);
     assert.equal(readScope(dbPath, scopeId).cursor.created_at_ms, START + 60_000);
     assert.deepEqual(sqliteQuery(dbPath, "SELECT status FROM sync_runs ORDER BY id;").map((row) => row.status),
-      ["failed", "failed", "failed", "failed", "succeeded"]);
+      ["succeeded", "failed", "succeeded", "failed", "succeeded"]);
     assert.equal(sqliteQuery(dbPath, "SELECT COUNT(*) AS n FROM records;")[0].n, 3);
     assert.match(sqliteQuery(dbPath, `SELECT body FROM records WHERE external_id=${quoteSql(root.message_id)};`)[0].body, /synthetic 43/);
     assert.equal(paths.filter((path) => path.endsWith(root.message_id)).length, 3);

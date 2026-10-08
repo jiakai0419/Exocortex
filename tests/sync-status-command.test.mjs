@@ -102,7 +102,9 @@ test("buildStatus assembles one tagged snapshot without performing recovery", ()
     "read reconcile scope": [{ cursor_json: JSON.stringify({ has_more: true, pages_scanned: 2 }),
       cursor_updated_at: "2026-06-20T00:02:00.000Z" }],
     "read run counts": [{ status: "failed", count: 1 }, { status: "succeeded", count: 1 }],
-    "read recent runs": [{ status: "failed",
+    "read failed run transitions": [],
+    "read failed transition count": [{ count: 0 }],
+    "read recent runs": [{ id: 2, status: "failed",
       error_message: '{"error":{"type":"api","code":9499,"message":"too many request"}}' }],
     "read locks": [],
   };

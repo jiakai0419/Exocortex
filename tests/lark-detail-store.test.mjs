@@ -69,13 +69,20 @@ test("pending details leave full cursor unchanged while ordinary records and dur
   const root = raw("invented-merge", START + 1_000);
   const first = list(db, START, START + 2_000, [root], [ordinary("invented-one", START + 500)], {
     window_start_ms: START, window_end_ms: START + 2_000, coverage_mode: "invented false evidence", details_complete: true,
+    lark_progress: { version: 1, phase: "details", outcome: "complete", attempted: 99, failed: 0 },
   });
   assert.equal(first.effects.pending_details, 1);
   assert.equal(first.effects.full_cursor_promoted, false);
   assert.equal(readScope(db, SCOPE).cursor, null);
   const firstRun = run(db, first.runId);
-  assert.equal(firstRun.status, "failed");
-  assert.equal(firstRun.error_type, "LarkDetailIncomplete");
+  assert.equal(firstRun.status, "succeeded");
+  assert.equal(firstRun.error_type, null);
+  assert.equal(firstRun.error_message, null);
+  assert.equal(firstRun.cursor_after_json, null);
+  assert.deepEqual(firstRun.metadata.lark_progress, { version: 1, phase: "list", outcome: "awaiting_details",
+    attempted: 0, completed: 0, failed: 0, generation: 1 });
+  assert.deepEqual(sqliteQuery(db, `SELECT last_success_run_id,last_error_run_id FROM sync_scopes WHERE id='${SCOPE}';`)[0],
+    { last_success_run_id: null, last_error_run_id: null });
   assert.equal(firstRun.metadata.list_complete, true);
   assert.equal(firstRun.metadata.details_complete, false);
   assert.equal(firstRun.metadata.window_complete, false);
@@ -98,6 +105,9 @@ test("detail failures reschedule durably without changing known records or starv
   list(db, START + 1_000, START + 1_000, [newer]);
   const failure = retry(db, pending(db)[0], { error: new Error("invented permission denial") });
   assert.equal(failure.effects.pending_details, 1);
+  assert.equal(run(db, failure.runId).status, "failed");
+  assert.equal(run(db, failure.runId).metadata.lark_progress.outcome, "attempt_failed");
+  assert.equal(run(db, failure.runId).metadata.lark_progress.failed, 1);
   assert.deepEqual(records(db), before);
   const task = tasks(db)[0];
   assert.equal(task.attempt_count, 1);
@@ -106,6 +116,7 @@ test("detail failures reschedule durably without changing known records or starv
   assert.ok(Date.parse(task.retry_at) >= Date.parse(task.updated_at) + 60_000);
   assert.equal(pending(db, { now: new Date(task.updated_at) }).length, 0);
   list(db, START + 1_000, START + 3_000, [], [ordinary("invented-later", START + 2_500)]);
+  assert.equal(sqliteQuery(db, `SELECT last_error_run_id FROM sync_scopes WHERE id='${SCOPE}';`)[0].last_error_run_id, failure.runId);
   assert.equal(readLarkListProgress(db, readScope(db, SCOPE)).cursor.created_at_ms, START + 3_000);
   assert.ok(records(db).some((record) => record.external_id === "invented-later"));
   assert.equal(readScope(db, SCOPE).cursor.created_at_ms, START + 1_000);
@@ -130,6 +141,28 @@ test("last resolved debt promotes composed list proof and resets the next covera
   const next = list(db, START + 4_000, START + 5_000);
   assert.equal(run(db, next.runId).metadata.window_start_ms, START + 4_000);
   assert.equal(readLarkListProgress(db, readScope(db, SCOPE)).coverage_start_ms, START + 5_000);
+});
+
+test("a successful bounded detail batch leaves unattempted debt without recording a failed run", (t) => {
+  const db = database(t);
+  const roots = [raw("invented-batch-one", START + 500), raw("invented-batch-two", START + 1_000)];
+  const listed = list(db, START, START + 2_000, roots);
+  const original = run(db, listed.runId);
+  const first = retry(db, pending(db)[0], { record: detailRecord(roots[0]) }, {
+    lark_progress: { version: 1, phase: "list", outcome: "complete", failed: 0 },
+  });
+  assert.equal(first.effects.pending_details, 1);
+  assert.equal(first.effects.full_cursor_promoted, false);
+  const batch = run(db, first.runId);
+  assert.equal(batch.status, "succeeded");
+  assert.equal(batch.error_type, null);
+  assert.deepEqual(batch.metadata.lark_progress, { version: 1, phase: "details", outcome: "awaiting_details",
+    attempted: 1, completed: 1, failed: 0, generation: 2 });
+  assert.equal(readScope(db, SCOPE).cursor, null);
+  const closed = retry(db, pending(db)[0], { record: detailRecord(roots[1]) });
+  assert.equal(run(db, closed.runId).metadata.lark_progress.outcome, "complete");
+  assert.equal(closed.effects.full_cursor_promoted, true);
+  assert.deepEqual(run(db, listed.runId), original, "subsequent detail completion never rewrites the list run");
 });
 
 test("completed root receipts ignore unchanged key-order replay and provably older versions, reopening newer debt", (t) => {
@@ -322,6 +355,8 @@ test("an unordered detail response rejected by version protection remains retria
   list(db, START + 1_000, START + 2_000, [unknown]);
   const response = detailRecord(unknown);
   const finished = retry(db, pending(db)[0], { record: response });
+  assert.equal(run(db, finished.runId).status, "failed");
+  assert.equal(run(db, finished.runId).metadata.lark_progress.failed, 1);
   assert.equal(finished.effects.full_cursor_promoted, false);
   assert.equal(finished.effects.pending_details, 1);
   assert.deepEqual(records(db), before);
@@ -345,6 +380,8 @@ test("a detail version older than stored content backs off without blocking heal
   const effects = finishLarkDetailRun(db, scope, runId, due.map((task) => ({ message_id: task.message_id,
     fingerprint: task.fingerprint, record: detailRecord(task.raw_root) })));
   assert.equal(effects.pending_details, 1);
+  assert.deepEqual(run(db, runId).metadata.lark_progress, { version: 1, phase: "details", outcome: "attempt_failed",
+    attempted: 2, completed: 1, failed: 1, generation: 2 });
   assert.equal(effects.full_cursor_promoted, false);
   assert.equal(records(db).find((record) => record.external_id === stale.message_id).external_version, String(START + 4_000));
   assert.equal(tasks(db).find((task) => task.message_id === stale.message_id).last_error_type, "LarkDetailVersionConflict");
