@@ -1,4 +1,5 @@
 import { REMOTE_REASONS } from "./remote-sample-cache.mjs";
+import { safeCollectorDiagnostic } from "./remote-sample-diagnostic.mjs";
 // @ts-check
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
@@ -206,6 +207,9 @@ function publicStatusReport(collected, options) {
   const { report, service, installed, observedAt } = collected;
   const overview = report.overview;
   const sync = report.sync.status ? sanitizeStatusReportForPublicOutput(report.sync.status) : null;
+  const hasCollectorDiagnostic = Object.hasOwn(overview.freshness, "collector_diagnostic");
+  const collectorDiagnostic = safeCollectorDiagnostic(overview.freshness.collector_diagnostic);
+  const contradictorySample = hasCollectorDiagnostic && (overview.freshness.status === "sampled" || overview.freshness.result === "healthy");
   return { schema_version: 1, privacy: options.logs ? "private" : "public-safe", observed_at: new Date(observedAt).toISOString(),
     service: { status: choice(service.status, ["running", "loaded", "absent", "unknown"]), target_match: service.target_match,
       configuration: choice(installed.status, ["installed", "missing", "unknown"]), pid: count(service.pid), last_exit_code: Number.isSafeInteger(service.last_exit_code) ? service.last_exit_code : null },
@@ -213,12 +217,13 @@ function publicStatusReport(collected, options) {
       reason: HEALTH_REASONS.includes(overview.health.reason) ? overview.health.reason : "health_unavailable", local: choice(sync?.health, ["ok", "ok_with_history", "catching_up", "syncing", "not_ready", "needs_attention", "unknown"]) },
     activity: publicActivity(overview.activity),
     runtime_stats: summarizeRuntimeStats(report, collected.binding, observedAt),
-    freshness: { status: choice(overview.freshness.status, ["sampled", "unknown", "behind"]), auth_identity: choice(overview.freshness.auth_identity, ["unknown", "verified_at_check"]),
-      scope: choice(overview.freshness.scope, ["recent_hot_messages", "discovered_chats_rotating"]), reason: choice(overview.freshness.reason, FRESHNESS_REASONS),
+    freshness: { status: hasCollectorDiagnostic ? "unknown" : choice(overview.freshness.status, ["sampled", "unknown", "behind"]), auth_identity: choice(overview.freshness.auth_identity, ["unknown", "verified_at_check"]),
+      scope: choice(overview.freshness.scope, ["recent_hot_messages", "discovered_chats_rotating"]), reason: contradictorySample ? "invalid_evidence" : choice(overview.freshness.reason, FRESHNESS_REASONS),
       window: { start: publicTimestamp(overview.freshness.window?.start), end: publicTimestamp(overview.freshness.window?.end) },
       sample_count: count(overview.freshness.sample_count),
       ...(overview.freshness.scope === "discovered_chats_rotating" ? {
-        result: choice(overview.freshness.result, ["healthy","delayed","needs_attention","inconclusive","unavailable"]),
+        result: hasCollectorDiagnostic ? "unavailable" : choice(overview.freshness.result, ["healthy","delayed","needs_attention","inconclusive","unavailable"]),
+        ...(collectorDiagnostic ? { collector_diagnostic: collectorDiagnostic } : {}),
         chat_count: count(overview.freshness.chat_count),
         binding: { state: choice(overview.freshness.binding?.state, ["verified","unverified","conflict","unavailable"]),
           evidence: choice(overview.freshness.binding?.evidence, ["single_sent_actor","initialized_empty_database"]), tenant_verified: false },

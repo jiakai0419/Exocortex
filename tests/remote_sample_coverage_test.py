@@ -39,6 +39,7 @@ class SampleCoverageTests(unittest.TestCase):
             CREATE TABLE sync_runs(id INTEGER PRIMARY KEY,source_id TEXT,scope_id TEXT,status TEXT,
               metadata_json TEXT,cursor_before_json TEXT,cursor_after_json TEXT,started_at TEXT,finished_at TEXT);
             CREATE INDEX run_scope_started ON sync_runs(scope_id,started_at DESC);
+            CREATE INDEX run_status_started ON sync_runs(status,started_at DESC);
             CREATE TABLE lark_im_list_progress(scope_id TEXT PRIMARY KEY);
             CREATE TABLE lark_im_detail_tasks(scope_id TEXT,status TEXT,occurred_at_ms INTEGER);
             CREATE INDEX detail_scope_status ON lark_im_detail_tasks(scope_id,status);
@@ -162,6 +163,56 @@ class SampleCoverageTests(unittest.TestCase):
             self.run_window(left=END, right=END + 600_000, finished=END + 700_000)
         self.run_window()
         self.assertTrue(self.inspect()[KEY]['covered'])
+
+    def test_unrelated_success_history_does_not_consume_sample_query_work(self):
+        """Use both real-schema index shapes and a VM-work cap, not wall time.
+
+        With the status index available, SQLite can scan every successful run
+        before filtering a single scope. A bounded target must use its scope
+        instead, regardless of unrelated history retained by other chats.
+        """
+        self.run_window()
+        other_scope = check.RECEIVED_PREFIX + 'synthetic_unrelated'
+        self.con.execute('INSERT INTO sync_scopes VALUES(?,?,?,?)',
+                         (other_scope, 'lark.im', 1, json.dumps({'chat_id': 'synthetic_other_chat'})))
+        values = ('lark.im', other_scope, 'succeeded',
+                  json.dumps({'window_start': check.utc_text(START), 'window_end': check.utc_text(END),
+                              'window_complete': True}), cursor(START), cursor(END),
+                  check.utc_text(START), check.utc_text(END + 60_000))
+        self.con.executemany('''INSERT INTO sync_runs(source_id,scope_id,status,metadata_json,
+          cursor_before_json,cursor_after_json,started_at,finished_at) VALUES(?,?,?,?,?,?,?,?)''',
+                             [values] * 20_000)
+        self.con.row_factory = sqlite3.Row
+        callbacks = 0
+
+        def work_limit():
+            nonlocal callbacks
+            callbacks += 1
+            return int(callbacks > 100)
+
+        # Ten thousand VM instructions leave generous room for one scope/run
+        # while deterministically rejecting a scan through unrelated history.
+        self.con.set_progress_handler(work_limit, 100)
+        try:
+            result = check.inspect_sample_connection(self.con, [self.target()], NOW)
+        finally:
+            self.con.set_progress_handler(None, 0)
+        self.assertTrue(result[KEY]['covered'])
+        self.assertLessEqual(callbacks, 100)
+
+    def test_scope_query_does_not_require_a_named_index(self):
+        self.run_window()
+        self.con.execute('DROP INDEX run_scope_started')
+        self.assertTrue(self.inspect()[KEY]['covered'])
+
+    def test_status_index_hint_preserves_exact_text_success_filter(self):
+        # Unary + removes SQLite affinity; only the original exact text status
+        # may cover, never null, numbers, blobs or another status spelling.
+        for status in (None, 0, 1, '0', 'failed', 'SUCCEEDED', sqlite3.Binary(b'succeeded')):
+            with self.subTest(status=status):
+                self.con.execute('DELETE FROM sync_runs')
+                self.run_window(status=status)
+                self.assertFalse(self.inspect()[KEY]['covered'])
 
     def test_per_target_and_batch_caps_fail_closed(self):
         for _ in range(501):

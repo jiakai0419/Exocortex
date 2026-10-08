@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { publicTimestamp } from './public-safe.mjs';
 import { SAMPLE_POLICY } from './remote-sample-core.mjs';
 import { safeGuardianDiagnostic } from '../runtime/worker/remote-sample-process.mjs';
+import { safeCollectorDiagnostic } from './remote-sample-diagnostic.mjs';
 
 const COUNT_KEYS = ['present','missing','pending_sync','suspected_missing','confirmed_missing','stale_version','content_mismatch',
   'identity_conflict','local_newer','content_equal','content_unverified','unresolved_prior','expired_observations','observation_overflow'];
@@ -22,8 +23,10 @@ const hash = (value) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value
 export function publicRemoteReport(input) {
   const hasDiagnostic = input != null && Object.hasOwn(input, 'guardian_diagnostic');
   const diagnostic = safeGuardianDiagnostic(input?.guardian_diagnostic);
+  const hasCollectorDiagnostic = input != null && Object.hasOwn(input, 'collector_diagnostic');
+  const collectorDiagnostic = safeCollectorDiagnostic(input?.collector_diagnostic);
   // Even a malformed diagnostic cannot be stripped into a positive report.
-  const status = hasDiagnostic ? 'unavailable' : ['healthy','delayed','needs_attention','inconclusive','unavailable'].includes(input?.status) ? input.status : 'inconclusive';
+  const status = hasDiagnostic || hasCollectorDiagnostic ? 'unavailable' : ['healthy','delayed','needs_attention','inconclusive','unavailable'].includes(input?.status) ? input.status : 'inconclusive';
   const probe = Object.fromEntries(PROBE_KEYS.map((k) => [k, safeCount(input?.probe?.[k])]));
   const findings = Object.fromEntries(COUNT_KEYS.map((k) => [k, safeCount(input?.findings?.[k])]));
   const binding = { state: ['verified','unverified','conflict','unavailable'].includes(input?.binding?.state) ? input.binding.state : 'unverified',
@@ -32,8 +35,9 @@ export function publicRemoteReport(input) {
   return { schema_version: 3, ok: status === 'healthy' && input.ok === true && binding.state === 'verified' && probe.remote_messages_checked > 0 &&
     probe.probe_errors === 0 && probe.unsupported_chats === 0 && findings.missing === 0 && findings.confirmed_missing === 0 &&
     findings.stale_version === 0 && findings.content_mismatch === 0 && findings.identity_conflict === 0 && findings.unresolved_prior === 0,
-    status, reason: hasDiagnostic ? 'sample_process_failed' : REMOTE_REASONS.includes(input?.reason) ? input.reason : null, checked_at: publicTimestamp(input?.checked_at),
+    status, reason: hasDiagnostic ? 'sample_process_failed' : hasCollectorDiagnostic ? 'invalid_evidence' : REMOTE_REASONS.includes(input?.reason) ? input.reason : null, checked_at: publicTimestamp(input?.checked_at),
     ...(diagnostic ? { guardian_diagnostic: diagnostic } : {}),
+    ...(!hasDiagnostic && collectorDiagnostic ? { collector_diagnostic: collectorDiagnostic } : {}),
     scope: 'discovered_chats_rotating', window: { start: publicTimestamp(input?.window?.start), end: publicTimestamp(input?.window?.end) }, binding,
     probe: { mode: 'bounded_native_pages', comparison: 'identity_version_static_body', ...probe }, findings,
     missing_count: findings.missing, lag_ms: null,
@@ -84,6 +88,8 @@ export function parseRemoteSampleCache(input) {
   if (input?.kind !== 'lark_im_live_probe_cache/v3' || input.policy_version !== SAMPLE_POLICY.version || input.schema_version !== 3 || input.context?.source_id !== 'lark.im') return null;
   if (Object.hasOwn(input, 'guardian_diagnostic') && (!safeGuardianDiagnostic(input.guardian_diagnostic) ||
       input.ok !== false || input.status !== 'unavailable' || input.reason !== 'sample_process_failed')) return null;
+  if (Object.hasOwn(input, 'collector_diagnostic') && (!safeCollectorDiagnostic(input.collector_diagnostic) ||
+      input.ok !== false || input.status !== 'unavailable' || input.reason !== 'invalid_evidence')) return null;
   if (!validCounters(input.probe, input.findings) ||
       ![input.checked_at, input.expires_at, input.window?.start, input.window?.end].every(isoTime) ||
       input.reason !== null && !REMOTE_REASONS.includes(input.reason) ||
@@ -129,6 +135,7 @@ export function summarizeRemoteSample(cache, now, expectedContext) {
   const base = { scope: report.scope, sample_count: report.probe.remote_messages_checked, chat_count: report.probe.chats_checked,
     checked_at: report.checked_at, expires_at: cache.expires_at, window: report.window, result: report.status,
     binding: report.binding, findings: report.findings, sample: report.probe, auth_identity: 'verified_at_check',
+    ...(report.collector_diagnostic ? { collector_diagnostic: report.collector_diagnostic } : {}),
     last_success_at: cache.last_success_at, reason: report.reason, detail: '' };
   const unknown = (reason, detail) => ({ ...base, status: /** @type {const} */ ('unknown'), reason, detail });
   if (!expectedContext || !hash(cache.context?.database_key) || cache.context.database_key !== expectedContext.database_key || cache.context.source_id !== 'lark.im') {

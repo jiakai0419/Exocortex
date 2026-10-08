@@ -2,6 +2,7 @@
 import { serviceTimeRange, serviceTimestamp, durationText, formatStabilityInterval, formatLeaseIssues } from "./status-format.mjs";
 import { statusLayout } from "./status-layout.mjs";
 import { formatLogLine } from "./status-log-view.mjs";
+import { safeCollectorDiagnostic } from "../diagnostics/remote-sample-diagnostic.mjs";
 
 /** @typedef {Record<string, any>} Report */
 const TASKS = Object.freeze({ sent: "Sent messages", "discover-hot": "Active conversation refresh", "received-hot": "Active conversation messages",
@@ -167,6 +168,8 @@ export function renderStatusText(report, options = {}) {
       : `Not verified · ${reason}${uncertainties ? ` · ${uncertainties}` : ""}`;
     screen.row("Remote sample", `${result} · ${number(freshness.sample_count)} messages / ${number(freshness.chat_count)} discovered chats · checked ${stamp(freshness.checked_at)}`);
     if (detailed) {
+      const diagnostic = safeCollectorDiagnostic(freshness.collector_diagnostic);
+      if (diagnostic) screen.row("Sample diagnostic", `${diagnostic.stage} · ${diagnostic.code}`);
       screen.row("Sample window", range(freshness.window?.start, freshness.window?.end));
       screen.row("Sample coverage", `${number(freshness.sample?.hot_chats)} hot + ${number(freshness.sample?.fair_chats)} rotating · ${number(freshness.sample?.eligible_chats)} eligible chats · ${number(freshness.sample?.truncated_chats)} truncated`);
       screen.row("Sample content", comparisonAvailable ? `${number(f.content_equal)} static bodies matched · ${number(f.content_unverified)} unverified` : `Not verified · ${reason}`);

@@ -579,10 +579,15 @@ def inspect_sample_connection(con, targets, now_ms, deadline=None):
         metadata = "CASE WHEN json_valid(r.metadata_json) THEN r.metadata_json ELSE '{}' END"
         # Allow sub-millisecond SQL date rounding in this prefilter. Exact ISO
         # parsing, chronology and interval containment are checked below.
+        # Disqualify the competing status index for this bounded scope query:
+        # otherwise SQLite can scan every successful run for every target.
+        # Unary + retains the exact nonnumeric 'succeeded' comparison on the
+        # TEXT status column while letting any available scope index win; no
+        # named index, schema write, larger budget or weaker proof is required.
         rows = list(con.execute(f"""
             SELECT r.finished_at,r.started_at,{successful_run_columns()}
             FROM sync_runs r JOIN sync_scopes s ON s.id=r.scope_id AND s.source_id=r.source_id
-            WHERE r.scope_id=? AND r.source_id='lark.im' AND s.enabled=1 AND r.status='succeeded'
+            WHERE r.scope_id=? AND r.source_id='lark.im' AND s.enabled=1 AND +r.status='succeeded'
               AND julianday(json_extract({metadata}, '$.window_start')) <= julianday(?/1000.0,'unixepoch') + 0.00000002
               AND julianday(json_extract({metadata}, '$.window_end')) >= julianday(?/1000.0,'unixepoch') - 0.00000002
               AND julianday(r.finished_at) >= julianday(?/1000.0,'unixepoch') - 0.00000002

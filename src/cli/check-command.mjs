@@ -1,6 +1,7 @@
 // @ts-check
 import { collectCheckReport } from "../diagnostics/check-report.mjs";
 import { REMOTE_REASONS } from "../diagnostics/remote-sample-cache.mjs";
+import { safeCollectorDiagnostic } from "../diagnostics/remote-sample-diagnostic.mjs";
 import { terminalColumns, wrapLabelValue } from "../terminal/text-layout.mjs";
 
 const SAMPLE_REASONS = Object.freeze({
@@ -45,6 +46,8 @@ export async function runCheckCommand(options, context, deps = {}) {
       if (live.status !== "healthy" && REMOTE_REASONS.includes(live.reason)) {
         row("Reason", SAMPLE_REASONS[live.reason] || live.reason.replace(/_/g, " "));
       }
+      const diagnostic = safeCollectorDiagnostic(live.collector_diagnostic);
+      if (diagnostic) row("Sample diagnostic", `${diagnostic.stage} · ${diagnostic.code}`);
       row("Window", `${live.window.start} to ${live.window.end}`);
       row("Findings", `${live.findings.confirmed_missing} confirmed missing · ${live.findings.suspected_missing} suspected · ${live.findings.pending_sync} pending sync · ${live.findings.stale_version} older versions · ${live.findings.content_mismatch} source content differences`);
       for (const [key, label] of EXTRA_FINDINGS) {

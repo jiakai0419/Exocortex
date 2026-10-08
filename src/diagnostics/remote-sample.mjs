@@ -11,6 +11,7 @@ import { inspectRemoteSampleSnapshot } from './remote-sample-coverage.mjs';
 import { SAMPLE_POLICY, digest, epoch, selectSampleChats, evaluateSample } from './remote-sample-core.mjs';
 import { runGuardedRemoteSampleProcess, safeGuardianDiagnostic } from '../runtime/worker/remote-sample-process.mjs';
 import { publicRemoteReport } from './remote-sample-cache.mjs';
+import { collectorDiagnostic } from './remote-sample-diagnostic.mjs';
 export { writeRemoteSampleCache } from './remote-sample-cache.mjs';
 const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
@@ -117,6 +118,7 @@ export function collectRemoteSample(db, options = {}, deps = {}) {
   let binding = null; let selection = null;
   let observations = options.previousObservations || {};
   let retryAtMs = 0; let operation = '';
+  let stage = 'inventory';
   const finish = (outcome) => ({ outcome, rotation: outcome === 'ok' ? selection?.rotation ?? rotation : rotation,
     observations, report: { ...report, checked_at: new Date(now()).toISOString(), probe: { ...report.probe, api_calls: api.count() } },
     cacheContext: binding ? { database_key: context?.database_key, source_id: 'lark.im', account_key: binding.account_key,
@@ -130,7 +132,9 @@ export function collectRemoteSample(db, options = {}, deps = {}) {
     Object.assign(report.probe, { hot_chats_found: selection.selected.length, eligible_chats: selection.eligible,
       hot_chats: selection.hot, fair_chats: selection.fair });
     if (!selection.selected.length) { report.reason = 'no_eligible_chats'; return finish('ok'); }
+    stage = 'identity_before';
     const before = identity(api.call('/open-apis/authen/v1/user_info'));
+    stage = 'binding_before';
     binding = readBinding(before);
     report.binding = { state: binding.state, evidence: binding.evidence };
     if (options.accountKey && options.accountKey !== binding.account_key) observations = {};
@@ -144,12 +148,16 @@ export function collectRemoteSample(db, options = {}, deps = {}) {
       const tokens = new Set(); let token = '';
       for (let pageNo = 0; pageNo < SAMPLE_POLICY.pages; pageNo++) {
         let json;
+        stage = 'message_request';
         try { json = api.call('/open-apis/im/v1/messages', { container_id_type: 'chat', container_id: chat.chat_id,
           sort_type: 'ByCreateTimeDesc', page_size: pageSize, card_msg_content_type: 'user_card_content',
           start_time: String(Math.floor(start / 1000)), end_time: String(Math.ceil(end / 1000)), ...(token ? { page_token: token } : {}) }); }
         catch (error) { if (error instanceof SampleFailure && error.reason === 'restricted_mode') { report.probe.unsupported_chats++; break; } throw error; }
+        stage = 'message_page';
         const page = nativePage(json, 'remote sample page', tokens);
+        stage = 'message_shape';
         assertRawMessagePage(page.items, 'remote sample page');
+        stage = 'message_identity';
         report.probe.pages++;
         if (pageNo === 0) report.probe.chats_checked++;
         if (page.items.length > pageSize) throw new SampleFailure('invalid_page');
@@ -165,21 +173,27 @@ export function collectRemoteSample(db, options = {}, deps = {}) {
         if (pageNo + 1 === SAMPLE_POLICY.pages) report.probe.truncated_chats++;
       }
     }
+    stage = 'identity_after';
     const after = identity(api.call('/open-apis/authen/v1/user_info'));
     if (after.openId !== before.openId || after.tenantKey !== before.tenantKey) throw new SampleFailure('account_changed');
+    stage = 'database_context';
     if ((deps.context || liveProbeContext)(db)?.database_key !== context.database_key) throw new SampleFailure('database_changed');
     const targets = messages.map((m) => ({ key: digest([binding.database_key, binding.account_key, m.chat_id, m.message_id, epoch(m.create_time)]),
       scope_id: m.scope_id, message_id: m.message_id, created_ms: epoch(m.create_time) }));
     if (now() >= api.deadline) throw new SampleFailure('time_budget');
     // Coverage, debt and records must come from one SQLite snapshot, including concurrent revocation.
+    stage = 'snapshot';
     const { coverage, records } = (deps.inspectSnapshot || inspectRemoteSampleSnapshot)(db, targets, { timeoutMs: Math.min(5000, remaining()), now });
+    stage = 'binding_after';
     const finalBinding = readBinding(after);
     if (finalBinding.state !== 'verified' || finalBinding.account_key !== binding.account_key || finalBinding.database_key !== binding.database_key) throw new SampleFailure('account_changed');
+    stage = 'comparison';
     const evaluated = evaluateSample({ messages, records, coverage, binding, previous: observations, now: now(), windowEnd: end });
     observations = evaluated.observations;
     report.findings = evaluated.counts;
     report.missing_count = evaluated.counts.missing;
     report.probe.remote_messages_checked = messages.length;
+    stage = 'final_context';
     if ((deps.context || liveProbeContext)(db)?.database_key !== context.database_key || now() > api.deadline) throw new SampleFailure('context_changed');
     const c = evaluated.counts;
     if (c.confirmed_missing || c.identity_conflict || c.stale_version || c.content_mismatch) {
@@ -192,6 +206,7 @@ export function collectRemoteSample(db, options = {}, deps = {}) {
     return finish('ok');
   } catch (error) {
     report.status = 'unavailable'; report.reason = error instanceof SampleFailure ? error.reason : 'invalid_evidence';
+    if (!(error instanceof SampleFailure)) report.collector_diagnostic = collectorDiagnostic(stage, error);
     report.probe.probe_errors++;
     retryAtMs = error instanceof SampleFailure ? error.retryAtMs : 0;
     operation = error instanceof SampleFailure ? error.operation : '';
@@ -212,7 +227,7 @@ export function runReadOnlyRemoteSample(db, options = {}, deps = {}) {
     try {
       const parsed = JSON.parse(String(result.stdout));
       if (['ok','busy','failed'].includes(parsed.outcome) && parsed.report?.schema_version === 3) {
-        if (Object.hasOwn(parsed.report, 'guardian_diagnostic')) {
+        if (Object.hasOwn(parsed.report, 'guardian_diagnostic') || Object.hasOwn(parsed.report, 'collector_diagnostic')) {
           const report = publicRemoteReport(parsed.report);
           return { outcome: 'failed', report, ...(report.guardian_diagnostic ? { guardian_diagnostic: report.guardian_diagnostic } : {}) };
         }
