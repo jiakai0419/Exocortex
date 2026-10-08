@@ -43,7 +43,7 @@ function setRemote(fixture, config) {
 
 function fixture(t, remote = { contact: "success" }) {
   const dir = mkdtempSync(join(tmpdir(), "exocortex-sender-only-test-"));
-  for (const part of ["home", "config", "cache", "data"]) mkdirSync(join(dir, part));
+  for (const part of ["home", "config", "cache", "data", "api-state", "tmp"]) mkdirSync(join(dir, part), { mode: 0o700 });
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const value = { dir, db: join(dir, "synthetic.sqlite"), calls: join(dir, "calls.jsonl"),
     remote: join(dir, "remote.json"), cli: join(dir, "fake-lark-cli.mjs"),
@@ -142,13 +142,13 @@ function insertRow(fixture, { id = 1, ordinal = id, actor = TARGET, chat = CHAT,
 }
 
 function run(fixture, args = [], { exactArgs = false, audit = false } = {}) {
-  const result = spawnSync(process.execPath, ["bin/exocortex.mjs", "maintenance", "enrich", "--target", "records", "--format", "json", "--db", fixture.db,
+  const result = spawnSync(process.execPath, ["tests/helpers/enrichment-cli.mjs", fixture.dir, "maintenance", "enrich", "--target", "records", "--format", "json", "--db", fixture.db,
     ...(exactArgs ? [] : ["--sender-only", "--sender-id", TARGET]),
     ...(args.includes("--dry-run") ? [] : ["--apply"]), ...args.filter((arg) => arg !== "--dry-run")], {
     cwd: process.cwd(), encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 40_000,
     env: { PATH: SAFE_PATH, HOME: join(fixture.dir, "home"), XDG_CONFIG_HOME: join(fixture.dir, "config"),
       XDG_CACHE_HOME: join(fixture.dir, "cache"), XDG_DATA_HOME: join(fixture.dir, "data"),
-      TMPDIR: fixture.dir, LANG: "C", TZ: "UTC", LARK_CLI: fixture.cli,
+      TMPDIR: join(fixture.dir, "tmp"), LANG: "C", TZ: "UTC", LARK_CLI: fixture.cli,
       ...(audit ? { NODE_OPTIONS: `--require=${fixture.preload}` } : {}) },
   });
   assert.equal(result.error, undefined, String(result.error));
@@ -205,6 +205,7 @@ test("sender filtering precedes limit and reaches an old target without touching
   insertRow(f, { id: 3, ordinal: 200, actor: OTHER });
   const before = readRows(f);
   const output = summary(run(f, ["--limit", "1"]));
+  assert.equal(existsSync(join(f.dir, "api-state", "api.lock")), true, "real API lease belongs to the synthetic fixture");
   assert.equal(output.scanned, 1);
   assert.equal(output.planned, 1);
   assert.equal(output.updated, 1);

@@ -256,6 +256,10 @@ Preview enrichment of one target; apply commits through its own CAS.
 | `--unsafe-details` | boolean | `false` | — | Include private lookup details; records only. |
 | `--sender-only` | boolean | `false` | — | Bounded lookup of one exact sender; requires --sender-id. |
 | `--sender-id` | string | — | — | Exact sender for --sender-only. |
+| `--record-id` | integer | — | 可重复；≥ 1 | One to 100 distinct stored record IDs; repeat this flag; requires --names-only and excludes --limit. |
+| `--names-only` | boolean | `false` | — | Fill missing sender names only for exact --record-id targets; excludes --sender-only and --probe-apps. |
+| `--max-cli-attempts` | integer | `12` | ≥ 1；≤ 1000 | Hard command-wide lark-cli process-attempt cap, including pages and fallbacks; not an HTTP request count. |
+| `--max-seconds` | integer | `30` | ≥ 1；≤ 180 | Command-wide remote-work deadline; stops without committing a budget-interrupted lookup. |
 
 ### maintenance repair
 
@@ -291,6 +295,9 @@ Preview replay of explicit scopes and a fixed interval.
 | `--scope-id` | string | — | 必填；可重复 | One to three distinct stored scopes; repeat this flag. |
 | `--start` | string | — | 必填 | Explicit replay start with timezone. |
 | `--end` | string | — | 必填 | Explicit replay end with timezone. |
+| `--message-id` | string | — | 可重复 | One to 100 distinct existing messages; repeat this flag; exact mode requires one scope. |
+| `--max-cli-attempts` | integer | `12` | ≥ 1；≤ 1000 | Hard command-wide lark-cli process-attempt cap, including pages and fallbacks; not an HTTP request count. |
+| `--max-seconds` | integer | `30` | ≥ 1；≤ 180 | Command-wide remote-work deadline; stops without committing a budget-interrupted lookup. |
 
 ### maintenance prune-runs
 

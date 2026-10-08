@@ -60,14 +60,14 @@ function isolatedEnvironment(dir, fakeLarkCli, overrides = {}) {
   return {
     PATH: SAFE_PATH, HOME: join(dir, "home"), XDG_CONFIG_HOME: join(dir, "config"),
     XDG_CACHE_HOME: join(dir, "cache"), XDG_DATA_HOME: join(dir, "data"),
-    TMPDIR: dir, LANG: "C", TZ: "UTC",
+    TMPDIR: join(dir, "tmp"), LANG: "C", TZ: "UTC",
     LARK_CLI: fakeLarkCli, ...overrides,
   };
 }
 
 function tempDir(t) {
   const dir = mkdtempSync(join(tmpdir(), "exocortex-enrich-records-test-"));
-  for (const child of ["home", "config", "cache", "data"]) mkdirSync(join(dir, child));
+  for (const child of ["home", "config", "cache", "data", "api-state", "tmp"]) mkdirSync(join(dir, child), { mode: 0o700 });
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   return dir;
 }
@@ -288,7 +288,7 @@ test("scope and record metadata independently name synthetic rooms without expos
 
   const result = spawnSync(
     process.execPath,
-    ["bin/exocortex.mjs", "maintenance", "enrich", "--target", "records", "--format", "json", "--apply", "--db", dbPath, "--limit", "10"],
+    ["tests/helpers/enrichment-cli.mjs", dir, "maintenance", "enrich", "--target", "records", "--format", "json", "--apply", "--db", dbPath, "--limit", "10"],
     {
       cwd: process.cwd(),
       env: isolatedEnvironment(dir, fakeLarkCli),
@@ -299,6 +299,7 @@ test("scope and record metadata independently name synthetic rooms without expos
 
   assert.equal(result.status, 0, result.stderr);
   const summary = JSON.parse(result.stdout);
+  assert.equal(existsSync(join(dir, "api-state", "api.lock")), true, "real API lease belongs to the synthetic fixture");
   assert.equal(summary.ok, true);
   assert.equal(summary.updated, 2);
   for (const value of [LAB.app.id, LAB.app.name, LAB.room.name, LAB.shelf.name]) {
@@ -319,7 +320,7 @@ test("scope and record metadata independently name synthetic rooms without expos
 
   const unsafe = spawnSync(
     process.execPath,
-    ["bin/exocortex.mjs", "maintenance", "enrich", "--target", "records", "--format", "json", "--apply", "--db", dbPath, "--limit", "10", "--unsafe-details"],
+    ["tests/helpers/enrichment-cli.mjs", dir, "maintenance", "enrich", "--target", "records", "--format", "json", "--apply", "--db", dbPath, "--limit", "10", "--unsafe-details"],
     {
       cwd: process.cwd(),
       env: isolatedEnvironment(dir, fakeLarkCli),
@@ -349,7 +350,7 @@ function enrichmentFixture(t, options = {}) {
 }
 
 function runEnrichment(fixture, args = [], env = {}) {
-  return spawnSync(process.execPath, ["bin/exocortex.mjs", "maintenance", "enrich", "--target", "records", "--format", "json", "--db", fixture.dbPath, ...(args.includes("--dry-run") ? [] : ["--apply"]), ...args.filter((arg) => arg !== "--dry-run")], {
+  return spawnSync(process.execPath, ["tests/helpers/enrichment-cli.mjs", fixture.dir || dirname(fixture.dbPath), "maintenance", "enrich", "--target", "records", "--format", "json", "--db", fixture.dbPath, ...(args.includes("--dry-run") ? [] : ["--apply"]), ...args.filter((arg) => arg !== "--dry-run")], {
     cwd: process.cwd(),
     env: isolatedEnvironment(fixture.dir || dirname(fixture.dbPath), fixture.fakeLarkCli, env),
     encoding: "utf8",

@@ -113,21 +113,34 @@ test("a database without the required schema reports execution failure before an
   }
 });
 
-for (const state of ["busy", "unavailable", "acquired"]) {
-  test(`replay holds the shared API lease through admission and releases ${state} results`, () => {
-    for (const fail of [false, true]) {
-      const events = [], stdout = io(), stderr = io();
-      const parsed = parseRouteOptions("maintenance.replay", ["--db", "/synthetic/account-lease.sqlite",
-        "--scope-id", "lark.im.received.chat.synthetic", "--start", "2026-01-01T00:00:00Z", "--end", "2026-01-01T01:00:00Z"]);
-      const context = createCommandContext({ stdout, stderr, deps: {
-        tryAcquireLarkApiLease(options) { events.push("acquire"); assert.equal(options.role, "sync");
-          return { state, release() { events.push("release"); } }; },
-        executeLarkImReplay() { events.push("replay"); if (fail) throw new Error("invented replay failure"); return { ok: true }; },
-      } });
-      const code = runMaintenanceCommand(parsed.options, { ...context, provided: parsed.provided });
-      assert.equal(code, state === "acquired" && !fail ? 0 : 1);
-      assert.deepEqual(events, state === "acquired" ? ["acquire", "replay", "release"] : ["acquire", "release"]);
-      if (state !== "acquired") assert.match(stderr.text(), /replay skipped: Lark API/);
+test("replay delegates request-scoped leases without holding an outer command lease", () => {
+  const events = [], stdout = io(), stderr = io();
+  const parsed = parseRouteOptions("maintenance.replay", ["--db", "/synthetic/account-lease.sqlite",
+    "--scope-id", "lark.im.received.chat.synthetic", "--start", "2026-01-01T00:00:00Z", "--end", "2026-01-01T01:00:00Z"]);
+  const requestSessionDeps = { synthetic: true };
+  const context = createCommandContext({ stdout, stderr, deps: {
+    tryAcquireLarkApiLease() { assert.fail("an outer lease would block the replay session's own lease"); },
+    requestSessionDeps,
+    executeLarkImReplay(options, dependencies) {
+      events.push("replay");
+      assert.equal(options.maxCliAttempts, 12);
+      assert.equal(options.maxSeconds, 30);
+      assert.equal(dependencies.requestSessionDeps, requestSessionDeps);
+      return { ok: true };
+    },
+  } });
+  assert.equal(runMaintenanceCommand(parsed.options, { ...context, provided: parsed.provided }), 0);
+  assert.deepEqual(events, ["replay"]);
+  assert.equal(stderr.text(), "");
+});
+
+for (const route of ["maintenance.enrich", "maintenance.replay"]) {
+  test(`${route} parses hard CLI budgets and rejects invalid limits before execution`, () => {
+    const required = route.endsWith("enrich") ? ["--target", "records"] : ["--db", "synthetic.sqlite", "--scope-id", "synthetic.scope", "--start", "2026-01-01T00:00:00Z", "--end", "2026-01-01T01:00:00Z"];
+    const options = parseRouteOptions(route, [...required, "--max-cli-attempts", "3", "--max-seconds", "9"]).options;
+    assert.equal(options.maxCliAttempts, 3); assert.equal(options.maxSeconds, 9);
+    for (const args of [["--max-cli-attempts", "0"], ["--max-cli-attempts", "1001"], ["--max-seconds", "181"], ["--max-seconds", "1.5"]]) {
+      assert.throws(() => parseRouteOptions(route, [...required, ...args]));
     }
   });
 }

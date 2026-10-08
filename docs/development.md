@@ -34,6 +34,8 @@ CI 通过临时命令目录明确选择 `/usr/bin/python3` 与 `/usr/bin/sqlite3
 
 本机 Documents 目录中的新合成文件可能在创建后才被赋予 Darwin `UF_TRACKED`（文档 ID 跟踪标志），同时改变 `ctime`。姓名侧车夹具在发布给读取命令前，使用测试专用 helper 同步设置这个标志并验证其他身份字段不变；失败即中止，不等待静默期或重试命令。生产读取器仍严格比较 `ctime`。真实权限往返修改、同长度内容改写后恢复 `mtime` 的回归必须拒绝旧的配置快照，不能用放宽元数据比较来消除测试波动。
 
+维护 CLI 的假 API 回归经 `tests/helpers/enrichment-cli.mjs` 运行真实 parser、维护入口、transport 和 flock/cooldown，将 API 协调目录显式注入夹具内，绝不接触当前 UID 的生产共享目录。测试入口要求数据库及假 CLI 属于同一合成根；只把请求间隔转换为同一单调时钟上的虚拟时间，真实子进程耗时仍计入预算。会话反例需检查实际 spawn 次数、释放锁前发布冷却、同步在间隔取得锁、解析到部分结果后预算耗尽仍没有业务提交。跨调用 fixture 不能通过关闭冷却或持久锁机制获得通过。
+
 ## Four development and research entrypoints
 
 | 可执行文件 | 能力 |

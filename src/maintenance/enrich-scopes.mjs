@@ -49,6 +49,7 @@ function enrichScopes(opts, deps = {}) {
     }
   }
 
+  deps.assertReady?.();
   // A newer discovery/reconcile snapshot must survive the remote lookup.
   const { updated, skippedConflicts } = commitEnrichmentUpdates(dbPath, updates, {
     dryRun: opts.dryRun, reason: "lark-im-enrich-scopes", label: "update scopes",

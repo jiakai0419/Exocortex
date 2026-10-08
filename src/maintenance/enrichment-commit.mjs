@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { acquireMaintenanceLock, quoteSql, releaseMaintenanceLock, sqliteQuery }
   from "../../dist/storage/sqlite/ingestion-store.js";
+import { MaintenanceRequestError } from "./request-session.mjs";
 import { publicDiagnosticError } from "../diagnostics/public-safe.mjs";
 
 class EnrichmentContentionError extends Error {}
@@ -8,7 +9,7 @@ class EnrichmentContentionError extends Error {}
 function publicEnrichmentError(error, label) {
   // These local contention messages contain only counts and fixed text. All
   // other storage, JSON and transport failures cross the diagnostic boundary.
-  const safe = error instanceof EnrichmentContentionError
+  const safe = error instanceof EnrichmentContentionError || error instanceof MaintenanceRequestError
     ? error.message : publicDiagnosticError(error, label).message;
   return new Error(safe, { cause: error });
 }

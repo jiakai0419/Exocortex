@@ -19,12 +19,13 @@ export class CliExecutionError extends Error {
 
 /** Write only a locally constructed or already sanitized public message.
  * @param {{stdout:{write:(text:string)=>unknown}, stderr:{write:(text:string)=>unknown}}} streams
- * @param {{format?:string, code:"invalid_arguments"|"execution_failed", message:string, reason?:string, textPrefix?:string}} error
+ * @param {{format?:string, code:"invalid_arguments"|"execution_failed", message:string, reason?:string, textPrefix?:string, requestBudget?:Record<string,number|string|null>}} error
  */
-export function writeCliError(streams, { format, code, message, reason, textPrefix = "" }) {
+export function writeCliError(streams, { format, code, message, reason, textPrefix = "", requestBudget }) {
   if (format === "json") {
     streams.stdout.write(`${JSON.stringify({ schema_version: 1, ok: false, error: { code, message,
-      ...(PUBLIC_ERROR_REASONS.has(reason || "") ? { reason } : {}) } })}\n`);
+      ...(PUBLIC_ERROR_REASONS.has(reason || "") ? { reason } : {}) },
+      ...(requestBudget ? { request_budget: requestBudget } : {}) })}\n`);
   } else streams.stderr.write(`${textPrefix}${message}\n`);
 }
 

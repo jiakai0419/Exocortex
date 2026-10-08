@@ -3,6 +3,7 @@ import test from "node:test";
 import { runCli } from "../bin/exocortex.mjs";
 import { CliExecutionError } from "../src/cli/context.mjs";
 import { ReplayInputError } from "../src/maintenance/replay.mjs";
+import { createMaintenanceRequestSession } from "../src/maintenance/request-session.mjs";
 import { runStep } from "../src/runtime/worker/worker.mjs";
 
 const NOW = Date.parse("2030-01-02T12:00:00Z");
@@ -92,19 +93,6 @@ test("sync busy lease remains execution failure and never reaches the database",
   assert.equal(errorReport(result, "execution_failed").error.message, "sync skipped: Lark API is busy");
   assert.equal(result.stderr, ""); assert.equal(released, 1);
 });
-
-for (const state of ["busy", "unavailable"]) {
-  test(`replay ${state} lease is an execution failure with no replay work`, async () => {
-    let released = 0;
-    const result = await invoke([...replay, "--start", START, "--end", END, "--format", "json"], { deps: {
-      tryAcquireLarkApiLease: () => ({ state, release() { released++; } }),
-      executeLarkImReplay: noEffect,
-    } });
-    const expected = state === "busy" ? "replay skipped: Lark API is busy" : "replay skipped: Lark API lease unavailable";
-    assert.equal(errorReport(result, "execution_failed").error.message, expected);
-    assert.equal(result.stderr, ""); assert.equal(released, 1);
-  });
-}
 
 for (const [action, dependency] of [["init", "initializeDatabase"], ["backup", "executeSqliteMaintenance"],
   ["compact", "executeSqliteMaintenance"], ["prune-runs", "executeSqliteMaintenance"],
@@ -198,3 +186,33 @@ test("worker only reads recognized error envelopes and preserves process failure
   assert.equal(step(envelope, { signal: "SIGKILL" }).stderr, "worker step terminated with a process error or signal");
   assert.equal(step(envelope, { status: 0 }).stderr, "worker step reported an unhealthy summary");
 });
+
+
+for (const action of ["enrich", "replay"]) {
+  test(`${action} budget abort exposes safe actual CLI attempt counts`, async () => {
+    let spawned = 0;
+    const session = createMaintenanceRequestSession({ maxCliAttempts: 1, maxSeconds: 7 }, {
+      monotonicClock: () => 0, now: () => NOW,
+      env: { LARK_CLI: "/invented/private-path?token=INVENTED_TOKEN" },
+      tryAcquireLease: () => ({ state: "acquired", release() {} }),
+      readSharedCooldown: () => ({ state: "ready" }),
+      spawnSync() { spawned++; return { status: 0, stdout: "{}", stderr: "" }; },
+    });
+    const execute = () => {
+      session.runLark(["api", "GET", "/synthetic-first"]);
+      session.runLark(["api", "GET", "/synthetic-second"]);
+      assert.fail("budget stop must reach the command boundary");
+    };
+    const argv = action === "replay" ? [...replay, "--start", START, "--end", END] : ["maintenance", "enrich", "--target", "records"];
+    const result = await invoke([...argv, "--format", "json"], {
+      deps: { [action === "replay" ? "executeLarkImReplay" : "executeEnrichment"]: execute },
+    });
+    assert.equal(result.code, 1); assert.equal(spawned, 1); assert.equal(result.stderr, "");
+    const report = JSON.parse(result.stdout);
+    assert.equal(report.ok, false); assert.equal(report.error.code, "execution_failed");
+    assert.equal(report.error.message, "maintenance requests stopped: cli_budget");
+    assert.deepEqual(report.request_budget, { max_cli_attempts: 1, cli_attempts: 1, max_seconds: 7,
+      min_interval_ms: 1000, elapsed_ms: 0, stop_reason: "cli_budget" });
+    assert.doesNotMatch(result.stdout, /private-path|INVENTED_TOKEN|synthetic-first/);
+  });
+}

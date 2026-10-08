@@ -126,8 +126,12 @@ function normalizedBody(row, canonical, raw) {
   return row.body;
 }
 
-function loadRows(dbPath, limit) {
-  return sqliteJson(
+function loadRows(dbPath, limit, recordIds) {
+  if (recordIds && (!Array.isArray(recordIds) || recordIds.length < 1 || recordIds.length > 100
+    || recordIds.some((id) => !Number.isSafeInteger(id) || id <= 0) || new Set(recordIds).size !== recordIds.length)) {
+    throw new Error("record selection requires one to 100 distinct positive integer IDs");
+  }
+  const rows = sqliteJson(
     dbPath,
     `SELECT
        r.id,
@@ -144,10 +148,13 @@ function loadRows(dbPath, limit) {
      LEFT JOIN sync_scopes s ON s.id = r.first_seen_scope_id
      WHERE r.source_id = 'lark.im'
        AND r.record_type = 'lark.im.message'
+       ${recordIds ? `AND r.id IN (${recordIds.join(',')})` : ''}
      ORDER BY r.occurred_at_ms DESC, r.id DESC
-     LIMIT ${Number(limit)};`,
+     ${recordIds ? '' : `LIMIT ${Number(limit)}`};`,
     "load records",
   );
+  if (recordIds && rows.length !== recordIds.length) throw new Error("requested records are missing or are not Lark messages");
+  return rows;
 }
 
 function loadKnownChatNames(dbPath) {
@@ -252,7 +259,7 @@ function rowOpenId(row) {
     && (!row.canonical.sender_id_type || row.canonical.sender_id_type === 'open_id') ? id : '';
 }
 
-function runSenderOnly(dbPath, opts, runLark) {
+function runSenderOnly(dbPath, opts, runLark, assertReady) {
   // All selection guards precede LIMIT, so recent unrelated rows cannot hide
   // an eligible historical sender. An extra row reports the bounded coverage.
   const candidates = sqliteJson(dbPath, `
@@ -335,6 +342,7 @@ function runSenderOnly(dbPath, opts, runLark) {
       actor: row.actor_id, container: row.container_id, body: row.body, raw: row.raw_json });
   }
   const { updates } = prepareUpdates(dbPath, rows, proposals, true);
+  assertReady?.();
   const { updated, skippedConflicts } = commitUpdates(dbPath, updates, opts.dryRun);
   const unresolved = rows.length - proposals.length;
   return {
@@ -346,23 +354,54 @@ function runSenderOnly(dbPath, opts, runLark) {
   };
 }
 
+/** Exact selection does not authorize repairing identities, authoritative clears,
+ * system senders or known names. App sender evidence may omit id_type, as in
+ * native app messages, but may never contradict an explicit person namespace. */
+function namesOnlyExclusion(row) {
+  const canonical = row.canonical;
+  const raw = row.raw;
+  const identity = senderIdentity(raw);
+  if (canonical.msg_type === 'system' || raw.msg_type === 'system') return 'system_message';
+  if (canonical.sender_name_state === 'cleared') return 'explicitly_cleared';
+  if (personName(canonical.sender_name, [row.actor_id, ...identity.identifiers])) return 'known_name';
+  if (!identity.id || identity.conflict || identity.id !== row.actor_id || canonical.sender_id !== row.actor_id
+    || !row.container_id || canonical.chat_id !== row.container_id || raw.chat_id !== row.container_id
+    || canonical.sender_id_type && identity.type && canonical.sender_id_type !== identity.type) return 'unverified_identity';
+  const app = raw.sender?.sender_type === 'app' || raw.sender?.type === 'app' || identity.type === 'app_id';
+  if (app) {
+    return /^cli_[A-Za-z0-9_-]+$/.test(identity.id)
+      && (!identity.type || identity.type === 'app_id')
+      && (!canonical.sender_id_type || canonical.sender_id_type === 'app_id')
+      && (!canonical.sender_type || canonical.sender_type === 'app') ? null : 'unverified_identity';
+  }
+  return rowOpenId(row) && canonical.sender_type !== 'app' ? null : 'unverified_identity';
+}
+
 /** @param {JsonObject} opts @param {JsonObject} [deps] */
 function enrichRecords(opts, deps = {}) {
   const run = deps.runLark || runLark;
   const dbPath = resolve(opts.db);
   if (!existsSync(dbPath)) throw new Error(`database not found: ${dbPath}`);
-  if (opts.senderOnly) return runSenderOnly(dbPath, opts, run);
+  if (opts.senderOnly) return runSenderOnly(dbPath, opts, run, deps.assertReady);
+  if (opts.namesOnly && !opts.recordIds?.length) throw new Error("names-only enrichment requires exact records");
+  if (opts.recordIds?.length && !opts.namesOnly) throw new Error("exact records require names-only enrichment");
 
   /** @type {JsonObject[]} */
-  const rows = loadRows(dbPath, opts.limit).map((row) => ({
+  const selected = loadRows(dbPath, opts.limit, opts.namesOnly ? opts.recordIds : undefined).map((row) => ({
     ...row,
     canonical: parseMaybeJson(row.canonical_json) || {},
     raw: nativeRow(parseMaybeJson(row.raw_json) || {}),
     config: parseMaybeJson(row.scope_config_json) || {},
   }));
-  const knownChatNames = loadKnownChatNames(dbPath);
+  const exclusions = { system_message: 0, explicitly_cleared: 0, known_name: 0, unverified_identity: 0 };
+  const rows = opts.namesOnly ? selected.filter((row) => {
+    const reason = namesOnlyExclusion(row);
+    if (reason) exclusions[reason]++;
+    return !reason;
+  }) : selected;
+  const knownChatNames = opts.namesOnly ? new Map() : loadKnownChatNames(dbPath);
 
-  const self = getSelfProfile(run);
+  const self = opts.namesOnly ? { open_id: '', name: '' } : getSelfProfile(run);
   const seed = new Map();
   if (self.open_id && self.name) seed.set(self.open_id, self.name);
 
@@ -395,7 +434,7 @@ function enrichRecords(opts, deps = {}) {
     const partner = chatPartner(row.raw, row.canonical);
     const partnerId = partner?.open_id || partner?.id || partner?.user_id || "";
     const partnerName = partner?.name || partner?.display_name || "";
-    if (partnerId && !partnerName) contactIds.push(partnerId);
+    if (!opts.namesOnly && partnerId && !partnerName) contactIds.push(partnerId);
 
     const ctype = chatType(row.raw, row.canonical, row.config);
     if (cid && ctype !== "p2p" && openId && !sname && !isAppSender) {
@@ -431,6 +470,8 @@ function enrichRecords(opts, deps = {}) {
   // Request construction, response validation and seed priority have one
   // implementation shared with ingestion and the bounded sender-only mode.
   const resolver = createNameResolver({ onLookup(event) {
+    if (opts.namesOnly && event.kind === 'application' && event.status === 'resolved'
+      && !personName(event.name, [event.app_id])) event = { ...event, status: 'missing_name' };
     recordLookupDiagnostic(diagnostics, event);
     if (event.status !== "failed") return;
     if (event.kind === "application") failedAppIds.add(event.app_id);
@@ -459,7 +500,20 @@ function enrichRecords(opts, deps = {}) {
   }
   diagnostics.app_ids_requested = uniqueAppIds(appIds).length;
   const appNames = resolver.resolveApplicationNames(appIds, { ...lookupOpts, forceRefresh: opts.probeApps });
+  if (opts.namesOnly) {
+    for (const [id, name] of appNames) {
+      const display = personName(name, [id]);
+      if (display) appNames.set(id, display); else appNames.delete(id);
+    }
+  }
   const appFallbackNames = resolver.resolveChatBotAppFallbackNames(appIdsByChat, appNames, lookupOpts);
+  if (opts.namesOnly) {
+    // Exact records are only a subset of a chat. Apparent uniqueness among
+    // selected app IDs cannot prove that an unbound bot belongs to that app.
+    for (const [key, value] of appFallbackNames) {
+      if (value.source !== 'chat_bot_app_id') appFallbackNames.delete(key);
+    }
+  }
   diagnostics.app_fallback_names = appFallbackNames.size;
   const appProbeResultsById = new Map(diagnostics.app_lookup_results.map((result) => [result.app_id, result]));
 
@@ -480,7 +534,7 @@ function enrichRecords(opts, deps = {}) {
     const appFallback = appFallbackNames.get(`${cid}:${sid}`);
     const appFallbackName = appFallback?.name || "";
     const preferredAppName = appName || (opts.probeApps ? appFallbackName : "");
-    const sname =
+    let sname =
       preferredAppName ||
       existingSenderName ||
       appName ||
@@ -488,6 +542,12 @@ function enrichRecords(opts, deps = {}) {
       memberName ||
       contactName ||
       null;
+    if (opts.namesOnly) {
+      sname = personName(sname, senderIdentity(row.raw).identifiers) || null;
+      // Failed/empty/echoed names never create a new unknown status, clear or
+      // provenance change. The unresolved count below keeps the gap visible.
+      if (!sname) continue;
+    }
     const partner = chatPartner(row.raw, row.canonical);
     const partnerId = partner?.open_id || partner?.id || partner?.user_id || null;
     const partnerName = partner?.name || partner?.display_name || contactNames.get(partnerId) || null;
@@ -523,28 +583,33 @@ function enrichRecords(opts, deps = {}) {
     } else if (!existingSenderName && contactName) {
       next.sender_name_source = "contact";
       next.sender_name_confidence = "high";
+    } else if (opts.namesOnly && existingSenderName) {
+      next.sender_name_source = "message_sender";
+      next.sender_name_confidence = "high";
     }
-    if (!next.sender_type && String(sid || "").startsWith("cli_")) next.sender_type = "app";
-    next.chat_id = next.chat_id || cid || null;
-    next.chat_type = next.chat_type || ctype || null;
-    next.chat_name = next.chat_name || cname || null;
-    if (!row.canonical.chat_name) {
-      // All chat-name inputs here come from persisted snapshots. Mark them so
-      // the shared merge can distinguish enrichment from a fresh source name.
-      delete next.chat_name_state;
-      if (cname) next.chat_name_source = "local_history";
+    if (!opts.namesOnly) {
+      if (!next.sender_type && String(sid || "").startsWith("cli_")) next.sender_type = "app";
+      next.chat_id = next.chat_id || cid || null;
+      next.chat_type = next.chat_type || ctype || null;
+      next.chat_name = next.chat_name || cname || null;
+      if (!row.canonical.chat_name) {
+        // All chat-name inputs here come from persisted snapshots. Mark them so
+        // the shared merge can distinguish enrichment from a fresh source name.
+        delete next.chat_name_state;
+        if (cname) next.chat_name_source = "local_history";
+      }
+      if (partnerId || next.chat_partner) {
+        next.chat_partner = {
+          ...(next.chat_partner && typeof next.chat_partner === "object" ? next.chat_partner : {}),
+          open_id: partnerId,
+          name: partnerName,
+        };
+        delete next.chat_partner.name_state;
+      }
+      if (typeof row.raw.deleted === "boolean" && typeof next.deleted !== "boolean") next.deleted = row.raw.deleted;
     }
-    if (partnerId || next.chat_partner) {
-      next.chat_partner = {
-        ...(next.chat_partner && typeof next.chat_partner === "object" ? next.chat_partner : {}),
-        open_id: partnerId,
-        name: partnerName,
-      };
-      delete next.chat_partner.name_state;
-    }
-    if (typeof row.raw.deleted === "boolean" && typeof next.deleted !== "boolean") next.deleted = row.raw.deleted;
 
-    const body = normalizedBody(row, next, row.raw);
+    const body = opts.namesOnly ? row.body : normalizedBody(row, next, row.raw);
     const proposedJson = JSON.stringify(next);
     if (proposedJson !== row.canonical_json || body !== row.body) {
       proposals.push({ id: row.id, old: row.canonical_json, next: proposedJson,
@@ -552,8 +617,15 @@ function enrichRecords(opts, deps = {}) {
     }
   }
 
-  const { updates, projections } = prepareUpdates(dbPath, rows, proposals);
+  const { updates, projections } = prepareUpdates(dbPath, rows, proposals, opts.namesOnly);
+  const unresolved = opts.namesOnly ? rows.filter((row) => !personName(projections.get(row.id)?.sender_name,
+    [row.actor_id, ...senderIdentity(row.raw).identifiers])).length : 0;
   const unresolvedNameTargets = new Set();
+  if (opts.namesOnly) for (const row of rows) {
+    if (!personName(projections.get(row.id)?.sender_name, [row.actor_id, ...senderIdentity(row.raw).identifiers])) {
+      unresolvedNameTargets.add(JSON.stringify(['sender', row.container_id, row.actor_id]));
+    }
+  }
   for (const target of failedTargets) {
     const canonical = projections.get(target.row.id) || {};
     const unresolved = target.kind === "sender"
@@ -561,6 +633,7 @@ function enrichRecords(opts, deps = {}) {
       : canonical.chat_partner?.name_state !== "cleared" && !canonical.chat_partner?.name && !canonical.chat_partner?.display_name;
     if (unresolved) unresolvedNameTargets.add(target.key);
   }
+  deps.assertReady?.();
   const { updated, skippedConflicts } = commitUpdates(dbPath, updates, opts.dryRun);
   const appFallbacksById = new Map();
   for (const [key, fallback] of appFallbackNames.entries()) {
@@ -590,13 +663,15 @@ function enrichRecords(opts, deps = {}) {
   const output = {
     ok: true,
     dry_run: opts.dryRun,
-    scanned: rows.length,
+    scanned: selected.length,
     planned: updates.length,
     updated,
     skipped_conflicts: skippedConflicts,
     unresolved_name_targets: unresolvedNameTargets.size,
-    partial: unresolvedNameTargets.size > 0,
-    unchanged: rows.length - updates.length,
+    partial: unresolvedNameTargets.size > 0 || Boolean(opts.namesOnly && (unresolved > 0 || exclusions.unverified_identity > 0 || skippedConflicts > 0)),
+    unchanged: selected.length - updates.length,
+    ...(opts.namesOnly ? { mode: 'names-only', requested_records: selected.length, eligible_records: rows.length,
+      resolved: rows.length - unresolved, unresolved, exclusions } : {}),
     contact_names: contactNames.size,
     group_member_names: memberNames.size,
     app_names: appNames.size,

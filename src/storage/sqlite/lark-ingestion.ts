@@ -39,6 +39,17 @@ function commitBoundedReplayRecords(dbPath: string, options: BoundedReplayOption
       throw new Error("bounded replay candidate is outside the selected scope or window");
     }
   }
+  const exactTargets = options.exactTargets;
+  if (exactTargets !== undefined && (!Array.isArray(exactTargets) || !exactTargets.length || exactTargets.length > 100 ||
+      exactTargets.length !== records.length || new Set(exactTargets.map((target) => target.external_id)).size !== exactTargets.length ||
+      exactTargets.some((target) => !Number.isSafeInteger(target.id) || target.id < 1 ||
+        typeof target.external_id !== "string" || !target.external_id || target.container_id !== config.chat_id ||
+        !Number.isSafeInteger(target.occurred_at_ms) || target.occurred_at_ms < startMs || target.occurred_at_ms > endMs ||
+        typeof target.external_version !== "string" || !/^\d+$/.test(target.external_version) ||
+        !records.some((record) => record.external_id === target.external_id && record.container_id === target.container_id &&
+          record.occurred_at_ms === target.occurred_at_ms && record.expected_external_version === target.external_version)))) {
+    throw new Error("invalid exact replay target fence");
+  }
   // Never create or migrate a missing database as a side effect of a repair.
   const preflight = spawnSync("sqlite3", ["-readonly", resolve(dbPath)], {
     input: ".bail on\nPRAGMA query_only=ON;\nSELECT id FROM bounded_replay_runs LIMIT 0;\n",
@@ -73,6 +84,12 @@ function commitBoundedReplayRecords(dbPath: string, options: BoundedReplayOption
           AND s.enabled=1 AND src.enabled=1 AND s.config_json IS ${quoteSql(scope.config_json)}
           AND json_extract(src.config_json,'$.initial_sync_start_ms') IS ${initialSyncStartMs}
       ) THEN 1 ELSE 0 END;
+      ${(exactTargets || []).map((target) => `INSERT INTO __replay_guard SELECT CASE WHEN EXISTS (
+        SELECT 1 FROM records WHERE id=${target.id} AND source_id=${quoteSql(scope.source_id)}
+          AND external_id=${quoteSql(target.external_id)} AND record_type='lark.im.message'
+          AND container_id IS ${quoteSql(target.container_id)} AND occurred_at_ms IS ${target.occurred_at_ms}
+          AND external_version IS ${quoteSql(target.external_version)}
+      ) THEN 1 ELSE 0 END;`).join("\n")}
       CREATE TEMP TABLE __replay_before (existed INTEGER NOT NULL, same_fact INTEGER NOT NULL);
       CREATE TEMP TABLE __replay_effects (changed INTEGER NOT NULL, existed INTEGER NOT NULL, same_fact INTEGER NOT NULL);
       ${statements}

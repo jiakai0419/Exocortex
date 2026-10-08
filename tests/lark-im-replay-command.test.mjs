@@ -8,6 +8,7 @@ import { executeLarkImReplay, validateReplayOptions, parseReplayTime } from "../
 import { runMaintenanceCommand } from "../src/cli/maintenance-command.mjs";
 import { parseRouteOptions } from "../src/cli/registry.mjs";
 import { createCommandContext } from "../src/cli/context.mjs";
+import { createMaintenanceRequestSession } from "../src/maintenance/request-session.mjs";
 function parseArgs(argv) { return validateReplayOptions(parseRouteOptions("maintenance.replay",argv).options); }
 function runReplay(argv, io) {
   const parsed=parseRouteOptions("maintenance.replay",argv);
@@ -45,8 +46,11 @@ function fixture(t, chats = [CHAT]) {
   return { db, dir };
 }
 
-function options(db, {apply = true, chats = [CHAT], start = START, end = END} = {}) {
+function options(db, {apply = true, chats = [CHAT], start = START, end = END, messageIds = [], maxCliAttempts, maxSeconds} = {}) {
   return parseArgs(["--db",db,...chats.flatMap((chat) => ["--scope-id",chatScopeId(chat)]),"--start",start,"--end",end,
+    ...messageIds.flatMap((id) => ["--message-id",id]),
+    ...(maxCliAttempts === undefined ? [] : ["--max-cli-attempts",String(maxCliAttempts)]),
+    ...(maxSeconds === undefined ? [] : ["--max-seconds",String(maxSeconds)]),
     ...(apply ? ["--apply"] : [])]);
 }
 
@@ -236,16 +240,16 @@ test("exact inclusive millisecond limits trim conservative remote overlap", (t) 
   assert.deepEqual(ro(db,"SELECT external_id FROM records ORDER BY external_id;").map((row)=>row.external_id),["om_edge_1","om_edge_2"]);
 });
 
-test("a failed later scope leaves only complete audited scopes and a repeat resumes safely", (t) => {
+test("a failed later remote scope leaves every staged scope unwritten", (t) => {
   const chats=[CHAT,"oc_synthetic_second"];
   const {db}=fixture(t,chats);
   const before=protectedState(db);
   const fetch=(chat)=>({messages:[message(`om_${chat}`,{chat_id:chat})],pages:1});
   const first=run(db,[],{fetchChatMessages:(chat)=>{if(chat!==CHAT)throw new Error("interrupted");return fetch(chat);}},{chats});
-  assert.equal(first.ok,false); assert.equal(first.scopes[0].inserted,1); assert.equal(first.scopes[1].ok,false);
-  assert.equal(ro(db,"SELECT count(*) AS n FROM bounded_replay_runs;")[0].n,1);
+  assert.equal(first.ok,false); assert.equal(first.scopes[0].index,2); assert.equal(first.scopes[0].ok,false);
+  assertNoRepair(db);
   const second=run(db,[],{fetchChatMessages:fetch},{chats});
-  assert.equal(second.ok,true); assert.equal(second.scopes[0].duplicate,1); assert.equal(second.scopes[1].inserted,1);
+  assert.equal(second.ok,true); assert.equal(second.scopes[0].inserted,1); assert.equal(second.scopes[1].inserted,1);
   assert.deepEqual(protectedState(db),before);
 });
 
@@ -333,4 +337,218 @@ test("CLI summaries expose conflicts and failures using nonzero status without p
   assert.equal(code,2); assert.equal(stderr,""); assert.equal(JSON.parse(stdout).ok,false);
   assert.doesNotMatch(stdout,/secret-synthetic-body/);
   assertNoRepair(db);
+});
+
+test("exact replay validates unique IDs, one scope and local identity before requests", async (t) => {
+  for (const messageIds of [[""],[" om_spaced"],["om_dup","om_dup"]]) {
+    assert.throws(() => options("/synthetic",{messageIds}));
+  }
+  assert.throws(() => options("/synthetic",{messageIds:Array.from({length:101},(_,i)=>`om_${i}`)}),/at most 100/);
+  assert.throws(() => options("/synthetic",{messageIds:["om_target"],chats:[CHAT,"oc_another"]}),/one scope/);
+  const cases = {
+    absent: "DELETE FROM records;",
+    wrong_chat: "UPDATE records SET container_id='oc_not_selected';",
+    wrong_type: "UPDATE records SET record_type='synthetic.other';",
+    wrong_source: "INSERT INTO sources(id,kind,display_name) VALUES('synthetic.other','synthetic','Synthetic'); UPDATE records SET source_id='synthetic.other';",
+    before_window: `UPDATE records SET occurred_at_ms=${START_MS-1};`,
+    after_window: `UPDATE records SET occurred_at_ms=${END_MS+1};`,
+    unknown_version: "UPDATE records SET external_version=NULL;",
+    opaque_version: "UPDATE records SET external_version='opaque';",
+  };
+  for (const [name,mutation] of Object.entries(cases)) await t.test(name,(t)=>{
+    const {db}=fixture(t);
+    seedRecords(db,records([message("om_target")]));
+    sql(db,mutation);
+    const before=ro(db,"SELECT * FROM records;");
+    assert.throws(()=>run(db,[],{getSelfProfile:()=>assert.fail("no API before target validation")},{messageIds:["om_target"]}),/exact replay requires/);
+    assert.deepEqual(ro(db,"SELECT * FROM records;"),before);
+    assert.equal(ro(db,"SELECT count(*) AS n FROM bounded_replay_runs;")[0].n,0);
+  });
+});
+
+test("exact replay updates only selected existing messages and binds sorted IDs into the plan", (t) => {
+  const {db}=fixture(t);
+  const ids=["om_selected_a","om_selected_b","om_unselected"];
+  seedRecords(db,records(ids.map((id)=>message(id))));
+  const before=ro(db,"SELECT * FROM records ORDER BY id;");
+  const incoming=ids.concat("om_new_unselected").map((id)=>message(id,{update_time:String(START_MS+9000)}));
+  const first=run(db,incoming,{}, {messageIds:ids.slice(0,2),apply:false});
+  const reverse=run(db,incoming,{}, {messageIds:ids.slice(0,2).reverse(),apply:false});
+  const subset=run(db,incoming,{}, {messageIds:[ids[0]],apply:false});
+  assert.equal(first.plan_id,reverse.plan_id); assert.notEqual(first.plan_id,subset.plan_id);
+  assert.equal(first.scopes[0].candidates,2); assert.equal(first.scopes[0].fetched,4);
+  assert.deepEqual(ro(db,"SELECT * FROM records ORDER BY id;"),before);
+  const applied=run(db,incoming,{}, {messageIds:ids.slice(0,2)});
+  assert.equal(applied.ok,true); assert.equal(applied.scopes[0].inserted,0); assert.equal(applied.scopes[0].updated,2);
+  const after=ro(db,"SELECT * FROM records ORDER BY id;");
+  assert.equal(after.length,3); assert.deepEqual(after[2],before[2]);
+  assert.equal(ro(db,"SELECT candidate_count,fetched_count FROM bounded_replay_runs;")[0].candidate_count,2);
+});
+
+test("exact replay never hides missing, repeated, changed or malformed remote facts behind selection", async (t) => {
+  const target=message("om_target");
+  const cases={
+    missing:[message("om_not_target")],
+    identical_duplicate:[target,target],
+    newer_duplicate:[target,message("om_target",{update_time:String(START_MS+8000)})],
+    duplicate_outside_overlap:[target,message("om_target",{create_time:String(END_MS+1)})],
+    moved_creation:[message("om_target",{create_time:String(START_MS+2000)})],
+    moved_outside:[message("om_target",{create_time:String(END_MS+1)})],
+    malformed_unselected:[target,{}],
+    cross_chat_unselected:[target,message("om_other_chat",{chat_id:"oc_other"})],
+  };
+  for (const [name,messages] of Object.entries(cases)) await t.test(name,(t)=>{
+    const {db}=fixture(t); seedRecords(db,records([target]));
+    const before=ro(db,"SELECT * FROM records;");
+    const result=run(db,messages,{}, {messageIds:["om_target"]});
+    assert.equal(result.ok,false); assert.deepEqual(ro(db,"SELECT * FROM records;"),before);
+    assert.equal(ro(db,"SELECT count(*) AS n FROM bounded_replay_runs;")[0].n,0);
+  });
+});
+
+test("exact replay transaction fence rejects deletion, version and same-version identity changes", async (t) => {
+  for (const kind of ["deleted","updated","same_version_chat","same_version_time"]) await t.test(kind,(t)=>{
+    const {db,dir}=fixture(t); seedRecords(db,records([message("om_target")]));
+    const changed=records([message("om_target")])[0];
+    if(kind==="same_version_chat") changed.container_id="oc_concurrent_move";
+    if(kind==="same_version_time") changed.occurred_at_ms=END_MS+1000;
+    const mutation=kind==="deleted" ? "DELETE FROM records WHERE external_id='om_target';" : kind==="updated"
+      ? `UPDATE records SET external_version='${START_MS+7000}' WHERE external_id='om_target';`
+      : upsertRecordsSql([changed]);
+    installCommitInterleaving(dir,db,mutation);
+    const priorPath=process.env.PATH;
+    let result;
+    try {
+      process.env.PATH=`${dir}:${priorPath}`;
+      result=run(db,[message("om_target",{update_time:String(START_MS+9000)})],{}, {messageIds:["om_target"]});
+    } finally {process.env.PATH=priorPath;}
+    assert.equal(result.ok,false);
+    const rows=ro(db,"SELECT external_version,container_id,occurred_at_ms FROM records;");
+    if(kind==="deleted") assert.equal(rows.length,0);
+    else if(kind==="updated") assert.equal(rows[0].external_version,String(START_MS+7000));
+    else {
+      assert.equal(rows[0].external_version,String(START_MS+1000));
+      assert.equal(rows[0].container_id,changed.container_id);
+      assert.equal(rows[0].occurred_at_ms,changed.occurred_at_ms);
+    }
+    assert.equal(ro(db,"SELECT count(*) AS n FROM bounded_replay_runs;")[0].n,0);
+    assert.equal(ro(db,"SELECT count(*) AS n FROM maintenance_locks;")[0].n,0);
+  });
+});
+
+test("a local later-scope commit failure retains only earlier atomic audited commits", (t) => {
+  const chats=[CHAT,"oc_local_failure"];
+  const {db}=fixture(t,chats);
+  sql(db,`CREATE TRIGGER reject_second_audit BEFORE INSERT ON bounded_replay_runs
+    WHEN NEW.scope_id=${quoteSql(chatScopeId(chats[1]))} BEGIN SELECT RAISE(ABORT,'synthetic second audit failure'); END;`);
+  const result=run(db,[],{fetchChatMessages:(chat)=>({messages:[message(`om_${chat}`,{chat_id:chat})],pages:1})},{chats});
+  assert.equal(result.ok,false); assert.equal(result.scopes[0].inserted,1); assert.equal(result.scopes[1].ok,false);
+  assert.deepEqual(ro(db,"SELECT scope_id FROM bounded_replay_runs;").map((row)=>row.scope_id),[SCOPE]);
+  assert.deepEqual(ro(db,"SELECT container_id FROM records;").map((row)=>row.container_id),[CHAT]);
+});
+
+function replayTransportFixture(respond) {
+  let elapsed=0, attempts=0, releases=0;
+  const deps={ now:()=>END_MS+1000+elapsed, monotonicClock:()=>elapsed,
+    sleep(ms){elapsed+=ms;}, readSharedCooldown:()=>({state:"ready"}), writeSharedCooldown:()=>true,
+    tryAcquireLease:()=>({state:"acquired",release(){releases++;}}),
+    spawnSync(command,args){
+      attempts++;
+      const result=respond(args,attempts);
+      return {status:0,stdout:JSON.stringify(result),stderr:"",pid:100+attempts,signal:null,output:[]};
+    },
+  };
+  return { createRequestSession:(options)=>createMaintenanceRequestSession(options,deps),
+    attempts:()=>attempts,releases:()=>releases,advance:(ms)=>{elapsed+=ms;} };
+}
+const nativeList=(items,hasMore=false)=>({code:0,data:{items,has_more:hasMore,page_token:hasMore?"synthetic_next_page":""}});
+
+test("exact replay shares self/list actual-attempt budget and permits exactly the cap", (t) => {
+  const {db}=fixture(t); seedRecords(db,records([message("om_target")]));
+  const remote=message("om_target",{update_time:String(START_MS+9000)}).raw_api;
+  const transport=replayTransportFixture((args)=>args[0]==="contact"?SELF:nativeList([remote,message("om_unselected").raw_api]));
+  const result=executeLarkImReplay(options(db,{messageIds:["om_target"],maxCliAttempts:2}),
+    {createRequestSession:transport.createRequestSession,now:()=>END_MS+1000});
+  assert.equal(result.ok,true); assert.equal(result.scopes[0].updated,1);
+  assert.equal(result.request_budget.cli_attempts,2); assert.equal(result.request_budget.stop_reason,null);
+  assert.equal(transport.attempts(),2); assert.equal(transport.releases(),2);
+  assert.equal(ro(db,"SELECT count(*) AS n FROM records;")[0].n,1);
+});
+
+test("self, pagination and merge details cannot bypass the exact replay attempt cap", async (t) => {
+  for (const kind of ["self_only","pagination","merge_detail"]) await t.test(kind,(t)=>{
+    const {db}=fixture(t); seedRecords(db,records([message("om_target")]));
+    const before=ro(db,"SELECT * FROM records;");
+    const remote=message("om_target",{update_time:String(START_MS+9000)}).raw_api;
+    const merge={...message("om_extra_merge").raw_api,msg_type:"merge_forward",body:{content:"{}"}};
+    const transport=replayTransportFixture((args)=>args[0]==="contact"?SELF:
+      nativeList(kind==="merge_detail"?[remote,merge]:[remote],kind==="pagination"));
+    const limit=kind==="self_only"?1:2;
+    const result=executeLarkImReplay(options(db,{messageIds:["om_target"],maxCliAttempts:limit}),
+      {createRequestSession:transport.createRequestSession,now:()=>END_MS+1000});
+    assert.equal(result.ok,false); assert.equal(result.request_budget.stop_reason,"cli_budget");
+    assert.equal(transport.attempts(),limit); assert.equal(result.request_budget.cli_attempts,limit);
+    assert.deepEqual(ro(db,"SELECT * FROM records;"),before);
+    assert.equal(ro(db,"SELECT count(*) AS n FROM bounded_replay_runs;")[0].n,0);
+  });
+});
+
+test("a shared request budget exhausted in a later scope cannot commit an earlier staged scope", (t) => {
+  const chats=[CHAT,"oc_budget_second"];
+  const {db}=fixture(t,chats);
+  const transport=replayTransportFixture((args)=>args[0]==="contact"?SELF:nativeList([message("om_first_scope").raw_api]));
+  const result=executeLarkImReplay(options(db,{chats,maxCliAttempts:2}),
+    {createRequestSession:transport.createRequestSession,now:()=>END_MS+1000});
+  assert.equal(result.ok,false); assert.equal(result.request_budget.stop_reason,"cli_budget");
+  assert.equal(transport.attempts(),2); assertNoRepair(db);
+});
+
+test("local commit work after remote completion retains receipts beyond the remote deadline", (t) => {
+  const chats=[CHAT,"oc_commit_second"];
+  const {db}=fixture(t,chats);
+  const transport=replayTransportFixture((args)=>{
+    if(args[0]==="contact") return SELF;
+    const cid=JSON.parse(args[args.indexOf("--params")+1]).container_id;
+    return nativeList([message(`om_${cid}`,{chat_id:cid}).raw_api]);
+  });
+  let commits=0;
+  const result=executeLarkImReplay(options(db,{chats,maxCliAttempts:3,maxSeconds:5}),{
+    createRequestSession:transport.createRequestSession,now:()=>END_MS+1000,
+    commitBoundedReplayRecords(){commits++; transport.advance(6000); return {audit_id:`synthetic_${commits}`,inserted:1,updated:0,duplicate:0,conflicts:0};},
+  });
+  assert.equal(result.ok,true); assert.equal(commits,2); assert.equal(result.scopes.length,2);
+  assert.equal(result.request_budget.stop_reason,null); assert.equal(result.request_budget.cli_attempts,3);
+});
+
+test("actual adapter pagination rejects a repeated exact target even with enough attempt budget", (t) => {
+  const {db}=fixture(t); seedRecords(db,records([message("om_target")]));
+  const before=ro(db,"SELECT * FROM records;");
+  const incoming=message("om_target",{update_time:String(START_MS+9000)}).raw_api;
+  const transport=replayTransportFixture((args,attempt)=>args[0]==="contact"?SELF:nativeList([incoming],attempt===2));
+  const result=executeLarkImReplay(options(db,{messageIds:["om_target"],maxCliAttempts:3}),
+    {createRequestSession:transport.createRequestSession,now:()=>END_MS+1000});
+  assert.equal(result.ok,false); assert.equal(transport.attempts(),3);
+  assert.equal(result.request_budget.stop_reason,null);
+  assert.match(result.scopes[0].error,/repeated/);
+  assert.deepEqual(ro(db,"SELECT * FROM records;"),before);
+  assert.equal(ro(db,"SELECT count(*) AS n FROM bounded_replay_runs;")[0].n,0);
+});
+
+test("a changed second exact target blocks every selected record in the same transaction", (t) => {
+  const {db,dir}=fixture(t);
+  const ids=["om_target_first","om_target_second"];
+  seedRecords(db,records(ids.map((id)=>message(id))));
+  const firstBefore=ro(db,"SELECT * FROM records WHERE external_id='om_target_first';")[0];
+  const moved=records([message(ids[1])])[0]; moved.container_id="oc_concurrent_move";
+  installCommitInterleaving(dir,db,upsertRecordsSql([moved]));
+  const priorPath=process.env.PATH;
+  let result;
+  try {
+    process.env.PATH=`${dir}:${priorPath}`;
+    result=run(db,ids.map((id)=>message(id,{update_time:String(START_MS+9000)})),{}, {messageIds:ids});
+  } finally {process.env.PATH=priorPath;}
+  assert.equal(result.ok,false);
+  assert.deepEqual(ro(db,"SELECT * FROM records WHERE external_id='om_target_first';")[0],firstBefore);
+  assert.equal(ro(db,"SELECT container_id FROM records WHERE external_id='om_target_second';")[0].container_id,moved.container_id);
+  assert.equal(ro(db,"SELECT count(*) AS n FROM bounded_replay_runs;")[0].n,0);
 });

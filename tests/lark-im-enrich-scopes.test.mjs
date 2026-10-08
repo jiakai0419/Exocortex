@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -62,6 +62,8 @@ process.stdout.write(JSON.stringify(${JSON.stringify(response)} ?? (${JSON.strin
 
 function fixture(t, options = {}) {
   const dir = mkdtempSync(join(tmpdir(), "exocortex-enrich-scopes-test-"));
+  mkdirSync(join(dir, "api-state"), { mode: 0o700 });
+  mkdirSync(join(dir, "tmp"), { mode: 0o700 });
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const dbPath = join(dir, "shape.sqlite");
   sqlite(dbPath, `
@@ -93,9 +95,9 @@ function addScope(dbPath, suffix, overrides = {}) {
 }
 
 function run(fixture, args = [], env = {}) {
-  return spawnSync(process.execPath, ["bin/exocortex.mjs", "maintenance", "enrich", "--target", "scopes", "--format", "json", "--db", fixture.dbPath, ...(args.includes("--dry-run") ? [] : ["--apply"]), ...args.filter((arg) => arg !== "--dry-run")], {
+  return spawnSync(process.execPath, ["tests/helpers/enrichment-cli.mjs", fixture.dir, "maintenance", "enrich", "--target", "scopes", "--format", "json", "--db", fixture.dbPath, ...(args.includes("--dry-run") ? [] : ["--apply"]), ...args.filter((arg) => arg !== "--dry-run")], {
     cwd: process.cwd(),
-    env: { ...process.env, LARK_CLI: fixture.fakeLarkCli, ...env },
+    env: { ...process.env, TMPDIR: join(fixture.dir, "tmp"), LARK_CLI: fixture.fakeLarkCli, ...env },
     encoding: "utf8",
   });
 }
@@ -114,6 +116,7 @@ test("scope enrichment queries without a maintenance lock, preserves cursor, and
   const result = run(f);
   assert.equal(result.status, 0, result.stderr);
   const summary = JSON.parse(result.stdout);
+  assert.equal(existsSync(join(f.dir, "api-state", "api.lock")), true, "real API lease belongs to the synthetic fixture");
   assert.equal(summary.planned, 1);
   assert.equal(summary.updated, 1);
   assert.equal(summary.failed, 0);

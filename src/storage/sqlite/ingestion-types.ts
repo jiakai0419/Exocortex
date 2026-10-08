@@ -49,6 +49,14 @@ export type BoundedReplayOptions = {
   pages: number;
   fetchedCount: number;
   records: StoredRecord[];
+  /** Optional existing-record identity fence for explicitly selected repairs. */
+  exactTargets?: Array<{
+    id: number;
+    external_id: string;
+    container_id: string;
+    occurred_at_ms: number;
+    external_version: string;
+  }>;
 };
 
 export type MaintenanceLockOptions = {

@@ -1,11 +1,11 @@
 // @ts-check
-import { acquireSyncLarkApiLease } from "../runtime/lark-api-lease.mjs";
 import { CliExecutionError, CliUsageError, writeCliError } from "./context.mjs";
 import { initializeDatabase } from "../../dist/storage/sqlite/initialize.js";
 import { executeSqliteMaintenance, publicPath, publicMaintenanceError } from "../storage/sqlite/maintenance.mjs";
 import { executeEnrichment, EnrichmentInputError } from "../maintenance/enrich.mjs";
 import { executeSyncRepair } from "../maintenance/repair.mjs";
 import { executeLarkImReplay, validateReplayOptions, safeReplayError, ReplayInputError } from "../maintenance/replay.mjs";
+import { MaintenanceRequestError } from "../maintenance/request-session.mjs";
 import { publicEnrichmentError } from "../maintenance/enrichment-commit.mjs";
 import { renderSqliteMaintenanceText } from "../terminal/sqlite-maintenance-view.mjs";
 
@@ -13,7 +13,6 @@ import { renderSqliteMaintenanceText } from "../terminal/sqlite-maintenance-view
 function runMaintenanceCommand(options, context) {
   const action = options.action || context.route.split(".").at(-1);
   const deps = context.deps || {};
-  let apiLease;
   try {
     let report;
     if (action === "init") {
@@ -35,11 +34,7 @@ function runMaintenanceCommand(options, context) {
         if (error instanceof ReplayInputError) throw new CliUsageError(error.message);
         throw error;
       }
-      const acquire = deps.tryAcquireLarkApiLease || (!context.deps ? acquireSyncLarkApiLease : undefined);
-      apiLease = acquire?.({ db: parsed.db, role: "sync" });
-      if (apiLease && apiLease.state !== "acquired") throw new CliExecutionError(
-        apiLease.state === "busy" ? "replay skipped: Lark API is busy" : "replay skipped: Lark API lease unavailable");
-      report = (deps.executeLarkImReplay || executeLarkImReplay)(parsed, { ...deps, now: context.now });
+      report = (deps.executeLarkImReplay || executeLarkImReplay)(parsed, { ...deps, env: context.env, now: context.now });
     } else throw new Error("unknown maintenance action");
     if (options.format !== "json" && ["backup", "prune-runs", "compact"].includes(action)) context.stdout.write(renderSqliteMaintenanceText(report));
     else context.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
@@ -49,9 +44,10 @@ function runMaintenanceCommand(options, context) {
     const safe = error instanceof CliUsageError || error instanceof CliExecutionError || error instanceof EnrichmentInputError ? error.message : action === "enrich" ? publicEnrichmentError(error, options.target === "scopes" ? "scope enrichment failed" : "record enrichment failed").message
       : action === "replay" ? safeReplayError(error) : publicMaintenanceError(error).message;
     writeCliError({ stdout: context.stdout, stderr: context.stderr }, { format: options.format,
-      code: error instanceof CliUsageError || error instanceof EnrichmentInputError ? "invalid_arguments" : "execution_failed", message: safe });
+      code: error instanceof CliUsageError || error instanceof EnrichmentInputError ? "invalid_arguments" : "execution_failed", message: safe,
+      ...(error instanceof MaintenanceRequestError ? { requestBudget: error.requestBudget } : {}) });
     return 1;
-  } finally { apiLease?.release(); }
+  }
 }
 
 export { runMaintenanceCommand };

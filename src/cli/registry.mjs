@@ -15,6 +15,10 @@ const logDir = option("--log-dir", "logDir", "path", "Worker log directory.", { 
 const bool = (flag, key, description) => option(flag, key, "boolean", description, { default: false });
 const positive = (flag, key, value, description) => option(flag, key, "integer", description, { default: value, min: 1 });
 const text = (flag, key, description, extra = {}) => option(flag, key, "string", description, extra);
+const maintenanceBudget = [
+  { ...positive("--max-cli-attempts", "maxCliAttempts", 12, "Hard command-wide lark-cli process-attempt cap, including pages and fallbacks; not an HTTP request count."), max: 1000 },
+  { ...positive("--max-seconds", "maxSeconds", 30, "Command-wide remote-work deadline; stops without committing a budget-interrupted lookup."), max: 180 },
+];
 const route = (id, summary, options, effects, privacy = "public-safe", modes = []) => ({
   id, path: id.split("."), group: id.split(".")[0], summary, options, effects, privacy, modes,
   example: `node bin/exocortex.mjs ${id.replaceAll(".", " ")}`,
@@ -81,6 +85,9 @@ export const COMMANDS = Object.freeze([
     bool("--unsafe-details", "unsafeDetails", "Include private lookup details; records only."),
     bool("--sender-only", "senderOnly", "Bounded lookup of one exact sender; requires --sender-id."),
     text("--sender-id", "senderId", "Exact sender for --sender-only."),
+    option("--record-id", "recordIds", "integer", "One to 100 distinct stored record IDs; repeat this flag; requires --names-only and excludes --limit.", { repeat: true, min: 1 }),
+    bool("--names-only", "namesOnly", "Fill missing sender names only for exact --record-id targets; excludes --sender-only and --probe-apps."),
+    ...maintenanceBudget,
   ], ["local-read", "remote-read"], "public-safe", [
     { when: "--apply", effects: ["database-write"] }, { when: "--unsafe-details", privacy: "private" },
   ]),
@@ -90,6 +97,8 @@ export const COMMANDS = Object.freeze([
     text("--scope-id", "scopeIds", "One to three distinct stored scopes; repeat this flag.", { repeat: true, required: true }),
     text("--start", "start", "Explicit replay start with timezone.", { required: true }),
     text("--end", "end", "Explicit replay end with timezone.", { required: true }),
+    text("--message-id", "messageIds", "One to 100 distinct existing messages; repeat this flag; exact mode requires one scope.", { repeat: true }),
+    ...maintenanceBudget,
   ], ["local-read", "remote-read"], "public-safe", [{ when: "--apply", effects: ["database-write"] }]),
   route("maintenance.prune-runs", "Preview run-history retention; applying can remove coverage evidence.", [db, format, apply], ["local-read"], "public-safe", [{ when: "--apply", effects: ["database-write"] }]),
   route("maintenance.compact", "Preview database compaction; --apply permits the write.", [db, format, apply], ["local-read"], "public-safe", [{ when: "--apply", effects: ["database-write"] }]),
