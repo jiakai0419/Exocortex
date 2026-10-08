@@ -2,7 +2,7 @@
 
 import { readOnlySqliteJson } from "../storage/sqlite/readonly-query.mjs";
 
-import { classifyLarkFailure } from "../adapters/lark-im/transport.mjs";
+import { classifySyncRunFailure } from "./sync-run-failure.mjs";
 import {
   publicCommandFailureReason,
   publicErrorCode,
@@ -92,7 +92,7 @@ function sanitizeQualityReportForPublicOutput(report) {
             transient: row.transient === true,
             code: publicErrorCode(row.error_code),
           }
-        : classifyLarkFailure(row.error_message || "");
+        : classifySyncRunFailure(row);
       return {
         failure_kind: classification.kind,
         transient: classification.transient === true,
@@ -233,7 +233,7 @@ function collectQualityReport(dbPath, deps = {}) {
   );
   const recentFailures = queryJson(
     dbPath,
-    `SELECT error_message
+    `SELECT error_type, error_message
      FROM sync_runs
      WHERE status = 'failed'
      ORDER BY id DESC
@@ -267,7 +267,7 @@ function collectQualityReport(dbPath, deps = {}) {
     scopes: scopes[0] || {},
     unsupported_reasons: unsupportedReasons,
     recent_failures: recentFailures.map((row) => {
-      const classification = classifyLarkFailure(row.error_message || "");
+      const classification = classifySyncRunFailure(row);
       return {
         failure_kind: classification.kind,
         transient: classification.transient,

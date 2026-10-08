@@ -15,7 +15,7 @@ import {
 import { resolve } from "node:path";
 import { summarizeWorkerEvents } from "../../dist/runtime/worker/lark-im-worker-core.js";
 import { activityDatabaseKey, inspectActivityProcesses, latestActivityEvents, evaluateActivityEvent, validateActivityEventShape, compareActivityProcessStarts, collectWorkerParentIdentities, collectActivityAncestors, verifyActivityAncestry } from "./lark-im-activity-evidence.mjs";
-import { classifyLarkFailure } from "../adapters/lark-im/transport.mjs";
+import { classifySyncRunFailure } from "./sync-run-failure.mjs";
 import { readLiveProbeCache, liveProbeContext, DEFAULT_LIVE_PROBE_TTL_MS } from "./live-probe-cache.mjs";
 import { buildStatus } from "./sync-status-report.mjs";
 import { probeService, parseLaunchdState, classifyLaunchdPrint } from "../runtime/service/launchd.mjs";
@@ -285,7 +285,7 @@ function collectRecentFailureKinds(dbPath, nowMs, windowMs, deps = {}) {
   const windowStart = new Date(nowMs - windowMs).toISOString();
   const rows = query(
     dbPath,
-    `SELECT error_message
+    `SELECT error_type, error_message
      FROM sync_runs
      WHERE status = 'failed'
        AND started_at >= ${quoteSql(windowStart)}
@@ -296,7 +296,7 @@ function collectRecentFailureKinds(dbPath, nowMs, windowMs, deps = {}) {
   /** @type {Record<string, number>} */
   const byKind = {};
   for (const row of rows) {
-    const kind = classifyLarkFailure(row.error_message || "").kind;
+    const kind = classifySyncRunFailure(row).kind;
     byKind[kind] = (byKind[kind] || 0) + 1;
   }
   return {

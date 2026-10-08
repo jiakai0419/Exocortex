@@ -30,6 +30,7 @@ const PUBLIC_MESSAGE_TYPES = new Set([
 
 const PUBLIC_FAILURE_KINDS = new Set([
   "command_unavailable",
+  "detail_incomplete",
   "internal_error",
   "network_error",
   "network_timeout",

@@ -52,7 +52,7 @@ const SAMPLE_DIFFERENCES = [
 const SAMPLE_UNCERTAINTIES = [["unresolved_prior", "prior findings unresolved"], ["local_newer", "newer local versions"],
   ["expired_observations", "expired observations"], ["observation_overflow", "observations beyond retained capacity"]];
 const FAILURE = Object.freeze({ command_unavailable: "Required command unavailable", internal_error: "Internal error", network_error: "Network error", network_timeout: "Network timeout", service_unavailable: "Service unavailable", spawn_error: "Could not start sync command", permission_denied: "Permission denied", rate_limited: "Rate limited", timeout: "Timed out", transient: "Temporary service error",
-  authentication: "Authentication failed", auth: "Authentication failed", invalid_request: "Invalid request", unavailable: "Service unavailable", unknown: "Unclassified failure" });
+  authentication: "Authentication failed", auth: "Authentication failed", invalid_request: "Invalid request", unavailable: "Service unavailable", detail_incomplete: "Merge-forward details pending at run end", unknown: "Unclassified failure" });
 /** @param {unknown} value */
 const number = (value) => Number.isSafeInteger(value) && Number(value) >= 0 ? String(value) : "unavailable";
 /** @param {unknown} name */

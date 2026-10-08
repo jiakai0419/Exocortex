@@ -4,7 +4,7 @@ import { databaseActivityEvidence, databaseOnlyHealth, observeLockOwners } from 
 
 import { readOnlySqliteJson } from "../storage/sqlite/readonly-query.mjs";
 
-import { classifyLarkFailure } from "../adapters/lark-im/transport.mjs";
+import { classifySyncRunFailure } from "./sync-run-failure.mjs";
 import {
   publicCommandFailureReason,
   publicErrorCode,
@@ -289,8 +289,8 @@ function readStatusSnapshot(dbPath, query) {
         FROM sync_scopes WHERE id = ${quoteSql(scopeId)} LIMIT 1` })),
     { label: "read run counts", columns: ["status", "count"],
       sql: "SELECT status, COUNT(*) AS count FROM sync_runs GROUP BY status ORDER BY status" },
-    { label: "read recent runs", columns: ["status", "started_at", "finished_at", "scanned_count", "inserted_count", "updated_count", "duplicate_count", "error_message"],
-      sql: `SELECT status, started_at, finished_at, scanned_count, inserted_count, updated_count, duplicate_count, error_message
+    { label: "read recent runs", columns: ["status", "started_at", "finished_at", "scanned_count", "inserted_count", "updated_count", "duplicate_count", "error_type", "error_message"],
+      sql: `SELECT status, started_at, finished_at, scanned_count, inserted_count, updated_count, duplicate_count, error_type, error_message
         FROM sync_runs ORDER BY id DESC LIMIT 10` },
     { label: "read locks", columns: ["locked_at", "expires_at", "locked_by"],
       sql: "SELECT locked_at, expires_at, locked_by FROM sync_locks ORDER BY locked_at DESC" },
@@ -410,7 +410,7 @@ function buildStatus(dbPath, deps = {}) {
     runs: {
       by_status: countBy(runCounts, "status", "count"),
       recent: recentRuns.map((run) => {
-        const classification = classifyLarkFailure(run.error_message || "");
+        const classification = classifySyncRunFailure(run);
         return {
           status: run.status,
           started_at: run.started_at,
