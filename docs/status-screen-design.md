@@ -139,9 +139,14 @@ visible once. Database failures appear by default only when positive or unknown;
 zero is available in detail. All unbound log history, including explicit failures
 and failure totals, remains in detail with its source and observation window. Neither mode includes raw DB keys,
 scope IDs, owners, private paths or raw errors. `status` stays read-only.
-Commands in detail require the same `--db` and `--log-dir` values; that requirement
-appears beside commands without printing private paths. Missing/expired samples
-remain optional, with no command suggestions in the default screen.
+Commands in detail require the same `--db` value. Reuse `--log-dir` only for
+`status`, `check --wait` or `check --live --write-live-cache`; plain `check` and
+`check --live` reject an explicit `--log-dir`. These mode-specific requirements
+appear beside commands without printing private paths. Never add waiting or
+cache writes merely to accept a log target. Missing/expired samples remain
+optional, with no command suggestions in the default screen. Acceptance passes
+the suggested commands through the real CLI parser and check planner without
+executing database reads, waits, remote requests or cache writes.
 
 ## Synthetic whole-screen target (plain, 80 columns)
 

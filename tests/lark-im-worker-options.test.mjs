@@ -153,13 +153,13 @@ test("once and max-cycles remain foreground-only and never enter persistent argu
 test("an injected worker clock also timestamps child step and cycle evidence", () => {
   const fixedMs = Date.parse("2026-06-15T12:00:00Z");
   const step = runStep("sent", [], { nowMs: () => fixedMs,
-    spawnSync: () => ({ status: 0, stdout: '{"ok":true}', stderr: "" }) });
+    runProcess: () => ({ status: 0, stdout: '{"ok":true}', stderr: "" }) });
   assert.equal(step.started_at, "2026-06-15T12:00:00.000Z");
   assert.equal(step.finished_at, step.started_at);
   let observed;
   runCycle({ ...parseWorker(["--once"]), logDir: "" }, 1, {
     nowMs: () => fixedMs, writeLog: { stdout: { write() {} } },
-    runStep: { spawnSync: () => ({ status: 0, stdout: '{"ok":true}', stderr: "" }) },
+    runStep: { runProcess: () => ({ status: 0, stdout: '{"ok":true}', stderr: "" }) },
     onComplete: (steps, payload) => { observed = { steps, payload }; },
   });
   assert.equal(observed.payload.at, step.started_at);
@@ -184,7 +184,7 @@ test("worker timestamps use the process clock when no clock is injected", (t) =>
   const fixedMs = Date.parse("2026-06-15T13:00:00Z");
   t.mock.method(Date, "now", () => fixedMs);
   const step = runStep("sent", [], {
-    spawnSync: () => ({ status: 0, stdout: '{"ok":true}', stderr: "" }),
+    runProcess: () => ({ status: 0, stdout: '{"ok":true}', stderr: "" }),
   });
   assert.equal(step.started_at, "2026-06-15T13:00:00.000Z");
   assert.equal(step.finished_at, step.started_at);

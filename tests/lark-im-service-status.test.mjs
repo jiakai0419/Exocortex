@@ -12,7 +12,15 @@ import {
   summarizeWorkerStability,
   summarizeServiceFreshness,
 } from "../src/diagnostics/lark-im-service-report.mjs";
-import { renderServiceStatusText } from "../src/terminal/lark-im-service-view.mjs";
+import { publicStatusReport } from "../src/diagnostics/status-report.mjs";
+import { renderStatusText } from "../src/terminal/status-view.mjs";
+import { rawStatusScreenFixture, STATUS_SCREEN_NOW } from "./helpers/status-screen-fixture.mjs";
+
+function publicServiceStatus(report) {
+  return publicStatusReport({ report, observedAt: STATUS_SCREEN_NOW,
+    service: { ...report.probe, target_match: "unknown" }, installed: { status: "installed" } }, { detail: true });
+}
+const statusText = (report) => plain(renderStatusText(publicServiceStatus(report), { columns: 160 }));
 
 
 function activePhaseEvidence(nowMs) {
@@ -386,46 +394,26 @@ test("service overview does not treat a reservation as current synchronization",
   assert.match(overview.activity.detail, /phase or owner evidence/);
 });
 
-test("service status view renders launchd, sync, unsupported scopes, and worker sections", () => {
-  const output = plain(
-    renderServiceStatusText({
-      label: "com.example.worker",
-      service_state: "running",
-      launchd: {
-        loaded: true,
-        state: "running",
-        pid: "123",
-        last_exit_code: "0",
-      },
-      sync: {
-        status: syncStatusFixture(),
-      },
-      worker: {
-        log: { path: "logs/test/worker.jsonl", exists: true, events: [] },
-        summary: workerSummaryFixture(),
-      },
-      stability: stabilityFixture(),
-    }),
-  );
+test("current status renders service, sync restrictions and retained worker history", () => {
+  const report = rawStatusScreenFixture();
+  report.sync.status.records = syncStatusFixture().records;
+  report.sync.status.scopes = { ...report.sync.status.scopes, ...syncStatusFixture().scopes };
+  report.worker.summary = workerSummaryFixture();
+  report.stability = stabilityFixture();
+  const output = statusText(report);
 
-  assert.match(output, /Lark IM service/);
-  assert.match(output, /Overview/);
-  assert.match(output, /Service\s+RUNNING/);
-  assert.match(output, /Health\s+OK all known enabled scopes have cursors/);
-  assert.match(output, /Activity\s+IDLE/);
-  assert.match(output, /Freshness\s+UNKNOWN no cached live probe/);
-  assert.doesNotMatch(output, /OK_WITH_HISTORY/);
-  assert.match(output, /Recent cycles \(up to 24h\)/);
-  assert.match(output, /Cycles\s+11 ok, 1 failed, 12 total/);
-  assert.match(output, /Last success\s+#12 1m ago/);
-  assert.match(output, /Longest between successes\s+41m/);
-  assert.match(output, /Failures\s+1 failed cycle, received-catchup x2, rate_limited x1/);
-  assert.match(output, /LaunchAgent/);
-  assert.match(output, /Records\s+3 total, 1 sent, 2 received/);
-  assert.match(output, /Unsupported scopes\s+1 · restricted_mode \(access restricted\)/);
-  assert.match(output, /restricted_mode/);
-  assert.match(output, /Worker/);
-  assert.match(output, /received-catchup/);
+  assert.match(output, /Exocortex status/);
+  assert.match(output, /Background\s+Running/);
+  assert.match(output, /Local health\s+OK/);
+  assert.match(output, /Current work\s+Waiting/);
+  assert.match(output, /Remote sample\s+Not verified · no cached remote sample/);
+  assert.match(output, /Completed rounds\s+11 succeeded · 1 failed · 12 total/);
+  assert.match(output, /Success spacing\s+Longest observed interval 41m/);
+  assert.match(output, /Failed task\s+Conversation history · 2/);
+  assert.match(output, /Stored messages\s+3 total · 1 sent · 2 received/);
+  assert.match(output, /Restricted chats\s+1 excluded/);
+  assert.match(output, /Restriction\s+1 · access restricted/);
+  assert.doesNotMatch(output, /OK_WITH_HISTORY|Lark IM service|received-catchup/);
 });
 
 test("service status recent failure kind aggregation is public-safe", () => {
@@ -482,50 +470,27 @@ test("service failure aggregation preserves shared classification priority and g
   }
 });
 
-test("service status view renders sync failure and missing worker log", () => {
-  const output = plain(
-    renderServiceStatusText({
-      label: "com.example.worker",
-      service_state: "not loaded",
-      launchd: {
-        loaded: false,
-      },
-      sync: {
-        status: null,
-        error_text: "sync unavailable",
-      },
-      worker: {
-        log: { path: "logs/test/worker.jsonl", exists: false, events: [] },
-        summary: { has_events: false, in_progress: false },
-      },
-    }),
-  );
-
-  assert.match(output, /STOPPED/);
-  assert.match(output, /PROBLEM sync unavailable/);
-  assert.match(output, /FAILED sync unavailable/);
-  assert.match(output, /no worker events yet/);
-  assert.match(output, /worker\.jsonl \(missing\)/);
-  assert.doesNotMatch(output, /logs\/test/);
+test("current status renders unavailable sync and missing worker log with public reasons", () => {
+  const report = rawStatusScreenFixture("unavailable");
+  report.probe = { status: "absent", loaded: false };
+  report.sync.error_text = "PRIVATE-SYNTHETIC-SYNC-FAILURE";
+  report.worker.log.path = "/private/PRIVATE-SENTINEL/logs/worker.jsonl";
+  const output = statusText(report);
+  assert.match(output, /Background\s+Stopped/);
+  assert.match(output, /Local health\s+NEEDS ATTENTION/);
+  assert.match(output, /Local database\s+Could not read message counts or sync progress/);
+  assert.match(output, /Log coverage\s+No worker log available/);
+  assert.match(output, /Latest round\s+No round completion recorded/);
+  assert.doesNotMatch(output + JSON.stringify(publicServiceStatus(report)), /PRIVATE-SYNTHETIC|PRIVATE-SENTINEL|\/private\//);
 });
 
-test("service status text never exposes an absolute worker log path", () => {
-  const output = plain(
-    renderServiceStatusText({
-      label: "com.example.worker",
-      service_state: "running",
-      launchd: { loaded: true, state: "running", pid: "123" },
-      sync: { status: syncStatusFixture() },
-      worker: {
-        log: { path: "/private/PRIVATE-SENTINEL/logs/worker.jsonl", exists: true, events: [] },
-        summary: workerSummaryFixture(),
-      },
-      stability: stabilityFixture(),
-    }),
-  );
-
-  assert.match(output, /Log\s+worker\.jsonl/);
-  assert.doesNotMatch(output, /PRIVATE-SENTINEL|\/private\//);
+test("current status text and JSON never expose an absolute worker log path", () => {
+  const report = rawStatusScreenFixture();
+  report.worker.log.path = "/private/PRIVATE-SENTINEL/logs/worker.jsonl";
+  const output = statusText(report);
+  assert.match(output, /Background\s+Running/);
+  assert.match(output, /Background history/);
+  assert.doesNotMatch(output + JSON.stringify(publicServiceStatus(report)), /PRIVATE-SENTINEL|\/private\//);
 });
 
 test("service status reexports the shared launchd parser", () => {
@@ -588,10 +553,9 @@ test("unavailable launchd inspection is UNKNOWN in report and view, not stopped"
   assert.equal(report.launchd.loaded, null);
   assert.equal(report.overview.service.status, "unknown");
   assert.equal(report.overview.health.status, "problem");
-  const output = plain(renderServiceStatusText(report));
-  assert.match(output, /Service\s+UNKNOWN/);
-  assert.match(output, /Loaded\s+UNKNOWN/);
-  assert.doesNotMatch(output, /STOPPED|NOT LOADED/);
+  const output = statusText(report);
+  assert.match(output, /Background\s+Could not check service state/);
+  assert.doesNotMatch(output, /Stopped|not loaded/);
 });
 
 test("foreground leases alone cannot establish activity when background service is stopped", () => {

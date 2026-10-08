@@ -52,7 +52,7 @@ test("worker preserves partial committed counts and debt without reporting a hea
   const result = sync(["--scope", "sent"], { sent: { ok: false, list_complete: true,
     incomplete: true, pending_details: 2, inserted: 3, updated: 1, duplicate: 0 } });
   const step = runStep("sent", [], { nowMs: () => instant,
-    spawnSync: () => ({ status: result.code, stdout: result.stdout, stderr: result.stderr }) });
+    runProcess: () => ({ status: result.code, stdout: result.stdout, stderr: result.stderr }) });
   assert.equal(step.ok, false);
   assert.equal(step.partial, true);
   assert.equal(step.exit_code, 2);
@@ -61,7 +61,7 @@ test("worker preserves partial committed counts and debt without reporting a hea
   assert.equal(step.summary.sent.pending_details, 2);
   assert.equal(step.summary.sent.list_complete, true);
   const debt = sync(["--scope", "received"], { received: [{ ok: false, incomplete: true, pending_details: 3, inserted: 4 }] });
-  const received = runStep("received-fair", [], { spawnSync: () => ({ status: 2, stdout: debt.stdout, stderr: "" }) });
+  const received = runStep("received-fair", [], { runProcess: () => ({ status: 2, stdout: debt.stdout, stderr: "" }) });
   assert.equal(received.summary.received.pending_details, 3);
   assert.equal(received.summary.received.inserted, 4);
   assert.equal(received.summary.received.failed, 1);
@@ -111,13 +111,12 @@ test("worker routes all child steps through bin with retained timeout and JSON r
   const calls = [];
   assert.equal(runCycle({ ...parseArgs(["--once", "--retention-every-cycles", "1"]), logDir: "" }, 1, {
     nowMs: () => instant, writeLog: { stdout: { write() {} } },
-    runStep: { spawnSync: (_cmd, args, opts) => { calls.push({ args, opts }); return { status: 0, stdout: '{"ok":true}', stderr: "" }; } },
+    runStep: { runProcess: (_cmd, args, opts) => { calls.push({ args, opts }); return { status: 0, stdout: '{"ok":true}', stderr: "" }; } },
   }), true);
   assert.equal(calls.length, 7);
   for (const call of calls) {
     assert.match(call.args[0], /\/bin\/exocortex\.mjs$/);
     assert.equal(call.opts.timeout, 600_000);
-    assert.equal(call.opts.killSignal, "SIGKILL");
   }
   assert.ok(calls.slice(0, 6).every((call) => call.args[1] === "sync"));
   assert.deepEqual(calls[6].args.slice(1), ["maintenance", "prune-runs", "--db", "data/exocortex.sqlite", "--apply", "--format", "json"]);
@@ -146,12 +145,12 @@ for (const abnormal of [
 ]) {
   test(`process error or signal defeats healthy child JSON and a complete cycle: ${abnormal.signal || "error"}`, () => {
     const child = { status: 0, stdout: '{"ok":true,"sent":{"ok":true,"inserted":1}}', stderr: "", ...abnormal };
-    const step = runStep("sent", [], { nowMs: () => instant, spawnSync: () => child });
+    const step = runStep("sent", [], { nowMs: () => instant, runProcess: () => child });
     assert.equal(step.ok, false);
     assert.ok(step.stderr.length > 0);
     let cycle;
     assert.equal(runCycle({ ...parseArgs(["--once"]), logDir: "" }, 1, {
-      nowMs: () => instant, runStep: { spawnSync: () => child },
+      nowMs: () => instant, runStep: { runProcess: () => child },
       writeLog: { stdout: { write: (line) => { const event = JSON.parse(line); if (event.type === "lark_im_worker_cycle") cycle = event; } } },
     }), false);
     assert.equal(cycle.ok, false);

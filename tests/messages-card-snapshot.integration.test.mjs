@@ -211,7 +211,12 @@ test("card and pending keywords in an ordinary message never trigger a reading n
   const fixture = seed(t, [ordinary]);
   const output = messages(fixture);
   assert.equal(occurrences(output, NOTICE), 0);
-  assert.ok(output.includes(ordinary.body));
+  const body = output.split("  消息    ")[1].replace(/\n$/, "").split("\n");
+  assert.equal(body.map((line, index) => {
+    if (index === 0) return line;
+    assert.ok(line.startsWith("          "));
+    return line.slice(10);
+  }).join(""), ordinary.body, "soft wrapping preserves the entire ordinary source paragraph");
 });
 
 test("partial card projection preserves all source prose even when it matches omitted notices", (t) => {
@@ -305,8 +310,11 @@ for (const limit of ["output", "node", "depth", "input"]) {
       assert.ok(output.includes(markers[limit]));
       assert.doesNotMatch(output, /部分内容未展开|INVENTED_HIDDEN_/);
       if (limit === "output") {
-        const body = output.split("\n").find((line) => line.startsWith("    x"));
-        assert.equal(body.length - 4, 16_000, "indentation is outside the unchanged card budget");
+        const body = output.split("  消息\n")[1].replace(/\n$/, "").split("\n").map((line) => {
+          assert.ok(line.startsWith("    "));
+          return line.slice(4);
+        }).join("");
+        assert.equal(body.length, 16_000, "soft line breaks and indentation are outside the unchanged card budget");
         assert.ok(body.endsWith(markers.output));
       }
       if (limit === "depth") assert.ok(output.includes(`    Invented opening\n    ${markers.depth}\n    Invented readable sibling`));
@@ -355,8 +363,9 @@ for (const [label, args, json] of [
       if (args.includes("--all")) assert.deepEqual(format.choices, ["text", "json"]);
       else assert.deepEqual(format, { flag: "--format", key: "format", type: "enum" });
     } else {
-      assert.ok(output.includes(HELP_NOTICE));
-      assert.ok(output.includes(HELP_ORDER));
+      const prose = output.replace(/\s+/g, " ");
+      assert.ok(prose.includes(HELP_NOTICE));
+      assert.ok(prose.includes(HELP_ORDER));
       assert.match(output, /--format <text\|json>/);
     }
   });

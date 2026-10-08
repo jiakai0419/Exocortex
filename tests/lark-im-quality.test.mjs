@@ -4,9 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { plain } from "../dist/terminal/index.js";
-import { collectQualityReport } from "../src/diagnostics/lark-im-quality-report.mjs";
-import { renderQualityText } from "../src/terminal/lark-im-quality-view.mjs";
+import { collectQualityReport, hasQualityIssues } from "../src/diagnostics/lark-im-quality-report.mjs";
 import {
   acquireLock,
   createRun,
@@ -18,18 +16,6 @@ import {
   succeedMessageRun,
 } from "../dist/storage/sqlite/ingestion-store.js";
 import { cursorAfter, recordFromMessage } from "../src/adapters/lark-im/core.mjs";
-
-function memoryWriter() {
-  let text = "";
-  return {
-    stream: {
-      write(chunk) {
-        text += String(chunk);
-      },
-    },
-    text: () => text,
-  };
-}
 
 function tempDb(t) {
   const dir = mkdtempSync(join(tmpdir(), "exocortex-quality-test-"));
@@ -213,10 +199,7 @@ test("lark im quality report flags missing names, chat names, and invalid bodies
     },
     { reason: "restricted_mode", error_code: null, count: 1 },
   ]);
-  assert.match(plain(renderQualityText(report)), /Lark IM data quality NEEDS ATTENTION/);
-  assert.match(plain(renderQualityText(report)), /Unsupported reasons/);
-  assert.match(plain(renderQualityText(report)), /code 230002/);
-  assert.match(plain(renderQualityText(report)), /restricted_mode/);
+  assert.equal(hasQualityIssues(report), true);
 });
 
 test("lark im quality treats senderless system and known unresolved app senders as advisory", (t) => {
@@ -270,7 +253,7 @@ test("lark im quality treats senderless system and known unresolved app senders 
   assert.equal(report.quality.unresolved_app_sender_name, 1);
   assert.equal(report.quality.missing_system_sender_name, 1);
   assert.equal(report.quality.actionable_missing_sender_name, 0);
-  assert.match(plain(renderQualityText(report)), /Lark IM data quality OK/);
+  assert.equal(hasQualityIssues(report), false);
 });
 
 test("lark im quality inherits unresolved app verdict within the same app and chat pair", (t) => {
@@ -290,7 +273,7 @@ test("lark im quality inherits unresolved app verdict within the same app and ch
   assert.equal(report.quality.unresolved_app_sender_name, 2);
   assert.equal(report.quality.missing_non_actionable_sender_name, 2);
   assert.equal(report.quality.actionable_missing_sender_name, 0);
-  assert.match(plain(renderQualityText(report)), /Lark IM data quality OK/);
+  assert.equal(hasQualityIssues(report), false);
 });
 
 test("lark im quality does not inherit unresolved app verdict across chats", (t) => {
@@ -310,7 +293,7 @@ test("lark im quality does not inherit unresolved app verdict across chats", (t)
   assert.equal(report.quality.unresolved_app_sender_name, 1);
   assert.equal(report.quality.missing_non_actionable_sender_name, 1);
   assert.equal(report.quality.actionable_missing_sender_name, 1);
-  assert.match(plain(renderQualityText(report)), /Lark IM data quality NEEDS ATTENTION/);
+  assert.equal(hasQualityIssues(report), true);
 });
 
 test("lark im quality does not inherit unresolved app verdict across apps", (t) => {
@@ -330,7 +313,7 @@ test("lark im quality does not inherit unresolved app verdict across apps", (t) 
   assert.equal(report.quality.unresolved_app_sender_name, 1);
   assert.equal(report.quality.missing_non_actionable_sender_name, 1);
   assert.equal(report.quality.actionable_missing_sender_name, 1);
-  assert.match(plain(renderQualityText(report)), /Lark IM data quality NEEDS ATTENTION/);
+  assert.equal(hasQualityIssues(report), true);
 });
 
 test("lark im quality classifies historical Lark rate limits", (t) => {
@@ -342,19 +325,18 @@ test("lark im quality classifies historical Lark rate limits", (t) => {
     lockedRun.scope,
     lockedRun.runId,
     new Error(
-      'lark-cli im +messages-search --sender <redacted> failed: {"ok":false,"error":{"type":"api","code":9499,"message":"too many request"}}',
+      'lark-cli im +messages-search --sender GENERATED_PRIVATE_QUALITY_SENDER failed: {"ok":false,"error":{"type":"api","code":9499,"message":"too many request"}}',
     ),
   );
   releaseLock(dbPath, scope.id);
 
   const report = collectQualityReport(dbPath);
-  const output = plain(renderQualityText(report));
+  const output = JSON.stringify(report);
 
   assert.deepEqual(report.recent_failures[0], {
     failure_kind: "rate_limited",
     transient: true,
     error_code: 9499,
   });
-  assert.match(output, /\[rate_limited\]/);
-  assert.doesNotMatch(output, /ou_secret/);
+  assert.doesNotMatch(output, /GENERATED_PRIVATE_QUALITY_SENDER|too many request|messages-search/);
 });

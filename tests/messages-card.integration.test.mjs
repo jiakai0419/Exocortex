@@ -34,10 +34,12 @@ test("old native card records render title, long multiline body, fields and butt
   assert.deepEqual(normalized.content_rendering, { status: "rendered", reason: null, version: 3 });
   assert.deepEqual(normalized.raw_api, original.raw, "projection preserves native source evidence");
   const text = messages(fixture, "text");
+  const unwrapped = text.replace(/\n {4}/g, "");
   for (const visible of ["Synthetic release review", ...paragraphs, "Owner: Synthetic Team", "Status: Review pending",
-    "Open synthetic review", "https://example.invalid/synthetic-review"]) assert.ok(text.includes(visible), visible);
-  assert.ok(text.indexOf(paragraphs[0]) < text.indexOf(paragraphs[6]));
-  assert.ok(text.slice(text.indexOf(paragraphs[0]), text.indexOf(paragraphs[6])).includes("\n"));
+    "Open synthetic review", "https://example.invalid/synthetic-review"]) assert.ok(unwrapped.includes(visible), visible);
+  assert.ok(unwrapped.indexOf(paragraphs[0]) < unwrapped.indexOf(paragraphs[6]));
+  assert.equal([...text.matchAll(/^    Synthetic paragraph \d+: /gm)].length, paragraphs.length,
+    "each source hard paragraph still begins on a separate display line");
   assert.doesNotMatch(text, /OLD_STORED_BODY|LEGACY_DERIVED_CONTENT|"elements"/);
   assert.deepEqual(snapshot(fixture), before, "reading and projecting old cards must not mutate any stored bytes or schema");
 });

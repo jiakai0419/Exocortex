@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { parseArgs, runCycle, runWorker, writeLog } from "../src/runtime/worker/worker.mjs";
 import { createActivityWriter, validateActivityEventShape } from "../src/diagnostics/lark-im-activity-evidence.mjs";
 import { collectStatusEvidence, serviceTargetEvidence, waitWorkerSummary } from "../src/diagnostics/status-report.mjs";
+import { summarizeRuntimeStats } from "../src/diagnostics/status-runtime-stats.mjs";
 import { collectCheckReport } from "../src/diagnostics/check-report.mjs";
 import { summarizeWorkerEvents, cyclePayload } from "../dist/runtime/worker/lark-im-worker-core.js";
 import { evaluateWaitState } from "../src/diagnostics/service-wait-state.mjs";
@@ -15,13 +16,13 @@ const START = Date.parse("2034-05-06T07:08:09.000Z");
 const clone = value => structuredClone(value);
 const quiet = { stdout: { write() {} } };
 
-function fixtures(t) {
+function fixtures(t, start = START) {
   const dir = mkdtempSync(join(tmpdir(), "synthetic-worker-binding-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const dbA = join(dir, "alpha.sqlite"); const dbB = join(dir, "beta.sqlite");
   writeFileSync(dbA, "invented alpha file identity"); writeFileSync(dbB, "invented beta file identity");
-  function worker(db, instance, success = true, retention = false, beforeChild = () => {}, processStartedAtMs = START - 60000) {
-    const logDir = join(dir, instance); let clock = START; let captured;
+  function worker(db, instance, success = true, retention = false, beforeChild = () => {}, processStartedAtMs = start - 60000) {
+    const logDir = join(dir, instance); let clock = start; let captured;
     const opts = { ...parseArgs(["--max-cycles", "2", "--retention-every-cycles", retention ? "1" : "999"]), db, logDir };
     const activity = createActivityWriter({ db, role: "worker", pid: 4321, instanceId: instance, now: () => ++clock,
       inspect: () => new Map([[4321, { state: "alive", started_at_ms: processStartedAtMs }]]),
@@ -29,13 +30,13 @@ function fixtures(t) {
     const stop = new Error("synthetic stop after first waiting phase");
     assert.throws(() => runWorker(opts, { activity, nowMs: () => ++clock,
       runCycle: (options, cycle, deps) => runCycle(options, cycle, { ...deps, writeLog: quiet,
-        runStep: { spawnSync: () => { beforeChild(); return { status: success ? 0 : 1, stdout: JSON.stringify({ ok: success }), stderr: "" }; } } }),
+        runStep: { runProcess: () => { beforeChild(); return { status: success ? 0 : 1, stdout: JSON.stringify({ ok: success }), stderr: "" }; } } }),
       sleepSeconds: () => {
         captured = readFileSync(join(logDir, "worker.jsonl"), "utf8").trim().split("\n").map(JSON.parse); throw stop;
       } }), error => error === stop);
     return captured;
   }
-  return { worker, dbA, dbB, dir };
+  return { worker, dbA, dbB, dir, start };
 }
 function evidence(events, currentEvents = events) {
   const activity = currentEvents.findLast(event => event.type === "lark_im_worker_activity" && event.phase === "waiting");
@@ -160,10 +161,10 @@ test("a database replaced during a real cycle cannot inherit completed steps fro
   const result = evidence(events); assert.equal(result.binding.target_match, "matched"); assert.equal(result.state.ready, false);
 });
 
-async function collectServiceBinding(fixture, events, processObservation = { state: "alive", started_at_ms: START - 60000 }) {
+async function collectServiceBinding(fixture, events, processObservation = { state: "alive", started_at_ms: fixture.start - 60000 }) {
   writeFileSync(join(fixture.dir, "worker.jsonl"), events.map(event => JSON.stringify(event)).join("\n") + "\n");
-  let now = START + 1000;
-  const context = { root: fixture.dir, cwd: fixture.dir, env: {}, provided: new Set(["--wait"]), startedAtMs: START, now: () => now };
+  let now = fixture.start + 1000;
+  const context = { root: fixture.dir, cwd: fixture.dir, env: {}, provided: new Set(["--wait"]), startedAtMs: fixture.start, now: () => now };
   const options = { db: fixture.dbA, logDir: fixture.dir, wait: true, timeoutSeconds: 1, pollSeconds: 1 };
   const collected = collectStatusEvidence(options, context, { readInstalledServiceConfig: () => ({ status: "installed" }), reportDeps: {
     runCommand: () => ({ status: 0, stdout: "state = running\npid = 4321\n", stderr: "" }), buildStatus: () => sync(),
@@ -175,6 +176,53 @@ async function collectServiceBinding(fixture, events, processObservation = { sta
     buildStatus: () => sync(), collectQualityReport: () => ({ quality: {} }),
   });
   return { result, collected };
+}
+
+for (const [target, select, field] of [
+  ["completion", rows => rows.findLast(event => event.type === "lark_im_worker_cycle"), "at"],
+  ["step start", rows => rows.find(event => event.type === "lark_im_worker_step"), "started_at"],
+  ["step finish", rows => rows.find(event => event.type === "lark_im_worker_step"), "finished_at"],
+]) for (const [damage, change] of [
+  ["nonexistent calendar date", value => value.replace("2037-03-02", "2037-02-30")],
+  ["missing timezone", value => value.slice(0, -1)],
+  ["numeric timestamp", value => Date.parse(value)],
+]) test(`real JSONL collector rejects ${damage} in ${target} for wait`, async t => {
+  const f = fixtures(t, Date.parse("2037-03-02T00:00:00.000Z"));
+  const events = f.worker(f.dbA, "calendar-worker");
+  const row = select(events); const original = row[field]; row[field] = change(original);
+  if (damage === "nonexistent calendar date") assert.equal(Date.parse(row[field]), Date.parse(original),
+    "the counterexample must normalize to the same otherwise-valid instant");
+  const { result, collected } = await collectServiceBinding(f, events);
+  assert.equal(collected.binding.target_match, "matched", "current worker identity remains verified");
+  assert.equal(collected.report.worker.log.activity_integrity, true, "the real reader preserves structurally valid history");
+  assert.equal(collected.workerSummary.last_cycle.complete, false);
+  assert.equal(result.checks.wait.status, "incomplete"); assert.equal(result.exit_code, 2);
+  const stats = summarizeRuntimeStats(collected.report, collected.binding, f.start + 1000);
+  if (target === "completion") {
+    assert.equal(stats.state, "unavailable"); assert.equal(stats.reason, "completion_invalid");
+  } else {
+    assert.equal(stats.state, "available"); assert.equal(stats.total_runs, 1);
+    assert.equal(stats.successful_runs, 1); assert.equal(stats.last_duration_ms, null);
+  }
+});
+
+for (const [zone, offset] of [["Z", 0], ["+08:00", 8], ["-04:00", -4]]) {
+  test(`real JSONL collector accepts equivalent ${zone} worker timestamps for wait and stats`, async t => {
+    const f = fixtures(t, Date.parse("2037-03-02T00:00:00.000Z"));
+    const events = f.worker(f.dbA, "calendar-worker");
+    const rows = completed(events);
+    const start = Date.parse(rows[0].started_at); const end = Date.parse(rows.at(-1).at);
+    for (const row of rows) for (const field of ["at", "started_at", "finished_at"]) {
+      if (row[field]) row[field] = new Date(Date.parse(row[field]) + offset * 3_600_000).toISOString().replace("Z", zone);
+    }
+    const { result, collected } = await collectServiceBinding(f, events);
+    assert.equal(collected.binding.target_match, "matched"); assert.equal(collected.workerSummary.last_cycle.complete, true);
+    assert.equal(result.checks.wait.status, "passed"); assert.equal(result.exit_code, 0);
+    assert.deepEqual(summarizeRuntimeStats(collected.report, collected.binding, f.start + 1000), {
+      scope: "current_worker_retained_log", state: "available", total_runs: 1, successful_runs: 1,
+      last_completed_at: new Date(end).toISOString(), last_duration_ms: end - start, reason: null,
+    });
+  });
 }
 
 for (const [name, expected, change] of [

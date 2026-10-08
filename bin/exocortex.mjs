@@ -13,7 +13,7 @@ export async function runCli(argv, overrides = {}) {
     const invocation = parseInvocation(argv, { context });
     format = invocation.options.format;
     if (invocation.help) {
-      context.stdout.write(renderHelp(invocation));
+      context.stdout.write(renderHelp(invocation, { stream: context.stdout }));
       return 0;
     }
     if (!invocation.definition) throw new CliUsageError("An executable command is required");

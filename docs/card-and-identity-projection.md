@@ -48,6 +48,18 @@ sender 的兼容输入范围是有限的：接受 `sender.id` 配合显式 `id_t
 
 sender 持久投影新增 `canonical.sender_id_type`。姓名 SQL 合并只有 effective namespace、actor 与适用的 chat 均相同才可继承。旧 canonical 缺 type 时先核对 raw 的显式类型；raw/canonical 相互矛盾不得继承。仅当两者都无类型证据时，`ou_` 兼容解释为 `open_id`、`cli_` 为 `app_id`，其他为 opaque legacy；显式 `user_id`/`union_id` 不能与这些旧兼容类型相等。该旧记录规则只服务合并兼容，不能授权联网；网络查询仍要求原始显式 typed 证据。新增类型须与 `message-record`、resolver 和补全共用同一小型身份函数，不让每条路径自行猜测。
 
+`messages` 的 sender 阅读遵守同一证据规则。canonical 已标记身份冲突或姓名明确清空时，不得借 raw 姓名复活；raw 的身份冲突及任一 ID alias 回显也不能供名。缺少 canonical 姓名的旧记录仍可使用与已存 actor 一致、namespace 无显式矛盾且通过共享 source-name 校验的 raw 姓名；可信 IDless 原始姓名继续可读。阅读只改变 display，不联网、不补全、不改 canonical/raw/hash/版本或游标。正常已知姓名、未知短 ID 和 senderless system 的日常显示保持。
+
+### 普通文本与富文本的消息内提及
+
+原生 `text/post` 也只消费本条消息的提及证据：`@_user_…` 仅匹配 `mentions.key`；富文本 `at` 的身份引用与消息 key 分开解析，不把不同 namespace 的同字符串合入无类型 Map。重复 key 的缺名、不同身份或不一致姓名保留未知，不按数组顺序选择；同一明确身份的重复证据及不冲突的 typed alias 增补保持兼容。无身份字段的旧 key/name 对仍可作为该消息内别名使用，不产生全局用户身份。
+
+无类型的富文本身份引用可能同时匹配多个 namespace；只有本条显式证据已把这些匹配桥接到同一已确认身份 root 时，才按该 root 去重并取名。独立 root 即使 ID 字节或姓名相同也保持未知。同一无冲突 root 未提供姓名时，仍可使用节点自身明确的 `user_name`；缺名、非法或冲突的 key 绑定则是否定证据，不能因同 root 的另一个 typed 匹配有姓名而被去重丢弃，也不能借节点的显式姓名绕过。
+
+替换仅发生在原始正文、标题、链接标签等文本槽；`at` 产生的姓名和 `a.href` 目标是终态字面值，不再送回 token 替换。`at.user_name` 的显式原始姓名保持可读，但不能消解已经明确冲突的身份绑定。未解决的提及就地保留未知或原始引用，并令投影为 `partial`，使用 `unresolved_message_mention`；若同时存在未知富文本结构，仍优先保留 `unsupported_post_element`。唯一映射、相同身份重复映射、全员提及、普通无提及消息的输出保持兼容。
+
+本修复影响新采集的 `text/post` 投影，raw/hash/source version 保持原有语义。历史非卡片 `messages` 仍读取已存 body，搜索仍匹配该 body，不因读取而重投影或修复历史正文；本轮不隐式批量 replay、重写历史或增加网络读取。合成验收同时覆盖冲突顺序、缺名、跨 namespace、生成姓名中的 token、链接目标及 SQLite 到 JSON/text 阅读，不能只测替换 helper。
+
 姓名状态沿用已实现的 SQL 合并合同：`resolved` 保留姓名与来源；缺字段、空 lookup、超时、拒绝、冲突为 `unknown`，不能抹掉同身份已有值；只有显式 `*_name_state=cleared`（对方为 `chat_partner.name_state`）才是权威清空。未知不能复活已清空值，新可信解析可以更新它。缓存会话名等历史证据只能补未知，不覆盖已知或权威清空。原始消息中的新姓名及同版本投影改善仍按既有版本保护规则处理。卡片临时映射只决定本次展示，不产生权威清空或修改 sender 的存储姓名。
 
 联网 resolver 保持 best-effort：消息采集不依赖姓名查询成功。正向缓存只保存确实解析出的姓名，键保留类型及必要的会话范围；ID 回显、空响应、错误和权限失败不缓存。现有容量为 1000、TTL 为 5 分钟，读取只刷新 LRU，不延长 TTL；每次查询已有 5 秒重试预算。过期或失败后仍可重新查询；实例不能跨账号复用。响应只接受本次明确请求的 typed ID，未请求的返回项不进入上下文。5 秒是单次调用预算，群成员最多 50 页也不等于一次补全有总预算。联系人批次固定 30 且显式 page-size=30；响应姓名、成员 localized_name、请求目标筛选和 self seed 优先级只在共享 resolver/身份 helper 维护，在线同步与常规/单目标 enrich 都委托这些规则，脚本只保留诊断与提交职责。

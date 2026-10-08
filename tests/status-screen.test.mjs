@@ -527,7 +527,7 @@ test("missing or expired samples retain their state and move optional actions to
   }
 });
 
-test("all suggested follow-ups explicitly require the original database and log target without exposing paths", async () => {
+test("suggested follow-ups preserve the database and mode-specific log target without exposing paths", async () => {
   for (const detail of [false, true]) {
     for (const [db, logDir] of [["/tmp/INVENTED_PRIVATE_DB/alpha.sqlite", "/tmp/INVENTED_PRIVATE_LOG/alpha"],
       ["/tmp/INVENTED_PRIVATE_DB/beta.sqlite", "/tmp/INVENTED_PRIVATE_LOG/beta"]]) {
@@ -544,7 +544,7 @@ test("all suggested follow-ups explicitly require the original database and log 
       const readable = compact(plain(output));
       if (detail) {
         const diagnostics = section(plain(output), "Diagnostics");
-        assert.match(diagnostics, /Command targets All suggestions require the same --db and --log-dir values as this status invocation\./);
+        assert.match(diagnostics, /Command targets Keep the same --db\. Keep --log-dir only for status, check --wait or check --live --write-live-cache\./);
         assert.match(diagnostics, /npm run exo -- check/);
         assert.match(diagnostics, /npm run exo -- status --format json/);
       } else assertDefaultNoiseAbsent(plain(output));

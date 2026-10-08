@@ -3,6 +3,7 @@ import { WORKER_DEFAULTS, WORKER_OPTION_SPECS } from "../runtime/worker/options.
 import { SYNC_OPTION_SPECS } from "../adapters/lark-im/sync-options.mjs";
 import { CliUsageError, createCommandContext } from "./context.mjs";
 import { parseOptions } from "./parse-options.mjs";
+import { terminalColumns, wrapLabelValue, wrapTextLine } from "../terminal/text-layout.mjs";
 export { parseOptions } from "./parse-options.mjs";
 
 const option = (flag, key, type, description, extra = {}) => ({ flag, key, type, description, ...extra });
@@ -38,7 +39,8 @@ export const COMMANDS = Object.freeze([
     bool("--logs", "logs", "Include a private bounded tail of existing logs."),
     positive("--lines", "lines", 20, "Log tail length; requires --logs."),
   ], ["local-read"], "public-safe", [{ when: "--logs", privacy: "private" }]),
-  route("check", "Collect database, sync and quality evidence and requested extensions.", [db, format, logDir, backupDir,
+  route("check", "Collect database, sync and quality evidence and requested extensions.", [db, format,
+    { ...logDir, description: "Worker log directory; requires --wait or --live --write-live-cache." }, backupDir,
     bool("--live", "live", "Read a bounded remote sample."),
     bool("--write-live-cache", "writeLiveCache", "Write the safe sample cache; requires --live."),
     bool("--unsafe-details", "unsafeDetails", "Include private sample details; requires --live."),
@@ -59,10 +61,10 @@ export const COMMANDS = Object.freeze([
     { when: "--live --unsafe-details", privacy: "private" },
   ]),
   route("sync", "Run one bounded pass, preserving message and detail-debt contracts.", [
-    ...SYNC_OPTION_SPECS, { ...format, default: "json", choices: ["json"], description: "Existing single-pass JSON summary contract." },
-  ], ["remote-read", "database-write", "activity-write"]),
+    ...SYNC_OPTION_SPECS, { ...format, default: "json", choices: ["json"], description: "Private single-pass JSON summary, including database path and possible business error details." },
+  ], ["remote-read", "database-write", "activity-write"], "private"),
   ...["install", "start", "stop", "restart", "uninstall"].map((action) => route(`service.${action}`,
-    ({ install: "Install configuration without starting the worker.", start: "Ensure the configured service is running.",
+    ({ install: "Validate local runtime dependencies and install configuration without starting the worker.", start: "Ensure the configured service is running.",
       stop: "Stop the configured service.", restart: "Explicitly replace the running service instance.",
       uninstall: "Stop and remove the installed service configuration." })[action],
     action === "install" ? [...WORKER_OPTION_SPECS, format] : [format],
@@ -124,8 +126,9 @@ export function commandCatalog({ route: routeId = "", all = true } = {}) {
   };
 }
 
-/** @param {{route?:string, options?:Record<string,any>, all?:boolean}} [input] */
-export function renderHelp({ route: routeId = "", options = { format: "text" }, all = false } = {}) {
+/** @param {{route?:string, options?:Record<string,any>, all?:boolean}} [input]
+ * @param {{columns?: number, stream?: {columns?: number}}} [layout] */
+export function renderHelp({ route: routeId = "", options = { format: "text" }, all = false } = {}, layout = {}) {
   const catalog = commandCatalog({ route: routeId, all });
   if (options.format === "json") return `${JSON.stringify(catalog, null, 2)}\n`;
   const lines = [routeId ? `Usage: node bin/exocortex.mjs ${routeId.replaceAll(".", " ")} [options]` : "Exocortex", ""];
@@ -145,5 +148,14 @@ export function renderHelp({ route: routeId = "", options = { format: "text" }, 
     }
   }
   lines.push("  --help, -h     Show help without loading command dependencies.", "  --format json  Machine-readable help.");
-  return `${lines.join("\n")}\n`;
+  const columns = terminalColumns(layout.stream, layout.columns);
+  return `${lines.flatMap((line) => {
+    if (!line) return [""];
+    const labeled = /^( *)(\S.*?)( {2,})(\S.*)$/.exec(line);
+    if (labeled) return wrapLabelValue(labeled[2], labeled[4], columns, { indent: labeled[1].length, gap: labeled[3] });
+    const named = /^( *)([^:]+:) (.+)$/.exec(line);
+    if (named) return wrapLabelValue(named[2], named[3], columns, { indent: named[1].length, gap: " " });
+    const indent = /^ */.exec(line)?.[0] || "";
+    return wrapTextLine(line.slice(indent.length), columns - indent.length).map((part) => `${indent}${part}`);
+  }).join("\n")}\n`;
 }

@@ -53,7 +53,7 @@ test("help works in a code-only fixture without dist, database, Python or extern
   const root = mkdtempSync(join(tmpdir(), "synthetic-cli-help-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   for (const path of ["bin/exocortex.mjs", "src/cli/registry.mjs", "src/cli/context.mjs", "src/cli/parse-options.mjs",
-    "src/runtime/worker/options.mjs", "src/adapters/lark-im/sync-options.mjs"]) {
+    "src/runtime/worker/options.mjs", "src/adapters/lark-im/sync-options.mjs", "src/terminal/text-layout.mjs"]) {
     const destination = join(root, path);
     mkdirSync(dirname(destination), { recursive: true });
     copyFileSync(path, destination);
@@ -70,6 +70,13 @@ test("help works in a code-only fixture without dist, database, Python or extern
     assert.equal(catalog.groups.length, 6);
     assert.equal(catalog.commands.length, 16);
     assert.doesNotMatch(result.stdout, /\u001b|PRIVATE_|sqlite3.*failed/);
+    const text = spawnSync(process.execPath, [entrypoint, "check", "--help"], {
+      cwd: root, env: { PATH: "/synthetic/no-programs", HOME: root }, encoding: "utf8", timeout: 30000,
+    });
+    assert.equal(text.status, 0, text.stderr);
+    assert.match(text.stdout, /Usage: node bin\/exocortex\.mjs check/);
+    assert.match(text.stdout, /--write-live-cache/);
+    assert.ok(text.stdout.split("\n").every((line) => line.length <= 80));
   }
 });
 

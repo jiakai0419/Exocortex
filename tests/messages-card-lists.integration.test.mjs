@@ -11,6 +11,16 @@ const text = (content) => ({ tag: "plain_text", property: { content } });
 const item = (type, order, elements, level = 0) => ({ type, level, ...(order === undefined ? {} : { order }), elements });
 const list = (...items) => ({ tag: "list", property: { items } });
 
+// These two fixtures each contain one source paragraph; remove only display
+// continuation indentation and require the complete projected source verbatim.
+function singleParagraphBody(human) {
+  const body = human.split("  消息\n")[1].replace(/\n$/, "");
+  return body.split("\n").map((line) => {
+    assert.ok(line.startsWith("    "));
+    return line.slice(4);
+  }).join("");
+}
+
 function seed(t, rows) {
   let fixture;
   let before;
@@ -37,7 +47,7 @@ test("historical raw list content reprojects link labels and following dates wit
   assert.equal(first[0].raw.content_rendering.version, 1);
   assert.equal(first[0].canonical.content_rendering.version, 1);
   const human = messages(fixture, "text");
-  assert.match(human, /3\. Paper Comet Archive .* opens on 2064-04-18; catalog closes 2064-05-02\./);
+  assert.equal(singleParagraphBody(human), first[0].display.card.text);
   assert.doesNotMatch(human, /HIDDEN_ENGLISH_COPY|OLD_STORED_BODY_|LEGACY_DERIVED_CONTENT/);
   assert.deepEqual(messages(fixture, "json"), first);
 });
@@ -101,7 +111,7 @@ test("list projection hides request buttons, keeps navigation and dates, and san
   assert.deepEqual(actual.display.card, { text: "6. Paper Observatory Catalogue （链接：https://example.invalid/catalogue [链接敏感部分已省略]） is available until 2070-11-12.",
     status: "rendered", reason: null, version: 3, omitted_actions: 1 });
   const human = messages(fixture, "text");
-  assert.match(human, /6\. Paper Observatory Catalogue .* is available until 2070-11-12\./);
+  assert.equal(singleParagraphBody(human), actual.display.card.text);
   assert.doesNotMatch(human, /HIDDEN_|SYNTHETIC_PASSWORD|SYNTHETIC_QUERY|SYNTHETIC_FRAGMENT|archive:/);
   assert.deepEqual(messages(fixture, "json"), [actual]);
 });

@@ -2,13 +2,18 @@
 
 import { renderSystemContent } from "./system-content.mjs";
 import { renderCardContent } from "./card-content.mjs";
+import { personName } from "./sender-identity.mjs";
 
 const SOURCE_API = "im.v1.messages";
 const RENDER_VERSION = 1;
+const MENTION_ID_TYPES = ["open_id", "user_id", "union_id", "app_id"];
 
 /** @typedef {Record<string, any>} JsonObject */
 /** @typedef {{mergeItems?: JsonObject[]}} NormalizeOptions */
 /** @typedef {{text: string, status: "rendered" | "partial" | "structured_fallback", reason: string | null, version: number}} RenderResult */
+/** @typedef {{parent: MentionIdentity | null, ids: Map<string, string>, name: string | null, conflict: boolean}} MentionIdentity */
+/** @typedef {{name: string | null, conflict: boolean, identifiers: string[]}} MentionBinding */
+/** @typedef {{unresolved: boolean}} MentionState */
 
 /** @param {unknown} value @returns {value is JsonObject} */
 function isObject(value) {
@@ -47,24 +52,140 @@ function fallback(item, reason, label) {
   return result(`[${label}]\n${original}`, "structured_fallback", reason);
 }
 
-/** @param {JsonObject} item */
-function mentionNames(item) {
-  const names = new Map();
+/** Message-local evidence only. Typed IDs may join when explicitly co-present;
+ * equal keys or equal names cannot join otherwise disjoint identities.
+ * @param {JsonObject} item */
+function mentionBindings(item) {
+  /** @type {Map<string, Map<string, MentionIdentity>>} */
+  const identities = new Map([...MENTION_ID_TYPES, "literal", "mention_key"].map((kind) => [kind, new Map()]));
+  /** @type {Map<string, {rows: MentionIdentity[], missing: boolean}>} */
+  const keys = new Map();
+  /** @param {MentionIdentity} identity @returns {MentionIdentity} */
+  function root(identity) {
+    let current = identity;
+    while (current.parent) current = current.parent;
+    while (identity.parent && identity.parent !== current) {
+      const next = identity.parent;
+      identity.parent = current;
+      identity = next;
+    }
+    return current;
+  }
+  /** @param {MentionIdentity} left @param {MentionIdentity} right */
+  function join(left, right) {
+    left = root(left); right = root(right);
+    if (left === right) return left;
+    right.parent = left;
+    left.conflict ||= right.conflict || Boolean(left.name && right.name && left.name !== right.name);
+    left.name ||= right.name;
+    for (const [kind, id] of right.ids) {
+      if (left.ids.has(kind) && left.ids.get(kind) !== id) left.conflict = true;
+      else left.ids.set(kind, id);
+    }
+    return left;
+  }
   for (const mention of Array.isArray(item.mentions) ? item.mentions : []) {
-    if (!isObject(mention) || typeof mention.name !== "string" || !mention.name.trim()) continue;
-    for (const key of [mention.key, typeof mention.id === "string" ? mention.id : mention.id?.open_id]) {
-      if (typeof key === "string" && key) names.set(key, mention.name);
+    if (!isObject(mention)) continue;
+    const key = typeof mention.key === "string" && mention.key ? mention.key : null;
+    const name = typeof mention.name === "string" && mention.name.trim() ? mention.name : null;
+    /** @type {MentionIdentity | null} */
+    let identity = null;
+    let invalid = false;
+    /** @param {string} kind @param {unknown} value */
+    function add(kind, value) {
+      if (value === undefined || value === null || value === "") return;
+      if (typeof value !== "string") { invalid = true; return; }
+      const table = identities.get(kind);
+      if (!table) { invalid = true; return; }
+      let next = table.get(value);
+      if (!next) {
+        next = { parent: null, ids: new Map([[kind, value]]), name: null, conflict: false };
+        table.set(value, next);
+      }
+      identity = identity ? join(identity, next) : root(next);
+    }
+    for (const kind of MENTION_ID_TYPES) {
+      add(kind, mention[kind]);
+      if (isObject(mention.id)) add(kind, mention.id[kind]);
+    }
+    if (typeof mention.id === "string") {
+      if (mention.id_type === undefined) add("literal", mention.id);
+      else if (MENTION_ID_TYPES.includes(mention.id_type)) add(mention.id_type, mention.id);
+      else invalid = true;
+    } else if (mention.id_type !== undefined || mention.id != null && !isObject(mention.id)) invalid = true;
+    if (!identity && key && !invalid) add("mention_key", key);
+    if (identity) {
+      const current = root(identity);
+      current.conflict ||= invalid || Boolean(current.name && name && current.name !== name);
+      current.name ||= name;
+    }
+    if (key) {
+      const binding = keys.get(key) || { rows: [], missing: false };
+      if (identity) binding.rows.push(identity);
+      binding.missing ||= !identity || !name || invalid;
+      keys.set(key, binding);
     }
   }
-  return names;
+  /** @param {MentionIdentity | undefined} identity @returns {MentionBinding} */
+  function binding(identity) {
+    const current = identity ? root(identity) : null;
+    const identifiers = current ? [...current.ids.values()] : [];
+    return { name: current && !current.conflict && personName(current.name, identifiers) ? current.name : null,
+      conflict: current?.conflict || false, identifiers };
+  }
+  /** @type {Map<string, MentionBinding>} */
+  const keyCache = new Map();
+  /** Evaluate after all explicit alias bridges have been joined, once per key
+   * across all original slots. This cache belongs only to the current message.
+   * @param {string} key @returns {MentionBinding} */
+  function keyBinding(key) {
+    const cached = keyCache.get(key);
+    if (cached) return cached;
+    const entry = keys.get(key);
+    const matched = binding(entry?.rows[0]);
+    if (entry) {
+      if (entry.rows.some((row) => root(row) !== root(entry.rows[0]))) matched.conflict = true;
+      if (entry.missing || matched.conflict) matched.name = null;
+    }
+    keyCache.set(key, matched);
+    return matched;
+  }
+  /** Native post user_id is historically a literal reference, including open
+   * IDs. Exact aliases may share a root only through explicit source bridges.
+   * @param {string} id @param {unknown} type @returns {MentionBinding} */
+  function reference(id, type) {
+    if (type !== undefined) return typeof type === "string" && MENTION_ID_TYPES.includes(type)
+      ? binding(identities.get(type)?.get(id)) : { name: null, conflict: true, identifiers: [id] };
+    /** @type {Set<MentionIdentity>} */
+    const matchedRoots = new Set();
+    for (const kind of [...MENTION_ID_TYPES, "literal"]) {
+      const identity = identities.get(kind)?.get(id);
+      if (identity) matchedRoots.add(root(identity));
+    }
+    if (keys.has(id)) {
+      // Key-level missing/conflicting evidence cannot be replaced by a typed
+      // alias's name or by an explicit node name, even within the same root.
+      const matched = keyBinding(id);
+      if (!matched.name || matched.conflict) return { ...matched, conflict: true };
+      const identity = keys.get(id)?.rows[0];
+      if (identity) matchedRoots.add(root(identity));
+    }
+    return matchedRoots.size === 1 ? binding(matchedRoots.values().next().value)
+      : { name: null, conflict: matchedRoots.size > 1, identifiers: [id] };
+  }
+  return { key: keyBinding, reference };
 }
 
-/** @param {string} text @param {JsonObject} item */
-function resolveTextMentions(text, item) {
-  const names = mentionNames(item);
+/** @param {string} text @param {ReturnType<typeof mentionBindings>} bindings @param {MentionState} state */
+function resolveTextMentions(text, bindings, state) {
   // Replace only complete API mention keys. In particular @_user_1 must not
-  // replace the prefix of an unresolved @_user_10.
-  return text.replace(/@_user_\d+\b/g, (key) => names.has(key) ? `@${names.get(key)}` : key);
+  // replace the prefix of an unresolved @_user_10. Inserted names are terminal.
+  return text.replace(/@_user_\d+\b/g, (key) => {
+    const { name } = bindings.key(key);
+    if (name) return `@${name}`;
+    state.unresolved = true;
+    return key;
+  });
 }
 
 /** @param {JsonObject} payload @returns {JsonObject | null} */
@@ -78,27 +199,33 @@ function postBody(payload) {
   return null;
 }
 
-/** @param {unknown} value @param {Map<string, string>} names @returns {string | null} */
-function postElement(value, names) {
+/** @param {unknown} value @param {ReturnType<typeof mentionBindings>} bindings @param {MentionState} state @returns {string | null} */
+function postElement(value, bindings, state) {
   if (!isObject(value)) return null;
+  // Only original text slots are parsed. Neither generated at labels nor href
+  // destinations are ever sent through mention replacement after concatenation.
   const text = typeof value.text === "string" ? value.text : null;
   switch (value.tag) {
     case "text":
-    case "md": return text;
+    case "md": return text === null ? null : resolveTextMentions(text, bindings, state);
     case "a": {
       const href = typeof value.href === "string" ? value.href : "";
-      return text && href ? `${text} (${href})` : text ?? (href || null);
+      const label = text === null ? null : resolveTextMentions(text, bindings, state);
+      return label && href ? `${label} (${href})` : label ?? (href || null);
     }
     case "at": {
       const id = typeof value.user_id === "string" ? value.user_id : "";
-      if (id === "all" || id === "@_all") return "@所有人";
-      const name = typeof value.user_name === "string" && value.user_name.trim()
-        ? value.user_name : names.get(id);
-      return name ? `@${name}` : id ? (id.startsWith("@") ? id : `@${id}`) : null;
+      if (value.id_type === undefined && (id === "all" || id === "@_all")) return "@所有人";
+      const matched = bindings.reference(id, value.id_type);
+      const name = matched.conflict ? null : personName(value.user_name, [id, ...matched.identifiers])
+        ? value.user_name : matched.name;
+      if (name) return `@${name}`;
+      state.unresolved = true;
+      return id ? (id.startsWith("@") ? id : `@${id}`) : "@未知用户";
     }
     case "emotion": return typeof value.emoji_type === "string" ? `:${value.emoji_type}:` : null;
     case "hr": return "\n---\n";
-    case "code_block": return text === null ? null : `\n${text}\n`;
+    case "code_block": return text === null ? null : `\n${resolveTextMentions(text, bindings, state)}\n`;
     // Media and unknown elements remain in the complete structural fallback;
     // a resource key is not a downloaded image or a rendered video.
     default: return null;
@@ -113,21 +240,22 @@ function renderPost(item, payload) {
   if ((body.title !== undefined && typeof body.title !== "string") || !Array.isArray(blocks)) {
     return fallback(item, "unsupported_post_structure", "富文本未完整渲染，以下为原始内容");
   }
-  const lines = typeof body.title === "string" && body.title ? [body.title] : [];
-  const names = mentionNames(item);
+  const bindings = mentionBindings(item);
+  const state = { unresolved: false };
+  const lines = typeof body.title === "string" && body.title ? [resolveTextMentions(body.title, bindings, state)] : [];
   let incomplete = false;
   for (const block of blocks) {
     if (!Array.isArray(block)) { incomplete = true; continue; }
-    const parts = block.map((element) => postElement(element, names));
+    const parts = block.map((element) => postElement(element, bindings, state));
     if (parts.some((part) => part === null)) incomplete = true;
     lines.push(parts.filter((part) => part !== null).join(""));
   }
-  const text = resolveTextMentions(lines.join("\n"), item);
+  const text = lines.join("\n");
   if (incomplete) {
     const preserved = fallback(item, "unsupported_post_element", "富文本未完整渲染，以下为完整原始内容");
     return result(text ? `${text}\n${preserved.text}` : preserved.text, "partial", preserved.reason);
   }
-  return result(text);
+  return result(text, state.unresolved ? "partial" : "rendered", state.unresolved ? "unresolved_message_mention" : null);
 }
 
 /** @param {JsonObject} item @param {JsonObject[]} mergeItems */
@@ -188,7 +316,9 @@ function renderApiMessageContent(item, options = {}) {
   if (type === "interactive") return renderCardContent(content, item.mentions);
   const payload = parseContent(content);
   if (type === "text" && isObject(payload) && typeof payload.text === "string") {
-    return result(resolveTextMentions(payload.text, item));
+    const state = { unresolved: false };
+    const text = resolveTextMentions(payload.text, mentionBindings(item), state);
+    return result(text, state.unresolved ? "partial" : "rendered", state.unresolved ? "unresolved_message_mention" : null);
   }
   if (type === "post" && isObject(payload)) return renderPost(item, payload);
   if (type === "system" && isObject(payload) && typeof payload.template === "string") {

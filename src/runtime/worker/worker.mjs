@@ -2,7 +2,7 @@
 
 import { ACTIVITY_GAP_MS, ACTIVITY_GRACE_MS, activityDatabaseKey, createActivityWriter } from "../../diagnostics/lark-im-activity-evidence.mjs";
 
-import { spawnSync } from "node:child_process";
+import { runGuardedWorkerStep } from "./step-process.mjs";
 import { parseOptions } from "../../cli/parse-options.mjs";
 import { writeLog, rotateLogIfNeeded } from "./log.mjs";
 import { dirname, resolve } from "node:path";
@@ -51,6 +51,7 @@ const STEP_OPERATIONS = {
  * @property {string} finished_at
  * @property {JsonObject | null} summary
  * @property {string} stderr
+ * @property {JsonObject=} guardian_diagnostic
  *
  * @typedef {object} SpawnResult
  * @property {number | null} status
@@ -58,9 +59,10 @@ const STEP_OPERATIONS = {
  * @property {string} stderr
  * @property {Error=} error
  * @property {string | null=} signal
+ * @property {JsonObject=} guardian_diagnostic
  *
  * @typedef {object} RunStepDeps
- * @property {(cmd: string, args: string[], options: JsonObject) => SpawnResult=} spawnSync
+ * @property {(cmd: string, args: string[], options: JsonObject) => SpawnResult=} runProcess
  * @property {string=} execPath
  * @property {() => Date=} now
  * @property {number=} timeoutSeconds
@@ -129,14 +131,12 @@ function sleepSeconds(seconds) {
  */
 function runStep(name, args, deps = {}) {
   const now = deps.now || (() => new Date((deps.nowMs || Date.now)()));
-  const run = deps.spawnSync || spawnSync;
+  const run = deps.runProcess || runGuardedWorkerStep;
   const execPath = deps.execPath || process.execPath;
   const startedAt = now().toISOString();
   const result = run(execPath, [deps.scriptPath || CLI_PATH, deps.command || "sync", ...args], {
-    encoding: "utf8",
     maxBuffer: 100 * 1024 * 1024,
     timeout: Number(deps.timeoutSeconds || WORKER_DEFAULTS.stepTimeoutSeconds) * 1000,
-    killSignal: "SIGKILL",
     ...(deps.cooldownsByOperation !== undefined || deps.activityEnv ? { env: {
       ...process.env,
       ...deps.activityEnv,
@@ -173,12 +173,16 @@ function runStep(name, args, deps = {}) {
     !Array.isArray(summary) &&
     summary.ok === true,
   );
-  const processFailed = Boolean(result.error || result.signal);
+  const processFailed = Boolean(result.error || result.signal || result.guardian_diagnostic);
   const ok = result.status === 0 && validSummary && !processFailed;
   const partial = result.status === 2 && summary?.ok === false && summary?.partial === true && !processFailed;
   const transport = errorTransport || compactTransportStats(summary?.transport);
   const outputSummary = compactSummary(summary);
   let failureDetail = stderr.trim();
+  if (result.guardian_diagnostic) {
+    const stages = [result.guardian_diagnostic.primary?.stage, result.guardian_diagnostic.cleanup?.stage].filter(Boolean);
+    failureDetail = `worker step terminated: ${stages.join(", ")}`;
+  }
   if (processFailed && !failureDetail) failureDetail = "worker step terminated with a process error or signal";
   if (!failureDetail && !processFailed && result.status !== 0 && summary?.schema_version === 1 && summary.ok === false &&
       ["invalid_arguments", "execution_failed"].includes(summary.error?.code) && typeof summary.error?.message === "string") {
@@ -198,6 +202,7 @@ function runStep(name, args, deps = {}) {
     finished_at: finishedAt,
     summary: transport ? { ...(outputSummary || {}), transport } : outputSummary,
     stderr: failureDetail.slice(0, 4000),
+    ...(result.guardian_diagnostic ? { guardian_diagnostic: result.guardian_diagnostic } : {}),
   };
 }
 

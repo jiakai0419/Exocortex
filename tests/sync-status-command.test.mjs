@@ -5,22 +5,8 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { plain } from "../dist/terminal/index.js";
 import { buildStatus, sanitizeStatusReportForPublicOutput, sqliteJson as readStatusRows } from "../src/diagnostics/sync-status-report.mjs";
-import { renderSyncStatusText as renderText } from "../src/terminal/sync-status-view.mjs";
 import { ensureInitialized, quoteSql } from "../dist/storage/sqlite/ingestion-store.js";
-
-function memoryWriter() {
-  let text = "";
-  return {
-    stream: {
-      write(chunk) {
-        text += String(chunk);
-      },
-    },
-    text: () => text,
-  };
-}
 
 function statusFixture(overrides = {}) {
   return {
@@ -85,17 +71,16 @@ function statusFixture(overrides = {}) {
   };
 }
 
-test("renderText shows summary, unsupported reasons, recovery, and recent failures", () => {
-  const output = plain(renderText(statusFixture()));
-
-  assert.match(output, /Exocortex sync status/);
-  assert.match(output, /Records\s+3 total, 1 sent, 2 received/);
-  assert.match(output, /Unsupported reasons/);
-  assert.match(output, /code 230002/);
-  assert.doesNotMatch(output, /Recovery/);
-  assert.match(output, /Recent non-success runs/);
-  assert.match(output, /FAILED \[rate_limited\]/);
-  assert.doesNotMatch(output, /lark\.im\.received\.chat\.1/);
+test("public sync snapshot preserves totals and bounded failures while omitting raw identities and recovery claims", () => {
+  const report = sanitizeStatusReportForPublicOutput(statusFixture());
+  assert.equal(report.records.total, 3);
+  assert.deepEqual(report.records.by_direction.map(({ direction, count }) => ({ direction, count })),
+    [{ direction: "received", count: 2 }, { direction: "sent", count: 1 }]);
+  assert.deepEqual(report.scopes.unsupported_reasons, [{ reason: "bot_user_out_of_chat", error_code: 230002, count: 1 }]);
+  assert.equal(report.runs.recent[0].failure_kind, "rate_limited");
+  assert.equal(report.runs.recent[0].status, "failed");
+  assert.equal(report.recovery.performed, false);
+  assert.doesNotMatch(JSON.stringify(report), /lark\.im\.received\.chat\.1|exocortex\.sqlite|Bot\/User/);
 });
 
 test("buildStatus assembles one tagged snapshot without performing recovery", () => {
@@ -185,10 +170,8 @@ test("status reports separate list progress and due detail debt without leaking 
     oldest_pending_ms: 1_919_999_940_000, next_retry_at: "2001-01-01T00:00:00.000Z" });
   assert.deepEqual(status.list_progress, { evidence: "available", scopes: 1,
     oldest_cursor_ms: 1_920_000_000_000, invalid_cursor_scopes: 0 });
-  const output = JSON.stringify(status) + plain(renderText(status));
+  const output = JSON.stringify(status);
   for (const value of [db, hidden, scope, "generated-root", "generated-hash"]) assert.equal(output.includes(value), false);
-  assert.match(output, /1 pending, 1 due for retry/);
-  assert.match(output, /List progress/);
   assert.deepEqual(readFileSync(db), before);
 });
 
@@ -207,7 +190,6 @@ test("legacy status stays explicit and partial or unreadable new detail schemas 
   assert.equal(status.details.evidence, "legacy_unavailable");
   assert.equal(status.details.pending_count, null);
   assert.equal(status.list_progress.scopes, null);
-  assert.match(plain(renderText(status)), /unavailable \(legacy database\)/);
   assert.deepEqual(readFileSync(db), before);
 });
 

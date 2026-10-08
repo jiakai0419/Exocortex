@@ -9,6 +9,7 @@ import { LABEL, target, readInstalledServiceConfig } from "../runtime/service/la
 import { publicFailureKind, publicTimestamp } from "./public-safe.mjs";
 import { publicActivity } from "./public-activity.mjs";
 import { summarizeRuntimeStats } from "./status-runtime-stats.mjs";
+import { parseWorkerEventTimestamp as timestamp } from "./worker-event-time.mjs";
 import { REQUIRED_CYCLE_STEPS } from "../../dist/runtime/worker/lark-im-worker-core.js";
 
 /** @typedef {Record<string, any>} JsonObject */
@@ -150,26 +151,28 @@ function waitWorkerSummary(report, binding) {
   const cycleIndex = events.lastIndexOf(cycle);
   const rows = cycle ? events.filter((/** @type {JsonObject} */ event) => event.cycle === cycle.cycle) : [];
   const steps = rows.filter((/** @type {JsonObject} */ event) => event.type === "lark_im_worker_step");
-  const timestamp = (/** @type {unknown} */ value) => typeof value === "string" ? Date.parse(value) : NaN;
   const bound = (/** @type {JsonObject} */ event) => event.version === 1 && event.database_key === worker?.database_key &&
     typeof event.database_key === "string" && /^[a-f0-9]{64}$/.test(event.database_key) &&
     event.instance_id === worker?.instance_id && Number.isSafeInteger(event.cycle) && event.cycle > 0;
   const starts = steps.map((/** @type {JsonObject} */ step) => timestamp(step.started_at));
   const ends = steps.map((/** @type {JsonObject} */ step) => timestamp(step.finished_at));
   const at = timestamp(cycle?.at);
+  const updatedAt = timestamp(worker?.updated_at);
   const expectedNames = cycle?.step_count === REQUIRED_CYCLE_STEPS.length + 1 ? [...REQUIRED_CYCLE_STEPS, "retention"] : REQUIRED_CYCLE_STEPS;
   const complete = Boolean(worker && binding.phase?.state === "waiting" && cycle && bound(cycle) && cycle.ok === true &&
     worker.cycle === cycle.cycle && Array.isArray(cycle.failed_steps) && cycle.failed_steps.length === 0 &&
     cycle.step_count === expectedNames.length && steps.length === cycle.step_count &&
     rows.filter((/** @type {JsonObject} */ event) => event.type === "lark_im_worker_cycle").length === 1 &&
-    Number.isFinite(at) && at <= timestamp(worker.updated_at) &&
-    steps.every((/** @type {JsonObject} */ step, /** @type {number} */ index) => bound(step) &&
-      step.step_index === index && step.name === expectedNames[index] && step.ok === true && step.exit_code === 0 &&
-      (step.partial === undefined || step.partial === false) &&
-      events.indexOf(step) < cycleIndex && Number.isFinite(starts[index]) && starts[index] >= worker.process_started_at_ms &&
-      (index === 0 || starts[index] >= ends[index - 1]) && Number.isFinite(ends[index]) && ends[index] >= starts[index] && ends[index] <= at));
-  summary.last_cycle = cycle ? { cycle: cycle.cycle, ok: cycle.ok === true, at: Number.isFinite(at) ? new Date(at).toISOString() : null,
-    complete, started_at: complete ? new Date(starts[0]).toISOString() : null } : null;
+    at !== null && updatedAt !== null && at <= updatedAt &&
+    steps.every((/** @type {JsonObject} */ step, /** @type {number} */ index) => {
+      const start = starts[index], end = ends[index], previousEnd = ends[index - 1];
+      return bound(step) && step.step_index === index && step.name === expectedNames[index] && step.ok === true && step.exit_code === 0 &&
+        (step.partial === undefined || step.partial === false) && events.indexOf(step) < cycleIndex &&
+        start !== null && start >= worker.process_started_at_ms && (index === 0 || previousEnd !== null && start >= previousEnd) &&
+        end !== null && end >= start && end <= at;
+    }));
+  summary.last_cycle = cycle ? { cycle: cycle.cycle, ok: cycle.ok === true, at: at !== null ? new Date(at).toISOString() : null,
+    complete, started_at: complete && starts[0] !== null ? new Date(starts[0]).toISOString() : null } : null;
   summary.in_progress = binding.phase?.state === "syncing";
   summary.unfinished_cycle = events.some((/** @type {JsonObject} */ event, /** @type {number} */ index) => event.type === "lark_im_worker_step" && index > cycleIndex);
   return summary;

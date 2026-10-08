@@ -34,7 +34,7 @@ export function executeMessages(options, deps = {}) {
 export function runMessagesCommand(options, context) {
   const messages = executeMessages(options, context.messagesDeps || context.deps || {});
   if (options.format === "json") context.stdout.write(`${JSON.stringify(messages, null, 2)}\n`);
-  else context.stdout.write(renderMessagesText(messages));
+  else context.stdout.write(renderMessagesText(messages, { stream: context.stdout }));
   return 0;
 }
 

@@ -86,12 +86,12 @@ test("a real identity-conflict comparison is visible despite zero missing/versio
   assert.match(text.output, /Remote sample: needs_attention/);
   assert.match(text.output, /Reason: Sample has source differences/);
   assert.match(text.output, /Message identity conflicts: 1\n/);
-  assert.match(text.output, /0 confirmed missing.*0 suspected.*0 pending sync.*0 older versions.*0 source content differences/);
+  assert.match(text.output.replace(/\s+/g, " "), /0 confirmed missing.*0 suspected.*0 pending sync.*0 older versions.*0 source content differences/);
   assert.equal(report.checks.live.evidence.findings.identity_conflict, 1);
   assert.deepEqual(report.checks.live.evidence, publicRemoteReport(sample("identity_conflict").report));
 });
 
-test("healthy text is unchanged and adds no zero anomaly rows or generic notices", async () => {
+test("healthy text wraps at the default width without zero anomaly rows or generic notices", async () => {
   const text = await command("healthy");
   const json = await command("healthy", { format: "json" });
   assert.equal(text.code, 0);
@@ -99,9 +99,11 @@ test("healthy text is unchanged and adds no zero anomaly rows or generic notices
   assert.equal(text.output, [
     "Check: PASSED", "database: PASSED", "sync: PASSED", "quality: PASSED", "coverage: NOT_REQUESTED",
     "backup: NOT_REQUESTED", "live: PASSED", "wait: NOT_REQUESTED",
-    "Remote sample: healthy · 1 messages / 1 discovered chats · checked 2030-01-02T12:00:00.000Z",
+    "Remote sample: healthy · 1 messages / 1 discovered chats · checked",
+    "               2030-01-02T12:00:00.000Z",
     "Window: 2030-01-01T11:50:00.000Z to 2030-01-02T11:50:00.000Z",
-    "Findings: 0 confirmed missing · 0 suspected · 0 pending sync · 0 older versions · 0 source content differences",
+    "Findings: 0 confirmed missing · 0 suspected · 0 pending sync · 0 older versions",
+    "          · 0 source content differences",
     "Compared: 1 static bodies · 0 body comparisons unverified · 0 truncated chats", "",
   ].join("\n"));
   assert.deepEqual(JSON.parse(json.output).checks.live.evidence, publicRemoteReport(sample("healthy").report));

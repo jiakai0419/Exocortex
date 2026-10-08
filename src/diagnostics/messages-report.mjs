@@ -3,6 +3,7 @@
 import { readOnlySqliteJson } from "../storage/sqlite/readonly-query.mjs";
 import { renderSystemContent } from "../adapters/lark-im/system-content.mjs";
 import { renderCardContent } from "../adapters/lark-im/card-content.mjs";
+import { personName, senderIdentity, senderNameFromSource } from "../adapters/lark-im/sender-identity.mjs";
 
 /**
  * @typedef {"all" | "sent" | "received"} MessageDirection
@@ -186,6 +187,26 @@ function displayCard(raw, options) {
   return renderCardContent(content, native.mentions, options);
 }
 
+/** Read-only sender projection. Raw evidence may fill an old missing name only
+ * for the same stored actor and namespace; it cannot undo rejection or clear.
+ * @param {Row} row
+ * @param {Row} canonical
+ * @param {Row} raw
+ */
+function displaySender(row, canonical, raw) {
+  const identity = senderIdentity(raw);
+  const id = canonical.sender_id || row.actor_id || identity.id || null;
+  const unnamed = { id, name: "" };
+  if (canonical.sender_name_state === "cleared" || canonical.sender_id_type === "conflicting") return unnamed;
+  const known = personName(canonical.sender_name, [id, row.actor_id, ...identity.identifiers]);
+  if (known) return { id, name: known };
+  if (identity.conflict
+    || [canonical.sender_id, row.actor_id].some((stored) => stored != null && stored !== "" && stored !== identity.id)
+    || canonical.sender_id_type != null && typeof canonical.sender_id_type !== "string"
+    || canonical.sender_id_type && identity.type && canonical.sender_id_type !== identity.type) return unnamed;
+  return { id, name: senderNameFromSource(raw) };
+}
+
 /**
  * @param {Row} row
  * @returns {EnrichedMessage}
@@ -194,7 +215,6 @@ function enrichRow(row) {
   const canonical = parseMaybeJson(row.canonical_json) || {};
   const raw = parseMaybeJson(row.raw_json) || {};
   const config = parseMaybeJson(row.scope_config_json) || {};
-  const sender = raw.sender && typeof raw.sender === "object" ? raw.sender : {};
   const chatPartner =
     canonical.chat_partner || (raw.chat_partner && typeof raw.chat_partner === "object" ? raw.chat_partner : null);
   const chatType =
@@ -205,8 +225,7 @@ function enrichRow(row) {
     (config.chat_id ? "group" : "unknown");
   const chatName = canonical.chat_name || raw.chat_name || raw.chat?.name || config.chat_name || null;
   const chatId = canonical.chat_id || row.container_id || config.chat_id || raw.chat_id || null;
-  const senderId = canonical.sender_id || row.actor_id || sender.id || sender.open_id || null;
-  const senderName = canonical.sender_name || sender.name || sender.display_name || null;
+  const { id: senderId, name: senderName } = displaySender(row, canonical, raw);
   const messageType = canonical.msg_type || raw.msg_type || raw.message_type || null;
   const senderType =
     canonical.sender_type ||

@@ -122,7 +122,7 @@ test("runStep invokes lark-im-sync with node and compacts JSON summaries", () =>
   const step = runStep("sent", ["--scope", "sent", "--db", "custom.sqlite"], {
     execPath: "/usr/local/bin/node",
     now: () => times.shift() || new Date("2026-06-20T00:00:02.000Z"),
-    spawnSync: (cmd, args, options) => {
+    runProcess: (cmd, args, options) => {
       calls.push([cmd, args, options]);
       return spawnResult({
         stdout: JSON.stringify({
@@ -148,10 +148,8 @@ test("runStep invokes lark-im-sync with node and compacts JSON summaries", () =>
   assert.match(calls[0][1][0], /\/bin\/exocortex\.mjs$/);
   assert.deepEqual(calls[0][1].slice(1), ["sync", "--scope", "sent", "--db", "custom.sqlite"]);
   assert.deepEqual(calls[0][2], {
-    encoding: "utf8",
     maxBuffer: 100 * 1024 * 1024,
     timeout: 600_000,
-    killSignal: "SIGKILL",
   });
   assert.equal(step.name, "sent");
   assert.equal(step.ok, true);
@@ -178,7 +176,7 @@ test("runStep invokes lark-im-sync with node and compacts JSON summaries", () =>
 test("runStep preserves failures and malformed stdout as null summary", () => {
   const step = runStep("received-hot", ["--scope", "received"], {
     now: () => new Date("2026-06-20T00:00:00.000Z"),
-    spawnSync: () =>
+    runProcess: () =>
       spawnResult({
         status: 2,
         stdout: "not-json",
@@ -197,7 +195,7 @@ test("runStep collects safe transport stats from failed-child stderr and preserv
   const step = runStep("sent", [], {
     nowMs: () => 1_000,
     cooldownsByOperation: { contact_search: 4_000, message_history_bundle: 500, "secret-id": 5_000 },
-    spawnSync: (_cmd, _args, options) => {
+    runProcess: (_cmd, _args, options) => {
       childEnv = options.env;
       return spawnResult({ status: 1, stderr: `${JSON.stringify({ type: "lark_transport_summary",
         transport: { calls: 1, exhausted: 1, rate_limits: 2, private_id: "do-not-log", cooldowns_by_operation: { contact_search: 8_000 } } })}\n` });
@@ -223,7 +221,7 @@ test("runCycle forwards cooldowns to later children without a global wait or mut
     cooldownsByOperation: cooldowns,
     writeLog: { stdout: { write() {} } },
     onComplete: (observed) => steps.push(...observed),
-    runStep: { spawnSync: (_cmd, _args, options) => {
+    runStep: { runProcess: (_cmd, _args, options) => {
       envs.push(JSON.parse(options.env.EXOCORTEX_LARK_COOLDOWNS_JSON));
       return spawnResult({ stdout: JSON.stringify({ ok: true, transport: {
         calls: 1, cooldowns_by_operation: envs.length === 1 ? { contact_search: 8_000 } : {},
@@ -256,7 +254,7 @@ test("runCycle defers only the high-level steps whose own operation deadline is 
       cooldownsByOperation: { [operation]: 8_000 },
       writeLog: { stdout: { write() {} } },
       onComplete: (steps) => observed.push(...steps),
-      runStep: { spawnSync: () => { spawned += 1; return spawnResult({ stdout: '{"ok":true}' }); } },
+      runStep: { runProcess: () => { spawned += 1; return spawnResult({ stdout: '{"ok":true}' }); } },
     });
     const deferred = observed.filter((step) => step.summary?.deferred);
     assert.deepEqual(deferred.map((step) => step.name), expectedDeferred, operation);
@@ -278,7 +276,7 @@ test("expired high-level cooldowns resume normally and error events defer later 
     nowMs: () => 1_000, cooldownsByOperation: cooldowns,
     writeLog: { stdout: { write() {} } },
     onComplete: (observed) => steps.push(...observed),
-    runStep: { spawnSync: (_cmd, args) => {
+    runStep: { runProcess: (_cmd, args) => {
       spawned += 1;
       if (args.includes("hot") && args.includes("received")) return spawnResult({ status: 1,
         stderr: JSON.stringify({ type: "lark_transport_summary", transport: { exhausted: 1, cooldowns_by_operation: { message_history_bundle: 8_000 } } }) });
@@ -295,7 +293,7 @@ test("expired high-level cooldowns resume normally and error events defer later 
 test("runStep fails closed on exit-zero malformed or unhealthy summaries", () => {
   const malformed = runStep("sent", [], {
     now: () => new Date("2026-06-20T00:00:00.000Z"),
-    spawnSync: () => spawnResult({ status: 0, stdout: "not-json" }),
+    runProcess: () => spawnResult({ status: 0, stdout: "not-json" }),
   });
   assert.equal(malformed.ok, false);
   assert.equal(malformed.exit_code, 0);
@@ -303,7 +301,7 @@ test("runStep fails closed on exit-zero malformed or unhealthy summaries", () =>
 
   const unhealthy = runStep("sent", [], {
     now: () => new Date("2026-06-20T00:00:00.000Z"),
-    spawnSync: () => spawnResult({ status: 0, stdout: JSON.stringify({ ok: false }) }),
+    runProcess: () => spawnResult({ status: 0, stdout: JSON.stringify({ ok: false }) }),
   });
   assert.equal(unhealthy.ok, false);
   assert.deepEqual(unhealthy.summary, {

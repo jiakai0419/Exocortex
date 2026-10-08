@@ -1,7 +1,9 @@
 // @ts-check
 // The anchor keeps the process-group leader alive while the worker may exit.
 // Its private control descriptors are never inherited by the actual worker.
-export const REMOTE_SAMPLE_ANCHOR = String.raw`
+// Two fixed callers share the lifecycle protocol. Ordinary steps preserve
+// stderr and never interpret the remote sampler's cache environment.
+function anchorCode(sample) { return String.raw`
 import json,os,subprocess,sys,time
 worker=None
 control=None
@@ -55,7 +57,7 @@ try:
     os.set_blocking(control,False)
     control_nonblocking=True
     os.set_blocking(status,False)
-    if os.environ.get('EXOCORTEX_REMOTE_SAMPLE_PUBLICATION') is not None:
+    if ${sample ? "True" : "False"} and os.environ.get('EXOCORTEX_REMOTE_SAMPLE_PUBLICATION') is not None:
         inherited=os.environ.get('EXOCORTEX_REMOTE_SAMPLE_LOCK_FD','')
         if not inherited.isascii() or not inherited.isdecimal() or int(inherited)<200:
             raise ValueError('cache lock unavailable')
@@ -87,7 +89,7 @@ try:
             time.sleep(min(0.05,max(0.0,deadline-time.monotonic())))
         if go and active():
             stage='anchor_worker_spawn'
-            worker=subprocess.Popen(sys.argv[5:],stdin=sys.stdin,stdout=sys.stdout,stderr=subprocess.DEVNULL,
+            worker=subprocess.Popen(sys.argv[5:],stdin=sys.stdin,stdout=sys.stdout,stderr=${sample ? "subprocess.DEVNULL" : "sys.stderr"},
                 start_new_session=False,close_fds=True,pass_fds=worker_fds)
             while active():
                 stage='anchor_control_read'
@@ -136,4 +138,7 @@ try:
 except Exception: pass
 # Avoid Popen finalizers implicitly polling again after a failed worker poll.
 os._exit(2)
-`;
+`; }
+
+export const REMOTE_SAMPLE_ANCHOR = anchorCode(true);
+export const WORKER_STEP_ANCHOR = anchorCode(false);

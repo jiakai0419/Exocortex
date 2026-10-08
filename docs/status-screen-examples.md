@@ -197,8 +197,8 @@ Diagnostics
   Coverage boundary      List positions and content checkpoints do not
                          independently verify all remote content through a
                          target time.
-  Command targets        All suggestions require the same --db and --log-dir
-                         values as this status invocation.
+  Command targets        Keep the same --db. Keep --log-dir only for status,
+                         check --wait or check --live --write-live-cache.
   Inspect further        npm run exo -- check · npm run exo -- status --detail ·
                          npm run exo -- status --format json · npm run exo --
                          status --logs (private)

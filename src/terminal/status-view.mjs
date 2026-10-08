@@ -1,5 +1,5 @@
 // @ts-check
-import { serviceTimeRange, serviceTimestamp, durationText, formatStabilityInterval, formatLeaseIssues } from "./lark-im-service-view.mjs";
+import { serviceTimeRange, serviceTimestamp, durationText, formatStabilityInterval, formatLeaseIssues } from "./status-format.mjs";
 import { statusLayout } from "./status-layout.mjs";
 import { formatLogLine } from "./status-log-view.mjs";
 
@@ -250,7 +250,7 @@ export function renderStatusText(report, options = {}) {
     const runCounts = Object.entries(detail.runs?.by_status || {}).map(([status, count]) => `${number(count)} ${status === "running" ? "unfinished records" : status}`);
     screen.row("Retained sync runs", detail.runs?.by_status === undefined ? "Run history evidence unavailable" : runCounts.join(" · ") || "No sync run records");
     screen.row("Coverage boundary", "List positions and content checkpoints do not independently verify all remote content through a target time.");
-    screen.row("Command targets", "All suggestions require the same --db and --log-dir values as this status invocation.");
+    screen.row("Command targets", "Keep the same --db. Keep --log-dir only for status, check --wait or check --live --write-live-cache.");
     screen.row("Inspect further", "npm run exo -- check · npm run exo -- status --detail · npm run exo -- status --format json · npm run exo -- status --logs (private)");
     screen.row("Remote check", "npm run exo -- check --live takes a new sample; add --write-live-cache to update the status cache.");
   }

@@ -178,7 +178,7 @@ test("worker logs retain safe CLI JSON errors and transport diagnostics", async 
   ];
   for (const result of results) {
     const step = runStep("sent", [], { nowMs: () => NOW,
-      spawnSync: () => ({ status: result.code, stdout: result.stdout, stderr: result.stderr }) });
+      runProcess: () => ({ status: result.code, stdout: result.stdout, stderr: result.stderr }) });
     assert.equal(step.ok, false);
     assert.equal(step.exit_code, 1);
     assert.equal(step.stderr, JSON.parse(result.stdout).error.message);
@@ -190,7 +190,7 @@ test("worker logs retain safe CLI JSON errors and transport diagnostics", async 
 test("worker only reads recognized error envelopes and preserves process failure precedence", () => {
   const envelope = { schema_version: 1, ok: false, error: { code: "execution_failed", message: "Safe CLI error" } };
   const step = (report, child = {}) => runStep("sent", [], { nowMs: () => NOW,
-    spawnSync: () => ({ status: 1, stdout: JSON.stringify(report), stderr: "", ...child }) });
+    runProcess: () => ({ status: 1, stdout: JSON.stringify(report), stderr: "", ...child }) });
   for (const report of [{ ...envelope, schema_version: 99 }, { ...envelope, ok: true },
     { ...envelope, error: { code: "unknown", message: "Ignored error" } },
     { ...envelope, error: { code: "execution_failed", message: { nested: "Ignored" } } }]) assert.equal(step(report).stderr, "");

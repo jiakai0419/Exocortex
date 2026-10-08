@@ -22,7 +22,10 @@ const iso = (offset = 0) => new Date(STATUS_SCREEN_NOW + offset).toISOString();
 const hash = (text) => createHash("sha256").update(text).digest("hex");
 
 // Generated only from invented status-screen fixtures, with TZ=UTC and NO_COLOR=1.
-// Detail/JSON hashes remain from 34f9698142fc479decd20968ab3002316278dcbd.
+// JSON hashes remain from 34f9698142fc479decd20968ab3002316278dcbd.
+// Detail hashes include the approved Command targets guidance and its wrapping.
+// Independent comparison of all 18 scenarios at four widths confirmed that
+// removing only that row leaves the prior detailed screens byte-identical.
 // Default hashes were regenerated from 6ffc3d5b047c73638b2a2f0450769e2c755ddff1
 // by removing its old four runtime rows and Message details row. The candidate
 // removes its paired runtime rows and the same detail row for comparison; an
@@ -37,10 +40,10 @@ const BASELINE_TEXT = {
   "default:80": "7a6c4d40382234cbed7eff58844c122fa9a8a2f5bad9475243b9e1ecf2c3b710",
   "default:56": "bd2cd9d5a179d6450548b65d09b920a9500c2ea81d25db1cc051901a22a88dfb",
   "default:40": "f4104d27b98586065485d9e4d41374a60d0dbb2d75b625790933791996621474",
-  "detail:96": "f6e766c2292962e2c81e7667592dda7f849eccbd24e1558b0c00af1745675722",
-  "detail:80": "3a1b6f67f93360129c4fde357259fcf183a35de75ba4ec664492b7d11b2a6cf5",
-  "detail:56": "9d839f5436f374cf5f46b5467c692fb9cddd8db521113224abf794a8df0d8182",
-  "detail:40": "2d4a4fd8e966fb2e200fdc25deabbc3475e71a8a77882289e9fce6e6ef83446e",
+  "detail:96": "bb60e775f5bd14ce824365e8c8d4fcb6848c1875b77603a07a404da3631f68e3",
+  "detail:80": "8e5aa0f015e2cf3928b96ef1d7ba22650019c43712b1b38f85388b580ae87f4e",
+  "detail:56": "94762ae1739fea49d128b3f419b6fcc731c3e4a0edfb850633c4adc3e005a184",
+  "detail:40": "b54851ec4a3eb34f0a8bd9d9ca447884daaf9d105cedb08cbd625052530565b5",
 };
 const BASELINE_JSON = {
   false: "dbfe1994f881cf37963be356f2acd33b63b09c161b59b3d29762a0fd430fef8c",

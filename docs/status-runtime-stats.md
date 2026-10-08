@@ -31,6 +31,15 @@ between completions or the configured interval. Steps must also follow any
 retained prior completion in both append order and time. No private identifiers, paths,
 raw events, or error strings enter the public projection.
 
+Completion and step timestamps share the same strict worker-event parser with
+`check --wait`: require an explicit timezone and a real calendar date, while
+accepting valid timezone-equivalent instants. An impossible date must not be
+normalized into a usable completion. An invalid completion makes these statistics
+unavailable; invalid or incomplete steps make duration unavailable. These rules
+do not merge the two consumers' acceptance policies: statistics may count a bound
+failed completion, whereas waiting requires a complete successful round begun
+after invocation.
+
 ## Invented target before implementation
 
 ```text

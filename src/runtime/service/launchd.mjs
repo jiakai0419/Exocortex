@@ -7,6 +7,7 @@ import { isDeepStrictEqual } from "node:util";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseWorkerProgramArguments, workerProgramArguments } from "../worker/options.mjs";
+import { ServiceDependencyError, resolveServiceDependencies, serviceEnvironment, verifyServiceDependencies } from "./dependencies.mjs";
 
 export const LABEL = "com.exocortex.lark-im-worker";
 export const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -170,7 +171,7 @@ export function servicePlist(config, deps = {}) {
     Label: LABEL,
     WorkingDirectory: root,
     ProgramArguments: [deps.nodePath || process.execPath, deps.workerPath || resolve(root, "src/runtime/worker/main.mjs"), ...workerProgramArguments(config)],
-    EnvironmentVariables: { PATH: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", LARK_CLI: deps.larkCli || (deps.env || process.env).LARK_CLI || "/opt/homebrew/bin/lark-cli" },
+    EnvironmentVariables: deps.serviceEnvironment || serviceEnvironment(deps),
     Umask: 63, RunAtLoad: true, KeepAlive: true,
     StandardOutPath: "/dev/null", StandardErrorPath: resolve(config.logDir, "launchd.err.log"),
   };
@@ -192,10 +193,10 @@ export function plistXml(config, deps = {}) {
 /** @param {import("../worker/options.mjs").WorkerSettings} config @param {ServiceDeps} [deps] */
 export function install(config, deps = {}) {
   const before = confirmedProbe(deps);
-  if (!deps.larkCli && !(deps.env || process.env).LARK_CLI) {
-    const found = run("which", ["lark-cli"], { allowFailure: true }, deps);
-    deps = { ...deps, larkCli: found.status === 0 && !found.error && !found.signal ? found.stdout.trim() : undefined };
-  }
+  let selected;
+  try { selected = resolveServiceDependencies(deps); }
+  catch (error) { throw error instanceof ServiceDependencyError ? new ServiceOperationError(error.message) : new ServiceOperationError("cannot select service dependencies"); }
+  deps = { ...deps, ...selected };
   const desired = servicePlist(config, deps);
   const existing = readInstalledServiceConfig(deps);
   const unchanged = existing.status === "installed" && isDeepStrictEqual(existing.plist, desired);
@@ -204,6 +205,8 @@ export function install(config, deps = {}) {
     throw new ServiceOperationError("service is loaded with a different or unknown configuration; stop it before installing");
   }
   if (unchanged) return { ok: true, action: "install", status: "unchanged" };
+  try { verifyServiceDependencies(selected, deps); }
+  catch (error) { throw error instanceof ServiceDependencyError ? new ServiceOperationError(error.message) : new ServiceOperationError("cannot verify service dependencies"); }
   const path = plistPath(deps);
   const temporary = `${path}.tmp-${process.pid}`;
   const write = deps.writeFileSync || writeFileSync;

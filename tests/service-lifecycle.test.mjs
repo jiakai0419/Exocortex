@@ -191,23 +191,23 @@ test("service adapter emits one safe result and delegates no status/check action
   assert.doesNotMatch(output, /synthetic|7011/);
   await assert.rejects(() => runServiceCommand({ action: "status" }, { serviceDeps: f.deps }), /unknown service action/);
 });
-for (const selection of ["provided", "environment", "which", "fallback"]) {
+for (const selection of ["provided", "environment", "PATH", "unavailable"]) {
   test(`install preserves lark-cli selection via ${selection} without remote calls`, () => {
     const f = fixture({ installed: false });
-    const expected = selection === "provided" ? "/synthetic/bin/lark-cli" : selection === "environment" ? "/synthetic/env/lark-cli" : selection === "which" ? "/synthetic/path/lark-cli" : "/opt/homebrew/bin/lark-cli";
+    const expected = selection === "provided" ? "/synthetic/bin/lark-cli" : selection === "environment" ? "/synthetic/env/lark-cli" : "/synthetic/path/lark-cli";
     if (selection !== "provided") delete f.deps.larkCli;
-    f.deps.env = selection === "environment" ? { LARK_CLI: expected } : {};
-    const run = f.deps.run;
-    f.deps.run = (cmd, args, options) => {
-      if (cmd === "which") {
-        f.state.calls.push([cmd, ...args]);
-        return selection === "which" ? ok(`${expected}\n`) : { status: 1, stdout: "", stderr: "" };
-      }
-      return run(cmd, args, options);
-    };
+    f.deps.env = { PATH: "/synthetic/path:/synthetic/bin", ...(selection === "environment" ? { LARK_CLI: expected } : {}) };
+    if (selection !== "unavailable") f.state.executables.add(expected);
+    if (selection === "unavailable") {
+      f.state.executables.delete("/synthetic/bin/lark-cli");
+      assert.throws(() => install(f.config, f.deps), /lark-cli is unavailable/);
+      assert.equal(f.state.files.size, 0);
+      assert.deepEqual(f.state.calls.map((call) => call[0]), ["launchctl"]);
+      return;
+    }
     assert.equal(install(f.config, f.deps).status, "installed");
     assert.ok(f.state.files.get(f.path).includes(`<key>LARK_CLI</key><string>${expected}</string>`));
-    assert.deepEqual(f.state.calls.filter((call) => call[0] === "which"), ["which", "fallback"].includes(selection) ? [["which", "lark-cli"]] : []);
+    assert.deepEqual(f.state.calls.filter((call) => call[0] === "which" || call[0] === expected), []);
     assert.deepEqual(lifecycleCalls(f), []);
   });
 }

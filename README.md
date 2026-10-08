@@ -36,7 +36,7 @@ node bin/exocortex.mjs check --through "$COVERAGE_TARGET_ISO"
 
 默认 `check` 聚合本地 database、sync、quality 证据，不要求服务运行，也不联网、建库、恢复遗留 run、chmod、写缓存或启停服务。`--wait` 等待调用后新的完整成功 worker 周期；`--through` 使用固定终点验证保留的覆盖证据。检查条件不满足返回 2，参数、依赖或读取失败返回 1；`status` 和 `messages` 读取成功返回 0，不证明同步完整。
 
-`check --live` 显式读取有界远端样本；加 `--write-live-cache` 通过同一持久调度状态更新缓存并遵守已有到期/退避。后台 worker 默认每 15 分钟在成功周期后采样（可禁用），`status` 只读缓存。设计、预算、账号证据和离线验收见 [Remote sample](docs/remote-sample-design.md)。`messages`、`status --logs` 和显式 `--unsafe-details` 输出属于私有内容。本地 ready 和有界 SAMPLED 都不能证明全历史完整。
+`check --live` 显式读取有界远端样本；加 `--write-live-cache` 通过同一持久调度状态更新缓存并遵守已有到期/退避。后台 worker 默认每 15 分钟在成功周期后采样（可禁用），`status` 只读缓存。设计、预算、账号证据和离线验收见 [Remote sample](docs/remote-sample-design.md)。`messages`、`sync`、`status --logs` 和显式 `--unsafe-details` 输出属于私有内容。`sync` 保留兼容 JSON 摘要，其中包含数据库路径和可能的业务错误细节，不用于公开诊断。本地 ready 和有界 SAMPLED 都不能证明全历史完整。
 
 显式 `sync --start` 必须带时区并持久保存为来源基线。空新库省略时首次运行使用当日本地零点；已有数据但缺基线的旧库必须显式确认。新发现或跨日仍无 cursor 的 scope 复用同一基线，已有 cursor 优先，不同的 `--start` 不能改写已有基线。
 

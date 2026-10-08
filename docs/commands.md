@@ -4,7 +4,7 @@
 
 公共规范入口：`node bin/exocortex.mjs`；人类快捷入口：`npm run exo --`。本表从 `--help --all --format json` 的 registry 目录生成，共 **6 个顶层命令、16 个执行路由**。默认帮助突出 messages、status 与帮助；开发和研究工具见 [Development](development.md)。
 
-默认路径相对安装 root，显式相对路径按 cwd 解析。`messages` 与显式日志/unsafe 模式为私有输出；默认诊断只输出安全投影。`sync` 保留已有 JSON summary 契约，仅支持 JSON。域内参数关系仍由各命令校验，不因目录列出而自动允许任意组合。操作配方见 [Operations](operations.md)，行为变化与退役门槛见 [CLI migration](cli-migration.md)。
+默认路径相对安装 root，显式相对路径按 cwd 解析。`messages`、`sync` 与显式日志/unsafe 模式为私有输出；默认诊断只输出安全投影。`sync` 保留已有 JSON summary 契约，仅支持 JSON，可能包含私有路径与业务错误细节。域内参数关系仍由各命令校验，不因目录列出而自动允许任意组合。操作配方见 [Operations](operations.md)，行为变化与退役门槛见 [CLI migration](cli-migration.md)。
 
 ## Routes
 
@@ -14,8 +14,8 @@
 | `messages` | Read local messages newest message time first, including original private JSON. Cards are captured API snapshots and may differ from the current client state. JSON retains card rendering status and diagnostics. | local-read | `private` |
 | `status` | Observe service, health, activity and freshness without live requests. | local-read | `public-safe` |
 | `check` | Collect database, sync and quality evidence and requested extensions. | local-read | `public-safe` |
-| `sync` | Run one bounded pass, preserving message and detail-debt contracts. | remote-read, database-write, activity-write | `public-safe` |
-| `service install` | Install configuration without starting the worker. | configuration-write | `public-safe` |
+| `sync` | Run one bounded pass, preserving message and detail-debt contracts. | remote-read, database-write, activity-write | `private` |
+| `service install` | Validate local runtime dependencies and install configuration without starting the worker. | configuration-write | `public-safe` |
 | `service start` | Ensure the configured service is running. | service-lifecycle | `public-safe` |
 | `service stop` | Stop the configured service. | service-lifecycle | `public-safe` |
 | `service restart` | Explicitly replace the running service instance. | service-lifecycle | `public-safe` |
@@ -93,7 +93,7 @@ Collect database, sync and quality evidence and requested extensions.
 | --- | --- | --- | --- | --- |
 | `--db` | path | `data/exocortex.sqlite` | — | Database; default relative to installation root, explicit relative paths to cwd. |
 | `--format` | text/json | `text` | — | Output format. |
-| `--log-dir` | path | `logs/lark-im` | — | Worker log directory. |
+| `--log-dir` | path | `logs/lark-im` | — | Worker log directory; requires --wait or --live --write-live-cache. |
 | `--backup-dir` | path | `backups/private` | — | Private backup directory. |
 | `--live` | boolean | `false` | — | Read a bounded remote sample. |
 | `--write-live-cache` | boolean | `false` | — | Write the safe sample cache; requires --live. |
@@ -114,7 +114,7 @@ Collect database, sync and quality evidence and requested extensions.
 
 Run one bounded pass, preserving message and detail-debt contracts.
 
-默认效果：`remote-read, database-write, activity-write`；输出：`public-safe`。
+默认效果：`remote-read, database-write, activity-write`；输出：`private`。
 
 | 参数 | 类型/取值 | 默认 | 约束 | 说明 |
 | --- | --- | --- | --- | --- |
@@ -138,11 +138,11 @@ Run one bounded pass, preserving message and detail-debt contracts.
 | `--retry-delay-ms` | integer | `2000` | — | Retry delay ms. |
 | `--detail-limit` | integer | `5` | — | Due detail roots per details run, capped at 20. |
 | `--detail-scope` | string | — | — | Detail scope. |
-| `--format` | json | `json` | — | Existing single-pass JSON summary contract. |
+| `--format` | json | `json` | — | Private single-pass JSON summary, including database path and possible business error details. |
 
 ### service install
 
-Install configuration without starting the worker.
+Validate local runtime dependencies and install configuration without starting the worker.
 
 默认效果：`configuration-write`；输出：`public-safe`。
 

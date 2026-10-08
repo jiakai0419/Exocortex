@@ -35,7 +35,7 @@
 | 13 | `lark-im-service.mjs` | 生命周期到 `service`；观察到 `status`；等待到 `check --wait` | A |
 | 14 | `lark-im-sync.mjs` | 公共 `sync` 与 worker 子进程共用 bin；算法与导出直接来自领域模块 | A |
 | 15 | `lark-im-worker.mjs` | 内部 `src/runtime/worker/main.mjs`；本提交移除旧桥，部署按 W 门槛验收 | W |
-| 16 | `lib/doctor-core.mjs` | 直接 import `src/diagnostics/doctor-core.mjs` 中仍适用的领域规则；聚合归 check | A |
+| 16 | `lib/doctor-core.mjs` | 聚合与通过谓词归 `check`；质量及同步领域报告直接复用，旧 doctor 聚合模块退役 | A |
 | 17 | `lib/ingestion-store.mjs` | 直接 import `dist/storage/sqlite/ingestion-store.js`，保持 TS/dist 边界 | A |
 | 18 | `lib/lark-im-adapter.mjs` | 直接 import `src/adapters/lark-im/adapter.mjs` | A |
 | 19 | `lib/lark-im-core.mjs` | 按职责直接 import `src/adapters/lark-im/core.mjs` 等实现 | A |
@@ -71,6 +71,12 @@
 
 仓内清点覆盖源文件、生成物、配置、测试和文档中的路径引用；授权切换另外核验了已识别 LaunchAgent。该有限范围不能证明所有未知外部调用均不存在。发现具体用户控制的本地调用后应加入同批迁移；真正外部绑定才登记 X。
 
+### 旧报告链清理契约
+
+现行健康检查只通过 `check` 聚合，现行状态文本只通过 `status` 渲染。无产品调用者的 doctor 聚合、doctor/sync-status/quality 旧文本视图及旧 service 整屏渲染不再保留为第二套实现。同步、质量、服务的领域报告继续保留；当前 status 使用的时间、间隔和租约格式化函数仍共用一个普通模块，保留时区与 DST 行为，不新增入口。
+
+退役测试只删除旧入口或版式专属断言。隐私、未知/失败状态、非行动性质量提示和不可用远端证据等有效反例迁到当前 `check/status` 接线或对应领域报告；不能用删除旧测试代替当前入口的正常与失败对照。当前 status 的默认/详细文本和 JSON 能力不得退步，SQLite maintenance 的在用文本视图不属于本次清理。
+
 ## 行为差异
 
 | 旧用法/行为 | CLI v2 合同 |
@@ -90,7 +96,7 @@
 | details 欠账与执行失败混用退出 1 | 公共 sync 明确部分完成/欠账为 2，执行失败为 1，worker 同步消费新分类 |
 | probe 默认写报告或隐含 events | metadata 不启动 events；sample/events 显式、有界；仅 `--output` 写私有报告 |
 
-`messages` 保留原数组 JSON 与 raw/body/canonical/display 字段。维护预览不放宽数据范围：replay 仍要求显式 DB 和 1–3 个不同 scope，records 默认 limit 1000、scopes 默认 50，sender-only 默认 50/上限 100 且总远端预算 30 秒。`--probe-apps` 只对 records 有效。`--unsafe-details` 仅在 check live 或 records enrichment 模式成立，整份输出按 private 处理。
+`messages` 保留原数组 JSON 与 raw/body/canonical/display 字段。`sync` 的兼容 JSON summary 也按 private 分类：成功摘要包含数据库路径，scope 失败可能保留业务错误；分类修正不改变摘要字段、worker 消费或退出码。维护预览不放宽数据范围：replay 仍要求显式 DB 和 1–3 个不同 scope，records 默认 limit 1000、scopes 默认 50，sender-only 默认 50/上限 100 且总远端预算 30 秒。`--probe-apps` 只对 records 有效。`--unsafe-details` 仅在 check live 或 records enrichment 模式成立，整份输出按 private 处理。
 
 已退役桥曾保留重复参数最后取值及 cwd 默认路径规则；这些专用兼容分支已在本提交删除。内部入口、公共命令和持久服务配置继续拒绝重复参数，显式可重复的选项仍按其声明处理。内部 worker 的 `--once` 与 `--max-cycles` 各出现一次时，仍按最后出现的生命周期选项决定；两者均不进入长期服务配置。
 

@@ -6,6 +6,7 @@ OS/process modules. No fixture operation starts a child, touches a real pipe,
 waits for a real PID, or sends a signal. Both modes use only invented identities.
 """
 import ast
+import base64
 import builtins
 import errno
 import io
@@ -19,6 +20,7 @@ import types
 request = json.load(sys.stdin)
 scenario = request.get("scenario", {})
 mode = request.get("mode", "guardian")
+step_profile = request.get("profile") == "step"
 assert mode in ("guardian", "anchor", "cache_gate"), "unknown fixture mode"
 calls, operations, spawns, frames = [], [], [], []
 handlers, descriptors, nonblocking = {}, {}, {}
@@ -287,11 +289,14 @@ if mode == "anchor":
 
 
 class FakePipe:
+    def __init__(self, fd=17):
+        self.fd = fd
+
     def fileno(self):
-        return 17
+        return self.fd
 
     def close(self):
-        operations.append({"op": "capture_close", "fd": 17})
+        operations.append({"op": "capture_close", "fd": self.fd})
         visit("capture_close", True)
 
 
@@ -307,6 +312,7 @@ class FakeChild:
     def __init__(self, pid):
         self.pid = pid
         self.stdout = FakePipe()
+        self.stderr = FakePipe(18)
         self.returncode = None
 
     def wait(self, timeout=None):
@@ -340,6 +346,8 @@ def describe_stream(value):
         return "stdin"
     if value is fake_sys.stdout:
         return "stdout"
+    if value is fake_sys.stderr:
+        return "stderr"
     return type(value).__name__
 
 
@@ -369,17 +377,25 @@ def popen(args, **kwargs):
 def read(fd, count):
     if fd in cache_handles:
         return cache_read(fd, count)
-    if fd == 17:
+    if fd == 18 and not step_profile:
+        raise FakeFixtureLimit("unexpected stderr capture in sample profile")
+    if fd in (17, 18):
         stage = "capture_drain" if state["cleanup"] else "capture_read"
         operations.append({"op": "read", "stage": stage, "args": [fd, count]})
         visit(stage, state["cleanup"])
-        if state["payload_sent"]:
+        key = "payload_sent" if fd == 17 else "stderr_sent"
+        if step_profile and scenario.get("continuous_output") and state["go"]:
+            state["elapsed"] += 0.002
+            return b"x" * min(count, 128)
+        if state.get(key):
             if scenario.get("live_descendants") and not state["cleanup"]:
                 raise BlockingIOError(errno.EAGAIN, "synthetic descendant keeps stdout open")
             return b""
         if mode == "guardian" and not state["go"]:
             raise BlockingIOError(errno.EAGAIN, "synthetic unavailable")
-        state["payload_sent"] = True
+        state[key] = True
+        if fd == 18:
+            return (b"x" * 65537 if scenario.get("stderr_overflow") else scenario.get("stderr_text", "").encode())[:count]
         return (b"x" * 65537 if scenario.get("overflow") or scenario.get("output_overflow")
                 else b'{"outcome":"ok","synthetic":true}')[:count]
     item = descriptors[fd]
@@ -467,7 +483,7 @@ def killpg(pid, number):
 
 
 def set_blocking(fd, blocking):
-    stage = "anchor_setup" if mode == "anchor" else "capture_nonblocking" if fd == 17 else "control_nonblocking"
+    stage = "anchor_setup" if mode == "anchor" else "capture_nonblocking" if fd in (17, 18) else "control_nonblocking"
     before = nonblocking.setdefault(str(fd), False)
     attempt = {"fd": fd, "requested_nonblocking": not blocking, "before": before, "after": before, "succeeded": False}
     blocking_attempts.append(attempt)
@@ -550,6 +566,8 @@ class FakeOutput:
 out = FakeOutput()
 err = io.TextIOWrapper(err_bytes, encoding="utf-8", write_through=True)
 argv = ["guardian", "123", "5" if scenario.get("deadline") else "5000", "synthetic", "worker-argument"]
+if step_profile:
+    argv.insert(3, str(scenario.get("limit", 65536)))
 if mode == "anchor":
     argv = ["anchor", "111", "0.005" if scenario.get("deadline") else "5.0", str(control_pair[0]), str(status_pair[1]), "synthetic", "worker-argument"]
 fake_sys = types.SimpleNamespace(argv=scenario.get("argv", argv), executable="synthetic-python",
@@ -576,7 +594,7 @@ replacement = {"os": fake_os, "signal": fake_signal, "subprocess": fake_subproce
                "sys": fake_sys, "time": fake_time}
 # Reject dependencies before execution. Even a new nested import must use a
 # fake module; imports cannot fall through to real process or filesystem APIs.
-allowed = {**replacement, "json": json, "re": re, "stat": stat}
+allowed = {**replacement, "json": json, "re": re, "stat": stat, "base64": base64}
 tree = ast.parse(request["code"], "<mock-" + mode + ">")
 for node in ast.walk(tree):
     if isinstance(node, ast.Import):

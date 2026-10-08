@@ -90,6 +90,8 @@ STOPPED  LaunchAgent 未加载。
 
 `service install` 只校验并原子保存配置，不启动服务。正在运行的配置若不同则拒绝覆盖，需先显式 stop；相同配置可直接保留。`--db`、日志目录及共同 WorkerConfig 都解析后固化；`--once` / `--max-cycles` 不进入常驻配置。
 
+安装时还会解析本机 Node、SQLite、Python 与 LARK CLI 路径，以所选后台 PATH、隔离初始化环境进行无网络依赖检查；失败时保留原配置，不启动 worker。检查不验证 launchd 继承环境或运行时初始化配置，不代替启动后验收。不会复制 shell 的完整环境或凭据，也不通过运行 LARK CLI 验证账号。自定义安装目录、检查能力与限制见[服务运行依赖](service-dependencies.md)。
+
 `service start` 是 ensure-running：已确认运行时不更换实例；已加载但未运行时请求非强制 kickstart，未加载时 bootstrap 后启动。无法检查时失败。`service restart` 才明确执行 stop → start。启动返回 0 只表示请求已接受，持续运行与新周期用 `check --wait` 验收。
 
 `stop` 与 `uninstall` 必须确认 job absent；unknown 不能冒充停止，uninstall 在停止或确认失败时保留 plist。安装校验、文件替换与回滚失败都显式报告，不把磁盘配置恢复等同于进程恢复。现有安装配置的迁移门槛见 [W](cli-migration.md#worker-切换门槛-w)。
@@ -118,6 +120,8 @@ UNKNOWN  缺阶段、过期、进程检查失败、重启身份变化或证据�
 ```
 
 锁表示互斥，遗留 running 行和未结束的历史 cycle 都不能单独证明当前活动。当前阶段按日志追加顺序、实例及数据库绑定选择，不按可重置的周期号或最大时间戳猜测。worker 步骤使用真实子进程硬超时；间隔使用下次运行时间。独立前台没有整体硬期限，只在真实阶段转换后的五秒观察窗口内可证明活跃，长阻塞后诚实显示 UNKNOWN。新 worker 启动后才会产生这些阶段；旧日志不能补造它们。
+
+普通 worker 步骤由短生命周期 guardian 管理独立进程组；步骤超时、worker 父进程退出，或步骤结束后仍有请求子进程时，先清理所属组再接受结果。API 锁继续由正在执行的请求继承，不能通过删除锁文件恢复。清理只尝试一次组终止，并有有限收割期限；失败以固定 stage/errno 记录 primary 与 cleanup，不能被成功 JSON 或部分成功掩盖。guardian 自身遭 SIGKILL、宿主故障、权限拒绝或后代主动离开所属组不在自动清理保证内，不能据此声称锁已释放。
 
 Service STOPPED 仍可同时存在独立前台 Activity SYNCING。共享 sync report 只读取数据库证据，其 `current_activity.evidence=database_only` 不能证明阶段；锁或遗留 run 导致 UNKNOWN，不再声称 currently syncing。Service 另有阶段与 OS 观察，因此可得出更具体结果；这些检查并非原子 OS 快照，期限按最终观察时间校验。公共 JSON 保留兼容 `status`（waiting/stopped 对应 idle），新增精确 `state` 和有限时间证据，不公开进程或原始锁标识。Activity 不证明健康、完整覆盖或远端新鲜度。
 
@@ -161,7 +165,7 @@ node bin/exocortex.mjs check --db /absolute/path/to/exocortex.sqlite \
 - **Health & current work**：本地健康、后台运行和已验证工作。正常结果不重复实现证据；无法确认后台是否服务所选数据库时明确显示。健康来自服务、所选库及当前活动，不受未绑定 worker 历史结果升级或降级。
 - **Messages & progress**：保存的消息、启用接收会话、尚无内容检查点的会话、未完成名单及详情欠账、受限会话和缓存样本。详情来源包含全局发送源，不能称为会话数量。原始最旧列表检查点只在详情显示；默认仍显示列表证据不可用或无效。不会用列表位置替代持久起点到固定终点的连续成功窗口覆盖；本次不新增覆盖查询、缓存或 status 参数，既有 `check --through` 保持原样。
 - **Problems**：仅在有事实时出现，显示正数/不可查询的数据库失败及预约异常。受限、详情债和其他已显示状态不重复列一遍。正常零失败、命令建议和目标参数提示放到详情。
-- **Background history / Diagnostics**：只在详情显示。worker 日志未绑定所选数据库；窗口、完成轮次、失败任务和旧结果都保留。原始最旧列表检查点、正常关联证据、远端样本范围/身份边界也在详情。所有命令沿用本次 `--db` / `--log-dir`，不打印私有路径。`check --live` 取得本次样本，显式加 `--write-live-cache` 才更新 status 缓存。
+- **Background history / Diagnostics**：只在详情显示。worker 日志未绑定所选数据库；窗口、完成轮次、失败任务和旧结果都保留。原始最旧列表检查点、正常关联证据、远端样本范围/身份边界也在详情。所有建议沿用本次 `--db`；仅 `status`、`check --wait` 和 `check --live --write-live-cache` 沿用 `--log-dir`，普通 `check` 与 `check --live` 不接受该参数。提示不打印私有路径。`check --live` 取得本次样本，显式加 `--write-live-cache` 才更新 status 缓存，不为继承日志目录而添加写缓存模式。
 
 详情显示日志请求回看长度、窗口内事件首末时间及部分/截断状态、最长成功间隔、最新已完成任务和未收尾历史。只有旧事件时明确窗口内无事件，旧结果仍带日期；未来或无效时间不能写成刚刚成功。成功间隔不是停机时长，少于两次成功不可用。未绑定日志历史（包括明确失败和失败计数）全部只在详情显示，并标明归属未经验证，不能当作当前库发生故障。
 
@@ -353,6 +357,8 @@ diagnostic output   为维护、验收、排障展示系统状态。
 ```
 
 `node bin/exocortex.mjs messages --limit 20` 是产品阅读命令，会显示本地消息内容、群名和人员名。它的输出默认不适合复制到公开 issue、文档或 CI 日志。
+
+`sync` 同样为私有输出：保留现有 JSON 摘要和退出码，摘要包含数据库绝对路径，scope 内的业务失败还可能包含原始错误细节。机器命令目录将其标为 `private`；不要把同步 stdout 当作 public-safe 诊断报告公开。外层异常的安全封装不改变整份同步输出的分类。需要安全本地诊断时使用下列 `status` 或 `check`。
 
 诊断与维护默认只展示状态、计数、时间和有限原因，不输出真实身份、姓名、正文或原始错误 payload：
 
