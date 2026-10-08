@@ -244,6 +244,7 @@ Preview enrichment of one target; apply commits through its own CAS.
 | --- | --- |
 | `--apply` | database-write |
 | `--unsafe-details` | private |
+| `--review-out` | private-review-file-write |
 
 | 参数 | 类型/取值 | 默认 | 约束 | 说明 |
 | --- | --- | --- | --- | --- |
@@ -260,6 +261,9 @@ Preview enrichment of one target; apply commits through its own CAS.
 | `--names-only` | boolean | `false` | — | Fill missing sender names only for exact --record-id targets; excludes --sender-only and --probe-apps. |
 | `--max-cli-attempts` | integer | `12` | ≥ 1；≤ 1000 | Hard command-wide lark-cli process-attempt cap, including pages and fallbacks; not an HTTP request count. |
 | `--max-seconds` | integer | `30` | ≥ 1；≤ 180 | Command-wide remote-work deadline; stops without committing a budget-interrupted lookup. |
+| `--review-out` | path | — | — | Publish a private exact-target review file; dry-run only, with explicit request budgets. |
+| `--review-in` | path | — | — | Require this private review file for exact-target --apply; refetch and reject any drift. |
+| `--review-sha256` | string | — | — | SHA-256 of the exact reviewed file bytes, including its final newline; required with --review-in. |
 
 ### maintenance repair
 
@@ -286,6 +290,7 @@ Preview replay of explicit scopes and a fixed interval.
 | 显式模式 | 附加效果或输出级别 |
 | --- | --- |
 | `--apply` | database-write |
+| `--review-out` | private-review-file-write |
 
 | 参数 | 类型/取值 | 默认 | 约束 | 说明 |
 | --- | --- | --- | --- | --- |
@@ -298,6 +303,9 @@ Preview replay of explicit scopes and a fixed interval.
 | `--message-id` | string | — | 可重复 | One to 100 distinct existing messages; repeat this flag; exact mode requires one scope. |
 | `--max-cli-attempts` | integer | `12` | ≥ 1；≤ 1000 | Hard command-wide lark-cli process-attempt cap, including pages and fallbacks; not an HTTP request count. |
 | `--max-seconds` | integer | `30` | ≥ 1；≤ 180 | Command-wide remote-work deadline; stops without committing a budget-interrupted lookup. |
+| `--review-out` | path | — | — | Publish a private exact-target review file; dry-run only, with explicit request budgets. |
+| `--review-in` | path | — | — | Require this private review file for exact-target --apply; refetch and reject any drift. |
+| `--review-sha256` | string | — | — | SHA-256 of the exact reviewed file bytes, including its final newline; required with --review-in. |
 
 ### maintenance prune-runs
 

@@ -19,6 +19,11 @@ const maintenanceBudget = [
   { ...positive("--max-cli-attempts", "maxCliAttempts", 12, "Hard command-wide lark-cli process-attempt cap, including pages and fallbacks; not an HTTP request count."), max: 1000 },
   { ...positive("--max-seconds", "maxSeconds", 30, "Command-wide remote-work deadline; stops without committing a budget-interrupted lookup."), max: 180 },
 ];
+const maintenanceReview = [
+  option('--review-out', 'reviewOut', 'path', 'Publish a private exact-target review file; dry-run only, with explicit request budgets.'),
+  option('--review-in', 'reviewIn', 'path', 'Require this private review file for exact-target --apply; refetch and reject any drift.'),
+  text('--review-sha256', 'reviewSha256', 'SHA-256 of the exact reviewed file bytes, including its final newline; required with --review-in.'),
+];
 const route = (id, summary, options, effects, privacy = "public-safe", modes = []) => ({
   id, path: id.split("."), group: id.split(".")[0], summary, options, effects, privacy, modes,
   example: `node bin/exocortex.mjs ${id.replaceAll(".", " ")}`,
@@ -88,8 +93,10 @@ export const COMMANDS = Object.freeze([
     option("--record-id", "recordIds", "integer", "One to 100 distinct stored record IDs; repeat this flag; requires --names-only and excludes --limit.", { repeat: true, min: 1 }),
     bool("--names-only", "namesOnly", "Fill missing sender names only for exact --record-id targets; excludes --sender-only and --probe-apps."),
     ...maintenanceBudget,
+    ...maintenanceReview,
   ], ["local-read", "remote-read"], "public-safe", [
     { when: "--apply", effects: ["database-write"] }, { when: "--unsafe-details", privacy: "private" },
+    { when: '--review-out', effects: ['private-review-file-write'] },
   ]),
   route("maintenance.repair", "Preview structural recovery; apply uses existing fences.", [db, format, apply], ["local-read"], "public-safe", [{ when: "--apply", effects: ["database-write"] }]),
   route("maintenance.replay", "Preview replay of explicit scopes and a fixed interval.", [
@@ -99,7 +106,8 @@ export const COMMANDS = Object.freeze([
     text("--end", "end", "Explicit replay end with timezone.", { required: true }),
     text("--message-id", "messageIds", "One to 100 distinct existing messages; repeat this flag; exact mode requires one scope.", { repeat: true }),
     ...maintenanceBudget,
-  ], ["local-read", "remote-read"], "public-safe", [{ when: "--apply", effects: ["database-write"] }]),
+    ...maintenanceReview,
+  ], ["local-read", "remote-read"], "public-safe", [{ when: "--apply", effects: ["database-write"] }, { when: '--review-out', effects: ['private-review-file-write'] }]),
   route("maintenance.prune-runs", "Preview run-history retention; applying can remove coverage evidence.", [db, format, apply], ["local-read"], "public-safe", [{ when: "--apply", effects: ["database-write"] }]),
   route("maintenance.compact", "Preview database compaction; --apply permits the write.", [db, format, apply], ["local-read"], "public-safe", [{ when: "--apply", effects: ["database-write"] }]),
 ]);

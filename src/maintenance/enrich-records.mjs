@@ -10,6 +10,7 @@ import { larkSenderNameIsUnknownSql, larkSenderNamespaceSql, mergeLarkNameProjec
 import { createNameResolver, NAME_LOOKUP_RETRY_BUDGET_MS, uniqueAppIds } from "../adapters/lark-im/name-resolver.mjs";
 import { displayNameFromUser, personName, senderAliasesByOpenId, senderIdentity, senderNameFromSource, senderOpenId } from "../adapters/lark-im/sender-identity.mjs";
 import { classifyLarkFailure, createLarkCliRunner, createTransportState } from "../adapters/lark-im/transport.mjs";
+import { beginMaintenanceReview, reviewRequested, effectiveRecord, MaintenanceReviewError } from './review-artifact.mjs';
 
 function parseMaybeJson(value) {
   if (!value) return null;
@@ -126,14 +127,14 @@ function normalizedBody(row, canonical, raw) {
   return row.body;
 }
 
-function loadRows(dbPath, limit, recordIds) {
+function loadRows(dbPath, limit, recordIds, review = false) {
   if (recordIds && (!Array.isArray(recordIds) || recordIds.length < 1 || recordIds.length > 100
     || recordIds.some((id) => !Number.isSafeInteger(id) || id <= 0) || new Set(recordIds).size !== recordIds.length)) {
     throw new Error("record selection requires one to 100 distinct positive integer IDs");
   }
   const rows = sqliteJson(
     dbPath,
-    `SELECT
+    `SELECT ${review ? 'r.*,' : ''}
        r.id,
        r.external_id,
        r.external_version,
@@ -219,10 +220,12 @@ function prepareUpdates(dbPath, rows, proposals, senderOnly = false) {
     FROM proposals p;`, 'merge name projections');
   const rowsById = new Map(rows.map((row) => [row.id, row]));
   const projections = new Map(rows.map((row) => [row.id, row.canonical]));
+  const projectionJson = new Map(rows.map((row) => [row.id, row.canonical_json]));
   const updates = [];
   for (const result of merged) {
     const row = rowsById.get(result.id);
     projections.set(result.id, parseMaybeJson(result.canonical_json) || {});
+    projectionJson.set(result.id, result.canonical_json);
     if (result.canonical_json === row.canonical_json && result.body === row.body) continue;
     updates.push(`UPDATE records
        SET canonical_json = ${quoteSql(result.canonical_json)},
@@ -240,12 +243,13 @@ function prepareUpdates(dbPath, rows, proposals, senderOnly = false) {
          AND body IS ${quoteSql(row.body)};
        INSERT INTO __enrichment_effects (updated) VALUES (changes());`);
   }
-  return { updates, projections };
+  return { updates, projections, projectionJson };
 }
 
-function commitUpdates(dbPath, updates, dryRun) {
+/** @param {any} reviewFence @param {any} reviewBeforeCommit */
+function commitUpdates(dbPath, updates, dryRun, reviewFence = undefined, reviewBeforeCommit = undefined) {
   return commitEnrichmentUpdates(dbPath, updates, {
-    dryRun, reason: "lark-im-enrich-records", label: "update records",
+    dryRun, reason: "lark-im-enrich-records", label: "update records", reviewFence, reviewBeforeCommit,
   });
 }
 
@@ -387,12 +391,18 @@ function enrichRecords(opts, deps = {}) {
   if (opts.recordIds?.length && !opts.namesOnly) throw new Error("exact records require names-only enrichment");
 
   /** @type {JsonObject[]} */
-  const selected = loadRows(dbPath, opts.limit, opts.namesOnly ? opts.recordIds : undefined).map((row) => ({
+  const selected = loadRows(dbPath, opts.limit, opts.namesOnly ? opts.recordIds : undefined, reviewRequested(opts)).map((row) => ({
     ...row,
     canonical: parseMaybeJson(row.canonical_json) || {},
     raw: nativeRow(parseMaybeJson(row.raw_json) || {}),
     config: parseMaybeJson(row.scope_config_json) || {},
   }));
+  const scopeIds = reviewRequested(opts) ? [...new Set(selected.map(row => row.first_seen_scope_id))] : [];
+  const reviewScopes = scopeIds.length ? sqliteJson(dbPath,
+    `SELECT id,source_id,enabled,config_json FROM sync_scopes WHERE id IN (${scopeIds.map(quoteSql).join(',')});`, 'read review scopes')
+    .map(row => ({ id: row.id, source_id: row.source_id, enabled: row.enabled, config_json: row.config_json })) : [];
+  if (reviewRequested(opts) && reviewScopes.length !== scopeIds.length) throw new MaintenanceReviewError('binding_unavailable');
+  const review = beginMaintenanceReview(opts, { db: dbPath, mode: 'names', rows: selected, scopes: reviewScopes, now: deps.now || Date.now });
   const exclusions = { system_message: 0, explicitly_cleared: 0, known_name: 0, unverified_identity: 0 };
   const rows = opts.namesOnly ? selected.filter((row) => {
     const reason = namesOnlyExclusion(row);
@@ -617,7 +627,7 @@ function enrichRecords(opts, deps = {}) {
     }
   }
 
-  const { updates, projections } = prepareUpdates(dbPath, rows, proposals, opts.namesOnly);
+  const { updates, projections, projectionJson } = prepareUpdates(dbPath, rows, proposals, opts.namesOnly);
   const unresolved = opts.namesOnly ? rows.filter((row) => !personName(projections.get(row.id)?.sender_name,
     [row.actor_id, ...senderIdentity(row.raw).identifiers])).length : 0;
   const unresolvedNameTargets = new Set();
@@ -634,7 +644,14 @@ function enrichRecords(opts, deps = {}) {
     if (unresolved) unresolvedNameTargets.add(target.key);
   }
   deps.assertReady?.();
-  const { updated, skippedConflicts } = commitUpdates(dbPath, updates, opts.dryRun);
+  const reviewed = review?.finish(selected.map(row => {
+    const exclusion = namesOnlyExclusion(row);
+    const after = { ...effectiveRecord(row), canonical_json: projectionJson.get(row.id) ?? row.canonical_json };
+    const resolved = personName(projections.get(row.id)?.sender_name, [row.actor_id, ...senderIdentity(row.raw).identifiers]);
+    return { before: row, after, exclusion, outcome: exclusion ? 'excluded' : after.canonical_json !== row.canonical_json ? 'update' : resolved ? 'unchanged' : 'unresolved' };
+  }));
+  deps.assertReady?.();
+  const { updated, skippedConflicts } = commitUpdates(dbPath, updates, opts.dryRun, reviewed?.fence, reviewed?.assertBinding);
   const appFallbacksById = new Map();
   for (const [key, fallback] of appFallbackNames.entries()) {
     const separatorIndex = key.lastIndexOf(":");
@@ -662,6 +679,7 @@ function enrichRecords(opts, deps = {}) {
   /** @type {JsonObject} */
   const output = {
     ok: true,
+    ...(reviewed ? { review: reviewed.summary } : {}),
     dry_run: opts.dryRun,
     scanned: selected.length,
     planned: updates.length,

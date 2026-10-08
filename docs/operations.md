@@ -731,4 +731,46 @@ node bin/exocortex.mjs maintenance enrich --target records --db "$DB_PATH" \
 
 精确卡片回放可在一个 scope、一个固定窗口内重复 `--message-id "$MESSAGE_ID"`（1–100 个不同 ID），并明确给出上述两个预算。所有目标必须已存在于选定会话及窗口，且具有已知数字版本；未知版本直接拒绝。仍须完整读取该窗口，可能读到其他消息并消耗预算，但只有授权 ID 进入提交。缺失或重复的目标、错误会话及不完整分页整轮失败；提交在同一事务内检查读取时的记录 ID、会话、创建时间和版本，目标被删除、替换、同版本移动身份或并发更新时不会被重新插入或覆盖。版本必须严格变新才更新；相同版本内容冲突保留现状。多条消息可按已确认会话与时间窗分组，不能将窗口读取范围误称为只读那几个 ID。
 
-预览和 apply 是两次独立远端读取，精确 ID 与预算不构成对新正文或审批状态的确认。卡片仍是 API 快照；同版本冲突、未解析姓名、未重访观察必须如实保留。生产操作前仍需确认具体范围、预算和写入授权；这些本地能力不会自动修复生产数据。
+不带 review 参数时，预览和 apply 保持既有兼容行为：两次独立远端读取，精确 ID 与预算不构成对新正文或审批状态的确认，names 并发 CAS 可以逐项跳过。需要约束实际批准内容时，使用下面的私有审批工件。卡片仍是 API 快照；同版本冲突、未解析姓名、未重访观察必须如实保留。生产操作前仍需确认具体范围、预算和写入授权；这些本地能力不会自动修复生产数据。
+
+### 私有逐记录预览与批准
+
+`--review-out` 为 exact names-only 或单 scope exact replay 发布逐记录工件。它只复用本轮已获取的结果，不增加 self、联系人或消息 API 请求；预览不写数据库、不获取数据库维护锁。仍有原命令的只读远端请求、共享 API 租约/冷却和进程内姓名缓存；不会改变采样到期时间。默认 stdout 保持安全计数，只增加 schema、文件实际字节 SHA-256、变更数和过期时间，不展示路径、ID、姓名或正文。review 模式拒绝 `--unsafe-details`。
+
+先自行选择一个已有、当前用户所有、权限 0700 的私有目录。目标文件必须不存在；命令以 0600 排他发布，不覆盖已有文件，不自动创建或修改目录权限。以下变量必须由操作者明确设置；工件不自动提供目标、数据库路径或预算：
+
+```bash
+node bin/exocortex.mjs maintenance enrich --target records --db "$DB_PATH" \
+  --names-only --record-id "$RECORD_ID_A" --record-id "$RECORD_ID_B" \
+  --max-cli-attempts 4 --max-seconds 20 --review-out "$PRIVATE_NAMES_REVIEW"
+# 阅读私有文件后，将返回的实际文件摘要与明确写入授权一起固定。
+node bin/exocortex.mjs maintenance enrich --target records --db "$DB_PATH" \
+  --names-only --record-id "$RECORD_ID_A" --record-id "$RECORD_ID_B" \
+  --max-cli-attempts 4 --max-seconds 20 \
+  --apply --review-in "$PRIVATE_NAMES_REVIEW" --review-sha256 "$REVIEWED_SHA256"
+```
+
+卡片使用相同的 review 参数，原有 scope、窗口、全部 message ID 和两个预算必须再次明确给出：
+
+```bash
+node bin/exocortex.mjs maintenance replay --db "$DB_PATH" \
+  --scope-id "$SCOPE_ID" --start "$WINDOW_START" --end "$WINDOW_END" \
+  --message-id "$MESSAGE_ID_A" --message-id "$MESSAGE_ID_B" \
+  --max-cli-attempts 4 --max-seconds 20 --review-out "$PRIVATE_CARD_REVIEW"
+# 批准后保留相同范围/预算，将 review-out 换为以下三个参数：
+# --apply --review-in "$PRIVATE_CARD_REVIEW" --review-sha256 "$REVIEWED_SHA256"
+```
+
+`--review-out` 仅允许 dry-run；`--review-in`、`--review-sha256`、`--apply` 必须同时出现。两种命令都必须显式提供次数和秒数预算；空 review 参数也失败关闭，不能退回 legacy apply。SHA 覆盖实际 UTF-8 文件全部字节，包括缩进与末尾换行，编辑格式或重复 JSON 键也会改变批准摘要。输入必须是当前用户所有、私有、单硬链接普通文件；拒绝符号链接、非私有目录、非规范父路径、未知 schema 字段和超限文件。文件是数据，不能执行 SQL、选择新路径、增加目标或扩大预算。
+
+工件逐项列出目标/版本、决策、姓名 before/after 及来源/置信度、聊天与删除标记，并区分字段缺失和 JSON null。卡片可读部分重新渲染 API 原文；实际 final after 使用正式 SQLite upsert 的版本和合并投影，保留已有权威姓名。相同或更旧版本只展示原行 final after 和 conflict/duplicate，不把 incoming 当成实际更新。`title`、`body`、`canonical_json`、`raw_json`、`content_hash` 每列只展示摘要、字节数及变化字段；完整拟写投影另有摘要绑定。可读卡片不是存储 body 列的逐字展开，也不是业务审批状态的证明。
+
+任何 before/after 卡片渲染为 partial 或 structured_fallback（包括未解析 mention）均拒绝工件；正文、节点、深度等截断不能静默称为完整。完整渲染中的交互值省略和 URL 凭据脱敏可以保留，但 disclosure 和 omitted_actions 明确说明不可读范围，原内容摘要仍参与批准比较。最多 100 个目标，工件最多 1 MiB，每条参与比较的 before/有效 after/已获取 incoming 源快照合计最多 256 KiB，全体最多 4 MiB，姓名和白名单文本字段每字段最多 1 KiB UTF-8。任何超限均失败关闭，不自动扩大限制。
+
+工件固定 30 分钟有效，无延长选项。apply 先验证工件、当前明确参数、DB 文件身份、来源/基线、scope 配置、本地账号证据及全部目标完整前值；不符时不请求 API。随后重新读取远端，fresh proposal 必须逐项等于批准工件；姓名相同而来源改变、原未解析目标新解析成功、raw-only 变化或版本变化也中止整轮。运行 ID、审计时间和生成的 updated_at 不进入拟写内容摘要；本地原行的全部字段（含原 updated_at）进入前值围栏。
+
+提交持有现有短时维护租约，再重检 DB/account/sidecar 绑定。获得 `BEGIN IMMEDIATE` 后，SQLite 使用真实事务时钟首先检查有效期，再检查全部选中行的完整前值、source、scope 和本地 sent actor 条件；任一变化回滚整轮，names 不再部分 skip。等写锁跨过有效期同样拒绝；成功提交后的过期不抹掉真实回执。names 的全部目标在一个事务内；批准 replay 仅单 scope；不同工件或命令之间没有原子性保证。
+
+names 的账号绑定只来自现有本地证据，未增加实时 self 验证；replay 复用本轮原有 self 验证。source 内绑定受 SQLite 事务保护，文件 sidecar/DB 身份在提交前稳定重检，但没有引入文件描述符绑定执行器，不承诺抵御同 UID 恶意进程在最终文件校验与 SQLite 打开之间替换路径。运行中的同步允许继续；若维护/同步锁占用、前值变化或期限过短，应重新预览并重新批准，不能绕过围栏。预览本身不需要停服，是否停服以另行授权的运行安排为准。
+
+工件含私有姓名、消息文本和目标 ID，必须留在私有本地目录；不要放入 Git、公开日志或 CI 附件。预览不会授予真实数据修改权，部署和生产 apply 仍需各自的明确授权。

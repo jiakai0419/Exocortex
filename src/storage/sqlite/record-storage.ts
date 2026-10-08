@@ -139,6 +139,7 @@ const MUTABLE_RECORD_COLUMNS = [
   "canonical_json",
   "raw_json",
 ];
+const REVIEW_EFFECTIVE_COLUMNS = ["id", "source_id", "first_seen_scope_id", "external_id", ...MUTABLE_RECORD_COLUMNS];
 
 function mergedCanonicalSql(existingAlias: string, incomingAlias: string) {
   const existing = existingAlias;
@@ -168,6 +169,37 @@ function strictlyNewerVersionSql(existingAlias: string, incomingAlias: string) {
         length(${newNumeric}) = length(${oldNumeric}) AND ${newNumeric} > ${oldNumeric} COLLATE BINARY
       )
   ))`;
+}
+
+/** Read-only projection for existing exact replay targets. This is the actual
+ * strict upsert expression, including its SQL-side name merge, rather than a
+ * JavaScript approximation of what incoming canonical JSON might become.
+ * Callers must require one returned row per selected existing target. */
+function boundedReplayProjectionSql(records: StoredRecord[]) {
+  if (!Array.isArray(records) || records.length < 1 || records.length > 100) {
+    throw new Error("bounded replay review requires between 1 and 100 records");
+  }
+  const normalized = normalizeBoundedReplayRecords(records, "lark.im");
+  if (normalized.some((record) => record.record_type !== "lark.im.message" ||
+      !Number.isSafeInteger(record.occurred_at_ms))) {
+    throw new Error("invalid bounded replay review record");
+  }
+  const incomingColumns = ["source_id", "external_id", ...MUTABLE_RECORD_COLUMNS];
+  const sameFact = "r.external_version IS i.external_version AND r.content_hash IS i.content_hash AND r.raw_json IS i.raw_json";
+  return `WITH i (${incomingColumns.join(",")}) AS (VALUES
+      ${normalized.map((record) => `(${incomingColumns.map((column) => column === "occurred_at_ms"
+        ? String(record.occurred_at_ms) : quoteSql(record[column as keyof StoredRecord])).join(",")})`).join(",\n")}
+    ), projection AS MATERIALIZED (
+      SELECT r.*, CASE WHEN ${strictlyNewerVersionSql("r", "i")} AND ${recordDiffSql("r", "i")} THEN 1 ELSE 0 END AS should_update,
+        CASE WHEN ${sameFact} THEN 1 ELSE 0 END AS same_fact,
+        ${MUTABLE_RECORD_COLUMNS.map((column) => `${column === "canonical_json"
+          ? mergedCanonicalSql("r", "i") : `i.${column}`} AS incoming_${column}`).join(",\n")}
+      FROM i JOIN records r ON r.source_id=i.source_id AND r.external_id=i.external_id
+    ) SELECT id, external_id,
+      CASE WHEN should_update=1 THEN 'update' WHEN same_fact=1 THEN 'duplicate' ELSE 'conflict' END AS outcome,
+      json_object(${REVIEW_EFFECTIVE_COLUMNS.flatMap((column) => [quoteSql(column),
+        MUTABLE_RECORD_COLUMNS.includes(column) ? `CASE WHEN should_update=1 THEN incoming_${column} ELSE ${column} END` : column]).join(",\n")}) AS after_json
+      FROM projection ORDER BY id;`;
 }
 
 function recordUpdateSetSql() {
@@ -336,4 +368,4 @@ ${incomingRecordsSql(normalizedRecords)}
 }
 
 
-export { encodeSourceVersion, normalizeExternalVersion, normalizeStoredRecords, normalizeBoundedReplayRecords, numericVersionSql, versionCanReplaceSql, upsertRecordsSql, recordWritesSql };
+export { REVIEW_EFFECTIVE_COLUMNS, boundedReplayProjectionSql, encodeSourceVersion, normalizeExternalVersion, normalizeStoredRecords, normalizeBoundedReplayRecords, numericVersionSql, versionCanReplaceSql, upsertRecordsSql, recordWritesSql };

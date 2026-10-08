@@ -190,4 +190,4 @@ function recordSuccessfulSyncBinding(options, deps = {}) {
 }
 
 export { captureRemoteAccountBinding, readRemoteAccountBinding, recordSuccessfulSyncBinding,
-  accountBindingAdmissionError, reserveSyncAccountBinding };
+  accountBindingAdmissionError, reserveSyncAccountBinding, readSidecar as readRemoteAccountBindingSidecar };

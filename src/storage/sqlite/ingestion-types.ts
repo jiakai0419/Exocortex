@@ -38,6 +38,18 @@ export type WriteEffects = {
   duplicate: number;
 };
 
+/** Trusted local snapshots rechecked inside an approved maintenance commit.
+ * Artifact values never become SQL: workflows first read and validate the live
+ * rows, then pass those complete rows through this additional transaction fence. */
+export type MaintenanceReviewFence = {
+  createdAtMs: number;
+  expiresAtMs: number;
+  sourceConfigJson: string;
+  sentActor: string | null;
+  records: Array<Record<string, unknown>>;
+  scopes?: Array<{ id: string; source_id: string; enabled: number; config_json: string }>;
+};
+
 export type BoundedReplayOptions = {
   scope: SyncScope;
   initialSyncStartMs: number;
@@ -49,6 +61,9 @@ export type BoundedReplayOptions = {
   pages: number;
   fetchedCount: number;
   records: StoredRecord[];
+  reviewFence?: MaintenanceReviewFence;
+  /** Recheck local file/account binding after acquiring the maintenance lease. */
+  reviewBeforeCommit?: () => void;
   /** Optional existing-record identity fence for explicitly selected repairs. */
   exactTargets?: Array<{
     id: number;

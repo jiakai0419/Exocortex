@@ -7,6 +7,7 @@ import { quoteSql, sqlJson, sqliteQuery } from "./sqlite-executor.js";
 import { acquireMaintenanceLock, releaseMaintenanceLock } from "./sync-locks.js";
 import { RUN_FENCE_METADATA_KEY, scopeCursorJson, validateRecordCursor, cursorCanAdvanceSql, checkedRunId, runFenceGuardSql } from "./sync-run-fence.js";
 import { normalizeStoredRecords, normalizeBoundedReplayRecords, normalizeExternalVersion, numericVersionSql, versionCanReplaceSql, upsertRecordsSql, recordWritesSql } from "./record-storage.js";
+import { reviewFenceSql } from "./maintenance-review.js";
 
 /** Commit one completely fetched, explicitly bounded repair without touching
  * normal runs, scope cursors, or freshness markers. Remote work belongs outside
@@ -31,6 +32,11 @@ function commitBoundedReplayRecords(dbPath: string, options: BoundedReplayOption
     throw new Error("invalid bounded replay fetch evidence");
   }
   const records = normalizeBoundedReplayRecords(options.records, scope.source_id);
+  const reviewFence = options.reviewFence === undefined ? "" : reviewFenceSql(options.reviewFence);
+  if (options.reviewFence && (options.reviewFence.records.length !== records.length || records.some((record) =>
+    !options.reviewFence!.records.some((before) => before.source_id === record.source_id && before.external_id === record.external_id)))) {
+    throw new Error("bounded replay review fence must cover every candidate exactly");
+  }
   if (records.length > 10_000 || records.length > fetchedCount) throw new Error("bounded replay candidate limit exceeded");
   for (const record of records) {
     if (record.record_type !== "lark.im.message" || record.first_seen_scope_id !== scope.id ||
@@ -72,8 +78,10 @@ function commitBoundedReplayRecords(dbPath: string, options: BoundedReplayOption
       INSERT INTO __replay_effects (changed, existed, same_fact)
       SELECT changes(), existed, same_fact FROM __replay_before;
     `).join("\n");
+    options.reviewBeforeCommit?.();
     const rows = sqliteQuery(dbPath, `
       BEGIN IMMEDIATE;
+      ${reviewFence}
       CREATE TEMP TABLE __replay_guard (allowed INTEGER NOT NULL CHECK (allowed=1));
       INSERT INTO __replay_guard SELECT CASE WHEN EXISTS (
         SELECT 1 FROM maintenance_locks WHERE name='global' AND owner=${quoteSql(owner)}

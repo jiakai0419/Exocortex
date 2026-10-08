@@ -14,7 +14,8 @@ const inside = (root, path) => {
   return child !== "" && child !== ".." && !child.startsWith("../") && !isAbsolute(child);
 };
 const root = resolve(fixtureRoot);
-assert.deepEqual(args.slice(0, 2), ["maintenance", "enrich"]);
+assert.equal(args[0], "maintenance");
+assert.ok(["enrich", "replay"].includes(args[1]), "only fixture-owned enrichment or replay is supported");
 const db = args[args.indexOf("--db") + 1];
 assert.ok(args.includes("--db") && inside(root, resolve(db)), "the database must belong to this fixture");
 if (existsSync(db)) assert.ok(inside(realpathSync(root), realpathSync(db)), "the database must not resolve outside its fixture");

@@ -9,16 +9,18 @@ import { readOnlySqliteJson } from "../storage/sqlite/readonly-query.mjs";
 import { readRemoteAccountBinding, accountBindingAdmissionError } from "../diagnostics/remote-account-binding.mjs";
 import { publicDiagnosticError } from "../diagnostics/public-safe.mjs";
 import { createMaintenanceRequestSession, MaintenanceRequestError } from "./request-session.mjs";
+import { beginMaintenanceReview, validateReviewOptions, reviewRequested, MaintenanceReviewError } from './review-artifact.mjs';
 import {
   commitBoundedReplayRecords,
   normalizeBoundedReplayRecords,
   quoteSql,
   validateInitialSyncStartMs,
+  boundedReplayProjectionSql,
 } from "../../dist/storage/sqlite/ingestion-store.js";
 
 /** @typedef {Record<string, any>} JsonObject */
 /** @typedef {{id:string,source_id:string,enabled:number,config_json:string,config:JsonObject}} ReplayScope */
-/** @typedef {{db:string,scopeIds:string[],messageIds:string[],start:string,end:string,startMs:number,endMs:number,apply:boolean,help:boolean,maxCliAttempts?:number,maxSeconds?:number}} ReplayOptions */
+/** @typedef {{db:string,scopeIds:string[],messageIds:string[],start:string,end:string,startMs:number,endMs:number,apply:boolean,help:boolean,maxCliAttempts?:number,maxSeconds?:number,reviewOut?:string,reviewIn?:string,reviewSha256?:string}} ReplayOptions */
 /** @typedef {{fetchChatMessages?:ReturnType<typeof createLarkImAdapter>['fetchChatMessages'],getSelfProfile?:ReturnType<typeof createLarkImAdapter>['getSelfProfile'],
  * commitBoundedReplayRecords?:typeof commitBoundedReplayRecords,now?:()=>number,env?:NodeJS.ProcessEnv,
  * createRequestSession?:typeof createMaintenanceRequestSession,requestSessionDeps?:JsonObject}} ReplayDeps */
@@ -51,6 +53,7 @@ function validateReplayOptions(options) {
   if (!Array.isArray(opts.messageIds) || opts.messageIds.length > 100 || opts.messageIds.some((id) => typeof id !== "string" || !id.trim() || id !== id.trim() || id.length > 512) ||
       new Set(opts.messageIds).size !== opts.messageIds.length) throw new ReplayInputError("message IDs must be at most 100 distinct, nonempty strings");
   if (opts.messageIds.length > 0 && opts.scopeIds.length !== 1) throw new ReplayInputError("exact message replay requires one scope");
+  validateReviewOptions(opts, 'replay');
   opts.startMs = parseReplayTime(opts.start, "--start");
   opts.endMs = parseReplayTime(opts.end, "--end");
   if (opts.endMs <= opts.startMs) throw new ReplayInputError("--end must be after --start");
@@ -62,7 +65,7 @@ function validateReplayOptions(options) {
  * @param {string} dbPath @param {ReplayOptions} opts @param {ReplayScope[]} scopes */
 function readExactTargets(dbPath, opts, scopes) {
   if (!opts.messageIds.length) return new Map();
-  const rows = readOnlySqliteJson(dbPath, `SELECT id,external_id,external_version,record_type,container_id,occurred_at_ms
+  const rows = readOnlySqliteJson(dbPath, `SELECT ${reviewRequested(opts) ? '*' : 'id,external_id,external_version,record_type,container_id,occurred_at_ms'}
     FROM records WHERE source_id='lark.im' AND external_id IN (${opts.messageIds.map(quoteSql).join(",")});`, "read exact replay targets");
   if (rows.length !== opts.messageIds.length || rows.some((row) => row.record_type !== "lark.im.message" ||
       row.container_id !== scopes[0].config.chat_id || !Number.isSafeInteger(row.occurred_at_ms) ||
@@ -75,12 +78,13 @@ function readExactTargets(dbPath, opts, scopes) {
 
 /** @param {unknown} error */
 function safeReplayError(error) {
-  if (error instanceof ReplayInputError || error instanceof MaintenanceRequestError) return error.message;
+  if (error instanceof ReplayInputError || error instanceof MaintenanceRequestError || error instanceof MaintenanceReviewError) return error.message;
   return publicDiagnosticError(error, "bounded replay failed; no partial scope commit was accepted").message;
 }
 
 /** @param {ReplayOptions} opts @param {ReplayDeps} [deps] */
 function executeLarkImReplay(opts, deps = {}) {
+  validateReviewOptions(opts, 'replay');
   const dbPath = resolve(opts.db);
   if (opts.endMs > (deps.now || Date.now)()) throw new ReplayInputError("--end must not be in the future");
   const source = readOnlySqliteJson(dbPath, "SELECT enabled,config_json FROM sources WHERE id='lark.im';", "read replay source")[0];
@@ -107,6 +111,8 @@ function executeLarkImReplay(opts, deps = {}) {
     return /** @type {ReplayScope} */ ({ ...row, config });
   });
   const targets = readExactTargets(dbPath, opts, scopes);
+  const review = beginMaintenanceReview(opts, { db: dbPath, mode: 'replay', rows: [...targets.values()],
+    scopes: scopes.map(({ id, source_id, enabled, config_json }) => ({ id, source_id, enabled, config_json })), now: deps.now || Date.now });
   // Existing fully injected domain tests remain isolated from process-global
   // leases. Production and request-session tests share one actual-attempt budget.
   const session = deps.createRequestSession || !deps.getSelfProfile || !deps.fetchChatMessages
@@ -119,6 +125,7 @@ function executeLarkImReplay(opts, deps = {}) {
   const admissionError = accountBindingAdmissionError(readRemoteAccountBinding({ db: dbPath, selfOpenId: self.open_id }));
   if (admissionError) throw new ReplayInputError(admissionError);
   const selfHash = createHash("sha256").update(self.open_id).digest("hex");
+  review?.verifySelf(selfHash);
   const planId = createHash("sha256").update(JSON.stringify({ kind: "bounded_replay/v1", scopes: [...opts.scopeIds].sort(),
     baseline, start: opts.startMs, end: opts.endMs, self: selfHash,
     ...(targets.size ? { message_ids: [...opts.messageIds].sort() } : {}) })).digest("hex");
@@ -128,6 +135,7 @@ function executeLarkImReplay(opts, deps = {}) {
     initial_sync_start_ms: baseline, window_start_ms: opts.startMs, window_end_ms: opts.endMs,
     selected_scopes: scopes.length, audit_schema_ready: auditExists, cursor_policy: "unchanged",
     scopes: /** @type {JsonObject[]} */ ([]),
+    review: /** @type {JsonObject|undefined} */ (undefined),
   };
   const staged = [];
   const finish = () => ({ ...summary, ...(session ? { request_budget: session.summary() } : {}) });
@@ -177,6 +185,22 @@ function executeLarkImReplay(opts, deps = {}) {
     summary.scopes.push({ ok: false, error: safeReplayError(error) });
     return finish();
   }
+  let reviewed;
+  if (review) {
+    try {
+      const records = staged[0].records;
+      const projections = readOnlySqliteJson(dbPath, boundedReplayProjectionSql(records), 'project reviewed replay');
+      if (projections.length !== targets.size) throw new MaintenanceReviewError('snapshot_changed');
+      reviewed = review.finish(projections.map(row => ({ before: targets.get(row.external_id), after: JSON.parse(row.after_json),
+        observed: records.find(record => record.external_id === row.external_id), outcome: row.outcome })));
+      summary.review = reviewed.summary;
+      session?.assertReady();
+    } catch (error) {
+      summary.ok = false;
+      summary.scopes.push({ ok: false, error: safeReplayError(error) });
+      return finish();
+    }
+  }
   for (const { scope, records, fetched, result } of staged) {
     try {
       if (opts.apply) {
@@ -184,6 +208,7 @@ function executeLarkImReplay(opts, deps = {}) {
           scope: /** @type {any} */ (scope), initialSyncStartMs: baseline, startMs: opts.startMs, endMs: opts.endMs,
           planId, attemptId, selfIdHash: selfHash, pages: fetched.pages, fetchedCount: fetched.messages.length, records,
           ...(targets.size ? { exactTargets: /** @type {any} */ ([...targets.values()]) } : {}),
+          ...(reviewed?.fence ? { reviewFence: reviewed.fence, reviewBeforeCommit: reviewed.assertBinding } : {}),
         });
         summary.scopes.push({ ...result, ...effects });
       } else {

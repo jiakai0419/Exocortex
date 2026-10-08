@@ -1,5 +1,6 @@
 // @ts-check
 import { constants, openSync, fstatSync, lstatSync, readSync, closeSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 
 const same = (a, b) => ['dev','ino','size','mtimeNs','ctimeNs','mode','uid','nlink'].every((key) => a[key] === b[key]);
 const privateFile = (info) => info.isFile() && info.nlink === 1n && (info.mode & 0o077n) === 0n &&
@@ -10,7 +11,7 @@ const privateFile = (info) => info.isFile() && info.nlink === 1n && (info.mode &
  * @param {string} path
  * @param {{maxBytes?:number,requirePrivate?:boolean}} [options]
  * @param {{afterRead?:()=>void}} [deps]
- * @returns {{status:"ready"|"missing"|"invalid",value:any,private:boolean}}
+ * @returns {{status:"ready"|"missing"|"invalid",value:any,private:boolean,sha256?:string}}
  */
 export function readStableJsonFile(path, { maxBytes = 65536, requirePrivate = true } = {}, deps = {}) {
   let fd;
@@ -29,7 +30,9 @@ export function readStableJsonFile(path, { maxBytes = 65536, requirePrivate = tr
     const after = fstatSync(fd, { bigint: true });
     const current = lstatSync(path, { bigint: true });
     if (length !== Number(before.size) || !same(before, after) || !same(after, current) || !current.isFile() || current.isSymbolicLink()) throw new Error('unstable_json_file');
-    return { status: 'ready', value: JSON.parse(bytes.subarray(0, length).toString('utf8')), private: privateFile(after) };
+    const actual = bytes.subarray(0, length);
+    return { status: 'ready', value: JSON.parse(actual.toString('utf8')), private: privateFile(after),
+      sha256: createHash('sha256').update(actual).digest('hex') };
   } catch (error) {
     if (/** @type {NodeJS.ErrnoException} */ (error)?.code === 'ENOENT' && fd === undefined) return { status: 'missing', value: null, private: false };
     return { status: 'invalid', value: null, private: false };

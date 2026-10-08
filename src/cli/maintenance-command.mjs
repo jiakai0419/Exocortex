@@ -6,6 +6,7 @@ import { executeEnrichment, EnrichmentInputError } from "../maintenance/enrich.m
 import { executeSyncRepair } from "../maintenance/repair.mjs";
 import { executeLarkImReplay, validateReplayOptions, safeReplayError, ReplayInputError } from "../maintenance/replay.mjs";
 import { MaintenanceRequestError } from "../maintenance/request-session.mjs";
+import { MaintenanceReviewError, reviewRequested } from '../maintenance/review-artifact.mjs';
 import { publicEnrichmentError } from "../maintenance/enrichment-commit.mjs";
 import { renderSqliteMaintenanceText } from "../terminal/sqlite-maintenance-view.mjs";
 
@@ -14,6 +15,9 @@ function runMaintenanceCommand(options, context) {
   const action = options.action || context.route.split(".").at(-1);
   const deps = context.deps || {};
   try {
+    if (reviewRequested(options) && (!context.provided.has('--max-cli-attempts') || !context.provided.has('--max-seconds'))) {
+      throw new CliUsageError('maintenance review requires explicit --max-cli-attempts and --max-seconds');
+    }
     let report;
     if (action === "init") {
       const result = (deps.initializeDatabase || initializeDatabase)(options.db);
@@ -41,7 +45,7 @@ function runMaintenanceCommand(options, context) {
     if (["backup", "prune-runs", "compact"].includes(action) && report.status === "failed") return 1;
     return report.ok === false || report.partial === true ? 2 : 0;
   } catch (error) {
-    const safe = error instanceof CliUsageError || error instanceof CliExecutionError || error instanceof EnrichmentInputError ? error.message : action === "enrich" ? publicEnrichmentError(error, options.target === "scopes" ? "scope enrichment failed" : "record enrichment failed").message
+    const safe = error instanceof CliUsageError || error instanceof CliExecutionError || error instanceof EnrichmentInputError || error instanceof MaintenanceReviewError ? error.message : action === "enrich" ? publicEnrichmentError(error, options.target === "scopes" ? "scope enrichment failed" : "record enrichment failed").message
       : action === "replay" ? safeReplayError(error) : publicMaintenanceError(error).message;
     writeCliError({ stdout: context.stdout, stderr: context.stderr }, { format: options.format,
       code: error instanceof CliUsageError || error instanceof EnrichmentInputError ? "invalid_arguments" : "execution_failed", message: safe,

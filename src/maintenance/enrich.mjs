@@ -4,12 +4,14 @@ import { NAME_LOOKUP_RETRY_BUDGET_MS } from "../adapters/lark-im/name-resolver.m
 import { enrichRecords } from "./enrich-records.mjs";
 import { enrichScopes } from "./enrich-scopes.mjs";
 import { createMaintenanceRequestSession } from "./request-session.mjs";
+import { validateReviewOptions } from "./review-artifact.mjs";
 
 class EnrichmentInputError extends Error {}
 
 /** One workflow entrance; target-specific planning and CAS remain separate.
  * @param {Record<string, any>} options @param {Record<string, any>} [deps] */
 function executeEnrichment(options, deps = {}) {
+  validateReviewOptions(options, 'names');
   if (!["records", "scopes"].includes(options.target)) throw new EnrichmentInputError("--target must be records or scopes");
   if (options.recordIds !== undefined && !Array.isArray(options.recordIds)) throw new EnrichmentInputError("--record-id requires an integer selection");
   const hasRecordIds = Array.isArray(options.recordIds) && options.recordIds.length > 0;
@@ -53,7 +55,7 @@ function executeEnrichment(options, deps = {}) {
     retryBudgetMs: Math.min(NAME_LOOKUP_RETRY_BUDGET_MS, Number(settings.retryBudgetMs || NAME_LOOKUP_RETRY_BUDGET_MS)) });
   const assertReady = session?.assertReady || deps.assertReady || (() => {});
   const report = opts.target === "records"
-    ? (deps.enrichRecords || enrichRecords)(opts, { runLark, assertReady })
+    ? (deps.enrichRecords || enrichRecords)(opts, { runLark, assertReady, now: deps.now })
     : (deps.enrichScopes || enrichScopes)(opts, { assertReady, fetchChatMetadata: deps.fetchChatMetadata || createLarkImAdapter({ run: runLark }).fetchChatMetadata });
   return { ...report, target: opts.target,
     ...(session ? { request_budget: session.summary() } : {}),
