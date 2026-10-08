@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -18,7 +18,8 @@ const scope = chatScopeId(chat);
 const hash = 'a'.repeat(64);
 
 function fixture(t) {
-  const root = mkdtempSync(join(tmpdir(), 'exocortex-review-cli-'));
+  // Review output requires a canonical parent even when the host TMPDIR is an alias.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'exocortex-review-cli-')));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const db = join(root, 'authored.sqlite');
   const calls = join(root, 'fake-cli-attempts');

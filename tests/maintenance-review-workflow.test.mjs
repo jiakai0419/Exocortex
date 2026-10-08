@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { chmodSync, copyFileSync, existsSync, fsyncSync, linkSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, fsyncSync, linkSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -27,7 +27,9 @@ const publicReport = report => assert.doesNotMatch(JSON.stringify(report), /Synt
 const card = text => ({ elements: [{ tag: 'markdown', content: text }] });
 
 function fixture(t, count = 2, cards = false) {
-  const dir = mkdtempSync(join(tmpdir(), 'exocortex-review-flow-'));
+  // macOS TMPDIR can contain /var -> /private/var (or another parent symlink).
+  // Ordinary fixtures need canonical paths; explicit unsafe-path cases below do not.
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'exocortex-review-flow-')));
   chmodSync(dir, 0o700);
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const f = { dir, db: join(dir, 'synthetic.sqlite'), calls: [], start: Date.now() - 86_400_000 };
