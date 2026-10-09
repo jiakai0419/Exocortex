@@ -32,6 +32,7 @@ function commitBoundedReplayRecords(dbPath: string, options: BoundedReplayOption
     throw new Error("invalid bounded replay fetch evidence");
   }
   const records = normalizeBoundedReplayRecords(options.records, scope.source_id);
+  if (options.reviewFence?.mode === "names") throw new Error("bounded replay rejects a names review fence");
   const reviewFence = options.reviewFence === undefined ? "" : reviewFenceSql(options.reviewFence);
   if (options.reviewFence && (options.reviewFence.records.length !== records.length || records.some((record) =>
     !options.reviewFence!.records.some((before) => before.source_id === record.source_id && before.external_id === record.external_id)))) {

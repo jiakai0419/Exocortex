@@ -823,6 +823,8 @@ node bin/exocortex.mjs maintenance preview --db /private/example/messages.sqlite
 
 `--resume` 在任何新 API 前严格校验所有已发布 review，包括字节 SHA（若已记入 manifest）、schema/policy、TTL、精确 constraints、当前完整记录 before、records 表列集合及 DB/来源/账号/scope 绑定。完成的单元零 API 复用；准确含义是**复用未过期的本地审阅证据**，不是重新验证远端。发布成功但进度写入前中断的固定路径文件也必须通过同样完整校验才可认领。过期、缺失、篡改或漂移会拒绝恢复，不覆盖旧文件，不自动再抓一遍；要重新取证应显式使用新进度目录。
 
+精确 names-only 修复面向已有记录，其 `first_seen_scope_id` 是历史来源归属；首次预览时已禁用的 scope 可以原样复用和批准提交，不会重新启用同步。预览、续跑和事务内提交都绑定 scope 的原 enabled 值及配置；0→1、1→0、来源、账号、记录或实质配置变化仍拒绝。事务 fence 仅对 names 模式允许已禁用归属，并要求恰好覆盖所有目标的 first-seen scopes；旧无模式 fence 和 replay 仍要求启用 scope。
+
 每一次显式 resume 获得一个新的命令预算，输出分开显示 `previous_invocations` 的历史计费 CLI、已记录耗时下界/中断次数，以及 `request_budget` 的本次实际 CLI、计费 CLI 和耗时。CLI 在 spawn 前持久计费，进程恰好在计费与 spawn 之间中断可能保守多记一次；中断后的耗时只报告已记录下界，不能解释为跨调用总时限。进度最多保留 100 次调用，达到上限后停止。无法持久计费时不会发起该请求。
 
 后面单元失败会保留前面完整文件，命令返回非零并给出完成数量与停止原因。含 unresolved/conflict 的完整审阅证据仍保留并显式标为 partial，不能当作所有问题均已解决。应用时逐份人工查看 review，并用原有 `maintenance enrich/replay --review-in --review-sha256 --apply` 的同一精确目标和单元预算重新抓取、比对、原子提交。协调器没有 apply 模式，也不会把独立 review 合并为批准文件；原 `--review-out` 批次与整批 apply 的原子语义不变。

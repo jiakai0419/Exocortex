@@ -315,6 +315,64 @@ test('a complete multi-record names unit applies through the original fresh-fetc
   assert.throws(() => run(f, { resume: true }), /snapshot_changed/, 'applied data no longer matches the old complete before');
 });
 
+for (const resume of [false, true]) test(`names review preserves a disabled first-seen scope through ${resume ? 'resume and ' : ''}fresh-fetch apply`, t => {
+  const f = fixture(t, 2), before = rows(f);
+  sql(f, `UPDATE sync_scopes SET enabled=0 WHERE id=${quoteSql(SCOPE)};`);
+  f.units = [{ mode: 'names', record_ids: f.ids, max_cli_attempts: 1, max_seconds: 10 }];
+  write(f.plan, { schema: PLAN_SCHEMA, units: f.units });
+  assert.equal(run(f).ok, true);
+  assert.equal(json(artifact(f)).binding.scopes[0].enabled, 0); noWrites(f, before);
+  if (resume) {
+    const reused = run(f, { resume: true });
+    assert.equal(reused.ok, true); assert.equal(reused.request_budget.cli_attempts, 0);
+    assert.equal(f.state.requests.length, 1); noWrites(f, before);
+  }
+  const applied = executeEnrichment({ db: f.db, target: 'records', namesOnly: true, recordIds: f.ids,
+    apply: true, reviewIn: artifact(f), reviewSha256: json(manifest(f)).units[0].review_sha256,
+    maxCliAttempts: 1, maxSeconds: 10 }, f.deps);
+  assert.equal(applied.updated, 2); assert.equal(f.state.requests.length, 2);
+  assert.equal(sqliteQuery(f.db, `SELECT enabled FROM sync_scopes WHERE id=${quoteSql(SCOPE)};`)[0].enabled, 0);
+  const after = rows(f);
+  for (let i = 0; i < before.length; i++) {
+    assert.equal(JSON.parse(after[i].canonical_json).sender_name, `Synthetic Reader ${i}`);
+    for (const column of ['raw_json', 'body', 'content_hash', 'external_version', 'first_seen_scope_id']) assert.equal(after[i][column], before[i][column]);
+  }
+});
+
+for (const change of ['enable', 'disable', 'scope_source', 'scope_config', 'source_disabled', 'account', 'record']) {
+  for (const route of ['resume', 'apply']) test(`names ${route} rejects ${change} drift with no new API or record writes`, t => {
+    const f = fixture(t, 1);
+    if (change !== 'disable') sql(f, `UPDATE sync_scopes SET enabled=0 WHERE id=${quoteSql(SCOPE)};`);
+    assert.equal(run(f).ok, true);
+    sql(f, ({ enable: `UPDATE sync_scopes SET enabled=1 WHERE id=${quoteSql(SCOPE)};`,
+      disable: `UPDATE sync_scopes SET enabled=0 WHERE id=${quoteSql(SCOPE)};`,
+      scope_source: `INSERT INTO sources(id,display_name,kind) VALUES('synthetic.other','Synthetic Other','synthetic'); UPDATE sync_scopes SET source_id='synthetic.other' WHERE id=${quoteSql(SCOPE)};`,
+      scope_config: `UPDATE sync_scopes SET config_json=json_set(config_json,'$.unknown_policy',true) WHERE id=${quoteSql(SCOPE)};`,
+      source_disabled: "UPDATE sources SET enabled=0 WHERE id='lark.im';",
+      account: "UPDATE sources SET config_json=json_set(config_json,'$.initial_account_binding.account_key','" + 'a'.repeat(64) + "') WHERE id='lark.im';",
+      record: `UPDATE records SET body='Synthetic changed body' WHERE id=${f.ids[0]};`,
+    })[change]);
+    const before = rows(f), saved = readFileSync(artifact(f)), progress = readFileSync(manifest(f));
+    assert.throws(() => route === 'resume' ? run(f, { resume: true }) : executeEnrichment({ db: f.db,
+      target: 'records', namesOnly: true, recordIds: f.ids, apply: true, reviewIn: artifact(f),
+      reviewSha256: json(manifest(f)).units[0].review_sha256, maxCliAttempts: 1, maxSeconds: 10 }, f.deps), /review rejected/);
+    assert.equal(f.state.requests.length, 1); noWrites(f, before);
+    assert.deepEqual(readFileSync(artifact(f)), saved); assert.deepEqual(readFileSync(manifest(f)), progress);
+  });
+}
+
+test('disabled replay scope rejects first preview and post-preview resume before new API', t => {
+  const f = fixture(t, 1, 'replay');
+  assert.equal(run(f).ok, true); const requests = f.state.requests.length;
+  sql(f, `UPDATE sync_scopes SET enabled=0 WHERE id=${quoteSql(SCOPE)};`);
+  assert.throws(() => run(f, { resume: true }), /binding_changed/);
+  const otherProgress = join(f.root, 'disabled-replay'); mkdirSync(otherProgress, { mode: 0o700 });
+  const disabled = run(f, { progressDir: otherProgress });
+  assert.equal(disabled.ok, false); assert.equal(disabled.stop_reason, 'unit_failed');
+  assert.equal(disabled.reviewed, 0); assert.equal(disabled.request_budget.cli_attempts, 0);
+  assert.equal(f.state.requests.length, requests);
+});
+
 test('resolver catches cannot erase a failed monotonic wait before publication', t => {
   const f = fixture(t, 1, 'replay');
   f.deps.requestSessionDeps.sleep = () => {};

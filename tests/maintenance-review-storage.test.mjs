@@ -216,6 +216,33 @@ test("review schema rejects missing, extra, duplicate, malformed and unbounded s
   assertUnchanged(f);
 });
 
+test("only an exact names fence admits an unchanged disabled first-seen scope", (t) => {
+  const f = fixture(t), disabled = { ...f.scope, enabled: 0 };
+  sql(f.db, `UPDATE sync_scopes SET enabled=0 WHERE id=${quoteSql(SCOPE)};`);
+  const reviewed = fence(f, { mode: 'names', scopes: [disabled] });
+  assert.deepEqual(enrich(f, reviewed), { updated: 2, skippedConflicts: 0 });
+  for (const mode of [undefined, 'replay', 'unknown']) {
+    assert.throws(() => reviewFenceSql({ ...reviewed, mode }), /invalid maintenance review/);
+  }
+  for (const scopes of [undefined, [{ ...disabled, id: 'synthetic_other_scope' }],
+    [disabled, { ...disabled, id: 'synthetic_extra_scope' }]]) {
+    assert.throws(() => reviewFenceSql({ ...reviewed, scopes }), /names review/);
+  }
+  assert.throws(() => replay(f, candidates(f), fence(f, { mode: 'names' })), /rejects a names review fence/);
+});
+
+for (const [beforeEnabled, afterEnabled] of [[0, 1], [1, 0]]) {
+  test(`names SQL transaction rejects scope ${beforeEnabled} to ${afterEnabled} after review generation`, t => {
+    const f = fixture(t);
+    sql(f.db, `UPDATE sync_scopes SET enabled=${beforeEnabled} WHERE id=${quoteSql(SCOPE)};`);
+    const reviewed = fence(f, { mode: 'names', scopes: [{ ...f.scope, enabled: beforeEnabled }] });
+    const guarded = `BEGIN IMMEDIATE; ${reviewFenceSql(reviewed)} UPDATE records SET body='Synthetic forbidden scope drift'; COMMIT;`;
+    sql(f.db, `UPDATE sync_scopes SET enabled=${afterEnabled} WHERE id=${quoteSql(SCOPE)};`);
+    assert.throws(() => sql(f.db, guarded), /CHECK constraint failed/);
+    assertUnchanged(f);
+  });
+}
+
 test("a fence valid when generated expires while BEGIN IMMEDIATE waits for a real SQLite writer", async (t) => {
   const f = fixture(t);
   const expiresAtMs = Date.now() + 1800;

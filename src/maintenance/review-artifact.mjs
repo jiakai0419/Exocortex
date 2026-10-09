@@ -232,7 +232,7 @@ function constraints(options, mode) {
 /** All content is an internally computed projection; nothing from the input
  * artifact is used as SQL, a filename, an API parameter or a proposed value.
  * @param {Record<string,any>} options
- * @param {{db:string,mode:string,rows:Record<string,any>[],scopes?:Array<{id:string,source_id:string,enabled:number,config_json:string}>,now?:()=>number}} context */
+ * @param {{db:string,mode:'names'|'replay',rows:Record<string,any>[],scopes?:Array<{id:string,source_id:string,enabled:number,config_json:string}>,now?:()=>number}} context */
 function beginMaintenanceReview(options, { db, mode, rows, scopes = [], now = Date.now }) {
   if (!reviewRequested(options)) return null;
   validateReviewOptions(options, mode);
@@ -340,7 +340,7 @@ function beginMaintenanceReview(options, { db, mode, rows, scopes = [], now = Da
     return { summary: { schema: artifact.schema, sha256: hash, records: entries.length, changes, expires_at_ms: artifact.expires_at_ms,
       raw_policy: 'opaque_digest_only', card_policy: 'api_snapshot_not_business_approval', partial: partialReview(artifact) },
       assertBinding: approval ? assertBinding : undefined,
-      fence: approval ? { createdAtMs: artifact.created_at_ms, expiresAtMs: artifact.expires_at_ms,
+      fence: approval ? { mode, createdAtMs: artifact.created_at_ms, expiresAtMs: artifact.expires_at_ms,
         sourceConfigJson: control.sourceConfigJson, sentActor: fresh.sentActor, records: snapshots, scopes } : undefined };
   }
   return { finish, verifySelf };
@@ -350,7 +350,7 @@ function beginMaintenanceReview(options, { db, mode, rows, scopes = [], now = Da
  * current remote state and never returns proposed SQL values or an apply fence.
  * The normal apply route still refetches and compares the entire proposal.
  * @param {Record<string,any>} options
- * @param {{db:string, mode:string, now?:()=>number, expectedSha256?:string}} context */
+ * @param {{db:string, mode:'names'|'replay', now?:()=>number, expectedSha256?:string}} context */
 function reuseMaintenanceReview(options, { db, mode, now = Date.now, expectedSha256 }) {
   const loaded = readStableJsonFile(privatePath(options.reviewOut), { maxBytes: REVIEW_MAX_BYTES });
   if (loaded.status !== 'ready') fail('invalid_file');
@@ -365,7 +365,11 @@ function reuseMaintenanceReview(options, { db, mode, now = Date.now, expectedSha
   if (rows.length !== ids.length || rows.some(row => row.record_type !== 'lark.im.message')) fail('snapshot_changed');
   const scopeIds = mode === 'names' ? [...new Set(rows.map(row => row.first_seen_scope_id))] : options.scopeIds;
   const scopes = readOnlySqliteJson(db, `SELECT id,source_id,enabled,config_json FROM sync_scopes WHERE id IN (${scopeIds.map(quoteSql).join(',')});`, 'read reusable review scopes').map(scope => ({ id: scope.id, source_id: scope.source_id, enabled: scope.enabled, config_json: scope.config_json }));
-  if (scopes.length !== scopeIds.length || scopes.some(scope => scope.source_id !== 'lark.im' || scope.enabled !== 1)) fail('binding_changed');
+  // Names repair addresses existing records; first-seen scopes can already be
+  // retired. Their exact enabled value remains approval-bound. Replay still
+  // requires an active scope, as it does during initial preview and apply.
+  if (scopes.length !== scopeIds.length || scopes.some(scope => scope.source_id !== 'lark.im'
+    || mode === 'replay' && scope.enabled !== 1)) fail('binding_changed');
   const { reviewOut, ...base } = options;
   beginMaintenanceReview({ ...base, apply: true, reviewIn: reviewOut, reviewSha256: loaded.sha256 }, { db, mode, rows, scopes, now });
   if (artifact.records.some(record => rows.find(row => row.id === record.id)?.external_id !== record.external_id)

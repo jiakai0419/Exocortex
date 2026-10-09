@@ -42,6 +42,7 @@ export type WriteEffects = {
  * Artifact values never become SQL: workflows first read and validate the live
  * rows, then pass those complete rows through this additional transaction fence. */
 export type MaintenanceReviewFence = {
+  mode?: "names" | "replay";
   createdAtMs: number;
   expiresAtMs: number;
   sourceConfigJson: string;

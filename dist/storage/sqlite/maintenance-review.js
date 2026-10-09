@@ -30,8 +30,9 @@ function jsonText(value, objectOnly = false) {
  * This intentionally fences no-op selected rows too. The runtime clock is
  * SQLite's transaction-time clock, not a pre-API JavaScript timestamp. */
 function reviewFenceSql(fence) {
-    exactObject(fence, ["createdAtMs", "expiresAtMs", "sourceConfigJson", "sentActor", "records"], ["scopes"]);
-    if (!Number.isSafeInteger(fence.createdAtMs) || fence.createdAtMs < 0 ||
+    exactObject(fence, ["createdAtMs", "expiresAtMs", "sourceConfigJson", "sentActor", "records"], ["scopes", "mode"]);
+    if (fence.mode !== undefined && fence.mode !== "names" && fence.mode !== "replay" ||
+        !Number.isSafeInteger(fence.createdAtMs) || fence.createdAtMs < 0 ||
         !Number.isSafeInteger(fence.expiresAtMs) || fence.expiresAtMs - fence.createdAtMs !== REVIEW_LIFETIME_MS ||
         !jsonText(fence.sourceConfigJson, true) ||
         !(fence.sentActor === null || typeof fence.sentActor === "string" && /^ou_[A-Za-z0-9_-]+$/.test(fence.sentActor)) ||
@@ -60,6 +61,8 @@ function reviewFenceSql(fence) {
         }
         ids.add(row.id);
     }
+    if (fence.mode === "names" && fence.scopes === undefined)
+        throw new Error("names review requires first-seen scopes");
     if (fence.scopes !== undefined) {
         if (!Array.isArray(fence.scopes) || fence.scopes.length < 1 || fence.scopes.length > 100) {
             throw new Error("invalid maintenance review scopes");
@@ -68,10 +71,17 @@ function reviewFenceSql(fence) {
         for (const scope of fence.scopes) {
             exactObject(scope, ["id", "source_id", "enabled", "config_json"]);
             if (typeof scope.id !== "string" || !scope.id || scope.id.includes("\0") || scope.source_id !== "lark.im" ||
-                scope.enabled !== 1 || !jsonText(scope.config_json, true) || scopeIds.has(scope.id)) {
+                !(scope.enabled === 1 || fence.mode === "names" && scope.enabled === 0) ||
+                !jsonText(scope.config_json, true) || scopeIds.has(scope.id)) {
                 throw new Error("invalid maintenance review scope snapshot");
             }
             scopeIds.add(scope.id);
+        }
+        // A names-only repair does not reactivate historical scopes. Bind exactly
+        // the stored records' provenance and retain enabled/config CAS below.
+        const firstSeen = new Set(fence.records.map(row => row.first_seen_scope_id));
+        if (fence.mode === "names" && (scopeIds.size !== firstSeen.size || [...firstSeen].some(id => !scopeIds.has(id)))) {
+            throw new Error("names review must cover exact first-seen scopes");
         }
     }
     const nowMs = "(CAST(strftime('%s','now') AS INTEGER) * 1000 + CAST(substr(strftime('%f','now'),4,3) AS INTEGER))";
