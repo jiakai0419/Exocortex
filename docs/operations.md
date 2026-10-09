@@ -788,3 +788,41 @@ v3 的 `binding.scope_config_policy` 必须为 `lark_im_scope_json_remove_hot/v1
 names 的账号绑定只来自现有本地证据，未增加实时 self 验证；replay 复用本轮原有 self 验证。source 内绑定受 SQLite 事务保护，文件 sidecar/DB 身份在提交前稳定重检，但没有引入文件描述符绑定执行器，不承诺抵御同 UID 恶意进程在最终文件校验与 SQLite 打开之间替换路径。运行中的同步允许继续；若维护/同步锁占用、前值变化或期限过短，应重新预览并重新批准，不能绕过围栏。预览本身不需要停服，是否停服以另行授权的运行安排为准。
 
 工件含私有姓名、消息文本和目标 ID，必须留在私有本地目录；不要放入 Git、公开日志或 CI 附件。预览不会授予真实数据修改权，部署和生产 apply 仍需各自的明确授权。
+
+### 独立单元预览与本地恢复
+
+需要逐目标保留预览时，使用 `maintenance preview`。它只读取 API/业务数据库，在调用者提供的 0700 canonical 私有目录中写入 0600 的完整 review 和 `manifest.json`；不会写业务表、审计表或 maintenance locks。计划文件也必须位于私有 canonical 目录、属于当前用户且权限为 0600。计划及所有输出均为私有业务工件，不进入 Git。
+
+以下 IDs 和时刻均为新造示例。计划使用固定 schema，禁止未知字段、重复同模式目标和自定义输出路径；最多 100 个单元，每个单元最多 100 个精确目标。names 的 `record_ids` 是本地记录 ID，可把同一查名目标的多条记录明确放入一个单元；replay 必须指定一个 scope 和固定时间窗。每单元的预算是完整单元在本次调用中的上限，包含其所有 `sync_busy` 重试。
+
+```json
+{
+  "schema": "exocortex_private_preview_plan/v1",
+  "units": [
+    {"mode": "names", "record_ids": [101, 102], "max_cli_attempts": 3, "max_seconds": 15},
+    {"mode": "replay", "scope_id": "lark.im.received.chat.synthetic", "message_ids": ["om_synthetic_review"], "start": "2030-01-01T00:00:00Z", "end": "2030-01-01T00:01:00Z", "max_cli_attempts": 4, "max_seconds": 20}
+  ]
+}
+```
+
+```sh
+node bin/exocortex.mjs maintenance preview --db /private/example/messages.sqlite \
+  --plan /private/example/plan.json --progress-dir /private/example/progress \
+  --max-cli-attempts 10 --max-seconds 60 --format json
+# 中断后用完全相同的 DB、计划文件字节、目录及命令预算显式恢复：
+node bin/exocortex.mjs maintenance preview --db /private/example/messages.sqlite \
+  --plan /private/example/plan.json --progress-dir /private/example/progress \
+  --max-cli-attempts 10 --max-seconds 60 --resume --format json
+```
+
+`unit-001.review.json` 等每份文件都是一个完整独立 review，仍使用既有 review schema、30 分钟 TTL、完整 before 与 proposal 摘要及账号/来源/scope fences。`manifest.json` 使用 `exocortex_private_preview_progress/v1`，仅包含计划字节 SHA、数据库身份、命令预算、单元状态/review SHA 和每次调用的计费记录；它不是批准文件，不含原始 proposal 缓存。目录内 `coordinator.lock` 仅防止同时运行同一计划，独立于共享 API 锁；进程退出自动释放，不删锁文件或抢占同步服务。
+
+命令 `--max-cli-attempts` / `--max-seconds` 必须显式指定，限制本次调用跨所有单元的总远端工作。实际 CLI spawn（包括分页、self 和 fallback）都计数；一次互斥失败本身不消耗 CLI 次数，但之前已完成请求不会因重试清零。每次启动单元前，剩余总额度必须容纳该单元完整固定上限，否则提前停止，不改写 review constraints 来挤入剩余额度。总时限从入口开始，包含本地准备、租约与等待；进行中的有界本地文件发布可能稍晚结束，已经成功发布的完整回执不会被事后超时覆盖。预览的最终预算检查在发布前；apply 的额外检查和事务 fence 保持不变。
+
+仅 `sync_busy` 允许最多三次 session 尝试，第二、三次分别先无 API 锁等待 2 秒、4 秒；等待也消耗本次和单元时间预算。单元之间保留至少 1 秒无锁间隔。每次使用新的正式请求 session，保留已耗单元/总额度，不清除旧 session 的终止状态；不重试 cooldown、限流、权限或预算失败。共享冷却、账号检查、CLI 内部 retries=0 和每请求 flock 均沿用正常入口。退让给予同步服务获取锁的机会，不承诺 FIFO 或绝对优先级。
+
+`--resume` 在任何新 API 前严格校验所有已发布 review，包括字节 SHA（若已记入 manifest）、schema/policy、TTL、精确 constraints、当前完整记录 before、records 表列集合及 DB/来源/账号/scope 绑定。完成的单元零 API 复用；准确含义是**复用未过期的本地审阅证据**，不是重新验证远端。发布成功但进度写入前中断的固定路径文件也必须通过同样完整校验才可认领。过期、缺失、篡改或漂移会拒绝恢复，不覆盖旧文件，不自动再抓一遍；要重新取证应显式使用新进度目录。
+
+每一次显式 resume 获得一个新的命令预算，输出分开显示 `previous_invocations` 的历史计费 CLI、已记录耗时下界/中断次数，以及 `request_budget` 的本次实际 CLI、计费 CLI 和耗时。CLI 在 spawn 前持久计费，进程恰好在计费与 spawn 之间中断可能保守多记一次；中断后的耗时只报告已记录下界，不能解释为跨调用总时限。进度最多保留 100 次调用，达到上限后停止。无法持久计费时不会发起该请求。
+
+后面单元失败会保留前面完整文件，命令返回非零并给出完成数量与停止原因。含 unresolved/conflict 的完整审阅证据仍保留并显式标为 partial，不能当作所有问题均已解决。应用时逐份人工查看 review，并用原有 `maintenance enrich/replay --review-in --review-sha256 --apply` 的同一精确目标和单元预算重新抓取、比对、原子提交。协调器没有 apply 模式，也不会把独立 review 合并为批准文件；原 `--review-out` 批次与整批 apply 的原子语义不变。

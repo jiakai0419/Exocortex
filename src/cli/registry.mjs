@@ -98,6 +98,13 @@ export const COMMANDS = Object.freeze([
     { when: "--apply", effects: ["database-write"] }, { when: "--unsafe-details", privacy: "private" },
     { when: '--review-out', effects: ['private-review-file-write'] },
   ]),
+  route("maintenance.preview", "Preview independent exact-target units with durable private reviews and locally validated resume.", [
+    { ...db, default: undefined, required: true }, format,
+    option('--plan', 'plan', 'path', 'Private v1 JSON plan containing bounded names/replay units; never an approval.', { required: true }),
+    option('--progress-dir', 'progressDir', 'path', 'Existing canonical private directory for the manifest and independent complete reviews.', { required: true }),
+    bool('--resume', 'resume', 'Reuse valid unexpired local reviews without remote revalidation; this explicit invocation receives a new budget.'),
+    ...maintenanceBudget,
+  ], ['local-read', 'remote-read', 'private-review-file-write', 'private-progress-file-write']),
   route("maintenance.repair", "Preview structural recovery; apply uses existing fences.", [db, format, apply], ["local-read"], "public-safe", [{ when: "--apply", effects: ["database-write"] }]),
   route("maintenance.replay", "Preview replay of explicit scopes and a fixed interval.", [
     { ...db, default: undefined, required: true }, format, apply,

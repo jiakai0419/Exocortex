@@ -658,8 +658,8 @@ function enrichRecords(opts, deps = {}) {
     const after = { ...effectiveRecord(row), canonical_json: projectionJson.get(row.id) ?? row.canonical_json };
     const resolved = personName(projections.get(row.id)?.sender_name, [row.actor_id, ...senderIdentity(row.raw).identifiers]);
     return { before: row, after, exclusion, outcome: exclusion ? 'excluded' : after.canonical_json !== row.canonical_json ? 'update' : resolved ? 'unchanged' : 'unresolved' };
-  }));
-  deps.assertReady?.();
+  }), deps.assertReady);
+  if (!opts.dryRun || !reviewed) deps.assertReady?.();
   const { updated, skippedConflicts } = commitUpdates(dbPath, updates, opts.dryRun, reviewed?.fence, reviewed?.assertBinding);
   const appFallbacksById = new Map();
   for (const [key, fallback] of appFallbackNames.entries()) {

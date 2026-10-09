@@ -14,7 +14,7 @@ npm run exo -- status
 
 `messages` 阅读本机私有消息；`status` 查看当前服务和同步概况。规范入口为 `node bin/exocortex.mjs`，`npm run exo --` 是本地快捷方式，无需全局安装。机器读取 JSON 时直接使用 Node 入口，避免 npm 前缀。
 
-完整界面为 6 个顶层命令、16 个执行路由。帮助不计为业务路由，开发工具和内部 worker 不进入产品目录：
+完整界面为 6 个顶层命令、17 个执行路由。帮助不计为业务路由，开发工具和内部 worker 不进入产品目录：
 
 ```sh
 node bin/exocortex.mjs --help --all

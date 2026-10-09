@@ -2,6 +2,7 @@
 import { CliExecutionError, CliUsageError, writeCliError } from "./context.mjs";
 import { initializeDatabase } from "../../dist/storage/sqlite/initialize.js";
 import { executeSqliteMaintenance, publicPath, publicMaintenanceError } from "../storage/sqlite/maintenance.mjs";
+import { executePreviewUnits, PreviewUnitsError } from '../maintenance/preview-units.mjs';
 import { executeEnrichment, EnrichmentInputError } from "../maintenance/enrich.mjs";
 import { executeSyncRepair } from "../maintenance/repair.mjs";
 import { executeLarkImReplay, validateReplayOptions, safeReplayError, ReplayInputError } from "../maintenance/replay.mjs";
@@ -15,7 +16,7 @@ function runMaintenanceCommand(options, context) {
   const action = options.action || context.route.split(".").at(-1);
   const deps = context.deps || {};
   try {
-    if (reviewRequested(options) && (!context.provided.has('--max-cli-attempts') || !context.provided.has('--max-seconds'))) {
+    if ((reviewRequested(options) || action === 'preview') && (!context.provided.has('--max-cli-attempts') || !context.provided.has('--max-seconds'))) {
       throw new CliUsageError('maintenance review requires explicit --max-cli-attempts and --max-seconds');
     }
     let report;
@@ -26,6 +27,8 @@ function runMaintenanceCommand(options, context) {
       report = (deps.executeSqliteMaintenance || executeSqliteMaintenance)({ backupDir: context.resolvePath("backups/private", { explicit: false }),
         backupKeepCount: 7, backupKeepDays: 30, backup: null, latest: false, ...options,
         action, dryRun: options.apply !== true }, { ...deps, now: () => new Date(context.now()), cwd: context.root });
+    } else if (action === 'preview') {
+      report = (deps.executePreviewUnits || executePreviewUnits)(options, { ...deps, env: context.env, now: context.now });
     } else if (action === "enrich") {
       report = (deps.executeEnrichment || executeEnrichment)(options, { ...deps, env: context.env, now: context.now });
     } else if (action === "repair") {
@@ -45,7 +48,7 @@ function runMaintenanceCommand(options, context) {
     if (["backup", "prune-runs", "compact"].includes(action) && report.status === "failed") return 1;
     return report.ok === false || report.partial === true ? 2 : 0;
   } catch (error) {
-    const safe = error instanceof CliUsageError || error instanceof CliExecutionError || error instanceof EnrichmentInputError || error instanceof MaintenanceReviewError ? error.message : action === "enrich" ? publicEnrichmentError(error, options.target === "scopes" ? "scope enrichment failed" : "record enrichment failed").message
+    const safe = error instanceof CliUsageError || error instanceof CliExecutionError || error instanceof EnrichmentInputError || error instanceof MaintenanceReviewError || error instanceof PreviewUnitsError ? error.message : action === "enrich" ? publicEnrichmentError(error, options.target === "scopes" ? "scope enrichment failed" : "record enrichment failed").message
       : action === "replay" ? safeReplayError(error) : publicMaintenanceError(error).message;
     writeCliError({ stdout: context.stdout, stderr: context.stderr }, { format: options.format,
       code: error instanceof CliUsageError || error instanceof EnrichmentInputError ? "invalid_arguments" : "execution_failed", message: safe,

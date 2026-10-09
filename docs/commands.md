@@ -2,7 +2,7 @@
 
 <!-- Generated from src/cli/registry.mjs through the public machine catalog. Update from registry; do not hand-edit option rows. -->
 
-公共规范入口：`node bin/exocortex.mjs`；人类快捷入口：`npm run exo --`。本表从 `--help --all --format json` 的 registry 目录生成，共 **6 个顶层命令、16 个执行路由**。默认帮助突出 messages、status 与帮助；开发和研究工具见 [Development](development.md)。
+公共规范入口：`node bin/exocortex.mjs`；人类快捷入口：`npm run exo --`。本表从 `--help --all --format json` 的 registry 目录生成，共 **6 个顶层命令、17 个执行路由**。默认帮助突出 messages、status 与帮助；开发和研究工具见 [Development](development.md)。
 
 默认路径相对安装 root，显式相对路径按 cwd 解析。`messages`、`sync` 与显式日志/unsafe 模式为私有输出；默认诊断只输出安全投影。`sync` 保留已有 JSON summary 契约，仅支持 JSON，可能包含私有路径与业务错误细节。域内参数关系仍由各命令校验，不因目录列出而自动允许任意组合。操作配方见 [Operations](operations.md)，行为变化与退役门槛见 [CLI migration](cli-migration.md)。
 
@@ -23,6 +23,7 @@
 | `maintenance init` | Initialize schema with its independent initialization lock. | database-write, permissions-write | `public-safe` |
 | `maintenance backup` | Create and verify a private backup before publishing it. | backup-write, same-source-backup-cleanup | `public-safe` |
 | `maintenance enrich` | Preview enrichment of one target; apply commits through its own CAS. | local-read, remote-read | `public-safe` |
+| `maintenance preview` | Preview independent exact-target units with durable private reviews and locally validated resume. | local-read, remote-read, private-review-file-write, private-progress-file-write | `public-safe` |
 | `maintenance repair` | Preview structural recovery; apply uses existing fences. | local-read | `public-safe` |
 | `maintenance replay` | Preview replay of explicit scopes and a fixed interval. | local-read, remote-read | `public-safe` |
 | `maintenance prune-runs` | Preview run-history retention; applying can remove coverage evidence. | local-read | `public-safe` |
@@ -264,6 +265,22 @@ Preview enrichment of one target; apply commits through its own CAS.
 | `--review-out` | path | — | — | Publish a private exact-target review file; dry-run only, with explicit request budgets. |
 | `--review-in` | path | — | — | Require this private review file for exact-target --apply; refetch and reject any drift. |
 | `--review-sha256` | string | — | — | SHA-256 of the exact reviewed file bytes, including its final newline; required with --review-in. |
+
+### maintenance preview
+
+Preview independent exact-target units with durable private reviews and locally validated resume.
+
+默认效果：`local-read, remote-read, private-review-file-write, private-progress-file-write`；输出：`public-safe`。
+
+| 参数 | 类型/取值 | 默认 | 约束 | 说明 |
+| --- | --- | --- | --- | --- |
+| `--db` | path | — | 必填 | Database; default relative to installation root, explicit relative paths to cwd. |
+| `--format` | text/json | `text` | — | Output format. |
+| `--plan` | path | — | 必填 | Private v1 JSON plan containing bounded names/replay units; never an approval. |
+| `--progress-dir` | path | — | 必填 | Existing canonical private directory for the manifest and independent complete reviews. |
+| `--resume` | boolean | `false` | — | Reuse valid unexpired local reviews without remote revalidation; this explicit invocation receives a new budget. |
+| `--max-cli-attempts` | integer | `12` | ≥ 1；≤ 1000 | Hard command-wide lark-cli process-attempt cap, including pages and fallbacks; not an HTTP request count. |
+| `--max-seconds` | integer | `30` | ≥ 1；≤ 180 | Command-wide remote-work deadline; stops without committing a budget-interrupted lookup. |
 
 ### maintenance repair
 

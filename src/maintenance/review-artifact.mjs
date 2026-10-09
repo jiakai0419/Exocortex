@@ -51,6 +51,7 @@ const exactKeys = (value, keys) => value && typeof value === 'object' && !Array.
 const hashValue = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const finite = value => Number.isSafeInteger(value) && value >= 0;
 const scalar = value => value === null || typeof value === 'string' || Number.isFinite(value);
+const partialReview = artifact => artifact.records.some(record => ['unresolved', 'conflict'].includes(record.outcome) || record.exclusion === 'unverified_identity');
 
 function reviewRequested(options) { return ['reviewOut', 'reviewIn', 'reviewSha256'].some(key => options[key] !== undefined); }
 function validateReviewOptions(options, mode) {
@@ -260,7 +261,8 @@ function beginMaintenanceReview(options, { db, mode, rows, scopes = [], now = Da
     if (approval && approval.binding.verified_self_sha256 !== value) fail('binding_changed');
     self = value;
   }
-  function finish(decisions) {
+  /** @param {any[]} decisions @param {(() => void)=} beforePublish */
+  function finish(decisions, beforePublish) {
     if (mode === 'replay' && !self) fail('binding_unavailable');
     const current = readOnlySqliteJson(db, `SELECT * FROM records WHERE id IN (${snapshots.map(row => row.id).join(',')});`, 'recheck review snapshot')
       .map(recordSnapshot).sort((a,b) => a.id - b.id);
@@ -326,6 +328,9 @@ function beginMaintenanceReview(options, { db, mode, rows, scopes = [], now = Da
       if (!equal(approval, artifact)) fail('proposal_changed');
       if (!changes) fail('no_changes');
     }
+    // Publication is the dry-run completion boundary, like a committed write.
+    // A later elapsed deadline must not hide an already durable review receipt.
+    if (!approval) beforePublish?.();
     const hash = approval ? options.reviewSha256 : publish(options.reviewOut, artifact);
     const assertBinding = () => {
       validateArtifact(artifact, Date.now());
@@ -333,7 +338,7 @@ function beginMaintenanceReview(options, { db, mode, rows, scopes = [], now = Da
       if (!equal(latest.binding, control.binding)) fail('binding_changed');
     };
     return { summary: { schema: artifact.schema, sha256: hash, records: entries.length, changes, expires_at_ms: artifact.expires_at_ms,
-      raw_policy: 'opaque_digest_only', card_policy: 'api_snapshot_not_business_approval' },
+      raw_policy: 'opaque_digest_only', card_policy: 'api_snapshot_not_business_approval', partial: partialReview(artifact) },
       assertBinding: approval ? assertBinding : undefined,
       fence: approval ? { createdAtMs: artifact.created_at_ms, expiresAtMs: artifact.expires_at_ms,
         sourceConfigJson: control.sourceConfigJson, sentActor: fresh.sentActor, records: snapshots, scopes } : undefined };
@@ -341,5 +346,35 @@ function beginMaintenanceReview(options, { db, mode, rows, scopes = [], now = Da
   return { finish, verifySelf };
 }
 
-export { beginMaintenanceReview, validateReviewOptions, reviewRequested, MaintenanceReviewError, recordSnapshot,
+/** Reuse only unexpired, complete local evidence. This does not fetch or verify
+ * current remote state and never returns proposed SQL values or an apply fence.
+ * The normal apply route still refetches and compares the entire proposal.
+ * @param {Record<string,any>} options
+ * @param {{db:string, mode:string, now?:()=>number, expectedSha256?:string}} context */
+function reuseMaintenanceReview(options, { db, mode, now = Date.now, expectedSha256 }) {
+  const loaded = readStableJsonFile(privatePath(options.reviewOut), { maxBytes: REVIEW_MAX_BYTES });
+  if (loaded.status !== 'ready') fail('invalid_file');
+  if (expectedSha256 && loaded.sha256 !== expectedSha256) fail('approval_mismatch');
+  const artifact = validateArtifact(loaded.value, now());
+  // Include unknown DB columns in the rejection, just as the apply SQL fence does.
+  const columns = readOnlySqliteJson(db, "SELECT name FROM pragma_table_info('records');", 'read review schema').map(row => row.name);
+  if (!equal([...columns].sort(), [...REVIEW_RECORD_COLUMNS].sort())) fail('snapshot_changed');
+  const ids = mode === 'names' ? options.recordIds : options.messageIds;
+  const selector = mode === 'names' ? 'id' : 'external_id';
+  const rows = readOnlySqliteJson(db, `SELECT * FROM records WHERE source_id='lark.im' AND ${selector} IN (${ids.map(quoteSql).join(',')});`, 'read reusable review snapshots');
+  if (rows.length !== ids.length || rows.some(row => row.record_type !== 'lark.im.message')) fail('snapshot_changed');
+  const scopeIds = mode === 'names' ? [...new Set(rows.map(row => row.first_seen_scope_id))] : options.scopeIds;
+  const scopes = readOnlySqliteJson(db, `SELECT id,source_id,enabled,config_json FROM sync_scopes WHERE id IN (${scopeIds.map(quoteSql).join(',')});`, 'read reusable review scopes').map(scope => ({ id: scope.id, source_id: scope.source_id, enabled: scope.enabled, config_json: scope.config_json }));
+  if (scopes.length !== scopeIds.length || scopes.some(scope => scope.source_id !== 'lark.im' || scope.enabled !== 1)) fail('binding_changed');
+  const { reviewOut, ...base } = options;
+  beginMaintenanceReview({ ...base, apply: true, reviewIn: reviewOut, reviewSha256: loaded.sha256 }, { db, mode, rows, scopes, now });
+  if (artifact.records.some(record => rows.find(row => row.id === record.id)?.external_id !== record.external_id)
+    || (mode === 'replay' ? !hashValue(artifact.binding.verified_self_sha256) : artifact.binding.verified_self_sha256 !== null)) fail('snapshot_changed');
+  return { schema: artifact.schema, sha256: loaded.sha256, records: artifact.records.length,
+    changes: artifact.records.filter(record => record.outcome === 'update').length, expires_at_ms: artifact.expires_at_ms,
+    raw_policy: 'opaque_digest_only', card_policy: 'api_snapshot_not_business_approval',
+    partial: partialReview(artifact) };
+}
+
+export { beginMaintenanceReview, reuseMaintenanceReview, validateReviewOptions, reviewRequested, MaintenanceReviewError, recordSnapshot,
   effectiveRecord, publish as publishReviewArtifact, REVIEW_SCHEMA, REVIEW_MAX_BYTES, REVIEW_RECORD_BYTES, REVIEW_TOTAL_BYTES, REVIEW_AGE_MS };

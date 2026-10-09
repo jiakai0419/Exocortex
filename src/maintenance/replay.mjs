@@ -191,10 +191,19 @@ function executeLarkImReplay(opts, deps = {}) {
       const records = staged[0].records;
       const projections = readOnlySqliteJson(dbPath, boundedReplayProjectionSql(records), 'project reviewed replay');
       if (projections.length !== targets.size) throw new MaintenanceReviewError('snapshot_changed');
+      // Finish local preview queries before publication: a durable review is
+      // followed only by its receipt, never another fallible SQLite read.
+      const previewScopes = !opts.apply ? staged.map(({ records, result }) => {
+        const existing = records.length === 0 ? 0 : readOnlySqliteJson(dbPath,
+          `SELECT count(*) AS count FROM records WHERE source_id='lark.im' AND external_id IN (${records.map(record => quoteSql(record.external_id)).join(',')});`,
+          'preview reviewed replay candidates')[0].count;
+        return { ...result, missing_candidates: records.length - Number(existing), existing_candidates: Number(existing) };
+      }) : [];
       reviewed = review.finish(projections.map(row => ({ before: targets.get(row.external_id), after: JSON.parse(row.after_json),
-        observed: records.find(record => record.external_id === row.external_id), outcome: row.outcome })));
+        observed: records.find(record => record.external_id === row.external_id), outcome: row.outcome })), session?.assertReady);
       summary.review = reviewed.summary;
-      session?.assertReady();
+      if (opts.apply) session?.assertReady();
+      else { summary.scopes.push(...previewScopes); return finish(); }
     } catch (error) {
       summary.ok = false;
       summary.scopes.push({ ok: false, error: safeReplayError(error) });
