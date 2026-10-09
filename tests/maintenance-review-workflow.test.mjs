@@ -5,13 +5,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { executeEnrichment } from '../src/maintenance/enrich.mjs';
+import { commitEnrichmentUpdates } from '../src/maintenance/enrichment-commit.mjs';
 import { executeLarkImReplay, validateReplayOptions } from '../src/maintenance/replay.mjs';
 import { beginMaintenanceReview, effectiveRecord, publishReviewArtifact, REVIEW_AGE_MS } from '../src/maintenance/review-artifact.mjs';
 import { runMaintenanceCommand } from '../src/cli/maintenance-command.mjs';
 import { parseRouteOptions } from '../src/cli/registry.mjs';
 import { createCommandContext } from '../src/cli/context.mjs';
 import { normalizeApiMessage } from '../src/adapters/lark-im/raw-message.mjs';
-import { prepareChatWindowRecords } from '../src/adapters/lark-im/sync-runner.mjs';
+import { createSyncRunner, prepareChatWindowRecords } from '../src/adapters/lark-im/sync-runner.mjs';
 import { chatScopeId } from '../src/adapters/lark-im/core.mjs';
 import { commitBoundedReplayRecords, ensureInitialized, INITIAL_ACCOUNT_KIND, quoteSql, sqliteExec, sqliteQuery, upsertRecordsSql } from '../dist/storage/sqlite/ingestion-store.js';
 
@@ -105,6 +106,188 @@ function saveSyntheticExample(mode, file, stdout) {
   writeFileSync(join(destination, `synthetic-${mode}-stdout.json`), `${JSON.stringify({ fixture: 'authored_synthetic_only', stdout }, null, 2)}\n`, { mode: 0o600 });
 }
 
+const SCOPE_POLICY = 'lark_im_scope_json_remove_hot/v1';
+const HOT_FIELDS = ['hot_rank', 'hot_seen_at', 'last_hot_snapshot_id'];
+const scopeConfigText = f => ro(f, `SELECT config_json FROM sync_scopes WHERE id=${quoteSql(SCOPE)};`)[0].config_json;
+function initializeHotScope(f) {
+  sql(f, `UPDATE sync_scopes SET config_json=${quoteSql(JSON.stringify({ chat_id: CHAT, chat_type: 'group',
+    chat_name: 'Synthetic Scope', hot_rank: 9, hot_seen_at: new Date(f.start).toISOString(),
+    last_hot_snapshot_id: 'hot_synthetic_before' }))} WHERE id=${quoteSql(SCOPE)};`);
+}
+function advanceHotDiscovery(f) {
+  let boundaryCalls = 0;
+  const runner = createSyncRunner({
+    fetchChatDiscoveryPage: () => {
+      boundaryCalls++;
+      return { chats: [{ chat_id: CHAT, chat_type: 'group', chat_name: 'Synthetic Scope' }], has_more: false, page_token: '' };
+    },
+    makeSnapshotId: () => 'hot_synthetic_after', nowIso: () => new Date(f.end).toISOString(),
+  });
+  const result = runner.syncDiscovery(f.db, { startMs: f.start, endMs: f.end, pageSize: 50, maxPages: 1,
+    chatPageSize: 100, maxChatPages: 100, discoveryPagesPerRun: 1, receivedScopesPerRun: 0,
+    discoveryMode: 'hot', reconcileIntervalHours: 24, receivedMode: 'all', chatTypes: 'group,p2p',
+    stableHorizonSeconds: 30, stableHorizonMs: 30000, endExplicit: true, lockTtlSeconds: 600, retries: 0, retryDelayMs: 0 });
+  assert.equal(result.ok, true, JSON.stringify(result)); assert.equal(boundaryCalls, 1);
+  assert.equal(result.snapshot_id, 'hot_synthetic_after');
+  assert.equal(ro(f, "SELECT COUNT(*) AS n FROM sync_runs WHERE status='succeeded';")[0].n, 1);
+}
+function scopeWorkflow(f, mode) {
+  const options = mode === 'names' ? nameOptions(f) : replayOptions(f);
+  const messages = mode === 'text' ? f.rows.map((_, i) => message(f, i, 'text', {
+    update_time: String(f.start + 20_000 + i), body: { content: JSON.stringify({ text: `Synthetic approved text ${i}` }) },
+  })) : undefined;
+  return { options, run: (opts = options, deps = {}) => mode === 'names' ? names(f, opts, deps) : replay(f, messages, opts, deps) };
+}
+// Synthetic compatibility fixtures project only the documented wire shape.
+// The real native workflow authors all snapshots, decisions and proposal hashes;
+// approved apply must still refetch and reproduce every record without a bypass.
+function legacyApproval(f, options, preview, schema) {
+  const input = approved(options, preview);
+  input.reviewSha256 = rewrite(options.reviewOut, artifact => {
+    artifact.schema = `exocortex_private_maintenance_review/${schema}`;
+    delete artifact.binding.scope_config_policy;
+    for (const scope of artifact.binding.scopes) scope.config_sha256 = hash(scopeConfigText(f));
+    if (schema === 'v1') {
+      delete artifact.disclosure.non_card_text;
+      for (const record of artifact.records) for (const side of ['before', 'after']) delete record.display[side].non_card;
+    }
+  });
+  return input;
+}
+
+for (const [mode, kind] of [['names', 'text'], ['names', 'interactive'], ['card', 'interactive'], ['text', 'text']]) {
+  test(`v3 ${mode} (${kind}) approval survives only the three fields changed by formal hot discovery`, t => {
+    const f = fixture(t, 2, kind); initializeHotScope(f);
+    const w = scopeWorkflow(f, mode), preview = w.run(), artifact = readArtifact(w.options.reviewOut);
+    assert.equal(artifact.schema, 'exocortex_private_maintenance_review/v3');
+    assert.equal(artifact.binding.scope_config_policy, SCOPE_POLICY);
+    assert.equal(artifact.expires_at_ms - artifact.created_at_ms, REVIEW_AGE_MS);
+    for (const r of artifact.records) if (mode !== 'text') assert.equal(r.display.after.non_card, null);
+    const rows = ro(f), before = JSON.parse(scopeConfigText(f));
+    advanceHotDiscovery(f);
+    const after = JSON.parse(scopeConfigText(f));
+    assert.deepEqual(Object.keys(after).filter(key => JSON.stringify(after[key]) !== JSON.stringify(before[key])).sort(), HOT_FIELDS);
+    assert.deepEqual(ro(f), rows, 'formal discovery changes no selected record');
+    const calls = f.calls.length, result = w.run(approved(w.options, preview));
+    assert.equal(mode === 'names' ? result.updated : result.scopes[0].updated, 2);
+    assert.ok(f.calls.length > calls, 'approval still refetches the authoritative proposal');
+    assert.equal(scopeConfigText(f), JSON.stringify(after), 'apply does not overwrite scheduler progress');
+    publicReport(result);
+  });
+}
+
+for (const mutation of ['unknown_added', 'unknown_removed', 'unknown_null_removed', 'unknown_large_integer', 'nested_hot',
+  'chat_id', 'chat_type', 'chat_name', 'scope_source', 'scope_enabled', 'source_enabled', 'baseline', 'account']) {
+  test(`v3 approval binds ${mutation} before any API`, t => {
+    const f = fixture(t, 1, true); initializeHotScope(f);
+    if (mutation === 'unknown_removed') sql(f, `UPDATE sync_scopes SET config_json=json_set(config_json,'$.future_policy','must_remain') WHERE id=${quoteSql(SCOPE)};`);
+    if (mutation === 'unknown_null_removed') sql(f, `UPDATE sync_scopes SET config_json=json_set(config_json,'$.future_policy',null) WHERE id=${quoteSql(SCOPE)};`);
+    if (mutation === 'unknown_large_integer') sql(f, `UPDATE sync_scopes SET config_json=substr(config_json,1,length(config_json)-1)||',"future_policy":9007199254740992}' WHERE id=${quoteSql(SCOPE)};`);
+    if (mutation === 'nested_hot') sql(f, `UPDATE sync_scopes SET config_json=json_set(config_json,'$.future_policy',json('{"hot_rank":1}')) WHERE id=${quoteSql(SCOPE)};`);
+    const w = scopeWorkflow(f, 'card'), preview = w.run(), before = ro(f), calls = f.calls.length;
+    if (mutation === 'unknown_added') sql(f, `UPDATE sync_scopes SET config_json=json_set(config_json,'$.future_policy','new') WHERE id=${quoteSql(SCOPE)};`);
+    if (['unknown_removed', 'unknown_null_removed'].includes(mutation)) sql(f, `UPDATE sync_scopes SET config_json=json_remove(config_json,'$.future_policy') WHERE id=${quoteSql(SCOPE)};`);
+    if (mutation === 'unknown_large_integer') sql(f, `UPDATE sync_scopes SET config_json=replace(config_json,'9007199254740992','9007199254740993') WHERE id=${quoteSql(SCOPE)};`);
+    if (mutation === 'nested_hot') sql(f, `UPDATE sync_scopes SET config_json=json_set(config_json,'$.future_policy.hot_rank',2) WHERE id=${quoteSql(SCOPE)};`);
+    if (['chat_id', 'chat_type', 'chat_name'].includes(mutation)) sql(f, `UPDATE sync_scopes SET config_json=json_set(config_json,${quoteSql(`$.${mutation}`)},'synthetic_changed') WHERE id=${quoteSql(SCOPE)};`);
+    if (mutation === 'scope_source') sql(f, `INSERT INTO sources (id,display_name,kind) VALUES ('synthetic.other','Synthetic other','synthetic'); UPDATE sync_scopes SET source_id='synthetic.other' WHERE id=${quoteSql(SCOPE)};`);
+    if (mutation === 'scope_enabled') sql(f, `UPDATE sync_scopes SET enabled=0 WHERE id=${quoteSql(SCOPE)};`);
+    if (mutation === 'source_enabled') sql(f, "UPDATE sources SET enabled=0 WHERE id='lark.im';");
+    if (mutation === 'baseline') sql(f, "UPDATE sources SET config_json=json_set(config_json,'$.initial_sync_start_ms',json_extract(config_json,'$.initial_sync_start_ms')-1) WHERE id='lark.im';");
+    if (mutation === 'account') sql(f, `UPDATE sources SET config_json=json_set(config_json,'$.initial_account_binding.account_key',${quoteSql(hash('synthetic_other_account'))}) WHERE id='lark.im';`);
+    assert.throws(() => w.run(approved(w.options, preview)), /binding_changed|binding_unavailable|inconsistent chat identity|missing or disabled|not a Lark chat scope/);
+    assert.equal(f.calls.length, calls); noWrites(f, before);
+  });
+}
+
+for (const mutation of ['unknown_schema', 'unknown_policy', 'missing_policy', 'extra_policy', 'ttl_extended']) {
+  test(`v3 rejects ${mutation} as an invalid contract before any API`, t => {
+    const f = fixture(t, 1), w = scopeWorkflow(f, 'names'), preview = w.run(), before = ro(f), calls = f.calls.length;
+    const input = approved(w.options, preview);
+    input.reviewSha256 = rewrite(w.options.reviewOut, artifact => {
+      if (mutation === 'unknown_schema') artifact.schema = 'exocortex_private_maintenance_review/v999';
+      if (mutation === 'unknown_policy') artifact.binding.scope_config_policy = 'lark_im_scope_json_remove_hot/v999';
+      if (mutation === 'missing_policy') delete artifact.binding.scope_config_policy;
+      if (mutation === 'extra_policy') artifact.binding.scope_config_excluded_fields = ['chat_id'];
+      if (mutation === 'ttl_extended') artifact.expires_at_ms++;
+    });
+    assert.throws(() => w.run(input), /invalid_file/); assert.equal(f.calls.length, calls); noWrites(f, before);
+  });
+}
+
+for (const [mode, schema] of [['names', 'v1'], ['card', 'v1'], ['text', 'v2']]) {
+  for (const drift of [false, true]) test(`legacy ${schema} ${mode} approval ${drift ? 'rejects hot drift before API' : 'still refetches and applies its exact proposal'}`, t => {
+    const f = fixture(t, 1, mode === 'card'); initializeHotScope(f);
+    const w = scopeWorkflow(f, mode), preview = w.run(), input = legacyApproval(f, w.options, preview, schema);
+    const before = ro(f), calls = f.calls.length;
+    if (drift) {
+      advanceHotDiscovery(f);
+      assert.throws(() => w.run(input), /binding_changed/); assert.equal(f.calls.length, calls); noWrites(f, before);
+    } else {
+      const result = w.run(input);
+      assert.equal(mode === 'names' ? result.updated : result.scopes[0].updated, 1);
+      assert.ok(f.calls.length > calls);
+    }
+  });
+}
+
+for (const mode of ['names', 'card', 'text']) {
+  test(`v3 ${mode} apply rejects scheduler drift during its own API round`, t => {
+    const f = fixture(t, 2, mode === 'card'); initializeHotScope(f);
+    const w = scopeWorkflow(f, mode), preview = w.run(), before = ro(f);
+    const drift = () => sql(f, `UPDATE sync_scopes SET config_json=json_set(config_json,'$.hot_rank',1) WHERE id=${quoteSql(SCOPE)};`);
+    if (mode === 'names') assert.throws(() => w.run(approved(w.options, preview), { runLark: args => {
+      f.calls.push(args); drift();
+      return { users: args[args.indexOf('--user-ids') + 1].split(',').map(open_id => ({ open_id, name: `Synthetic Reader ${open_id.slice(-1)}` })) };
+    } }), /binding_changed/);
+    else {
+      const result = w.run(approved(w.options, preview), { getSelfProfile: () => { f.calls.push('self'); drift(); return SELF; } });
+      assert.equal(result.ok, false); assert.match(JSON.stringify(result), /binding_changed/);
+    }
+    noWrites(f, before);
+  });
+}
+
+for (const mode of ['card', 'text']) {
+  test(`v3 ${mode} SQLite fence rejects scheduler drift after the final application recheck atomically`, t => {
+    const f = fixture(t, 2, mode === 'card'); initializeHotScope(f);
+    const w = scopeWorkflow(f, mode), preview = w.run(), before = ro(f);
+    let passedApplicationFence = false;
+    const result = w.run(approved(w.options, preview), { commitBoundedReplayRecords: (db, options) => commitBoundedReplayRecords(db, {
+      ...options, reviewBeforeCommit: () => {
+        options.reviewBeforeCommit(); passedApplicationFence = true;
+        sql(f, `UPDATE sync_scopes SET config_json=json_set(config_json,'$.hot_seen_at','Synthetic later discovery') WHERE id=${quoteSql(SCOPE)};`);
+      },
+    }) });
+    assert.equal(passedApplicationFence, true); assert.equal(result.ok, false);
+    noWrites(f, before);
+  });
+}
+
+for (const drift of [false, true]) test(`v3 names commit helper ${drift ? 'atomically rejects hot drift after its application check' : 'accepts the complete current scope fence'}`, t => {
+  const f = fixture(t, 2); initializeHotScope(f);
+  const before = ro(f), options = nameOptions(f);
+  const scopes = ro(f, `SELECT id,source_id,enabled,config_json FROM sync_scopes WHERE id=${quoteSql(SCOPE)};`);
+  const decisions = before.map(row => ({ before: row, outcome: 'update', after: { ...effectiveRecord(row),
+    canonical_json: JSON.stringify({ ...JSON.parse(row.canonical_json), sender_name: 'Synthetic Reader Race' }),
+  } }));
+  const context = { db: f.db, mode: 'names', rows: before, scopes };
+  const preview = beginMaintenanceReview(options, context).finish(decisions);
+  const reviewed = beginMaintenanceReview(approved(options, { review: preview.summary }), context).finish(decisions);
+  const updates = decisions.map(({ before: row, after }) => `UPDATE records SET canonical_json=${quoteSql(after.canonical_json)} WHERE id=${row.id};
+    INSERT INTO __enrichment_effects (updated) VALUES (changes());`);
+  let checked = false;
+  const commit = () => commitEnrichmentUpdates(f.db, updates, { dryRun: false, reason: 'synthetic-review-test', label: 'synthetic reviewed names',
+    reviewFence: reviewed.fence, reviewBeforeCommit: () => {
+      reviewed.assertBinding(); checked = true;
+      if (drift) sql(f, `UPDATE sync_scopes SET config_json=json_set(config_json,'$.last_hot_snapshot_id','hot_synthetic_race') WHERE id=${quoteSql(SCOPE)};`);
+    },
+  });
+  if (drift) { assert.throws(commit, /CHECK constraint failed/); noWrites(f, before); }
+  else assert.deepEqual(commit(), { updated: 2, skippedConflicts: 0 });
+  assert.equal(checked, true);
+});
+
 test('names review reuses one lookup, displays exact authority and presence, and approved apply refetches then commits atomically', t => {
   const f = fixture(t);
   sql(f, `UPDATE records SET canonical_json=json_remove(canonical_json,'$.sender_name') WHERE id=${f.ids[0]};
@@ -146,7 +329,7 @@ test('card review uses final SQL merge, refetches without extra API, binds opaqu
   assert.equal(preview.ok, true); assert.equal(preview.review.changes, 2); assert.equal(f.calls.length, 2);
   assert.deepEqual(readFileSync(f.db), bytes);
   const artifact = readArtifact(opts.reviewOut);
-  assert.equal(artifact.schema, 'exocortex_private_maintenance_review/v1');
+  assert.equal(artifact.schema, 'exocortex_private_maintenance_review/v3');
   assert.equal(artifact.binding.verified_self_sha256, hash(SELF.open_id));
   for (const record of artifact.records) {
     assert.match(record.display.before.card.text, /Synthetic card before/);
@@ -168,7 +351,7 @@ test('card review uses final SQL merge, refetches without extra API, binds opaqu
 });
 
 for (const kind of ['text', 'post', 'system', 'general_calendar', 'video_chat']) {
-  test(`${kind} exact replay publishes complete stored text in v2 and approved apply preserves the reviewed result`, t => {
+  test(`${kind} exact replay publishes complete stored text in v3 and approved apply preserves the reviewed result`, t => {
     const f = fixture(t, 1, kind), before = ro(f), dbBytes = readFileSync(f.db), opts = replayOptions(f);
     const messages = [message(f, 0, kind, { update_time: String(f.start + 20_000),
       body: { content: JSON.stringify(nonCardContent(kind, 'Synthetic non-card after\n完整正文🙂')) } })];
@@ -176,7 +359,7 @@ for (const kind of ['text', 'post', 'system', 'general_calendar', 'video_chat'])
     assert.equal(preview.ok, true); assert.equal(preview.review.changes, 1); assert.equal(f.calls.length, 2);
     assert.deepEqual(readFileSync(f.db), dbBytes); noWrites(f, before);
     const artifact = readArtifact(opts.reviewOut), record = artifact.records[0];
-    assert.equal(artifact.schema, 'exocortex_private_maintenance_review/v2');
+    assert.equal(artifact.schema, 'exocortex_private_maintenance_review/v3');
     assert.equal(preview.review.schema, artifact.schema);
     assert.match(artifact.disclosure.non_card_text, /exact_stored_title_and_body/);
     assert.deepEqual(record.display.before.non_card, { title: before[0].title, body: before[0].body });
@@ -211,7 +394,7 @@ test('mixed replay retains strict interactive rendering and cannot disguise a ca
   const messages = [message(f, 0, false, { update_time: String(f.start + 20_000) }), incoming(f, 1)];
   const preview = replay(f, messages, opts); assert.equal(preview.ok, true);
   const artifact = readArtifact(opts.reviewOut);
-  assert.equal(artifact.schema, 'exocortex_private_maintenance_review/v2');
+  assert.equal(artifact.schema, 'exocortex_private_maintenance_review/v3');
   assert.equal(artifact.records[1].display.after.non_card, null);
   assert.match(artifact.records[1].display.after.card.text, /Synthetic card after/);
   const malformed = replay(f, [messages[0], incoming(f, 1, '', { body: { content: JSON.stringify({ unsupported: true }) } })],
@@ -226,7 +409,7 @@ test('mixed replay retains strict interactive rendering and cannot disguise a ca
 });
 
 for (const mutation of ['hide_body', 'unknown_field', 'schema_downgrade', 'change_display']) {
-  test(`v2 approval rejects ${mutation} before writing`, t => {
+  test(`v3 approval rejects ${mutation} before writing`, t => {
     const f = fixture(t, 1), opts = replayOptions(f), before = ro(f);
     const messages = [message(f, 0, false, { update_time: String(f.start + 20_000) })];
     const preview = replay(f, messages, opts); assert.equal(preview.ok, true);

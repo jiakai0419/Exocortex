@@ -11,6 +11,9 @@ import { quoteSql, REVIEW_RECORD_COLUMNS, REVIEW_EFFECTIVE_COLUMNS } from '../..
 
 const REVIEW_SCHEMA = 'exocortex_private_maintenance_review/v1';
 const TEXT_REVIEW_SCHEMA = 'exocortex_private_maintenance_review/v2';
+const SCOPE_REVIEW_SCHEMA = 'exocortex_private_maintenance_review/v3';
+const SCOPE_CONFIG_POLICY = 'lark_im_scope_json_remove_hot/v1';
+const SCOPE_CONFIG_PROJECTION_SQL = "json_remove(config_json,'$.hot_rank','$.hot_seen_at','$.last_hot_snapshot_id')";
 const TEXT_REVIEW_TYPES = new Set(['text', 'post', 'system', 'general_calendar', 'video_chat']);
 const REVIEW_MAX_BYTES = 1024 * 1024;
 const REVIEW_RECORD_BYTES = 256 * 1024;
@@ -105,14 +108,16 @@ function publish(path, artifact, { sync = fsyncSync } = {}) {
 }
 
 function validateArtifact(value, now) {
-  const textReview = value?.schema === TEXT_REVIEW_SCHEMA;
+  const scopeReview = value?.schema === SCOPE_REVIEW_SCHEMA;
+  const textReview = value?.schema === TEXT_REVIEW_SCHEMA || scopeReview;
   if (!exactKeys(value, ['schema', 'mode', 'created_at_ms', 'expires_at_ms', 'disclosure', 'binding', 'constraints', 'records'])
-    || ![REVIEW_SCHEMA, TEXT_REVIEW_SCHEMA].includes(value.schema) || !['names', 'replay'].includes(value.mode)
-    || textReview && value.mode !== 'replay'
+    || ![REVIEW_SCHEMA, TEXT_REVIEW_SCHEMA, SCOPE_REVIEW_SCHEMA].includes(value.schema) || !['names', 'replay'].includes(value.mode)
+    || value.schema === TEXT_REVIEW_SCHEMA && value.mode !== 'replay'
     || !equal(value.disclosure, textReview ? TEXT_REVIEW_DISCLOSURE : REVIEW_DISCLOSURE)
     || !finite(value.created_at_ms) || value.expires_at_ms !== value.created_at_ms + REVIEW_AGE_MS) fail('invalid_file');
   if (now < value.created_at_ms || now >= value.expires_at_ms) fail('expired');
-  if (!exactKeys(value.binding, ['database_key', 'source_id', 'source_config_sha256', 'baseline', 'local_account_key', 'scopes', 'verified_self_sha256'])
+  if (!exactKeys(value.binding, ['database_key', 'source_id', 'source_config_sha256', 'baseline', 'local_account_key', 'scopes', 'verified_self_sha256', ...(scopeReview ? ['scope_config_policy'] : [])])
+    || scopeReview && value.binding.scope_config_policy !== SCOPE_CONFIG_POLICY
     || value.binding.source_id !== 'lark.im' || !hashValue(value.binding.database_key) || !hashValue(value.binding.source_config_sha256)
     || !hashValue(value.binding.local_account_key) || !finite(value.binding.baseline)
     || !(value.binding.verified_self_sha256 === null || hashValue(value.binding.verified_self_sha256))
@@ -147,7 +152,7 @@ function validateArtifact(value, now) {
           || !entry.present && entry.value !== null || !(entry.value === null || typeof entry.value === 'string' && bytes(entry.value) <= 1024
             || allowBoolean && typeof entry.value === 'boolean')) fail('invalid_file');
       }
-      const nonCard = textReview && TEXT_REVIEW_TYPES.has(display.canonical.msg_type.value);
+      const nonCard = value.mode === 'replay' && textReview && TEXT_REVIEW_TYPES.has(display.canonical.msg_type.value);
       if (nonCard) {
         if (display.card !== null || !exactKeys(display.non_card, ['title', 'body'])
           || !Object.values(display.non_card).every(text => text === null || typeof text === 'string' && bytes(text) <= REVIEW_RECORD_BYTES)) fail('invalid_file');
@@ -163,7 +168,7 @@ function validateArtifact(value, now) {
         || !hashValue(record.opaque[side][field].sha256) || !finite(record.opaque[side][field].bytes)) fail('invalid_file');
     }
   }
-  if (textReview && !value.records.some(record => record.display.before.non_card !== null || record.display.after.non_card !== null)) fail('invalid_file');
+  if (value.schema === TEXT_REVIEW_SCHEMA && !value.records.some(record => record.display.before.non_card !== null || record.display.after.non_card !== null)) fail('invalid_file');
   return value;
 }
 
@@ -174,7 +179,7 @@ function readApproval(options, now) {
   return validateArtifact(loaded.value, now);
 }
 
-function captureBinding(db, scopes) {
+function captureBinding(db, scopes, scopeReview) {
   try {
     const databaseKey = activityDatabaseKey(db);
     const source = readOnlySqliteJson(db, "SELECT enabled,config_json FROM sources WHERE id='lark.im';", 'read maintenance review source')[0];
@@ -194,12 +199,20 @@ function captureBinding(db, scopes) {
       accountKey ||= sidecar.account_key;
     }
     if (!hashValue(accountKey) || captured.initial_account && captured.initial_account.account_key !== accountKey) fail('binding_unavailable');
-    const actualScopes = scopes.length ? readOnlySqliteJson(db, `SELECT id,source_id,enabled,config_json FROM sync_scopes WHERE id IN (${scopes.map(s => quoteSql(s.id)).join(',')});`, 'read maintenance review scopes') : [];
+    // The v3 projection applies only to the persisted approval digest. Retain
+    // exact config bytes for every within-operation check and the SQL fence.
+    // SQLite preserves unknown JSON values (including large integer spelling)
+    // instead of round-tripping them through JavaScript's number representation.
+    const projection = scopeReview ? `,CASE WHEN json_valid(config_json) THEN CASE WHEN json_type(config_json)='object' THEN ${SCOPE_CONFIG_PROJECTION_SQL} END END AS review_config_json` : '';
+    const capturedScopes = scopes.length ? readOnlySqliteJson(db, `SELECT id,source_id,enabled,config_json${projection} FROM sync_scopes WHERE id IN (${scopes.map(s => quoteSql(s.id)).join(',')});`, 'read maintenance review scopes') : [];
+    const actualScopes = capturedScopes.map(({ review_config_json, ...scope }) => scope);
     if (actualScopes.length !== scopes.length || !equal([...actualScopes].sort((a,b) => a.id.localeCompare(b.id)), [...scopes].sort((a,b) => a.id.localeCompare(b.id)))) fail('binding_changed');
+    if (scopeReview && capturedScopes.some(scope => typeof scope.review_config_json !== 'string')) fail('binding_unavailable');
     if (activityDatabaseKey(db) !== databaseKey) fail('binding_changed');
     return { sourceConfigJson: source.config_json, sentActor: captured.sent_actor || null, binding: { database_key: databaseKey, source_id: 'lark.im',
       source_config_sha256: sha(source.config_json), baseline, local_account_key: accountKey,
-      scopes: [...scopes].sort((a,b) => a.id.localeCompare(b.id)).map(s => ({ id:s.id, source_id:s.source_id, enabled:s.enabled, config_sha256:sha(s.config_json) })),
+      ...(scopeReview ? { scope_config_policy: SCOPE_CONFIG_POLICY } : {}),
+      scopes: [...capturedScopes].sort((a,b) => a.id.localeCompare(b.id)).map(s => ({ id:s.id, source_id:s.source_id, enabled:s.enabled, config_sha256:sha(scopeReview ? s.review_config_json : s.config_json) })),
       verified_self_sha256: null } };
   } catch (error) { if (error instanceof MaintenanceReviewError) throw error; fail('binding_unavailable'); }
 }
@@ -223,12 +236,16 @@ function beginMaintenanceReview(options, { db, mode, rows, scopes = [], now = Da
   if (!reviewRequested(options)) return null;
   validateReviewOptions(options, mode);
   const approval = options.reviewIn ? readApproval(options, now()) : null;
+  // Legacy approvals retain both their original schema and full-byte binding;
+  // a digest is never silently reinterpreted as a v3 projected configuration.
+  const schema = approval?.schema ?? SCOPE_REVIEW_SCHEMA;
+  const scopeReview = schema === SCOPE_REVIEW_SCHEMA;
   if (options.reviewOut) privateDestination(options.reviewOut);
   const snapshots = rows.map(recordSnapshot).sort((a,b) => a.id - b.id);
   if (!snapshots.length || snapshots.length > 100 || new Set(snapshots.map(r => r.id)).size !== snapshots.length) fail('snapshot_changed');
   const sizes = snapshots.map(row => bytes(stable(row)));
   if (sizes.some(size => size > REVIEW_RECORD_BYTES) || sizes.reduce((sum, size) => sum + size, 0) > REVIEW_TOTAL_BYTES) fail('too_large');
-  const control = captureBinding(db, scopes);
+  const control = captureBinding(db, scopes, scopeReview);
   const selection = constraints(options, mode);
   if (approval) {
     if (approval.mode !== mode || !equal(approval.constraints, selection)) fail('approval_mismatch');
@@ -248,7 +265,7 @@ function beginMaintenanceReview(options, { db, mode, rows, scopes = [], now = Da
     const current = readOnlySqliteJson(db, `SELECT * FROM records WHERE id IN (${snapshots.map(row => row.id).join(',')});`, 'recheck review snapshot')
       .map(recordSnapshot).sort((a,b) => a.id - b.id);
     if (!equal(current, snapshots)) fail('snapshot_changed');
-    const fresh = captureBinding(db, scopes);
+    const fresh = captureBinding(db, scopes, scopeReview);
     if (!equal(fresh.binding, control.binding)) fail('binding_changed');
     let total = 0;
     const entries = decisions.map(({ before, after, observed = after, outcome, exclusion = null }) => {
@@ -295,11 +312,11 @@ function beginMaintenanceReview(options, { db, mode, rows, scopes = [], now = Da
           changed_fields: OPAQUE_FIELDS.filter(key => !equal(original[key] ?? null, effective[key])) } };
     }).sort((a,b) => a.id - b.id);
     if (entries.length !== snapshots.length || entries.some((entry,i) => entry.id !== snapshots[i].id || entry.before_sha256 !== digest(snapshots[i]))) fail('snapshot_changed');
-    const textReview = entries.some(entry => entry.display.before.non_card || entry.display.after.non_card);
+    const textReview = schema !== REVIEW_SCHEMA;
     if (textReview) for (const entry of entries) for (const side of ['before', 'after']) entry.display[side].non_card ??= null;
     const binding = { ...control.binding, verified_self_sha256: self };
     const created = approval?.created_at_ms ?? now();
-    const artifact = { schema: textReview ? TEXT_REVIEW_SCHEMA : REVIEW_SCHEMA, mode, created_at_ms: created, expires_at_ms: created + REVIEW_AGE_MS,
+    const artifact = { schema, mode, created_at_ms: created, expires_at_ms: created + REVIEW_AGE_MS,
       disclosure: textReview ? TEXT_REVIEW_DISCLOSURE : REVIEW_DISCLOSURE,
       binding, constraints: selection, records: entries };
     validateArtifact(artifact, now());
@@ -312,7 +329,7 @@ function beginMaintenanceReview(options, { db, mode, rows, scopes = [], now = Da
     const hash = approval ? options.reviewSha256 : publish(options.reviewOut, artifact);
     const assertBinding = () => {
       validateArtifact(artifact, Date.now());
-      const latest = captureBinding(db, scopes);
+      const latest = captureBinding(db, scopes, scopeReview);
       if (!equal(latest.binding, control.binding)) fail('binding_changed');
     };
     return { summary: { schema: artifact.schema, sha256: hash, records: entries.length, changes, expires_at_ms: artifact.expires_at_ms,

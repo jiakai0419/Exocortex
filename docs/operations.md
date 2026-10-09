@@ -765,13 +765,17 @@ node bin/exocortex.mjs maintenance replay --db "$DB_PATH" \
 
 工件逐项列出目标/版本、决策、姓名 before/after 及来源/置信度、聊天与删除标记，并区分字段缺失和 JSON null。卡片可读部分重新渲染 API 原文；实际 final after 使用正式 SQLite upsert 的版本和合并投影，保留已有权威姓名。相同或更旧版本只展示原行 final after 和 conflict/duplicate，不把 incoming 当成实际更新。`title`、`body`、`canonical_json`、`raw_json`、`content_hash` 每列只展示摘要、字节数及变化字段；完整拟写投影另有摘要绑定。可读卡片不是存储 body 列的逐字展开，也不是业务审批状态的证明。
 
-names 和纯卡片回放继续使用 v1 工件。包含 text、post、system、general_calendar、video_chat 的回放使用 v2：这些类型的 `display.before/after.non_card` 完整展示实际存储的 `title` 与 `body`（保留 null、换行和 Unicode，不截断或脱敏），并继续提供各列摘要；原生 raw 消息类型必须与 canonical 类型一致。内容可能含私有信息，只能在私有工件中审阅，不输出到公开报告。这里展示的是存储/API 投影，不能据此认定客户端状态；post/system 的未解析参数、日历和通话消息的 API 原始结构也会按实际存储正文显示；API 不提供的实时参会、日历响应等客户端状态不由该工件推断。混合工件中的 interactive 项仍须完整卡片渲染，`non_card` 为 null。其他非卡片类型仍失败关闭。v2 保留 v1 的完整前值、身份、基线、期限及 fresh proposal 检查；旧部署不识别 v2，不能直接使用候选生成的 v2 工件在旧部署 apply，须先另行批准兼容代码部署并重新预览。
+新 names 和 replay 工件统一使用 `exocortex_private_maintenance_review/v3`。text、post、system、general_calendar、video_chat 回放的 `display.before/after.non_card` 完整展示实际存储的 `title` 与 `body`（保留 null、换行和 Unicode，不截断或脱敏），并继续提供各列摘要；原生 raw 消息类型必须与 canonical 类型一致。内容可能含私有信息，只能在私有工件中审阅，不输出到公开报告。这里展示的是存储/API 投影，不能据此认定客户端状态；post/system 的未解析参数、日历和通话消息的 API 原始结构也会按实际存储正文显示；API 不提供的实时参会、日历响应等客户端状态不由该工件推断。v3 names 和 interactive 项的 `non_card` 为 null；interactive 项仍须完整卡片渲染。其他非卡片类型仍失败关闭。
+
+v3 的 `binding.scope_config_policy` 必须为 `lark_im_scope_json_remove_hot/v1`。跨预览与批准的每个 scope 摘要是 SQLite `json_remove(config_json,'$.hot_rank','$.hot_seen_at','$.last_hot_snapshot_id')` 输出文本的 UTF-8 SHA-256，只排除这三个顶层热会话调度字段。正常 hot discovery 在人审期间更新或移除这些字段，不再使工件单独因此失效；其它字段（包括未知字段、嵌套同名字段及其新增/删除）、scope 身份和 enabled 状态继续参与绑定。投影由 SQLite 处理，未知大整数等值不会经 JavaScript 数字转换丢失精度。source 全配置、基线、账号、目标完整前值、重新获取的拟写内容和期限仍须匹配。
+
+旧 v1（names/纯卡片）和 v2（包含受支持非卡片回放）仍按原始完整 `config_json` 字节 SHA 和原 display/disclosure 契约验证、重建与 apply；它们不能包含新 policy 字段，也不会被自动升级或重新解释。未知 schema/policy 直接拒绝。旧部署不识别 v3；使用新工件前须另行批准兼容代码部署并重新预览，不能修改已批准文件或沿用过期工件。
 
 任何 before/after 卡片渲染为 partial 或 structured_fallback（包括未解析 mention）均拒绝工件；正文、节点、深度等截断不能静默称为完整。完整渲染中的交互值省略和 URL 凭据脱敏可以保留，但 disclosure 和 omitted_actions 明确说明不可读范围，原内容摘要仍参与批准比较。最多 100 个目标，工件最多 1 MiB，每条参与比较的 before/有效 after/已获取 incoming 源快照合计最多 256 KiB，全体最多 4 MiB，姓名和白名单文本字段每字段最多 1 KiB UTF-8。任何超限均失败关闭，不自动扩大限制。
 
 工件固定 30 分钟有效，无延长选项。apply 先验证工件、当前明确参数、DB 文件身份、来源/基线、scope 配置、本地账号证据及全部目标完整前值；不符时不请求 API。随后重新读取远端，fresh proposal 必须逐项等于批准工件；姓名相同而来源改变、原未解析目标新解析成功、raw-only 变化或版本变化也中止整轮。运行 ID、审计时间和生成的 updated_at 不进入拟写内容摘要；本地原行的全部字段（含原 updated_at）进入前值围栏。
 
-提交持有现有短时维护租约，再重检 DB/account/sidecar 绑定。获得 `BEGIN IMMEDIATE` 后，SQLite 使用真实事务时钟首先检查有效期，再检查全部选中行的完整前值、source、scope 和本地 sent actor 条件；任一变化回滚整轮，names 不再部分 skip。等写锁跨过有效期同样拒绝；成功提交后的过期不抹掉真实回执。names 的全部目标在一个事务内；批准 replay 仅单 scope；不同工件或命令之间没有原子性保证。
+提交持有现有短时维护租约，再重检 DB/account/sidecar 绑定。v3 的调度字段排除只适用于跨人审摘要；本次 apply 以新读取的 scope 完整配置为起点，后续 captureBinding 复查仍逐字节比较全部 `config_json`，包括三个热度字段。获得 `BEGIN IMMEDIATE` 后，SQLite 使用真实事务时钟首先检查有效期，再检查全部选中行的完整前值、source、完整 scope 配置和本地 sent actor 条件；任一变化回滚整轮，names 不再部分 skip。因此本次 API 获取期间或事务提交前的 hot 更新仍会安全拒绝，不能绕过后重试提交。等写锁跨过有效期同样拒绝；成功提交后的过期不抹掉真实回执。names 的全部目标在一个事务内；批准 replay 仅单 scope；不同工件或命令之间没有原子性保证。
 
 names 的账号绑定只来自现有本地证据，未增加实时 self 验证；replay 复用本轮原有 self 验证。source 内绑定受 SQLite 事务保护，文件 sidecar/DB 身份在提交前稳定重检，但没有引入文件描述符绑定执行器，不承诺抵御同 UID 恶意进程在最终文件校验与 SQLite 打开之间替换路径。运行中的同步允许继续；若维护/同步锁占用、前值变化或期限过短，应重新预览并重新批准，不能绕过围栏。预览本身不需要停服，是否停服以另行授权的运行安排为准。
 
