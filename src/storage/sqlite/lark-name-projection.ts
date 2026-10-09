@@ -114,8 +114,10 @@ function mergeLarkNameProjectionSql(
     {
       identity: `(${sameActor}) AND (${sameContainer})`,
       name: '$.sender_name', state: '$.sender_name_state',
+      historical: `json_extract(next, '$.sender_name_source') = 'local_history'`,
       fields: ['$.sender_name', '$.sender_name_source', '$.sender_name_confidence',
-        '$.sender_name_state', '$.sender_name_resolution_status', '$.sender_name_resolution_reason'],
+        '$.sender_name_state', '$.sender_name_resolution_status', '$.sender_name_resolution_reason',
+        '$.sender_name_authority_source', '$.sender_name_account_key'],
     },
     {
       identity: sameContainer,

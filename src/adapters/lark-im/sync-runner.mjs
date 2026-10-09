@@ -10,6 +10,7 @@ import {
   isRestrictedModeError,
 } from "./adapter.mjs";
 import { isExhaustedLarkTransportFailure } from "./transport.mjs";
+import { bindCurrentSenderNames, reuseKnownSenderNames } from "./name-history.mjs";
 import {
   acquireLock,
   confirmInitialLarkAccountSql,
@@ -128,6 +129,7 @@ import {
 const defaultDeps = {
   acquireLock,
   buildPeopleContext,
+  reuseKnownSenderNames,
   createRun,
   failRun,
   commitLarkListRun,
@@ -393,8 +395,15 @@ function retryScopeDetails(dbPath, opts, scope, selfProfile, deps, limit = 5,
           detailMaxPages: opts.detailMaxPages, detailMaxItems: opts.detailMaxItems,
         });
         const direction = senderId(message) === selfProfile.open_id ? "sent" : "received";
-        const record = recordFromMessage(message, lockedScope.id, direction,
-          { self: selfProfile }, lockedScope.config || {});
+        const nameBudgetMs = Math.max(0, Math.min(5000, Math.floor(deadline - deps.nowMs())));
+        const context = nameBudgetMs > 0 ? deps.buildPeopleContext([message], {
+          retries: opts.retries, retryDelayMs: opts.retryDelayMs,
+          nameLookupDeadlineMs: Date.now() + nameBudgetMs,
+        }, selfProfile, lockedScope.config || {}) : { self: selfProfile };
+        // A completed detail must not introduce a guessed application identity.
+        if ('app_fallbacks' in context) context.app_fallbacks = new Map(
+          [...context.app_fallbacks].filter(([, value]) => value.source === 'chat_bot_app_id' && value.confidence === 'high'));
+        const record = recordFromMessage(message, lockedScope.id, direction, context, lockedScope.config || {});
         outcomes.push({ message_id: task.message_id, fingerprint: task.fingerprint, record });
       } catch (error) {
         const reason = error && typeof error === "object" && "detailReason" in error
@@ -406,6 +415,11 @@ function retryScopeDetails(dbPath, opts, scope, selfProfile, deps, limit = 5,
       }
     }
     if (!outcomes.length) throw new Error("detail retry budget exhausted before a task could be attempted");
+    const complete = outcomes.filter((outcome) => outcome.record);
+    const reused = deps.reuseKnownSenderNames(dbPath,
+      bindCurrentSenderNames(complete.map((outcome) => /** @type {import('./message-record.mjs').LocalRecord} */ (outcome.record)), selfProfile), selfProfile,
+      Math.max(0, Math.floor(deadline - deps.nowMs())));
+    for (let index = 0; index < complete.length; index += 1) complete[index].record = reused[index];
     const effects = deps.finishLarkDetailRun(dbPath, lockedScope, runId, outcomes, {
       adapter: "lark.im.details", detail_attempts: outcomes.length,
     });
@@ -447,11 +461,12 @@ function syncListedScope(dbPath, opts, scopeId, selfProfile, direction, deps) {
     }
     const endMs = Number(fetched.window_end_ms);
     const context = deps.buildPeopleContext(fetched.messages, opts, selfProfile, scope.config || {});
-    const records = direction === "sent"
+    const prepared = direction === "sent"
       ? prepareRecords(fetched.messages, scope.id, "sent", listScope.cursor, opts.startMs, endMs,
         null, context, scope.config || {})
       : prepareChatWindowRecords(fetched.messages, scope.id, listScope.cursor, opts.startMs, endMs,
         selfProfile.open_id, context, scope.config || {});
+    const records = deps.reuseKnownSenderNames(dbPath, bindCurrentSenderNames(prepared, selfProfile), selfProfile);
     const roots = fetched.detailRoots || [];
     const scanned = fetched.messages.length + roots.length;
     const effects = deps.commitLarkListRun(dbPath, scope, runId, records, roots, scanned, cursorAfter(endMs), {

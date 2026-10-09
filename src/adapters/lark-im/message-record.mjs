@@ -267,9 +267,9 @@ function nameCandidate(value, source, confidence) {
 function lookupDisplayNameDetails(context, id, chatIdValue, identifiers = id ? [id] : []) {
   if (!id) return null;
   const app = nameCandidate(context.apps?.get(id), "application_api", "high");
-  if (app) return app;
+  if (app && (app.state === "cleared" || personName(app.name, identifiers))) return app;
   const appFallback = nameCandidate(context.app_fallbacks?.get(`${chatIdValue}:${id}`), "chat_bot_unique", "medium");
-  if (appFallback) return appFallback;
+  if (appFallback && (appFallback.state === "cleared" || personName(appFallback.name, identifiers))) return appFallback;
   const chatMember = nameCandidate(context.chat_members?.get(`${chatIdValue}:${id}`), "chat_member", "high");
   if (chatMember && (chatMember.state === "cleared" || personName(chatMember.name, identifiers))) return chatMember;
   const contact = nameCandidate(context.contacts?.get(id), "contact", "high");

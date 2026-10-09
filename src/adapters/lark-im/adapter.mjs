@@ -46,6 +46,7 @@ import {
  * @typedef {object} AdapterOptions
  * @property {number=} retries
  * @property {number=} retryDelayMs
+ * @property {number=} nameLookupDeadlineMs
  *
  * @typedef {AdapterOptions & {
  *   pageSize: number,

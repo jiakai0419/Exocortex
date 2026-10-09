@@ -16,6 +16,7 @@ import { displayNameFromUser, personName, senderAliasesByOpenId, senderOpenId } 
  * @property {number=} retries
  * @property {number=} retryDelayMs
  * @property {number=} retryBudgetMs
+ * @property {number=} timeoutMs
  *
  * @typedef {(args: string[], options?: AdapterRunOptions) => JsonObject | null} LarkRunner
  *
@@ -23,6 +24,7 @@ import { displayNameFromUser, personName, senderAliasesByOpenId, senderOpenId } 
  * @property {number=} retries
  * @property {number=} retryDelayMs
  * @property {boolean=} forceRefresh Bypass application-name cache for an explicit probe.
+ * @property {number=} nameLookupDeadlineMs Shared absolute deadline for optional detail enrichment.
  *
  * @typedef {object} SelfProfile
  * @property {string} open_id
@@ -110,6 +112,14 @@ const NAME_LOOKUP_RETRY_BUDGET_MS = 5000;
  * @returns {NameResolver}
  */
 function createNameResolver({ run, now = Date.now, onLookup }) {
+  /** @param {string[]} args @param {AdapterRunOptions} options @param {AdapterOptions} opts */
+  function lookup(args, options, opts) {
+    if (opts.nameLookupDeadlineMs === undefined) return run(args, options);
+    const remaining = Math.floor(opts.nameLookupDeadlineMs - Date.now());
+    if (!Number.isFinite(remaining) || remaining <= 0) throw new Error('optional name lookup budget exhausted');
+    const budget = Math.min(NAME_LOOKUP_RETRY_BUDGET_MS, remaining);
+    return run(args, { ...options, timeoutMs: budget, retryBudgetMs: budget });
+  }
   // An explicit observer receives private lookup evidence for its own report.
   // Nothing is logged here; observer failures cannot affect name resolution.
   const reportLookup = (/** @type {JsonObject} */ event) => {
@@ -121,6 +131,7 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
   const cacheMaxEntries = 1000;
   /** @type {Map<string, {name: string, expiresAt: number}>} */
   const nameCache = new Map();
+  let contextAccount = '';
 
   /** @param {string} key */
   function cachedName(key) {
@@ -165,7 +176,7 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
     // batch within that page and request it explicitly rather than default 20.
     for (const ids of chunk(unresolved, 30)) {
       try {
-        const json = run(
+        const json = lookup(
           [
             "contact",
             "+search-user",
@@ -184,6 +195,7 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
             retryDelayMs: opts.retryDelayMs,
             retryBudgetMs: NAME_LOOKUP_RETRY_BUDGET_MS,
           },
+          opts,
         );
         const users = firstArray(json?.users, json?.data?.users);
         /** @type {Map<string, string | null>} */
@@ -239,7 +251,7 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
       };
       if (pageToken) params.page_token = pageToken;
       try {
-        const json = run(
+        const json = lookup(
           [
             "im",
             "chat.members",
@@ -257,6 +269,7 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
             retryDelayMs: opts.retryDelayMs,
             retryBudgetMs: NAME_LOOKUP_RETRY_BUDGET_MS,
           },
+          opts,
         );
         const items = firstArray(json?.items, json?.data?.items);
         for (const item of items) {
@@ -299,7 +312,7 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
         continue;
       }
       try {
-        const json = run(
+        const json = lookup(
           [
             "api",
             "GET",
@@ -316,6 +329,7 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
             retryDelayMs: opts.retryDelayMs,
             retryBudgetMs: NAME_LOOKUP_RETRY_BUDGET_MS,
           },
+          opts,
         );
         const app = json?.data?.app || json?.app;
         const name = app?.app_name || firstArray(app?.i18n).find((item) => item?.i18n_key === "zh_cn")?.name || "";
@@ -345,7 +359,7 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
       const pendingIds = uniqueAppIds([...ids]).filter((id) => !officialApps.has(id));
       if (pendingIds.length === 0) continue;
       try {
-        const json = run(
+        const json = lookup(
           [
             "im",
             "chat.members",
@@ -363,6 +377,7 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
             retryDelayMs: opts.retryDelayMs,
             retryBudgetMs: NAME_LOOKUP_RETRY_BUDGET_MS,
           },
+          opts,
         );
         const bots = firstArray(json?.items, json?.data?.items).filter((bot) => botName(bot));
         const directMatches = new Set();
@@ -407,6 +422,10 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
    * @param {JsonObject} [scopeConfig]
    */
   function buildPeopleContext(messages, opts, selfProfile, scopeConfig = {}) {
+    // A resolver may be reused in one process; never attribute another account's
+    // cached authority to the current sync account when persisting provenance.
+    const account = selfProfile?.open_id || '';
+    if (account !== contextAccount) { nameCache.clear(); contextAccount = account; }
     const aliases = senderAliasesByOpenId(messages);
     const seed = new Map();
     if (selfProfile?.open_id && selfProfile?.name) seed.set(selfProfile.open_id, selfProfile.name);

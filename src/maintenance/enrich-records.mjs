@@ -342,6 +342,8 @@ function runSenderOnly(dbPath, opts, runLark, assertReady) {
     if (!name) continue;
     const next = { ...row.canonical, sender_id_type: 'open_id', sender_name: name,
       sender_name_source: direct ? 'message_sender' : member ? 'chat_member' : 'contact', sender_name_confidence: 'high' };
+    delete next.sender_name_authority_source;
+    delete next.sender_name_account_key;
     proposals.push({ id: row.id, old: row.canonical_json, next: JSON.stringify(next),
       actor: row.actor_id, container: row.container_id, body: row.body, raw: row.raw_json });
   }
@@ -596,6 +598,13 @@ function enrichRecords(opts, deps = {}) {
     } else if (opts.namesOnly && existingSenderName) {
       next.sender_name_source = "message_sender";
       next.sender_name_confidence = "high";
+    }
+    if (next.sender_name_source !== 'local_history') delete next.sender_name_authority_source;
+    // This workflow does not stamp the admitted sync account. A new lookup
+    // cannot inherit an older observation's account provenance by object spread.
+    if (appName || appFallbackName && (opts.probeApps || !existingSenderName)
+      || !existingSenderName && (memberName || contactName) || opts.namesOnly && existingSenderName) {
+      delete next.sender_name_account_key;
     }
     if (!opts.namesOnly) {
       if (!next.sender_type && String(sid || "").startsWith("cli_")) next.sender_type = "app";
