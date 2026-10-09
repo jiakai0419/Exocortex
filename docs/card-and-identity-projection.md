@@ -64,6 +64,10 @@ sender 持久投影新增 `canonical.sender_id_type`。姓名 SQL 合并只有 e
 
 联网 resolver 保持 best-effort：消息采集不依赖姓名查询成功。正向缓存只保存确实解析出的姓名，键保留类型及必要的会话范围；ID 回显、空响应、错误和权限失败不缓存。现有容量为 1000、TTL 为 5 分钟，读取只刷新 LRU，不延长 TTL；每次查询已有 5 秒重试预算。过期或失败后仍可重新查询；实例不能跨账号复用。响应只接受本次明确请求的 typed ID，未请求的返回项不进入上下文。5 秒是单次调用预算，群成员最多 50 页也不等于一次补全有总预算。联系人批次固定 30 且显式 page-size=30；响应姓名、成员 localized_name、请求目标筛选和 self seed 优先级只在共享 resolver/身份 helper 维护，在线同步与常规/单目标 enrich 都委托这些规则，脚本只保留诊断与提交职责。
 
+新消息列表及 merge-forward 详情重试可在本轮姓名查询仍未知时，读取同源的有界历史官方姓名证据。明确 typed ID、账号归属、原权威来源和 high 置信度必须一致；chat-member 与精确 bot 来源还绑定同一会话。冲突、ID 回声、medium 猜配与 `local_history` 副本不能成为种子。复用只填 unknown，以 `sender_name_source=local_history`、`sender_name_authority_source` 保留真实来源，不冒充本轮 API 成功；SQL 保留其不能覆盖 known/clear 的限制。
+
+强空库归属可证明同源历史范围；旧库的 `single_sent_actor` 仅证明其发送者证据，不能给旧 received 记录追认账号。新同步官方 high 结果记录当前准入账号的 `sender_name_account_key`，弱绑定下重启后的复用须精确匹配该标记；resolver 上下文换账号先清正向缓存。普通原始姓名、猜配和历史复制不打新账号标记。读取最多 100 个目标、1000 条证据，共享 4.5 秒预算；详情重试还受剩余工作时间约束。不建立新表、改写账号 sidecar 或让阅读命令联网。
+
 历史补全采用明确的 sender-only 路径：必须同时指定 `--sender-only --sender-id <open_id>`，只选择一个 actor，不增加 record/scope 泛化选择。`--limit` 默认 50、最大 100；SQL 先按目标身份及缺名或 ID 占位筛选，再按 `occurred_at_ms ASC, id ASC` 截定候选。排除已知姓名、权威 clear、无 actor、app 及 typed 冲突；先验证 row/canonical/raw 的可信 sender 身份一致，零候选零网络，不查询 self 或额外 profile。
 
 查询复用 resolver/transport，保留 30-ID 联系人批次但本模式唯一用户目标为 1；整轮远端预算 30 秒，每请求 timeout/retryBudget 不超过剩余预算与 5 秒的较小值，`retries=0`。群成员 fallback 整轮最多 3 个候选 chat、5 页（每页 100）；限额、截止或仍有 `has_more` 时明确 unresolved。contact 名只能用于同账号目标 actor 的选中记录，member 名只用于对应 chat。网络在维护锁外；短事务按原快照 CAS 并使用共享 merge，仅补充必要的 canonical.sender_id_type 身份元数据，并更新 sender_name/source/confidence 与 updated_at，保留 raw/hash/version/body/chat/partner 等其他字段。`first_seen_scope_id` 不能充当完整会话归属。`maintenance enrich --target records` 默认预览，仍可读取远端；`--apply` 才提交，不是离线模式。以上选择与数量参数已由集成任务确认冻结，不得按一次样本临时放宽。
