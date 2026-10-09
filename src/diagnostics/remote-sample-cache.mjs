@@ -19,14 +19,35 @@ const safeCount = (n) => Number.isSafeInteger(n) && n >= 0 ? n : 0;
 const isoTime = (value) => typeof value === 'string' && Number.isFinite(Date.parse(value)) && new Date(Date.parse(value)).toISOString() === value;
 const hash = (value) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value) ? value : null;
 
+/** @returns {Record<string, any>|null} */
+function safeHistory(value) {
+  const fields = ['requested', 'chats_checked', 'pages', 'messages_checked', 'unsupported_chats', 'truncated_chats', 'unroutable'];
+  if (!value || typeof value !== 'object' || Array.isArray(value) ||
+      Object.keys(value).length !== fields.length + 1 || !Object.hasOwn(value, 'window') ||
+      !fields.every(key => Number.isSafeInteger(value[key]) && value[key] >= 0) ||
+      value.requested !== 1 || value.chats_checked > 1 || value.pages < value.chats_checked || value.pages > value.chats_checked * SAMPLE_POLICY.pages ||
+      value.messages_checked > 1 || value.messages_checked > value.pages * SAMPLE_POLICY.pageSize || value.unsupported_chats > 1 || value.unroutable > 1 ||
+      value.truncated_chats > 1 || value.truncated_chats > value.pages - value.chats_checked ||
+      value.unroutable && (value.chats_checked || value.pages || value.messages_checked || value.unsupported_chats || value.window !== null) ||
+      !value.unroutable && (!value.window || Object.keys(value.window).length !== 2 ||
+        !isoTime(value.window.start) || !isoTime(value.window.end) || Date.parse(value.window.end) - Date.parse(value.window.start) !== 3000)) return null;
+  return { ...Object.fromEntries(fields.map(key => [key, value[key]])),
+    window: value.window ? { start: value.window.start, end: value.window.end } : null };
+}
+export { safeHistory as safeRemoteSampleHistory };
+
 /** @returns {Record<string, any>} */
 export function publicRemoteReport(input) {
   const hasDiagnostic = input != null && Object.hasOwn(input, 'guardian_diagnostic');
   const diagnostic = safeGuardianDiagnostic(input?.guardian_diagnostic);
   const hasCollectorDiagnostic = input != null && Object.hasOwn(input, 'collector_diagnostic');
   const collectorDiagnostic = safeCollectorDiagnostic(input?.collector_diagnostic);
+  const history = Object.hasOwn(input || {}, 'history') ? safeHistory(input.history) : null;
+  const invalidHistory = Object.hasOwn(input || {}, 'history') && (!history || history.window &&
+    (!isoTime(input.window?.start) || Date.parse(history.window.end) > Date.parse(input.window.start)) ||
+    input.ok === true && !validPositiveReport(input, history));
   // Even a malformed diagnostic cannot be stripped into a positive report.
-  const status = hasDiagnostic || hasCollectorDiagnostic ? 'unavailable' : ['healthy','delayed','needs_attention','inconclusive','unavailable'].includes(input?.status) ? input.status : 'inconclusive';
+  const status = hasDiagnostic || hasCollectorDiagnostic || invalidHistory ? 'unavailable' : ['healthy','delayed','needs_attention','inconclusive','unavailable'].includes(input?.status) ? input.status : 'inconclusive';
   const probe = Object.fromEntries(PROBE_KEYS.map((k) => [k, safeCount(input?.probe?.[k])]));
   const findings = Object.fromEntries(COUNT_KEYS.map((k) => [k, safeCount(input?.findings?.[k])]));
   const binding = { state: ['verified','unverified','conflict','unavailable'].includes(input?.binding?.state) ? input.binding.state : 'unverified',
@@ -34,10 +55,13 @@ export function publicRemoteReport(input) {
     tenant_verified: false };
   return { schema_version: 3, ok: status === 'healthy' && input.ok === true && binding.state === 'verified' && probe.remote_messages_checked > 0 &&
     probe.probe_errors === 0 && probe.unsupported_chats === 0 && findings.missing === 0 && findings.confirmed_missing === 0 &&
-    findings.stale_version === 0 && findings.content_mismatch === 0 && findings.identity_conflict === 0 && findings.unresolved_prior === 0,
-    status, reason: hasDiagnostic ? 'sample_process_failed' : hasCollectorDiagnostic ? 'invalid_evidence' : REMOTE_REASONS.includes(input?.reason) ? input.reason : null, checked_at: publicTimestamp(input?.checked_at),
+    findings.stale_version === 0 && findings.content_mismatch === 0 && findings.identity_conflict === 0 && findings.unresolved_prior === 0 &&
+    findings.pending_sync === 0 && findings.local_newer === 0 && findings.expired_observations === 0 && findings.observation_overflow === 0 &&
+    (!history || history.messages_checked === 1 && history.unroutable === 0 && history.unsupported_chats === 0),
+    status, reason: hasDiagnostic ? 'sample_process_failed' : hasCollectorDiagnostic || invalidHistory ? 'invalid_evidence' : REMOTE_REASONS.includes(input?.reason) ? input.reason : null, checked_at: publicTimestamp(input?.checked_at),
     ...(diagnostic ? { guardian_diagnostic: diagnostic } : {}),
     ...(!hasDiagnostic && collectorDiagnostic ? { collector_diagnostic: collectorDiagnostic } : {}),
+    ...(history ? { history } : {}),
     scope: 'discovered_chats_rotating', window: { start: publicTimestamp(input?.window?.start), end: publicTimestamp(input?.window?.end) }, binding,
     probe: { mode: 'bounded_native_pages', comparison: 'identity_version_static_body', ...probe }, findings,
     missing_count: findings.missing, lag_ms: null,
@@ -59,29 +83,48 @@ export function remoteSampleCache(result) {
 
 /** Check original counters before public projection normalizes anything. Failed attempts
  * may have completed pages without reaching comparison; all structural bounds still apply. */
-function validCounters(p, f) {
+/** @param {Record<string,any>|null} history */
+function validCounters(p, f, history = null) {
   if (!p || !f || !PROBE_KEYS.every((k) => Number.isSafeInteger(p[k]) && p[k] >= 0) ||
       !COUNT_KEYS.every((k) => Number.isSafeInteger(f[k]) && f[k] >= 0)) return false;
   const n = p.remote_messages_checked;
+  const historyPages = history?.pages || 0;
+  const historyMessages = history?.messages_checked || 0;
+  const historyUnsupported = history?.unsupported_chats || 0;
   if (p.hot_chats_requested > SAMPLE_POLICY.chats || p.hot_chats_found > p.hot_chats_requested ||
       p.hot_chats_found > p.eligible_chats || p.eligible_chats > 10000 ||
       p.hot_chats > SAMPLE_POLICY.hot || p.hot_chats + p.fair_chats !== p.hot_chats_found ||
       p.chats_checked > p.hot_chats_found || p.unsupported_chats > p.hot_chats_found ||
       p.probe_errors > 1 || p.messages_per_chat > SAMPLE_POLICY.pageSize ||
       p.pages < p.chats_checked || p.pages > p.chats_checked * SAMPLE_POLICY.pages ||
+      p.hot_chats_found + (history?.window ? 1 : 0) > p.hot_chats_requested ||
       p.truncated_chats > p.chats_checked || p.truncated_chats > p.pages - p.chats_checked ||
-      p.api_calls > SAMPLE_POLICY.calls || p.api_calls < p.pages + p.unsupported_chats + (p.pages + p.unsupported_chats > 0 ? 1 : 0) ||
+      p.api_calls > SAMPLE_POLICY.calls || p.api_calls < p.pages + historyPages + p.unsupported_chats + historyUnsupported + (p.pages + historyPages + p.unsupported_chats + historyUnsupported > 0 ? 1 : 0) ||
       p.pages > 0 && p.messages_per_chat === 0 ||
-      n > SAMPLE_POLICY.chats * SAMPLE_POLICY.pages * SAMPLE_POLICY.pageSize || n > p.pages * p.messages_per_chat ||
+      n > SAMPLE_POLICY.chats * SAMPLE_POLICY.pages * SAMPLE_POLICY.pageSize || n > p.pages * p.messages_per_chat + historyMessages || historyMessages > n ||
       f.present + f.missing !== n || f.content_equal + f.content_unverified !== n || f.content_equal > f.present ||
       f.suspected_missing + f.confirmed_missing > f.missing ||
       f.missing - f.suspected_missing - f.confirmed_missing > f.pending_sync ||
       f.pending_sync + f.suspected_missing + f.confirmed_missing + f.stale_version + f.content_mismatch + f.identity_conflict + f.local_newer > f.content_unverified ||
       f.stale_version + f.content_mismatch + f.identity_conflict + f.local_newer + f.content_equal > f.present ||
       f.unresolved_prior > SAMPLE_POLICY.observations || f.expired_observations > SAMPLE_POLICY.observations ||
-      f.observation_overflow > SAMPLE_POLICY.observations ||
-      f.unresolved_prior + f.expired_observations > SAMPLE_POLICY.observations) return false;
+      f.observation_overflow > SAMPLE_POLICY.observations) return false;
   return true;
+}
+
+/** Shared success contract for historical public reports and persisted caches.
+ * General counters also permit incomplete failed attempts; success cannot.
+ * @param {Record<string,any>|null} history */
+function validPositiveReport(input, history = null) {
+  const p = input?.probe; const f = input?.findings;
+  return input?.ok === true && input.status === 'healthy' && input.reason === null && input.binding?.state === 'verified' &&
+    ['single_sent_actor', 'initialized_empty_database'].includes(input.binding.evidence) && validCounters(p, f, history) &&
+    p.remote_messages_checked > 0 && p.chats_checked > 0 && p.chats_checked === p.hot_chats_found &&
+    p.messages_per_chat >= 1 && p.messages_per_chat <= SAMPLE_POLICY.pageSize &&
+    p.api_calls >= p.pages + (history?.pages || 0) + 2 && p.probe_errors === 0 && p.unsupported_chats === 0 &&
+    (!history || history.unroutable === 0 && history.unsupported_chats === 0 && history.messages_checked === 1) &&
+    ['missing', 'pending_sync', 'suspected_missing', 'confirmed_missing', 'stale_version', 'content_mismatch', 'identity_conflict',
+      'local_newer', 'unresolved_prior', 'expired_observations', 'observation_overflow'].every(key => f[key] === 0);
 }
 
 export function parseRemoteSampleCache(input) {
@@ -90,7 +133,10 @@ export function parseRemoteSampleCache(input) {
       input.ok !== false || input.status !== 'unavailable' || input.reason !== 'sample_process_failed')) return null;
   if (Object.hasOwn(input, 'collector_diagnostic') && (!safeCollectorDiagnostic(input.collector_diagnostic) ||
       input.ok !== false || input.status !== 'unavailable' || input.reason !== 'invalid_evidence')) return null;
-  if (!validCounters(input.probe, input.findings) ||
+  const history = Object.hasOwn(input, 'history') ? safeHistory(input.history) : null;
+  if (Object.hasOwn(input, 'history') && (!history || history.window &&
+      (!isoTime(input.window?.start) || Date.parse(history.window.end) > Date.parse(input.window.start)))) return null;
+  if (!validCounters(input.probe, input.findings, history) ||
       ![input.checked_at, input.expires_at, input.window?.start, input.window?.end].every(isoTime) ||
       input.reason !== null && !REMOTE_REASONS.includes(input.reason) ||
       typeof input.ok !== 'boolean' || !['healthy','delayed','needs_attention','inconclusive','unavailable'].includes(input.status) ||
@@ -99,12 +145,8 @@ export function parseRemoteSampleCache(input) {
       input.last_success_at !== (input.ok ? input.checked_at : null) || !['verified','unverified','conflict','unavailable'].includes(input.binding?.state) ||
       input.binding.state === 'verified' && !['single_sent_actor','initialized_empty_database'].includes(input.binding.evidence) ||
       input.missing_count !== input.findings.missing) return null;
-  if (input.ok && (input.status !== 'healthy' || input.reason !== null || input.binding.state !== 'verified' || input.context?.auth_identity_verified !== true ||
-      !hash(input.context?.account_key) || !hash(input.context?.database_key) || input.probe.remote_messages_checked === 0 || input.probe.chats_checked === 0 || input.probe.chats_checked !== input.probe.hot_chats_found || input.probe.messages_per_chat < 1 || input.probe.messages_per_chat > 20 ||
-      input.probe.pages < input.probe.chats_checked || input.probe.pages > input.probe.chats_checked * 2 || input.probe.api_calls < input.probe.pages + 2 ||
-      input.probe.remote_messages_checked > input.probe.pages * input.probe.messages_per_chat ||
-      ['missing','pending_sync','suspected_missing','confirmed_missing','stale_version','content_mismatch','identity_conflict','local_newer','unresolved_prior','expired_observations','observation_overflow']
-        .some((key) => input.findings[key] !== 0) || input.probe.probe_errors !== 0 || input.probe.unsupported_chats !== 0)) return null;
+  if (input.ok && (!validPositiveReport(input, history) || input.context?.auth_identity_verified !== true ||
+      !hash(input.context?.account_key) || !hash(input.context?.database_key))) return null;
   const cache = remoteSampleCache({ report: input, cacheContext: input.context });
   return { ...cache, expires_at: publicTimestamp(input.expires_at), last_success_at: publicTimestamp(input.last_success_at) };
 }
@@ -136,6 +178,7 @@ export function summarizeRemoteSample(cache, now, expectedContext) {
     checked_at: report.checked_at, expires_at: cache.expires_at, window: report.window, result: report.status,
     binding: report.binding, findings: report.findings, sample: report.probe, auth_identity: 'verified_at_check',
     ...(report.collector_diagnostic ? { collector_diagnostic: report.collector_diagnostic } : {}),
+    ...(report.history ? { history: report.history } : {}),
     last_success_at: cache.last_success_at, reason: report.reason, detail: '' };
   const unknown = (reason, detail) => ({ ...base, status: /** @type {const} */ ('unknown'), reason, detail });
   if (!expectedContext || !hash(cache.context?.database_key) || cache.context.database_key !== expectedContext.database_key || cache.context.source_id !== 'lark.im') {
@@ -145,11 +188,14 @@ export function summarizeRemoteSample(cache, now, expectedContext) {
   const start = Date.parse(report.window.start || ''); const end = Date.parse(report.window.end || '');
   if (!Number.isFinite(checked) || checked > now || !(expiry > checked) || expiry - checked > 3600000 ||
       !(start < end) || end - start > SAMPLE_POLICY.windowMs || end > checked - SAMPLE_POLICY.stableBufferMs) return unknown('invalid_timestamp','sample time is invalid');
+  if (report.history?.window && Date.parse(report.history.window.end) > start) return unknown('invalid_timestamp','historical sample time is invalid');
   if (now >= expiry) return unknown('expired','last sample expired');
   if (!hash(cache.context.account_key) || !cache.context.auth_identity_verified || report.binding.state !== 'verified') {
     return { ...unknown(report.reason || 'account_unverified','account association not verified'), auth_identity: 'unknown' };
   }
-  if (report.ok) return { ...base, status: 'sampled', detail: `${base.sample_count} messages sampled in ${base.chat_count} discovered chats` };
+  if (report.ok) return { ...base, status: 'sampled', detail: report.history
+    ? `${base.sample_count - report.history.messages_checked} current messages sampled in ${base.chat_count} discovered chats; ${report.history.messages_checked} retained historical target verified`
+    : `${base.sample_count} messages sampled in ${base.chat_count} discovered chats` };
   if (['delayed','needs_attention'].includes(report.status)) return { ...base, status: 'behind', detail: report.reason || 'sample differences observed' };
   return unknown(report.reason || 'inconclusive','sample not verified');
 }

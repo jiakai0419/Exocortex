@@ -166,11 +166,18 @@ export function renderStatusText(report, options = {}) {
     const result = matched ? "Sample matched" : freshness.reason === "expired" ? "Expired · cached sample expired"
       : usable && freshness.status === "behind" && findings ? findings
       : `Not verified · ${reason}${uncertainties ? ` · ${uncertainties}` : ""}`;
-    screen.row("Remote sample", `${result} · ${number(freshness.sample_count)} messages / ${number(freshness.chat_count)} discovered chats · checked ${stamp(freshness.checked_at)}`);
+    const sampleCounts = freshness.history
+      ? `${number(Math.max(0, freshness.sample_count - freshness.history.messages_checked))} current messages / ${number(freshness.chat_count)} chats + ${number(freshness.history.messages_checked)} historical target${freshness.history.messages_checked === 1 ? '' : 's'}`
+      : `${number(freshness.sample_count)} messages / ${number(freshness.chat_count)} discovered chats`;
+    screen.row("Remote sample", `${result} · ${sampleCounts} · checked ${stamp(freshness.checked_at)}`);
     if (detailed) {
       const diagnostic = safeCollectorDiagnostic(freshness.collector_diagnostic);
       if (diagnostic) screen.row("Sample diagnostic", `${diagnostic.stage} · ${diagnostic.code}`);
       screen.row("Sample window", range(freshness.window?.start, freshness.window?.end));
+      if (freshness.history) {
+        screen.row("Historical revisit", `${number(freshness.history.messages_checked)} target observed · ${number(freshness.history.unroutable)} unroutable · ${number(freshness.history.truncated_chats)} truncated`);
+        if (freshness.history.window) screen.row("History window", range(freshness.history.window.start, freshness.history.window.end));
+      }
       screen.row("Sample coverage", `${number(freshness.sample?.hot_chats)} hot + ${number(freshness.sample?.fair_chats)} rotating · ${number(freshness.sample?.eligible_chats)} eligible chats · ${number(freshness.sample?.truncated_chats)} truncated`);
       screen.row("Sample content", comparisonAvailable ? `${number(f.content_equal)} static bodies matched · ${number(f.content_unverified)} unverified` : `Not verified · ${reason}`);
       screen.row("Sample identity", usable ? `Matched at check · ${freshness.binding?.evidence === "single_sent_actor" ? "stored sent identity" : "initial empty database binding"}` : "Account association unverified");

@@ -45,6 +45,7 @@ function publicBackup(value) {
 /** @param {JsonObject} live */
 function liveReady(live) {
   if (Object.hasOwn(live, "guardian_diagnostic") || Object.hasOwn(live, "collector_diagnostic")) return false;
+  if (!publicRemoteReport(live).ok) return false;
   const start = Date.parse(String(live.window?.start || ""));
   const end = Date.parse(String(live.window?.end || ""));
   return live.ok === true && live.status === "healthy" && Number.isSafeInteger(live.probe?.remote_messages_checked) && live.probe.remote_messages_checked > 0 &&

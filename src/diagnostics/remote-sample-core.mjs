@@ -8,6 +8,7 @@ export const SAMPLE_POLICY = Object.freeze({ version: 1, intervalMs: 900000, ttl
 
 export function jsonValue(value) { try { return typeof value === 'string' ? JSON.parse(value) : value; } catch { return null; } }
 export function digest(value) { return createHash('sha256').update(JSON.stringify(value)).digest('hex'); }
+export function sampleScopeHash(binding, chatId) { return digest([binding.database_key, binding.account_key, chatId]); }
 export function canonical(value) {
   if (Array.isArray(value)) return value.map(canonical);
   if (value && typeof value === 'object') return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonical(value[key])]));
@@ -68,7 +69,7 @@ export function compareSampleMessage(remote, local) {
 }
 
 /** No identifiers or content leave this reducer. Observations are salted hashes. */
-export function evaluateSample({ messages, records, coverage, binding, previous = {}, now, windowEnd }) {
+export function evaluateSample({ messages, records, coverage, binding, previous = {}, previousOverflow = false, now, windowEnd }) {
   const counts = { present: 0, missing: 0, pending_sync: 0, suspected_missing: 0, confirmed_missing: 0,
     stale_version: 0, content_mismatch: 0, identity_conflict: 0, local_newer: 0,
     content_equal: 0, content_unverified: 0, unresolved_prior: 0, expired_observations: 0, observation_overflow: 0 };
@@ -76,7 +77,6 @@ export function evaluateSample({ messages, records, coverage, binding, previous 
   for (const [key,value] of Object.entries(previous)) {
     if (!/^[a-f0-9]{64}$/.test(key) || !value || !['missing','version','content'].includes(value.kind) ||
       !['first_seen','last_seen','run_finished','target'].every((k) => Number.isSafeInteger(value[k]) && value[k] >= 0 && value[k] <= now)) continue;
-    if (now - value.last_seen > SAMPLE_POLICY.observationTtlMs) { counts.expired_observations++; continue; }
     observations[key] = value;
   }
   const touched = new Set(); const differences = new Set();
@@ -105,12 +105,18 @@ export function evaluateSample({ messages, records, coverage, binding, previous 
       else if (comparison.kind === 'version') counts.stale_version++;
       else counts.content_mismatch++;
       observations[key] = { kind: comparison.kind, target: created, first_seen: old?.kind === comparison.kind ? old.first_seen : now,
-        last_seen: now, run_finished: validCoverage ? proof.latest_finished_ms : 0 };
+        last_seen: now, run_finished: validCoverage ? proof.latest_finished_ms : 0,
+        scope_hash: sampleScopeHash(binding, message.chat_id), last_checked: now };
     } else if (comparison.kind === 'match') delete observations[key];
     // Incomparable/local-newer do not erase previously observed discrepancies.
   }
   counts.unresolved_prior = Object.keys(observations).filter((k) => previous[k] && !differences.has(k)).length;
-  const entries = Object.entries(observations).sort((a,b) => b[1].last_seen - a[1].last_seen);
+  const entries = Object.entries(observations).sort((a,b) => Number(Boolean(previous[b[0]])) - Number(Boolean(previous[a[0]])) || b[1].last_seen - a[1].last_seen);
   counts.observation_overflow = Math.max(0, entries.length - SAMPLE_POLICY.observations);
-  return { counts, observations: Object.fromEntries(entries.slice(0, SAMPLE_POLICY.observations)) };
+  const retained = entries.slice(0, SAMPLE_POLICY.observations);
+  // Age is loss of freshness, never proof that a discrepancy was repaired.
+  counts.expired_observations = retained.filter(([, value]) => now - value.last_seen > SAMPLE_POLICY.observationTtlMs).length;
+  const observationOverflow = previousOverflow || counts.observation_overflow > 0;
+  if (observationOverflow) counts.observation_overflow = Math.max(1, counts.observation_overflow);
+  return { counts, observations: Object.fromEntries(retained), observationOverflow };
 }

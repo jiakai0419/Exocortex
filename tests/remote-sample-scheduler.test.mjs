@@ -221,7 +221,8 @@ test('corrupt, permissive or symlinked state cannot trigger a request', async t 
 });
 
 test('observation privacy, count and retention bounds reject invalid shapes', () => {
-  assert.deepEqual(sanitizeRemoteObservations({ [OBS_KEY]: observation(START - REMOTE_SAMPLE_OBSERVATION_TTL_MS - 1) }, START), {});
+  const expired = { [OBS_KEY]: observation(START - REMOTE_SAMPLE_OBSERVATION_TTL_MS - 1) };
+  assert.deepEqual(sanitizeRemoteObservations(expired, START), expired);
   assert.equal(sanitizeRemoteObservations({ [OBS_KEY]: { ...observation(), body: 'SYNTHETIC_BODY' } }, START), null);
   assert.equal(sanitizeRemoteObservations(Object.fromEntries(Array.from({ length: 201 }, (_, n) => [n.toString(16).padStart(64, '0'), observation()])), START), null);
   assert.equal(validateRemoteSampleState({}, 'f'.repeat(64), START), null);
@@ -371,23 +372,99 @@ test('successful cache stage preparation observes already committed state', asyn
   assert.equal(sampled.outcome, 'ok'); assert.equal(sampled.cachePrepared, true);
 });
 
-test('expired private observations reach the collector once for explicit aged-out accounting', async t => {
+test('expired private observations survive repeated due attempts until the collector verifies a match', async t => {
   const f = fixture(t); await executeRemoteSampleAttempt(f.opts, f.deps);
   f.setNow(START + REMOTE_SAMPLE_OBSERVATION_TTL_MS + 1);
   let sawExpired = false;
   await executeRemoteSampleAttempt(f.opts, { ...f.deps, collect: (_db, options) => {
-    sawExpired = Boolean(options.previousObservations[OBS_KEY]); return { ...f.result(), observations: {} };
+    sawExpired = Boolean(options.previousObservations[OBS_KEY]); return { ...f.result(), observations: options.previousObservations };
   } });
-  assert.equal(sawExpired, true); assert.deepEqual(f.state().observations, {});
+  assert.equal(sawExpired, true); assert.deepEqual(f.state().observations, { [OBS_KEY]: observation(START) });
+  f.setNow(f.state().next_due);
+  await executeRemoteSampleAttempt(f.opts, { ...f.deps, collect: (_db, options) => {
+    assert.deepEqual(options.previousObservations, { [OBS_KEY]: observation(START) });
+    return { ...f.result(), observations: options.previousObservations };
+  } });
+  assert.deepEqual(f.state().observations, { [OBS_KEY]: observation(START) });
 });
 
-test('unverified changed account cannot inherit prior observations or replace verified account binding', async t => {
-  const f = fixture(t); await executeRemoteSampleAttempt(f.opts, f.deps);
+test('overflow debt survives restart, collector omission and cache failure; a verified new account isolates it', async t => {
+  const f = fixture(t);
+  await executeRemoteSampleAttempt(f.opts, { ...f.deps, collect: () => ({ ...f.result(), observationOverflow: true }) });
+  assert.equal(f.state().observation_overflow, true);
+  f.setNow(f.state().next_due);
+  await executeRemoteSampleAttempt(f.opts, { ...f.deps, collect: (_db, options) => {
+    assert.equal(options.previousOverflow, true); return { ...f.result(), observations: {}, observationOverflow: false };
+  } });
+  assert.equal(f.state().observation_overflow, true);
+  f.setNow(f.state().next_due);
+  await executeRemoteSampleAttempt(f.opts, { ...f.deps, writeCache: () => false });
+  assert.equal(f.state().observation_overflow, true);
+  f.setNow(f.state().next_due);
+  await executeRemoteSampleAttempt(f.opts, { ...f.deps, collect: () => ({ ...f.result(), observations: {}, observationOverflow: false,
+    cacheContext: { account_key: 'c'.repeat(64), auth_identity_verified: true } }) });
+  assert.equal(f.state().account_key, 'c'.repeat(64));
+  assert.equal(f.state().observation_overflow, false);
+  assert.deepEqual(f.state().observations, {});
+});
+
+test('unverified changed account cannot inherit, erase or rebind the previous account observations', async t => {
+  const f = fixture(t); await executeRemoteSampleAttempt(f.opts, { ...f.deps, collect: () => ({ ...f.result(), observationOverflow: true }) });
   f.setNow(f.state().next_due);
   const sampled = await executeRemoteSampleAttempt(f.opts, { ...f.deps, collect: () => ({ ...f.result(),
     cacheContext: { account_key: 'c'.repeat(64), auth_identity_verified: false }, report: { status: 'inconclusive' } }) });
-  assert.equal(sampled.outcome, 'failed'); assert.deepEqual(f.state().observations, {});
+  assert.equal(sampled.outcome, 'failed'); assert.deepEqual(f.state().observations, { [OBS_KEY]: observation(START) });
   assert.equal(f.state().account_key, ACCOUNT); assert.equal(f.state().last_outcome, 'failed');
+  assert.equal(f.state().observation_overflow, true);
+  f.setNow(f.state().next_due);
+  await executeRemoteSampleAttempt(f.opts, { ...f.deps, collect: (_db, options) => {
+    assert.equal(options.accountKey, ACCOUNT); assert.equal(options.previousOverflow, true);
+    assert.deepEqual(options.previousObservations, { [OBS_KEY]: observation(START) });
+    return { ...f.result(), observations: options.previousObservations, observationOverflow: options.previousOverflow };
+  } });
+  assert.equal(f.state().observation_overflow, true);
+});
+
+test('a failed historical request advances only its attempt order, with no evidence refresh or deletion', async t => {
+  const f = fixture(t); await executeRemoteSampleAttempt(f.opts, f.deps);
+  f.setNow(f.state().next_due);
+  const before = f.state().observations[OBS_KEY];
+  await executeRemoteSampleAttempt(f.opts, { ...f.deps, collect: () => ({ ...f.result(), outcome: 'failed', observations: {},
+    historyAttempt: { key: OBS_KEY, checked_at: f.now(), database_key: f.key, source_id: 'lark.im' }, report: { status: 'unavailable', reason: 'api_unavailable' } }) });
+  assert.deepEqual(f.state().observations[OBS_KEY], { ...before, last_checked: f.now() });
+  assert.equal(f.state().rotation, 3);
+  f.setNow(f.state().next_due);
+  const attempted = f.state().observations[OBS_KEY];
+  await executeRemoteSampleAttempt(f.opts, { ...f.deps, collect: () => ({ ...f.result(), outcome: 'failed', observations: {},
+    historyAttempt: { key: OBS_KEY, checked_at: f.now(), database_key: f.key, source_id: 'lark.im', body: 'SYNTHETIC_SECRET' }, report: { status: 'unavailable', reason: 'api_unavailable' } }) });
+  assert.deepEqual(f.state().observations[OBS_KEY], attempted);
+  for (const changes of [{ database_key: 'd'.repeat(64) }, { source_id: 'synthetic.foreign' }]) {
+    f.setNow(f.state().next_due);
+    await executeRemoteSampleAttempt(f.opts, { ...f.deps, collect: () => ({ ...f.result(), outcome: 'failed', observations: {},
+      historyAttempt: { key: OBS_KEY, checked_at: f.now(), database_key: f.key, source_id: 'lark.im', ...changes },
+      report: { status: 'unavailable', reason: 'api_unavailable' } }) });
+    assert.deepEqual(f.state().observations[OBS_KEY], attempted);
+  }
+});
+
+test('failed publication rolls account, observations and overflow back to one consistent namespace', async t => {
+  const f = fixture(t); await executeRemoteSampleAttempt(f.opts, { ...f.deps, collect: () => ({ ...f.result(), observationOverflow: true }) });
+  f.setNow(f.state().next_due);
+  await executeRemoteSampleAttempt(f.opts, { ...f.deps, writeCache: () => false, collect: () => ({ ...f.result(), observations: {},
+    observationOverflow: false, cacheContext: { account_key: 'c'.repeat(64), auth_identity_verified: true } }) });
+  assert.equal(f.state().account_key, ACCOUNT);
+  assert.deepEqual(f.state().observations, { [OBS_KEY]: observation(START) });
+  assert.equal(f.state().observation_overflow, true);
+});
+
+test('unavailable binding cannot erase debt while leaving the old account namespace in place', async t => {
+  const f = fixture(t); await executeRemoteSampleAttempt(f.opts, { ...f.deps, collect: () => ({ ...f.result(), observationOverflow: true }) });
+  f.setNow(f.state().next_due);
+  await executeRemoteSampleAttempt(f.opts, { ...f.deps, collect: () => ({ ...f.result(), observations: {}, observationOverflow: false,
+    cacheContext: { auth_identity_verified: false }, report: { status: 'inconclusive', reason: 'account_unverified' } }) });
+  assert.equal(f.state().account_key, ACCOUNT);
+  assert.deepEqual(f.state().observations, { [OBS_KEY]: observation(START) });
+  assert.equal(f.state().observation_overflow, true);
 });
 
 test('manual cache-writing sample shares due gate and only returns a sanitized report', async t => {

@@ -47,9 +47,9 @@ except Exception:
     print(json.dumps({'outcome':'failed','reason':'scheduler_unavailable'})); sys.exit(2)
 `;
 
-/** @typedef {{first_seen:number,last_seen:number,run_finished:number,target:number,kind:'missing'|'version'|'content'}} Observation */
+/** @typedef {{first_seen:number,last_seen:number,run_finished:number,target:number,kind:'missing'|'version'|'content',scope_hash?:string,last_checked?:number}} Observation */
 /** @typedef {Record<string, Observation>} Observations */
-/** @typedef {{kind:string,database_key:string,account_key:string|null,written_at:number,next_due:number,failures:number,rotation:number,observations:Observations,last_outcome:string,cooldowns:Record<string,number>,blocked_reason:string|null}} ScheduleState */
+/** @typedef {{kind:string,database_key:string,account_key:string|null,written_at:number,next_due:number,failures:number,rotation:number,observations:Observations,observation_overflow?:boolean,last_outcome:string,cooldowns:Record<string,number>,blocked_reason:string|null}} ScheduleState */
 /** @typedef {{db:string,logDir:string,remoteSampleIntervalSeconds?:number,publication?:Record<string,any>}} ScheduleOptions */
 
 function plainObject(value) { return Boolean(value && typeof value === "object" && !Array.isArray(value)); }
@@ -72,23 +72,29 @@ function mergeCooldowns(previous, incoming, now) {
 
 /** Reject unexpected fields rather than preserving potentially private payloads.
  * @returns {Observations | null} */
-export function sanitizeRemoteObservations(value, now, dropExpired = true) {
+export function sanitizeRemoteObservations(value, now, _dropExpired = false) {
   if (!plainObject(value) || Object.keys(value).length > 200) return null;
   const safe = /** @type {Observations} */ ({});
   for (const [key, item] of Object.entries(value)) {
-    if (!HASH.test(key) || !exactKeys(item, ["first_seen", "last_seen", "run_finished", "target", "kind"]) ||
+    if (!HASH.test(key) || !plainObject(item) || !exactKeys(item,
+      ["first_seen", "last_seen", "run_finished", "target", "kind", ...["scope_hash", "last_checked"].filter(field => Object.hasOwn(item, field))]) ||
       !["missing", "version", "content"].includes(item.kind) ||
       ![item.first_seen, item.last_seen, item.run_finished, item.target].every(integer) ||
-      item.first_seen > item.last_seen || item.last_seen > now || item.run_finished > now || item.target > now) return null;
-    if (dropExpired && item.last_seen < now - REMOTE_SAMPLE_OBSERVATION_TTL_MS) continue;
-    safe[key] = { first_seen: item.first_seen, last_seen: item.last_seen, run_finished: item.run_finished, target: item.target, kind: item.kind };
+      item.first_seen > item.last_seen || item.last_seen > now || item.run_finished > now || item.target > now ||
+      Object.hasOwn(item, 'scope_hash') && !HASH.test(item.scope_hash) ||
+      Object.hasOwn(item, 'last_checked') && (!integer(item.last_checked) || item.last_checked > now)) return null;
+    safe[key] = { first_seen: item.first_seen, last_seen: item.last_seen, run_finished: item.run_finished, target: item.target, kind: item.kind,
+      ...(Object.hasOwn(item, 'scope_hash') ? { scope_hash: item.scope_hash } : {}),
+      ...(Object.hasOwn(item, 'last_checked') ? { last_checked: item.last_checked } : {}) };
   }
   return safe;
 }
 
 /** @returns {ScheduleState | null} */
 export function validateRemoteSampleState(value, databaseKey, now) {
-  if (!exactKeys(value, ["kind", "database_key", "account_key", "written_at", "next_due", "failures", "rotation", "observations", "last_outcome", "cooldowns", "blocked_reason"]) ||
+  if (!exactKeys(value, ["kind", "database_key", "account_key", "written_at", "next_due", "failures", "rotation", "observations", "last_outcome", "cooldowns", "blocked_reason",
+    ...(Object.hasOwn(value || {}, 'observation_overflow') ? ['observation_overflow'] : [])]) ||
+    Object.hasOwn(value || {}, 'observation_overflow') && typeof value.observation_overflow !== 'boolean' ||
     value.kind !== STATE_KIND || value.database_key !== databaseKey || !HASH.test(databaseKey) ||
     value.account_key !== null && !HASH.test(value.account_key) ||
     ![value.written_at, value.next_due, value.failures, value.rotation].every(integer) ||
@@ -97,7 +103,7 @@ export function validateRemoteSampleState(value, databaseKey, now) {
   const cooldowns = safeCooldowns(value.cooldowns, value.written_at);
   if (!cooldowns || ![null, "cooldown_invalid"].includes(value.blocked_reason) ||
     value.next_due > Math.max(value.written_at + REMOTE_SAMPLE_MAX_BACKOFF_MS, ...Object.values(cooldowns))) return null;
-  // Let the collector explicitly account for aged-out unresolved findings.
+  // The collector reports stale evidence but only a matching revisit clears it.
   const observations = sanitizeRemoteObservations(value.observations, now, false);
   return observations ? { ...value, observations } : null;
 }
@@ -307,7 +313,7 @@ export async function executeRemoteSampleAttempt(opts, deps = {}) {
   if (loaded.state?.blocked_reason) return failed("state_invalid");
   if (loaded.state && loaded.state.next_due > started) return { ...result("not_due", "not_due", loaded.state.next_due), cachePrepared: false };
   const previous = loaded.state || { kind: STATE_KIND, database_key: databaseKey, written_at: started,
-    next_due: started, failures: 0, rotation: 0, observations: {}, last_outcome: "ok", cooldowns: {}, account_key: null, blocked_reason: null };
+    next_due: started, failures: 0, rotation: 0, observations: {}, observation_overflow: false, last_outcome: "ok", cooldowns: {}, account_key: null, blocked_reason: null };
   const inherited = safeCooldowns(deps.cooldownsByOperation || {}, started);
   if (!inherited) return failed("state_invalid");
   const cooldowns = mergeCooldowns(previous.cooldowns, inherited, started);
@@ -323,6 +329,7 @@ export async function executeRemoteSampleAttempt(opts, deps = {}) {
   try {
     const collect = deps.collect || (await import("../../diagnostics/remote-sample.mjs")).collectRemoteSample;
     sampled = await collect(opts.db, { ...boundedCollectorOptions(deps.collectorOptions), rotation: previous.rotation, previousObservations: previous.observations,
+      previousOverflow: previous.observation_overflow === true,
       accountKey: previous.account_key, cooldownsByOperation: cooldowns,
       maxApiCalls: 12, minApiGapMs: 1000, totalTimeoutMs: 55_000, cacheTtlMs: Math.max(30 * 60_000, interval * 2) });
   } catch { sampled = { outcome: "failed" }; }
@@ -335,6 +342,17 @@ export async function executeRemoteSampleAttempt(opts, deps = {}) {
   const observedCooldowns = safeCooldowns(sampled?.cooldownsByOperation || {}, finished);
   const sampledAccount = HASH.test(sampled.cacheContext?.account_key || "") ? sampled.cacheContext.account_key : null;
   const changedUnverifiedAccount = sampledAccount && previous.account_key && sampledAccount !== previous.account_key && sampled.cacheContext?.auth_identity_verified !== true;
+  // A bad historical response must not pin the oldest target forever. Failed
+  // attempts may advance only scheduling metadata for an existing same-account
+  // observation; they can never add, resolve, reroute or refresh its evidence.
+  const attempted = sampled.historyAttempt;
+  const attemptedObservations = exactKeys(attempted, ['key', 'checked_at', 'database_key', 'source_id']) && HASH.test(attempted.key) &&
+    attempted.database_key === databaseKey && attempted.source_id === 'lark.im' &&
+    previous.observations[attempted.key] && integer(attempted.checked_at) && attempted.checked_at >= started && attempted.checked_at <= finished &&
+    sampled.cacheContext?.auth_identity_verified === true && sampledAccount === previous.account_key &&
+    !['account_changed', 'database_changed', 'context_changed'].includes(sampled.report?.reason)
+    ? { ...previous.observations, [attempted.key]: { ...previous.observations[attempted.key], last_checked: attempted.checked_at } }
+    : previous.observations;
   const ok = successful && Boolean(sampled.report) && observedCooldowns !== null && !changedUnverifiedAccount;
   const finalCooldowns = mergeCooldowns(cooldowns, observedCooldowns || {}, finished);
   const nextDue = Math.max(finished + (ok ? interval : busy ? BUSY_RETRY_MS : backoff), ...Object.values(finalCooldowns));
@@ -342,7 +360,11 @@ export async function executeRemoteSampleAttempt(opts, deps = {}) {
     blocked_reason: observedCooldowns ? null : "cooldown_invalid",
     account_key: ok && sampled.cacheContext?.auth_identity_verified === true && sampledAccount ? sampledAccount : previous.account_key,
     failures: ok ? 0 : busy ? previous.failures : failures, last_outcome: ok ? "ok" : busy ? "busy" : "failed",
-    rotation: ok ? sampled.rotation : previous.rotation, observations: changedUnverifiedAccount ? {} : ok ? observations : previous.observations };
+    rotation: ok ? sampled.rotation : previous.rotation,
+    observations: ok && sampled.cacheContext?.auth_identity_verified === true && sampledAccount ? observations : attemptedObservations,
+    observation_overflow: ok ? sampled.observationOverflow === true ||
+      previous.observation_overflow === true && !(sampled.cacheContext?.auth_identity_verified === true && sampledAccount && sampledAccount !== previous.account_key)
+      : previous.observation_overflow === true };
   try { writeState(paths.state, finalState, finished); } catch { return failed("state_write_failed"); }
   if (!observedCooldowns) return failed("state_invalid");
   // Prepare a private stage only after durable schedule state succeeds. The
@@ -357,7 +379,9 @@ export async function executeRemoteSampleAttempt(opts, deps = {}) {
   if (!cacheWritten) {
     invalidateAttempt(opts, deps, "sample_failed");
     if (ok) {
-      const failedState = { ...finalState, failures, last_outcome: "failed", rotation: previous.rotation, observations: previous.observations,
+      const failedState = { ...finalState, failures, last_outcome: "failed", rotation: previous.rotation, observations: attemptedObservations,
+        account_key: previous.account_key,
+        observation_overflow: previous.observation_overflow === true,
         next_due: Math.max(finished + backoff, ...Object.values(finalCooldowns)) };
       try { writeState(paths.state, failedState, finished); } catch { return failed("state_write_failed"); }
       return { ...result("failed", "cache_write_failed", failedState.next_due, finalCooldowns), cachePrepared: false };

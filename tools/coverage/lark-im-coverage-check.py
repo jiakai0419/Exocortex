@@ -501,7 +501,7 @@ def validate_sample_targets(payload, now_ms):
     keys = set()
     for target in targets:
         if (not isinstance(target, dict) or not {'key', 'scope_id', 'message_id', 'created_ms'} <= set(target)
-                or set(target) - {'key', 'scope_id', 'message_id', 'created_ms', 'observed_after_ms'}):
+                or set(target) - {'key', 'scope_id', 'message_id', 'created_ms', 'observed_after_ms', 'expected_chat_id'}):
             raise ValueError('invalid sample target')
         key, scope = target['key'], target['scope_id']
         if (not isinstance(key, str) or not re.fullmatch(r'[a-f0-9]{64}', key) or key in keys
@@ -513,6 +513,10 @@ def validate_sample_targets(payload, now_ms):
         if (not isinstance(message_id, str) or not message_id.strip() or len(message_id) > 512
                 or any(ord(char) < 32 or ord(char) == 127 for char in message_id)):
             raise ValueError('invalid sample target')
+        expected_chat = target.get('expected_chat_id')
+        if 'expected_chat_id' in target and (not isinstance(expected_chat, str) or not expected_chat.strip()
+                or len(expected_chat) > 512 or any(ord(char) < 32 or ord(char) == 127 for char in expected_chat)):
+            raise ValueError('invalid sample chat identity')
         for field in ('created_ms', 'observed_after_ms'):
             if field not in target:
                 continue
@@ -550,10 +554,7 @@ def inspect_sample_connection(con, targets, now_ms, deadline=None):
     for target in targets:
         key, scope, created = target['key'], target['scope_id'], target['created_ms']
         results[key] = sample_result('no_covering_run')
-        if time.monotonic() >= deadline or remaining < 2:
-            results[key] = sample_result('inspection_budget_exhausted')
-            continue
-        if not source_valid or created < baseline:
+        if not source_valid:
             results[key] = sample_result('source_unavailable')
             continue
         row = con.execute("""
@@ -562,8 +563,15 @@ def inspect_sample_connection(con, targets, now_ms, deadline=None):
         """, (scope,)).fetchone()
         scope_config = parse_json(row['config_json']) if row else None
         if (not isinstance(scope_config, dict) or not isinstance(scope_config.get('chat_id'), str)
-                or not scope_config['chat_id'].strip() or scope_config.get('unsupported_reason') is not None):
+                or not scope_config['chat_id'].strip() or scope_config.get('unsupported_reason') is not None
+                or 'expected_chat_id' in target and scope_config['chat_id'] != target['expected_chat_id']):
             results[key] = sample_result('scope_unavailable')
+            continue
+        if created < baseline:
+            results[key] = sample_result('before_sync_baseline')
+            continue
+        if time.monotonic() >= deadline or remaining < 2:
+            results[key] = sample_result('inspection_budget_exhausted')
             continue
         if len(detail_tables) != 2:
             results[key] = sample_result('detail_evidence_unavailable')

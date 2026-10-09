@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { SampleEvidenceError } from "./remote-sample-diagnostic.mjs";
 
-/** @typedef {{key:string,scope_id:string,message_id:string,created_ms:number,observed_after_ms?:number}} SampleCoverageTarget */
+/** @typedef {{key:string,scope_id:string,message_id:string,created_ms:number,observed_after_ms?:number,expected_chat_id?:string}} SampleCoverageTarget */
 /** @typedef {{covered:boolean,latest_finished_ms:number|null,details_pending:boolean,reason:string}} SampleCoverageEvidence */
 /** @typedef {Record<string, any>} JsonObject */
 const ROOT = fileURLToPath(new URL("../../", import.meta.url));
@@ -14,7 +14,7 @@ const MAX_RECORD_BYTES = 2 * 1024 * 1024;
 const RECORD_FIELDS = ["external_id", "source_id", "record_type", "container_id", "external_version", "raw_json", "canonical_json"];
 const MIN_EPOCH_MS = 100_000_000_000;
 const REASONS = new Set(["covered", "no_covering_run", "source_unavailable", "scope_unavailable",
-  "detail_evidence_unavailable", "details_pending", "inspection_budget_exhausted", "readonly_inspection_failed"]);
+  "before_sync_baseline", "detail_evidence_unavailable", "details_pending", "inspection_budget_exhausted", "readonly_inspection_failed"]);
 
 /** @param {unknown} value @param {number} now */
 function timestamp(value, now) {
@@ -42,7 +42,9 @@ function inspectRemoteSampleSnapshot(dbPath, targets, deps = {}) {
         || /[\u0000-\u001f\u007f]/u.test(target.message_id)
         || !timestamp(target.created_ms, now)
         || Object.hasOwn(target, "observed_after_ms") && !timestamp(target.observed_after_ms, now)
-        || Object.keys(target).some((key) => !["key", "scope_id", "message_id", "created_ms", "observed_after_ms"].includes(key))) {
+        || Object.hasOwn(target, "expected_chat_id") && (typeof target.expected_chat_id !== 'string' || !target.expected_chat_id.trim() ||
+          target.expected_chat_id.length > 512 || /[\u0000-\u001f\u007f]/u.test(target.expected_chat_id))
+        || Object.keys(target).some((key) => !["key", "scope_id", "message_id", "created_ms", "observed_after_ms", "expected_chat_id"].includes(key))) {
       throw new SampleEvidenceError("remote_sample_coverage_invalid_targets", "snapshot_invalid_targets");
     }
     keys.add(target.key);

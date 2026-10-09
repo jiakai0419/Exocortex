@@ -88,6 +88,28 @@ class SampleCoverageTests(unittest.TestCase):
         self.assertEqual(result, {'covered': True, 'latest_finished_ms': END + 60_000,
                                   'details_pending': False, 'reason': 'covered'})
 
+    def test_before_baseline_is_distinct_from_source_revocation(self):
+        target = self.target(created_ms=START - 60_000)
+        self.assertEqual(self.inspect([target])[KEY]['reason'], 'before_sync_baseline')
+        self.con.execute("UPDATE sources SET enabled=0 WHERE id='lark.im'")
+        self.assertEqual(self.inspect([target])[KEY]['reason'], 'source_unavailable')
+
+    def test_expected_chat_identity_matches_current_enabled_scope(self):
+        self.run_window()
+        target = self.target(expected_chat_id='synthetic_private_chat')
+        self.assertTrue(self.inspect([target])[KEY]['covered'])
+        self.con.execute('UPDATE sync_scopes SET config_json=? WHERE id=?',
+                         (json.dumps({'chat_id': 'synthetic_replaced_chat'}), SCOPE))
+        self.assertEqual(self.inspect([target])[KEY]['reason'], 'scope_unavailable')
+        self.con.execute('UPDATE sync_scopes SET enabled=0 WHERE id=?', (SCOPE,))
+        self.assertEqual(self.inspect([target])[KEY]['reason'], 'scope_unavailable')
+
+    def test_scope_revocation_precedes_baseline_and_history_budget(self):
+        self.con.execute('UPDATE sync_scopes SET enabled=0 WHERE id=?', (SCOPE,))
+        target = self.target(created_ms=START - 60_000, expected_chat_id='synthetic_private_chat')
+        with mock.patch.object(check, 'SAMPLE_TOTAL_RUNS', 0):
+            self.assertEqual(self.inspect([target])[KEY]['reason'], 'scope_unavailable')
+
     def test_reconfirmation_requires_later_finish_of_same_covering_window(self):
         observed = END + 120_000
         self.run_window()
@@ -233,7 +255,8 @@ class SampleCoverageTests(unittest.TestCase):
     def test_input_contract_rejects_future_duplicates_and_foreign_shapes(self):
         invalid = [self.target(created_ms=NOW + 1), self.target(observed_after_ms=NOW + 1),
                    self.target(scope_id=check.SENT_ID), self.target(created_ms=True), self.target(key='private-id'),
-                   self.target(message_id=''), self.target(message_id='x' * 513)]
+                   self.target(message_id=''), self.target(message_id='x' * 513),
+                   self.target(expected_chat_id=''), self.target(expected_chat_id=True), self.target(expected_chat_id='x' * 513)]
         for target in invalid:
             with self.subTest(target=target), self.assertRaises(ValueError):
                 check.validate_sample_targets({'targets': [target]}, NOW)
@@ -303,6 +326,27 @@ class SampleCoverageTests(unittest.TestCase):
         self.assertEqual(len(snapshot['records']), 1)
         self.assertEqual(snapshot['records'][0]['record_type'], 'synthetic.wrong_type')
         self.assertEqual(snapshot['records'][0]['source_id'], 'lark.im')
+
+    def test_expected_scope_identity_and_record_share_one_wal_snapshot(self):
+        self.con.commit()
+        self.con.execute('PRAGMA journal_mode=WAL')
+        self.run_window()
+        self.record()
+        self.con.commit()
+
+        def replace_scope_and_remove_record():
+            with sqlite3.connect(self.path, timeout=0.1) as writer:
+                writer.execute('UPDATE sync_scopes SET config_json=? WHERE id=?',
+                               (json.dumps({'chat_id': 'synthetic_replaced_chat'}), SCOPE))
+                writer.execute('DELETE FROM records')
+
+        payload = {'targets': [self.target(expected_chat_id='synthetic_private_chat')]}
+        before = check.inspect_sample_database(self.path, payload, now_ms=NOW, after_coverage=replace_scope_and_remove_record)
+        self.assertTrue(before['coverage'][KEY]['covered'])
+        self.assertEqual(len(before['records']), 1)
+        after = check.inspect_sample_database(self.path, payload, now_ms=NOW)
+        self.assertEqual(after['coverage'][KEY]['reason'], 'scope_unavailable')
+        self.assertEqual(after['records'], [])
 
     def test_record_read_failure_and_payload_budget_discard_all_coverage(self):
         self.run_window()

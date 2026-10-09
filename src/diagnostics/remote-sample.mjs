@@ -8,7 +8,8 @@ import { classifyLarkFailure } from '../adapters/lark-im/transport.mjs';
 import { tryAcquireLarkApiLease, readSharedLarkCooldown, writeSharedLarkCooldown } from '../runtime/lark-api-lease.mjs';
 import { readRemoteAccountBinding } from './remote-account-binding.mjs';
 import { inspectRemoteSampleSnapshot } from './remote-sample-coverage.mjs';
-import { SAMPLE_POLICY, digest, epoch, selectSampleChats, evaluateSample } from './remote-sample-core.mjs';
+import { SAMPLE_POLICY, digest, epoch, sampleScopeHash, selectSampleChats, evaluateSample } from './remote-sample-core.mjs';
+import { selectHistoricalObservation } from './remote-sample-history.mjs';
 import { runGuardedRemoteSampleProcess, safeGuardianDiagnostic } from '../runtime/worker/remote-sample-process.mjs';
 import { publicRemoteReport } from './remote-sample-cache.mjs';
 import { collectorDiagnostic } from './remote-sample-diagnostic.mjs';
@@ -75,8 +76,10 @@ export function loadSampleInventory(db, deps = {}) {
     json_extract(config_json,'$.chat_id') AS chat_id,
     json_extract(config_json,'$.unsupported_reason') AS unsupported_reason,
     json_extract(config_json,'$.hot_rank') AS hot_rank,
-    json_extract(config_json,'$.hot_seen_at') AS hot_seen_at
+    json_extract(config_json,'$.hot_seen_at') AS hot_seen_at,
+    (SELECT json_extract(config_json,'$.initial_sync_start_ms') FROM sources WHERE id='lark.im') AS initial_sync_start_ms
     FROM sync_scopes WHERE source_id='lark.im' AND id LIKE 'lark.im.received.chat.%'
+      AND EXISTS(SELECT 1 FROM sources WHERE id='lark.im' AND enabled=1)
     ORDER BY id LIMIT 10001;`, 'remote sample inventory');
 }
 
@@ -112,15 +115,18 @@ export function collectRemoteSample(db, options = {}, deps = {}) {
     if (ms <= 0) throw new SampleFailure('time_budget');
     return ms;
   };
-  const boundedQuery = (path, sql, label) => (deps.sqliteJson || readOnlySqliteJson)(path, sql, label, { timeoutMs: remaining() });
+  const boundedQuery = (path, sql, label, queryOptions = {}) => (deps.sqliteJson || readOnlySqliteJson)(path, sql, label,
+    { timeoutMs: Math.min(remaining(), queryOptions.timeoutMs || remaining()) });
   const localDeps = { ...deps, sqliteJson: boundedQuery };
   const readBinding = (self) => { remaining(); return (deps.readBinding || readRemoteAccountBinding)({ db, selfOpenId: self.openId, selfTenantKey: self.tenantKey }, { query: boundedQuery }); };
   let binding = null; let selection = null;
   let observations = options.previousObservations || {};
+  let observationOverflow = options.previousOverflow === true;
+  let historyAttempt = null;
   let retryAtMs = 0; let operation = '';
   let stage = 'inventory';
   const finish = (outcome) => ({ outcome, rotation: outcome === 'ok' ? selection?.rotation ?? rotation : rotation,
-    observations, report: { ...report, checked_at: new Date(now()).toISOString(), probe: { ...report.probe, api_calls: api.count() } },
+    observations, observationOverflow, historyAttempt, report: { ...report, checked_at: new Date(now()).toISOString(), probe: { ...report.probe, api_calls: api.count() } },
     cacheContext: binding ? { database_key: context?.database_key, source_id: 'lark.im', account_key: binding.account_key,
       auth_identity_verified: binding.state === 'verified' } : context, retryAtMs,
     cooldownsByOperation: retryAtMs && operation ? { [operation]: retryAtMs } : {}, cacheTtlMs: options.cacheTtlMs });
@@ -137,40 +143,58 @@ export function collectRemoteSample(db, options = {}, deps = {}) {
     stage = 'binding_before';
     binding = readBinding(before);
     report.binding = { state: binding.state, evidence: binding.evidence };
-    if (options.accountKey && options.accountKey !== binding.account_key) observations = {};
     if (binding.state !== 'verified') {
       report.reason = binding.state === 'conflict' ? 'account_mismatch' : 'account_unverified'; return finish('ok');
     }
     // Observations from another account must never participate in confirmation.
-    if (options.accountKey && options.accountKey !== binding.account_key) observations = {};
+    if (options.accountKey && options.accountKey !== binding.account_key) { observations = {}; observationOverflow = false; }
+    const revisit = maxChats > 1 ? (deps.selectHistoricalObservation || selectHistoricalObservation)(db, observations, binding, rows, start, started, localDeps) : null;
+    if (revisit) {
+      observations = { ...observations, [revisit.key]: { ...revisit.observation, last_checked: started,
+        ...(revisit.chat ? { scope_hash: sampleScopeHash(binding, revisit.chat.chat_id) } : {}) } };
+      report.history = { requested: 1, chats_checked: 0, pages: 0, messages_checked: 0, unsupported_chats: 0, truncated_chats: 0,
+        unroutable: revisit.chat ? 0 : 1, window: revisit.chat ? { start: new Date(revisit.start).toISOString(), end: new Date(revisit.end).toISOString() } : null };
+      if (revisit.chat) {
+        selection = selectSampleChats(rows, rotation, started, maxChats - 1);
+        Object.assign(report.probe, { hot_chats_found: selection.selected.length, eligible_chats: selection.eligible,
+          hot_chats: selection.hot, fair_chats: selection.fair });
+      }
+    }
     /** @type {Record<string, any>[]} */ const messages = []; const seenMessages = new Set();
-    for (const chat of selection.selected) {
+    const requests = selection.selected.map(chat => ({ chat, start, end, historical: false }));
+    if (revisit?.chat) requests.push({ chat: revisit.chat, start: revisit.start, end: revisit.end, historical: true });
+    for (const request of requests) {
+      const { chat, historical } = request;
+      const counters = historical ? report.history : report.probe;
       const tokens = new Set(); let token = '';
       for (let pageNo = 0; pageNo < SAMPLE_POLICY.pages; pageNo++) {
         let json;
         stage = 'message_request';
+        if (historical && pageNo === 0) historyAttempt = { key: revisit.key, checked_at: now(),
+          database_key: binding.database_key, source_id: 'lark.im' };
         try { json = api.call('/open-apis/im/v1/messages', { container_id_type: 'chat', container_id: chat.chat_id,
           sort_type: 'ByCreateTimeDesc', page_size: pageSize, card_msg_content_type: 'user_card_content',
-          start_time: String(Math.floor(start / 1000)), end_time: String(Math.ceil(end / 1000)), ...(token ? { page_token: token } : {}) }); }
-        catch (error) { if (error instanceof SampleFailure && error.reason === 'restricted_mode') { report.probe.unsupported_chats++; break; } throw error; }
+          start_time: String(Math.floor(request.start / 1000)), end_time: String(Math.ceil(request.end / 1000)), ...(token ? { page_token: token } : {}) }); }
+        catch (error) { if (error instanceof SampleFailure && error.reason === 'restricted_mode') { counters.unsupported_chats++; break; } throw error; }
         stage = 'message_page';
         const page = nativePage(json, 'remote sample page', tokens);
         stage = 'message_shape';
         assertRawMessagePage(page.items, 'remote sample page');
         stage = 'message_identity';
-        report.probe.pages++;
-        if (pageNo === 0) report.probe.chats_checked++;
+        counters.pages++;
+        if (pageNo === 0) counters.chats_checked++;
         if (page.items.length > pageSize) throw new SampleFailure('invalid_page');
         for (const item of page.items) {
           if (item.chat_id !== chat.chat_id || epoch(item.create_time) === null || !item.message_id || seenMessages.has(item.message_id)) throw new SampleFailure('invalid_page');
           seenMessages.add(item.message_id);
           const created = epoch(item.create_time);
-          if (created === null || created < start || created > end) continue;
+          if (created === null || created < request.start || created > request.end) continue;
+          if (historical && digest([binding.database_key, binding.account_key, item.chat_id, item.message_id, created]) !== revisit.key) continue;
           messages.push({ ...item, scope_id: chat.id });
         }
         if (!page.has_more) break;
         token = page.page_token;
-        if (pageNo + 1 === SAMPLE_POLICY.pages) report.probe.truncated_chats++;
+        if (pageNo + 1 === SAMPLE_POLICY.pages) counters.truncated_chats++;
       }
     }
     stage = 'identity_after';
@@ -179,20 +203,25 @@ export function collectRemoteSample(db, options = {}, deps = {}) {
     stage = 'database_context';
     if ((deps.context || liveProbeContext)(db)?.database_key !== context.database_key) throw new SampleFailure('database_changed');
     const targets = messages.map((m) => ({ key: digest([binding.database_key, binding.account_key, m.chat_id, m.message_id, epoch(m.create_time)]),
-      scope_id: m.scope_id, message_id: m.message_id, created_ms: epoch(m.create_time) }));
+      scope_id: m.scope_id, message_id: m.message_id, created_ms: epoch(m.create_time), expected_chat_id: m.chat_id }));
     if (now() >= api.deadline) throw new SampleFailure('time_budget');
     // Coverage, debt and records must come from one SQLite snapshot, including concurrent revocation.
     stage = 'snapshot';
     const { coverage, records } = (deps.inspectSnapshot || inspectRemoteSampleSnapshot)(db, targets, { timeoutMs: Math.min(5000, remaining()), now });
+    if (Object.values(coverage).some(proof => ['source_unavailable', 'scope_unavailable'].includes(proof.reason)) ||
+        revisit?.chat && coverage[revisit.key]?.reason === 'before_sync_baseline') throw new SampleFailure('context_changed');
     stage = 'binding_after';
     const finalBinding = readBinding(after);
     if (finalBinding.state !== 'verified' || finalBinding.account_key !== binding.account_key || finalBinding.database_key !== binding.database_key) throw new SampleFailure('account_changed');
     stage = 'comparison';
-    const evaluated = evaluateSample({ messages, records, coverage, binding, previous: observations, now: now(), windowEnd: end });
+    const evaluated = evaluateSample({ messages, records, coverage, binding, previous: observations, previousOverflow: observationOverflow, now: now(), windowEnd: end });
     observations = evaluated.observations;
+    observationOverflow = evaluated.observationOverflow;
     report.findings = evaluated.counts;
     report.missing_count = evaluated.counts.missing;
     report.probe.remote_messages_checked = messages.length;
+    if (revisit?.chat) report.history.messages_checked = messages.filter(message =>
+      digest([binding.database_key, binding.account_key, message.chat_id, message.message_id, epoch(message.create_time)]) === revisit.key).length;
     stage = 'final_context';
     if ((deps.context || liveProbeContext)(db)?.database_key !== context.database_key || now() > api.deadline) throw new SampleFailure('context_changed');
     const c = evaluated.counts;
@@ -200,7 +229,7 @@ export function collectRemoteSample(db, options = {}, deps = {}) {
       report.status = 'needs_attention'; report.reason = c.confirmed_missing ? 'confirmed_missing' : 'source_difference';
     } else if (c.missing || c.pending_sync || c.unresolved_prior || c.observation_overflow || c.expired_observations) {
       report.status = 'delayed'; report.reason = c.suspected_missing ? 'suspected_missing' : c.pending_sync ? 'sync_pending' : 'unresolved_observations';
-    } else if (!messages.length || report.probe.unsupported_chats || c.local_newer) {
+    } else if (!messages.length || report.probe.unsupported_chats || report.history?.unsupported_chats || c.local_newer) {
       report.reason = !messages.length ? 'no_usable_remote_messages' : 'partial_sample';
     } else { report.status = 'healthy'; report.ok = true; }
     return finish('ok');

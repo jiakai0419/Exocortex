@@ -1,4 +1,4 @@
-import { REMOTE_REASONS } from "./remote-sample-cache.mjs";
+import { REMOTE_REASONS, safeRemoteSampleHistory } from "./remote-sample-cache.mjs";
 import { safeCollectorDiagnostic } from "./remote-sample-diagnostic.mjs";
 // @ts-check
 import { existsSync } from "node:fs";
@@ -210,6 +210,12 @@ function publicStatusReport(collected, options) {
   const hasCollectorDiagnostic = Object.hasOwn(overview.freshness, "collector_diagnostic");
   const collectorDiagnostic = safeCollectorDiagnostic(overview.freshness.collector_diagnostic);
   const contradictorySample = hasCollectorDiagnostic && (overview.freshness.status === "sampled" || overview.freshness.result === "healthy");
+  const hasHistory = Object.hasOwn(overview.freshness, 'history');
+  const history = hasHistory ? safeRemoteSampleHistory(overview.freshness.history) : null;
+  const invalidHistory = hasHistory && (!history || count(overview.freshness.sample_count) === null ||
+    history.messages_checked > overview.freshness.sample_count || history.window &&
+    !(Date.parse(history.window.end) <= Date.parse(overview.freshness.window?.start)) ||
+    overview.freshness.status === 'sampled' && (history.unroutable || history.unsupported_chats || history.messages_checked !== 1));
   return { schema_version: 1, privacy: options.logs ? "private" : "public-safe", observed_at: new Date(observedAt).toISOString(),
     service: { status: choice(service.status, ["running", "loaded", "absent", "unknown"]), target_match: service.target_match,
       configuration: choice(installed.status, ["installed", "missing", "unknown"]), pid: count(service.pid), last_exit_code: Number.isSafeInteger(service.last_exit_code) ? service.last_exit_code : null },
@@ -217,13 +223,14 @@ function publicStatusReport(collected, options) {
       reason: HEALTH_REASONS.includes(overview.health.reason) ? overview.health.reason : "health_unavailable", local: choice(sync?.health, ["ok", "ok_with_history", "catching_up", "syncing", "not_ready", "needs_attention", "unknown"]) },
     activity: publicActivity(overview.activity),
     runtime_stats: summarizeRuntimeStats(report, collected.binding, observedAt),
-    freshness: { status: hasCollectorDiagnostic ? "unknown" : choice(overview.freshness.status, ["sampled", "unknown", "behind"]), auth_identity: choice(overview.freshness.auth_identity, ["unknown", "verified_at_check"]),
-      scope: choice(overview.freshness.scope, ["recent_hot_messages", "discovered_chats_rotating"]), reason: contradictorySample ? "invalid_evidence" : choice(overview.freshness.reason, FRESHNESS_REASONS),
+    freshness: { status: hasCollectorDiagnostic || invalidHistory ? "unknown" : choice(overview.freshness.status, ["sampled", "unknown", "behind"]), auth_identity: choice(overview.freshness.auth_identity, ["unknown", "verified_at_check"]),
+      scope: choice(overview.freshness.scope, ["recent_hot_messages", "discovered_chats_rotating"]), reason: contradictorySample || invalidHistory ? "invalid_evidence" : choice(overview.freshness.reason, FRESHNESS_REASONS),
       window: { start: publicTimestamp(overview.freshness.window?.start), end: publicTimestamp(overview.freshness.window?.end) },
       sample_count: count(overview.freshness.sample_count),
       ...(overview.freshness.scope === "discovered_chats_rotating" ? {
-        result: hasCollectorDiagnostic ? "unavailable" : choice(overview.freshness.result, ["healthy","delayed","needs_attention","inconclusive","unavailable"]),
+        result: hasCollectorDiagnostic || invalidHistory ? "unavailable" : choice(overview.freshness.result, ["healthy","delayed","needs_attention","inconclusive","unavailable"]),
         ...(collectorDiagnostic ? { collector_diagnostic: collectorDiagnostic } : {}),
+        ...(history && !invalidHistory ? { history } : {}),
         chat_count: count(overview.freshness.chat_count),
         binding: { state: choice(overview.freshness.binding?.state, ["verified","unverified","conflict","unavailable"]),
           evidence: choice(overview.freshness.binding?.evidence, ["single_sent_actor","initialized_empty_database"]), tenant_verified: false },

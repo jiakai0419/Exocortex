@@ -37,6 +37,29 @@ test('suspected, confirmed, pending, unavailable and expired remain distinct on 
   ])assert.match(plain(renderStatusText(report(f),{columns:120,stream})),expected);
 });
 
+test('status separates current samples from bounded historical targets and rejects private historical fields', () => {
+  const end = Date.parse(freshness().window.start) - 1000;
+  const history = { requested: 1, chats_checked: 1, pages: 1, messages_checked: 1, unsupported_chats: 0,
+    truncated_chats: 0, unroutable: 0, window: { start: new Date(end - 3000).toISOString(), end: new Date(end).toISOString() } };
+  const projected = report(freshness({ history, sample_count: 5, chat_count: 4 }));
+  assert.deepEqual(projected.freshness.history, history);
+  for (const columns of [48, 96]) {
+    const rendered = plain(renderStatusText(projected, { columns, stream, detail: true }));
+    assert.match(rendered.replace(/\s+/g, ' '), /4 current messages \/ 4 chats \+ 1 historical target/);
+    assert.match(rendered.replace(/\s+/g, ' '), /Historical revisit 1 target observed/);
+    assert.match(rendered.replace(/\s+/g, ' '), /History window/);
+    for (const line of rendered.split('\n')) assert.ok([...line].length <= columns);
+  }
+  for (const invalid of [{ ...history, body: 'SYNTHETIC_PRIVATE_BODY' }, { ...history, messages_checked: 2 },
+    { ...history, window: { start: new Date(STATUS_SCREEN_NOW).toISOString(), end: new Date(STATUS_SCREEN_NOW + 3000).toISOString() } }]) {
+    const value = report(freshness({ history: invalid }));
+    assert.equal(value.freshness.status, 'unknown'); assert.equal(value.freshness.result, 'unavailable');
+    assert.equal(value.freshness.history, undefined);
+    assert.doesNotMatch(JSON.stringify(value), /SYNTHETIC_PRIVATE_BODY/);
+    assert.doesNotMatch(plain(renderStatusText(value, { columns: 96, stream })), /Sample matched/);
+  }
+});
+
 test('manual cache-writing check shares scheduler and respects not_due without directly invoking collector',async()=>{
   const f=fixture();let scheduler=0;
   f.deps.runManualRemoteSample=(opts,deps)=>{scheduler++;assert.equal(opts.db,'/tmp/invented.sqlite');assert.ok(deps.collectorOptions.endMs);return{outcome:'not_due',reason:'not_due'}};
