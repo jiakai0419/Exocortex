@@ -25,6 +25,9 @@ const ro = (f, text = 'SELECT * FROM records ORDER BY id;') => sqliteQuery(f.db,
 const sql = (f, text) => sqliteExec(f.db, text, 'write synthetic review');
 const publicReport = report => assert.doesNotMatch(JSON.stringify(report), /Synthetic Reader|Synthetic App|Synthetic card|oc_synthetic|ou_synthetic|om_synthetic|synthetic\.sqlite|RAW_SECRET/);
 const card = text => ({ elements: [{ tag: 'markdown', content: text }] });
+const nonCardContent = (kind, text) => kind === 'post'
+  ? { title: 'Synthetic post title', content: [[{ tag: 'text', text }]] }
+  : kind === 'system' ? { template: text } : { text };
 
 function fixture(t, count = 2, cards = false) {
   // macOS TMPDIR can contain /var -> /private/var (or another parent symlink).
@@ -48,10 +51,12 @@ function fixture(t, count = 2, cards = false) {
   return f;
 }
 function message(f, index, cards = false, overrides = {}) {
+  const kind = typeof cards === 'string' ? cards : cards ? 'interactive' : 'text';
   return normalizeApiMessage({ message_id: `om_synthetic_review_${index}`, chat_id: CHAT,
     create_time: String(f.start + 1000 + index), update_time: String(f.start + 1000 + index),
-    msg_type: cards ? 'interactive' : 'text', sender: { id: `ou_synthetic_review_peer_${index}`, id_type: 'open_id', sender_type: 'user' },
-    body: { content: JSON.stringify(cards ? card(`Synthetic card before ${index}`) : { text: `Synthetic text ${index}` }) }, ...overrides });
+    msg_type: kind, sender: { id: `ou_synthetic_review_peer_${index}`, id_type: 'open_id', sender_type: 'user' },
+    body: { content: JSON.stringify(kind === 'interactive' ? card(`Synthetic card before ${index}`)
+      : nonCardContent(kind, `Synthetic text ${index}`)) }, ...overrides });
 }
 function nameOptions(f, extra = {}) {
   return { db: f.db, target: 'records', namesOnly: true, recordIds: f.ids, maxCliAttempts: 12, maxSeconds: 30,
@@ -141,6 +146,7 @@ test('card review uses final SQL merge, refetches without extra API, binds opaqu
   assert.equal(preview.ok, true); assert.equal(preview.review.changes, 2); assert.equal(f.calls.length, 2);
   assert.deepEqual(readFileSync(f.db), bytes);
   const artifact = readArtifact(opts.reviewOut);
+  assert.equal(artifact.schema, 'exocortex_private_maintenance_review/v1');
   assert.equal(artifact.binding.verified_self_sha256, hash(SELF.open_id));
   for (const record of artifact.records) {
     assert.match(record.display.before.card.text, /Synthetic card before/);
@@ -160,6 +166,84 @@ test('card review uses final SQL merge, refetches without extra API, binds opaqu
     assert.equal(row.id, before[i].id);
   }
 });
+
+for (const kind of ['text', 'post', 'system', 'general_calendar', 'video_chat']) {
+  test(`${kind} exact replay publishes complete stored text in v2 and approved apply preserves the reviewed result`, t => {
+    const f = fixture(t, 1, kind), before = ro(f), dbBytes = readFileSync(f.db), opts = replayOptions(f);
+    const messages = [message(f, 0, kind, { update_time: String(f.start + 20_000),
+      body: { content: JSON.stringify(nonCardContent(kind, 'Synthetic non-card after\n完整正文🙂')) } })];
+    const preview = replay(f, messages, opts); publicReport(preview);
+    assert.equal(preview.ok, true); assert.equal(preview.review.changes, 1); assert.equal(f.calls.length, 2);
+    assert.deepEqual(readFileSync(f.db), dbBytes); noWrites(f, before);
+    const artifact = readArtifact(opts.reviewOut), record = artifact.records[0];
+    assert.equal(artifact.schema, 'exocortex_private_maintenance_review/v2');
+    assert.equal(preview.review.schema, artifact.schema);
+    assert.match(artifact.disclosure.non_card_text, /exact_stored_title_and_body/);
+    assert.deepEqual(record.display.before.non_card, { title: before[0].title, body: before[0].body });
+    assert.equal(record.display.before.card, null); assert.equal(record.display.after.card, null);
+    assert.match(record.display.after.non_card.body, /Synthetic non-card after/);
+    assert.match(record.display.after.non_card.body, /完整正文🙂/);
+    assert.ok(record.changed_fields.includes('body'));
+    const result = replay(f, messages, approved(opts, preview)); publicReport(result);
+    assert.equal(result.ok, true); assert.equal(f.calls.length, 4);
+    const after = ro(f)[0];
+    assert.deepEqual(record.display.after.non_card, { title: after.title, body: after.body });
+    assert.equal(hash(after.body), record.opaque.after.body.sha256);
+  });
+}
+
+test('non-card same-version conflicts show the complete retained body, and new remote drift blocks apply', t => {
+  const f = fixture(t, 1), before = ro(f), opts = replayOptions(f);
+  const changed = message(f, 0, false, { update_time: String(f.start + 20_000), body: { content: JSON.stringify({ text: 'Synthetic approved text' }) } });
+  const preview = replay(f, [changed], opts); assert.equal(preview.ok, true);
+  const drifted = message(f, 0, false, { update_time: String(f.start + 20_000), body: { content: JSON.stringify({ text: 'Synthetic unapproved text' }) } });
+  const result = replay(f, [drifted], approved(opts, preview));
+  assert.equal(result.ok, false); assert.match(JSON.stringify(result), /proposal_changed/); noWrites(f, before);
+  const conflictOpts = replayOptions(f, { reviewOut: join(f.dir, 'conflict.json') });
+  const conflict = replay(f, [message(f, 0, false, { body: { content: JSON.stringify({ text: 'Synthetic equal-version conflict' }) } })], conflictOpts);
+  assert.equal(conflict.ok, true); assert.equal(conflict.review.changes, 0);
+  const record = readArtifact(conflictOpts.reviewOut).records[0];
+  assert.equal(record.outcome, 'conflict'); assert.deepEqual(record.display.after, record.display.before);
+});
+
+test('mixed replay retains strict interactive rendering and cannot disguise a card as plain text', t => {
+  const f = fixture(t, 2), opts = replayOptions(f), before = ro(f);
+  const messages = [message(f, 0, false, { update_time: String(f.start + 20_000) }), incoming(f, 1)];
+  const preview = replay(f, messages, opts); assert.equal(preview.ok, true);
+  const artifact = readArtifact(opts.reviewOut);
+  assert.equal(artifact.schema, 'exocortex_private_maintenance_review/v2');
+  assert.equal(artifact.records[1].display.after.non_card, null);
+  assert.match(artifact.records[1].display.after.card.text, /Synthetic card after/);
+  const malformed = replay(f, [messages[0], incoming(f, 1, '', { body: { content: JSON.stringify({ unsupported: true }) } })],
+    replayOptions(f, { reviewOut: join(f.dir, 'partial.json') }));
+  assert.equal(malformed.ok, false); assert.match(JSON.stringify(malformed), /incomplete_card/);
+  assert.equal(existsSync(join(f.dir, 'partial.json')), false); noWrites(f, before);
+  const raw = JSON.parse(before[0].raw_json); (raw.raw_api || raw).msg_type = 'interactive';
+  sql(f, `UPDATE records SET raw_json=${quoteSql(JSON.stringify(raw))} WHERE id=${f.ids[0]};`);
+  const disguised = replay(f, messages, replayOptions(f, { reviewOut: join(f.dir, 'disguised.json') }));
+  assert.equal(disguised.ok, false); assert.match(JSON.stringify(disguised), /invalid_file/);
+  assert.equal(existsSync(join(f.dir, 'disguised.json')), false);
+});
+
+for (const mutation of ['hide_body', 'unknown_field', 'schema_downgrade', 'change_display']) {
+  test(`v2 approval rejects ${mutation} before writing`, t => {
+    const f = fixture(t, 1), opts = replayOptions(f), before = ro(f);
+    const messages = [message(f, 0, false, { update_time: String(f.start + 20_000) })];
+    const preview = replay(f, messages, opts); assert.equal(preview.ok, true);
+    const input = approved(opts, preview);
+    input.reviewSha256 = rewrite(opts.reviewOut, artifact => {
+      if (mutation === 'hide_body') delete artifact.records[0].display.after.non_card;
+      if (mutation === 'unknown_field') artifact.records[0].display.after.non_card.hidden = 'Synthetic hidden';
+      if (mutation === 'schema_downgrade') artifact.schema = 'exocortex_private_maintenance_review/v1';
+      if (mutation === 'change_display') artifact.records[0].display.after.non_card.body = 'Synthetic edited display';
+    });
+    const calls = f.calls.length;
+    if (mutation === 'change_display') {
+      const result = replay(f, messages, input); assert.equal(result.ok, false); assert.match(JSON.stringify(result), /proposal_changed/);
+    } else { assert.throws(() => replay(f, messages, input), /invalid_file/); assert.equal(f.calls.length, calls); }
+    noWrites(f, before);
+  });
+}
 
 test('equal and older replay proposals expose stored final after and cannot become empty approved writes', t => {
   const f = fixture(t, 2, true), opts = replayOptions(f);

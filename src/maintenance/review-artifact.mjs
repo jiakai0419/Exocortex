@@ -10,6 +10,8 @@ import { renderCardContent } from '../adapters/lark-im/card-content.mjs';
 import { quoteSql, REVIEW_RECORD_COLUMNS, REVIEW_EFFECTIVE_COLUMNS } from '../../dist/storage/sqlite/ingestion-store.js';
 
 const REVIEW_SCHEMA = 'exocortex_private_maintenance_review/v1';
+const TEXT_REVIEW_SCHEMA = 'exocortex_private_maintenance_review/v2';
+const TEXT_REVIEW_TYPES = new Set(['text', 'post', 'system', 'general_calendar', 'video_chat']);
 const REVIEW_MAX_BYTES = 1024 * 1024;
 const REVIEW_RECORD_BYTES = 256 * 1024;
 const REVIEW_TOTAL_BYTES = 4 * 1024 * 1024;
@@ -24,6 +26,8 @@ const REVIEW_DISCLOSURE = { opaque_columns: OPAQUE_FIELDS,
   meaning: 'opaque_columns_are_digest_bound_not_fully_displayed',
   card_text: 'rendered_api_projection_not_the_stored_body_column_or_business_approval',
   omissions: 'interactive_values_and_url_credentials_are_intentionally_not_displayed' };
+const TEXT_REVIEW_DISCLOSURE = { ...REVIEW_DISCLOSURE,
+  non_card_text: 'exact_stored_title_and_body_not_client_state; private_text_is_not_redacted' };
 const REASONS = new Set(['invalid_options', 'unsafe_path', 'invalid_file', 'approval_mismatch', 'expired', 'binding_unavailable',
   'binding_changed', 'snapshot_changed', 'proposal_changed', 'too_large', 'incomplete_card', 'no_changes', 'publish_failed']);
 /** A finite local diagnostic; never expose file contents, IDs or filesystem errors. */
@@ -101,9 +105,11 @@ function publish(path, artifact, { sync = fsyncSync } = {}) {
 }
 
 function validateArtifact(value, now) {
+  const textReview = value?.schema === TEXT_REVIEW_SCHEMA;
   if (!exactKeys(value, ['schema', 'mode', 'created_at_ms', 'expires_at_ms', 'disclosure', 'binding', 'constraints', 'records'])
-    || value.schema !== REVIEW_SCHEMA || !['names', 'replay'].includes(value.mode)
-    || !equal(value.disclosure, REVIEW_DISCLOSURE)
+    || ![REVIEW_SCHEMA, TEXT_REVIEW_SCHEMA].includes(value.schema) || !['names', 'replay'].includes(value.mode)
+    || textReview && value.mode !== 'replay'
+    || !equal(value.disclosure, textReview ? TEXT_REVIEW_DISCLOSURE : REVIEW_DISCLOSURE)
     || !finite(value.created_at_ms) || value.expires_at_ms !== value.created_at_ms + REVIEW_AGE_MS) fail('invalid_file');
   if (now < value.created_at_ms || now >= value.expires_at_ms) fail('expired');
   if (!exactKeys(value.binding, ['database_key', 'source_id', 'source_config_sha256', 'baseline', 'local_account_key', 'scopes', 'verified_self_sha256'])
@@ -133,7 +139,7 @@ function validateArtifact(value, now) {
       || !Array.isArray(record.opaque.changed_fields) || record.opaque.changed_fields.some(field => !OPAQUE_FIELDS.includes(field))) fail('invalid_file');
     for (const side of ['before', 'after']) {
       const display = record.display[side];
-      if (!exactKeys(display, ['fields', 'sender', 'canonical', 'card']) || !exactKeys(display.fields, VISIBLE_FIELDS)
+      if (!exactKeys(display, ['fields', 'sender', 'canonical', 'card', ...(textReview ? ['non_card'] : [])]) || !exactKeys(display.fields, VISIBLE_FIELDS)
         || !Object.values(display.fields).every(scalar) || !exactKeys(display.sender, SENDER_FIELDS)
         || !exactKeys(display.canonical, CANONICAL_FIELDS)) fail('invalid_file');
       for (const [group, allowBoolean] of [[display.sender, false], [display.canonical, true]]) {
@@ -141,14 +147,23 @@ function validateArtifact(value, now) {
           || !entry.present && entry.value !== null || !(entry.value === null || typeof entry.value === 'string' && bytes(entry.value) <= 1024
             || allowBoolean && typeof entry.value === 'boolean')) fail('invalid_file');
       }
-      if (value.mode === 'names' ? display.card !== null : !exactKeys(display.card, ['text', 'status', 'reason', 'version', 'omitted_actions'])
-        || display.card.status !== 'rendered' || display.card.reason !== null || display.card.version !== 3
-        || typeof display.card.text !== 'string' || !finite(display.card.omitted_actions)) fail('invalid_file');
+      const nonCard = textReview && TEXT_REVIEW_TYPES.has(display.canonical.msg_type.value);
+      if (nonCard) {
+        if (display.card !== null || !exactKeys(display.non_card, ['title', 'body'])
+          || !Object.values(display.non_card).every(text => text === null || typeof text === 'string' && bytes(text) <= REVIEW_RECORD_BYTES)) fail('invalid_file');
+      } else {
+        if (textReview && display.non_card !== null) fail('invalid_file');
+        if (value.mode === 'names' ? display.card !== null : display.canonical.msg_type.value !== 'interactive'
+          || !exactKeys(display.card, ['text', 'status', 'reason', 'version', 'omitted_actions'])
+          || display.card.status !== 'rendered' || display.card.reason !== null || display.card.version !== 3
+          || typeof display.card.text !== 'string' || !finite(display.card.omitted_actions)) fail('invalid_file');
+      }
       if (!exactKeys(record.opaque[side], OPAQUE_FIELDS)) fail('invalid_file');
       for (const field of OPAQUE_FIELDS) if (!exactKeys(record.opaque[side][field], ['sha256', 'bytes'])
         || !hashValue(record.opaque[side][field].sha256) || !finite(record.opaque[side][field].bytes)) fail('invalid_file');
     }
   }
+  if (textReview && !value.records.some(record => record.display.before.non_card !== null || record.display.after.non_card !== null)) fail('invalid_file');
   return value;
 }
 
@@ -250,8 +265,15 @@ function beginMaintenanceReview(options, { db, mode, rows, scopes = [], now = Da
           return [key, { present, value }];
         }));
         const sender = projection(SENDER_FIELDS);
-        let card = null;
-        if (mode === 'replay') {
+        let card = null, nonCard = null;
+        if (mode === 'replay' && TEXT_REVIEW_TYPES.has(canonical.msg_type)) {
+          let raw; try { raw = JSON.parse(row.raw_json); } catch { fail('invalid_file'); }
+          if (!raw || typeof raw !== 'object' || Array.isArray(raw)) fail('invalid_file');
+          const native = raw.raw_api && typeof raw.raw_api === 'object' ? raw.raw_api : raw;
+          if ((native.msg_type || native.message_type) !== canonical.msg_type) fail('invalid_file');
+          nonCard = pick(row, ['title', 'body']);
+          if (!Object.values(nonCard).every(text => text === null || typeof text === 'string')) fail('invalid_file');
+        } else if (mode === 'replay') {
           let raw; try { raw = JSON.parse(row.raw_json); } catch { fail('incomplete_card'); }
           const native = raw.raw_api && typeof raw.raw_api === 'object' ? raw.raw_api : raw;
           if (canonical.msg_type !== 'interactive') fail('incomplete_card');
@@ -259,7 +281,8 @@ function beginMaintenanceReview(options, { db, mode, rows, scopes = [], now = Da
           if (rendered.status !== 'rendered') fail('incomplete_card');
           card = { text: rendered.text, status: rendered.status, reason: rendered.reason, version: rendered.version, omitted_actions: rendered.omitted_actions || 0 };
         }
-        return { fields: pick(row, VISIBLE_FIELDS), sender, canonical: projection(CANONICAL_FIELDS, true), card };
+        return { fields: pick(row, VISIBLE_FIELDS), sender, canonical: projection(CANONICAL_FIELDS, true), card,
+          ...(nonCard ? { non_card: nonCard } : {}) };
       };
       const opaque = row => Object.fromEntries(OPAQUE_FIELDS.map(key => {
         const text = typeof row[key] === 'string' ? row[key] : JSON.stringify(row[key] ?? null);
@@ -272,9 +295,12 @@ function beginMaintenanceReview(options, { db, mode, rows, scopes = [], now = Da
           changed_fields: OPAQUE_FIELDS.filter(key => !equal(original[key] ?? null, effective[key])) } };
     }).sort((a,b) => a.id - b.id);
     if (entries.length !== snapshots.length || entries.some((entry,i) => entry.id !== snapshots[i].id || entry.before_sha256 !== digest(snapshots[i]))) fail('snapshot_changed');
+    const textReview = entries.some(entry => entry.display.before.non_card || entry.display.after.non_card);
+    if (textReview) for (const entry of entries) for (const side of ['before', 'after']) entry.display[side].non_card ??= null;
     const binding = { ...control.binding, verified_self_sha256: self };
     const created = approval?.created_at_ms ?? now();
-    const artifact = { schema: REVIEW_SCHEMA, mode, created_at_ms: created, expires_at_ms: created + REVIEW_AGE_MS, disclosure: REVIEW_DISCLOSURE,
+    const artifact = { schema: textReview ? TEXT_REVIEW_SCHEMA : REVIEW_SCHEMA, mode, created_at_ms: created, expires_at_ms: created + REVIEW_AGE_MS,
+      disclosure: textReview ? TEXT_REVIEW_DISCLOSURE : REVIEW_DISCLOSURE,
       binding, constraints: selection, records: entries };
     validateArtifact(artifact, now());
     if (bytes(`${JSON.stringify(artifact, null, 2)}\n`) > REVIEW_MAX_BYTES) fail('too_large');
@@ -289,7 +315,7 @@ function beginMaintenanceReview(options, { db, mode, rows, scopes = [], now = Da
       const latest = captureBinding(db, scopes);
       if (!equal(latest.binding, control.binding)) fail('binding_changed');
     };
-    return { summary: { schema: REVIEW_SCHEMA, sha256: hash, records: entries.length, changes, expires_at_ms: artifact.expires_at_ms,
+    return { summary: { schema: artifact.schema, sha256: hash, records: entries.length, changes, expires_at_ms: artifact.expires_at_ms,
       raw_policy: 'opaque_digest_only', card_policy: 'api_snapshot_not_business_approval' },
       assertBinding: approval ? assertBinding : undefined,
       fence: approval ? { createdAtMs: artifact.created_at_ms, expiresAtMs: artifact.expires_at_ms,

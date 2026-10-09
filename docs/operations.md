@@ -750,7 +750,7 @@ node bin/exocortex.mjs maintenance enrich --target records --db "$DB_PATH" \
   --apply --review-in "$PRIVATE_NAMES_REVIEW" --review-sha256 "$REVIEWED_SHA256"
 ```
 
-卡片使用相同的 review 参数，原有 scope、窗口、全部 message ID 和两个预算必须再次明确给出：
+卡片及 text、post、system、general_calendar、video_chat 消息使用相同的 review 参数，原有 scope、窗口、全部 message ID 和两个预算必须再次明确给出：
 
 ```bash
 node bin/exocortex.mjs maintenance replay --db "$DB_PATH" \
@@ -764,6 +764,8 @@ node bin/exocortex.mjs maintenance replay --db "$DB_PATH" \
 `--review-out` 仅允许 dry-run；`--review-in`、`--review-sha256`、`--apply` 必须同时出现。两种命令都必须显式提供次数和秒数预算；空 review 参数也失败关闭，不能退回 legacy apply。SHA 覆盖实际 UTF-8 文件全部字节，包括缩进与末尾换行，编辑格式或重复 JSON 键也会改变批准摘要。输入必须是当前用户所有、私有、单硬链接普通文件；拒绝符号链接、非私有目录、非规范父路径、未知 schema 字段和超限文件。文件是数据，不能执行 SQL、选择新路径、增加目标或扩大预算。
 
 工件逐项列出目标/版本、决策、姓名 before/after 及来源/置信度、聊天与删除标记，并区分字段缺失和 JSON null。卡片可读部分重新渲染 API 原文；实际 final after 使用正式 SQLite upsert 的版本和合并投影，保留已有权威姓名。相同或更旧版本只展示原行 final after 和 conflict/duplicate，不把 incoming 当成实际更新。`title`、`body`、`canonical_json`、`raw_json`、`content_hash` 每列只展示摘要、字节数及变化字段；完整拟写投影另有摘要绑定。可读卡片不是存储 body 列的逐字展开，也不是业务审批状态的证明。
+
+names 和纯卡片回放继续使用 v1 工件。包含 text、post、system、general_calendar、video_chat 的回放使用 v2：这些类型的 `display.before/after.non_card` 完整展示实际存储的 `title` 与 `body`（保留 null、换行和 Unicode，不截断或脱敏），并继续提供各列摘要；原生 raw 消息类型必须与 canonical 类型一致。内容可能含私有信息，只能在私有工件中审阅，不输出到公开报告。这里展示的是存储/API 投影，不能据此认定客户端状态；post/system 的未解析参数、日历和通话消息的 API 原始结构也会按实际存储正文显示；API 不提供的实时参会、日历响应等客户端状态不由该工件推断。混合工件中的 interactive 项仍须完整卡片渲染，`non_card` 为 null。其他非卡片类型仍失败关闭。v2 保留 v1 的完整前值、身份、基线、期限及 fresh proposal 检查；旧部署不识别 v2，不能直接使用候选生成的 v2 工件在旧部署 apply，须先另行批准兼容代码部署并重新预览。
 
 任何 before/after 卡片渲染为 partial 或 structured_fallback（包括未解析 mention）均拒绝工件；正文、节点、深度等截断不能静默称为完整。完整渲染中的交互值省略和 URL 凭据脱敏可以保留，但 disclosure 和 omitted_actions 明确说明不可读范围，原内容摘要仍参与批准比较。最多 100 个目标，工件最多 1 MiB，每条参与比较的 before/有效 after/已获取 incoming 源快照合计最多 256 KiB，全体最多 4 MiB，姓名和白名单文本字段每字段最多 1 KiB UTF-8。任何超限均失败关闭，不自动扩大限制。
 
