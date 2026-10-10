@@ -44,6 +44,10 @@ type SyncSummary = {
     partial?: boolean;
     incomplete?: boolean;
     details?: RunSummary[];
+    profile?: string;
+    outcome?: string;
+    request_budget?: JsonObject;
+    [key: string]: unknown;
 };
 type AdaptiveFairOptions = {
     receivedScopesPerCycle: number;
@@ -63,6 +67,10 @@ type AdaptiveCycleObservation = {
     steps?: WorkerEvent[];
 };
 declare const REQUIRED_CYCLE_STEPS: string[];
+/** Optional maintenance has its own outcome. Its business debt cannot stand in
+ * for evidence that a forward step failed. Without receipts, keep the caller's
+ * conservative legacy cycle result. */
+declare function cycleHealthyWithoutHistory(steps: WorkerEvent[] | undefined, fallback: boolean): boolean;
 /** Version the added history slice so old six-step receipts are still readable. */
 declare function expectedCycleSteps(event: {
     step_count?: number;
@@ -85,13 +93,15 @@ declare function adaptiveFairDecision(state: AdaptiveFairState, observation: Ada
         reason: string;
         healthy_cycles: number;
         durations: {
-            work_ms: number;
             interval_ms: number;
             target_cycle_ms: number;
             fair_ms: number | null;
             other_ms: number;
             fair_budget_ms: number;
             per_scope_ms: number | null;
+            history_ms?: number | undefined;
+            forward_work_ms?: number | undefined;
+            work_ms: number;
         };
         observed_fair_scopes: number;
         pressure: {
@@ -180,6 +190,9 @@ declare function compactSummary(summary: SyncSummary | null | undefined): {
     partial?: boolean | undefined;
     ok: boolean | undefined;
 } | null;
+/** Strict public projection: never copy record IDs, raw/error payloads, arbitrary
+ * reasons or unknown nested fields into the worker's history receipt. */
+declare function compactHistorySummary(summary: SyncSummary | null | undefined): JsonObject | null;
 declare function cyclePayload(cycle: number, steps: WorkerEvent[], now?: () => string): WorkerCyclePayload;
 declare function runCycleWithRunner(opts: WorkerCycleOptions, cycle: number, runStep: WorkerStepRunner, writeLog: WorkerLogWriter, now?: () => string, onComplete?: (steps: WorkerEvent[], payload: WorkerCyclePayload) => void): boolean;
 declare function summarizeWorkerEvents(events: unknown[], nowMs?: number): {
@@ -210,4 +223,4 @@ declare function summarizeWorkerEvents(events: unknown[], nowMs?: number): {
         age_ms: number | null;
     } | null;
 };
-export { REQUIRED_CYCLE_STEPS, expectedCycleSteps, adaptiveFairDecision, buildCycleStepSpecs, compactRun, compactSummary, compactTransportCooldowns, compactTransportStats, createAdaptiveFairState, mergeTransportCooldowns, cyclePayload, runCycleWithRunner, summarizeWorkerEvents, };
+export { REQUIRED_CYCLE_STEPS, expectedCycleSteps, adaptiveFairDecision, buildCycleStepSpecs, compactRun, compactSummary, compactHistorySummary, compactTransportCooldowns, compactTransportStats, createAdaptiveFairState, mergeTransportCooldowns, cyclePayload, cycleHealthyWithoutHistory, runCycleWithRunner, summarizeWorkerEvents, };

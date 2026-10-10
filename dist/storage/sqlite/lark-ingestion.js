@@ -271,8 +271,9 @@ function commitLarkProgress(dbPath, scope, runId, records, scannedCount, metadat
     BEGIN IMMEDIATE;
     ${larkRunFenceSql(scope, runId, now)}
     CREATE TEMP TABLE __lark_attempts (failed INTEGER NOT NULL CHECK (failed IN (0, 1)));
-    ${mutationSql}
+    ${phase === "list" ? mutationSql : ""}
     ${recordWritesSql(normalized, now)}
+    ${phase === "details" ? mutationSql : ""}
     CREATE TEMP TABLE __lark_finish AS
       SELECT p.cursor_json, p.coverage_start_ms, p.generation,
         CAST(json_extract(p.cursor_json, '$.created_at_ms') AS INTEGER) AS end_ms,
@@ -427,12 +428,11 @@ function finishLarkDetailRun(dbPath, scope, runId, outcomes, metadata = {}) {
         const recordVersion = normalizeExternalVersion(outcome.record?.external_version);
         const taskCondition = `scope_id = ${quoteSql(scope.id)} AND message_id = ${quoteSql(outcome.message_id)}
       AND fingerprint = ${quoteSql(outcome.fingerprint)} AND status = 'pending'`;
-        // A response rejected by stored-version protection is not evidence of
-        // completeness. Keep and back off its debt while healthy siblings finish.
-        const completeSql = outcome.record ? `NOT EXISTS (
-      SELECT 1 FROM records existing CROSS JOIN (SELECT ${quoteSql(recordVersion)} AS external_version) incoming
-      WHERE existing.source_id = ${quoteSql(scope.source_id)} AND existing.external_id = ${quoteSql(outcome.message_id)}
-        AND NOT ${versionCanReplaceSql("existing", "incoming")}
+        // Consume the exact acceptance result used by the record write, including
+        // equal-version source conflicts. No independent detail selection policy.
+        const completeSql = outcome.record ? `EXISTS (
+      SELECT 1 FROM __record_acceptance a WHERE a.source_id=${quoteSql(scope.source_id)}
+        AND a.external_id=${quoteSql(outcome.message_id)} AND a.accepted
     )` : "0";
         return `
       INSERT INTO __lark_guard SELECT CASE WHEN EXISTS (SELECT 1 FROM lark_im_detail_tasks WHERE ${taskCondition}) THEN 1 ELSE 0 END;
@@ -446,9 +446,9 @@ function finishLarkDetailRun(dbPath, scope, runId, outcomes, metadata = {}) {
         occurred_at_ms = CASE WHEN ${completeSql} THEN ${resolvedRoot?.occurred_at_ms ?? "NULL"} ELSE occurred_at_ms END,
         retry_at = ${outcome.retry_at ? quoteSql(new Date(outcome.retry_at).toISOString())
             : `strftime('%Y-%m-%dT%H:%M:%fZ', ${quoteSql(now)}, '+' || min(86400, 60 * (1 << min(attempt_count, 11))) || ' seconds')`},
-        last_error_type = CASE WHEN ${completeSql} THEN NULL ELSE ${quoteSql(outcome.error?.name || (outcome.error ? "Error" : "LarkDetailVersionConflict"))} END,
+        last_error_type = CASE WHEN ${completeSql} THEN NULL ELSE ${quoteSql(outcome.error?.name || (outcome.error ? "Error" : "LarkDetailObservationConflict"))} END,
         last_error_message = CASE WHEN ${completeSql} THEN NULL ELSE ${quoteSql(outcome.error
-            ? String(outcome.error.message).slice(0, 4000) : "Detail response cannot replace the stored source version")} END,
+            ? String(outcome.error.message).slice(0, 4000) : "Detail observation was not accepted; complete-content debt remains pending")} END,
         updated_at = ${quoteSql(now)}, completed_at = CASE WHEN ${completeSql} THEN ${quoteSql(now)} ELSE NULL END WHERE ${taskCondition};
       INSERT INTO __lark_attempts SELECT status = 'pending' FROM lark_im_detail_tasks
         WHERE scope_id = ${quoteSql(scope.id)} AND message_id = ${quoteSql(outcome.message_id)};

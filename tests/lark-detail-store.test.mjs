@@ -10,6 +10,7 @@ import {
 } from "../dist/storage/sqlite/ingestion-store.js";
 import { normalizeApiMessage } from "../src/adapters/lark-im/raw-message.mjs";
 import { recordFromMessage } from "../src/adapters/lark-im/message-record.mjs";
+import { createLarkImAdapter } from "../src/adapters/lark-im/adapter.mjs";
 
 // All identities and content in this file are invented from scratch.
 const START = Date.parse("2026-01-01T00:00:00Z");
@@ -362,7 +363,7 @@ test("an unordered detail response rejected by version protection remains retria
   assert.deepEqual(records(db), before);
   const task = tasks(db)[0];
   assert.equal(task.status, "pending");
-  assert.equal(task.last_error_type, "LarkDetailVersionConflict");
+  assert.equal(task.last_error_type, "LarkDetailObservationConflict");
   assert.equal(task.attempt_count, 1);
   assert.ok(Date.parse(task.retry_at) > Date.parse(task.updated_at));
   assert.equal(readScope(db, SCOPE).cursor.created_at_ms, START + 1_000);
@@ -384,7 +385,7 @@ test("a detail version older than stored content backs off without blocking heal
     attempted: 2, completed: 1, failed: 1, generation: 2 });
   assert.equal(effects.full_cursor_promoted, false);
   assert.equal(records(db).find((record) => record.external_id === stale.message_id).external_version, String(START + 4_000));
-  assert.equal(tasks(db).find((task) => task.message_id === stale.message_id).last_error_type, "LarkDetailVersionConflict");
+  assert.equal(tasks(db).find((task) => task.message_id === stale.message_id).last_error_type, "LarkDetailObservationConflict");
   assert.equal(tasks(db).find((task) => task.message_id === healthy.message_id).status, "complete");
   assert.equal(readScope(db, SCOPE).cursor, null);
 });
@@ -456,4 +457,53 @@ test("an expired soft TTL retains the existing live-owner commit semantics befor
   assert.equal(effects.inserted, 1);
   assert.equal(effects.full_cursor_promoted, true);
   assert.equal(readScope(db, SCOPE).cursor.created_at_ms, START + 1_000);
+});
+
+
+test("equal-version rejected details keep coverage debt while a healthy sibling completes and later newer detail resolves", (t) => {
+  const db = database(t), root = raw("invented-source-conflict", START + 1_000, START + 2_000);
+  list(db, START, START + 1_000, [root]);
+  retry(db, pending(db)[0], { record: detailRecord(root) });
+  const before = records(db)[0];
+  const changed = { ...root, body: { content: '{"unknown_revision":2}' } };
+  const sibling = raw("invented-healthy-sibling", START + 2_000, START + 3_000);
+  list(db, START + 1_000, START + 3_000, [changed, sibling]);
+  const { scope, runId } = begin(db);
+  const effects = finishLarkDetailRun(db, scope, runId, pending(db).map(task => ({
+    message_id: task.message_id, fingerprint: task.fingerprint,
+    record: recordFromMessage(createLarkImAdapter({run: args => {
+      assert.equal(args[2], `/open-apis/im/v1/messages/${task.message_id}`);
+      return {code:0,data:{items:JSON.parse(detailRecord(task.raw_root).raw_json).raw_api_expansions.merge_forward.items}};
+    }}).fetchMessageDetails(task.raw_root,{retries:0,detailMaxPages:2,detailMaxItems:100}),SCOPE,"sent"),
+  })));
+  assert.equal(effects.updated, 0); assert.equal(effects.conflicts, 1); assert.equal(effects.inserted, 1);
+  assert.equal(effects.pending_details, 1); assert.equal(effects.full_cursor_promoted, false);
+  assert.equal(readScope(db, SCOPE).cursor.created_at_ms, START + 1_000);
+  const evidence = run(db, runId);
+  assert.equal(evidence.status, "failed"); assert.equal(evidence.metadata.details_complete, false);
+  assert.equal(evidence.metadata.window_complete, false); assert.equal(evidence.metadata.coverage_mode, undefined);
+  assert.deepEqual([evidence.metadata.lark_progress.completed,evidence.metadata.lark_progress.failed],[1,1]);
+  const debt = tasks(db).find(task => task.message_id === root.message_id);
+  assert.equal(debt.status, "pending"); assert.equal(debt.last_error_type, "LarkDetailObservationConflict");
+  assert.ok(Date.parse(debt.retry_at) >= Date.parse(debt.updated_at) + 60_000);
+  assert.equal(tasks(db).find(task => task.message_id === sibling.message_id).status, "complete");
+  assert.deepEqual(records(db).find(row => row.external_id === root.message_id), before);
+  // Repeating the same sent observation cannot self-confirm; it is not in history's received domain.
+  assert.equal(retry(db, debt, { record: detailRecord(changed) }).effects.pending_details, 1);
+  const resolved = retry(db, pending(db)[0], { record: detailRecord({ ...changed, update_time: String(START + 4_000) }) });
+  assert.equal(resolved.effects.full_cursor_promoted, true);
+  assert.equal(readScope(db, SCOPE).cursor.created_at_ms, START + 3_000);
+});
+
+test("an equivalent complete detail no-op can retire debt without rewriting its raw representative", (t) => {
+  const db = database(t), root = raw("invented-equivalent-detail", START + 1_000, START + 2_000);
+  list(db, START, START + 2_000, [root]);
+  const complete = detailRecord(root);
+  sqliteExec(db, upsertRecordsSql([complete]), "another path selected the same complete observation");
+  const reordered = Object.fromEntries(Object.entries(root).reverse());
+  reordered.body = { content: ' { } ' };
+  const finished = retry(db, pending(db)[0], { record: detailRecord(reordered) });
+  assert.equal(finished.effects.conflicts, undefined); assert.equal(finished.effects.full_cursor_promoted, true);
+  assert.equal(tasks(db)[0].status, "complete"); assert.equal(run(db, finished.runId).metadata.details_complete, true);
+  assert.equal(records(db)[0].raw_json, complete.raw_json);
 });

@@ -61,7 +61,7 @@ function history(f, messages=f.messages, extra={}) {
   return executeLarkImHistory({db:f.db,maxCliAttempts:4,maxSeconds:30},{
     createRequestSession:()=>({runLark:()=>{throw Error('unexpected real boundary');},assertReady(){},summary:()=>({cli_attempts:2,max_cli_attempts:4,max_seconds:30,elapsed_ms:1})}),
     getSelfProfile:()=>{f.calls++;return SELF;},
-    fetchChatMessages:(chat,start,end)=>{f.calls++;assert.equal(chat,CHAT);assert.ok(end-start<=1000);return {messages:messages.map(m=>normalizeApiMessage(m)),pages:1};},...extra});
+    fetchChatMessageList:(chat,start,end)=>{f.calls++;assert.equal(chat,CHAT);assert.ok(end-start<=1000);return {messages:messages.map(m=>normalizeApiMessage(m)),pages:1};},...extra});
 }
 
 test('normal ingestion and replay refuse the same equal-version conflict and retain unknown source data',t=>{
@@ -133,7 +133,7 @@ test('fixed horizon and scope rotation bound starvation while new traffic arrive
 
 for(const failure of ['missing','permission','incomplete'])test(`historical ${failure} records debt without deleting or falsely verifying a row`,t=>{
   const f=fixture(t,2), before=rows(f);
-  const result=history(f,[],{fetchChatMessages:()=>{if(failure==='permission')throw Error('invented forbidden secret');return {messages:[],pages:1,has_more:failure==='incomplete'};}});
+  const result=history(f,[],{fetchChatMessageList:()=>{if(failure==='permission')throw Error('invented forbidden secret');return {messages:[],pages:1,has_more:failure==='incomplete'};}});
   assert.equal(result.ok,false);assert.deepEqual(rows(f),before);assert.ok(state(f)[0].history_error);
   assert.equal(selectHistoryTarget(f.db).record.id,before[1].id);
   assert.doesNotMatch(JSON.stringify(result),/secret|om_invented|oc_invented/);
@@ -146,13 +146,13 @@ test('disabled source/scope performs no history API; local source/account drift 
   store.sqliteExec(f.db,`UPDATE sync_scopes SET enabled=1 WHERE id=${q(SCOPE)}; UPDATE sources SET enabled=0 WHERE id='lark.im';`);
   assert.equal(history(f).outcome,'no_eligible_known_record');assert.equal(f.calls,0);
   store.sqliteExec(f.db,"UPDATE sources SET enabled=1 WHERE id='lark.im';");
-  assert.throws(()=>history(f,f.messages,{fetchChatMessages:()=>{store.sqliteExec(f.db,"UPDATE sources SET enabled=0 WHERE id='lark.im';");return {messages:f.messages.map(m=>normalizeApiMessage(m)),pages:1};}}));
+  assert.throws(()=>history(f,f.messages,{fetchChatMessageList:()=>{store.sqliteExec(f.db,"UPDATE sources SET enabled=0 WHERE id='lark.im';");return {messages:f.messages.map(m=>normalizeApiMessage(m)),pages:1};}}));
   assert.equal(store.sqliteQuery(f.db,'SELECT COUNT(*) n FROM lark_im_history_progress;')[0].n,0);
 });
 
 test('a late fetch cannot overwrite an ABA local change or qualify its stale candidate as confirmation',t=>{
   const f=fixture(t), before=rows(f)[0], changed=native(f,0,{body:{content:'{"text":"Invented stale"}'}});
-  const result=history(f,[changed],{fetchChatMessages:()=>{
+  const result=history(f,[changed],{fetchChatMessageList:()=>{
     store.sqliteExec(f.db,`UPDATE records SET body='temporary invented'; UPDATE records SET body=${q(before.body)},updated_at=${q(before.updated_at)};`);
     return {messages:[normalizeApiMessage(changed)],pages:1};
   }});
@@ -322,9 +322,9 @@ test('history rotates enabled scopes independently of a permanently missing olde
   const records=prepareChatWindowRecords([normalizeApiMessage(other)],otherScope,null,f.start,f.start+60000,SELF.open_id,{self:SELF},{chat_id:otherChat,chat_type:'group'});
   store.sqliteExec(f.db,store.upsertRecordsSql(records));
   const first=selectHistoryTarget(f.db);
-  history(f,[],{fetchChatMessages:()=>({messages:[],pages:1})});
+  history(f,[],{fetchChatMessageList:()=>({messages:[],pages:1})});
   const second=selectHistoryTarget(f.db);assert.notEqual(second.scope.id,first.scope.id);
-  history(f,[],{fetchChatMessages:()=>({messages:[],pages:1})});
+  history(f,[],{fetchChatMessageList:()=>({messages:[],pages:1})});
   assert.equal(selectHistoryTarget(f.db).scope.id,first.scope.id);
 });
 
@@ -362,7 +362,7 @@ test('autonomous historical recheck requires a verified account association',t=>
   const f=fixture(t), before=rows(f);
   store.sqliteExec(f.db,"UPDATE sources SET config_json=json_remove(config_json,'$.initial_account_binding') WHERE id='lark.im';");
   let fetches=0;
-  assert.throws(()=>history(f,f.messages,{fetchChatMessages:()=>{fetches++;return {messages:[],pages:1};}}),/account identity unavailable/);
+  assert.throws(()=>history(f,f.messages,{fetchChatMessageList:()=>{fetches++;return {messages:[],pages:1};}}),/account identity unavailable/);
   assert.equal(fetches,0);assert.deepEqual(rows(f),before);
   assert.equal(store.sqliteQuery(f.db,'SELECT COUNT(*) n FROM lark_im_history_progress;')[0].n,0);
 });
@@ -376,4 +376,50 @@ test('automatic history retains one audit receipt per scope without pruning expl
   const audits=store.sqliteQuery(f.db,'SELECT id FROM bounded_replay_runs;');
   assert.equal(audits.length,2);assert.ok(audits.some(row=>row.id===manual));
   assert.equal(store.sqliteQuery(f.db,'SELECT generation FROM lark_im_history_progress;')[0].generation,4);
+});
+
+
+test('unversioned native observations expose unordered debt and cannot silently establish a numeric baseline',async t=>{
+  const f=fixture(t), unversioned={...f.messages[0]};delete unversioned.update_time;
+  store.sqliteExec(f.db,'DELETE FROM records;');
+  store.sqliteExec(f.db,store.upsertRecordsSql(records(f,[unversioned])));
+  const before=rows(f), changed=native(f,0,{body:{content:'{"text":"Invented numeric candidate"}'}});
+  for(let i=0;i<2;i++)assert.equal(normal(f,records(f,[changed])[0]).conflicts,1);
+  assert.deepEqual(rows(f),before);assert.equal(state(f)[0].reason,'source_version_unordered');
+  assert.equal(selectHistoryTarget(f.db),null);
+  const {buildStatus}=await import('../src/diagnostics/sync-status-report.mjs');
+  assert.equal(buildStatus(f.db).source_observations.pending_unordered_versions,1);
+});
+
+test('history confirmation resets on unknown scope policy changes but not the existing discovery scheduling projection',t=>{
+  const f=fixture(t), changed=native(f,0,{body:{content:'{"text":"Invented stable candidate"}'}});
+  assert.equal(history(f,[changed]).conflicts,1);const before=rows(f), first=state(f)[0].candidate_context;
+  store.sqliteExec(f.db,`UPDATE sync_scopes SET config_json=json_set(config_json,'$.unknown_future_policy','changed') WHERE id=${q(SCOPE)};`);
+  assert.equal(history(f,[changed]).conflicts,1);assert.deepEqual(rows(f),before);
+  assert.notEqual(state(f)[0].candidate_context,first);
+  store.sqliteExec(f.db,`UPDATE sync_scopes SET config_json=json_set(config_json,'$.hot_rank',4,'$.hot_seen_at','invented','$.last_hot_snapshot_id','invented') WHERE id=${q(SCOPE)};`);
+  assert.equal(history(f,[changed]).updated,1);
+});
+
+
+test('history-confirmed received details remain coverage debt until a fresh accepted detail retry completes',t=>{
+  const f=fixture(t,0), root=native(f,0,{msg_type:'merge_forward',body:{content:'{}'}});
+  const child=native(f,1,{upper_message_id:root.message_id});
+  const freshChild={...child,body:{content:'{"text":"Invented stable child","unknown_source_field":4}'}};
+  const expanded=items=>normalizeApiMessage(root,{mergeItems:[root,...items]});
+  const detail=items=>prepareChatWindowRecords([expanded(items)],SCOPE,null,f.start,f.start+60000,SELF.open_id,{self:SELF},{chat_id:CHAT,chat_type:'group'})[0];
+  store.sqliteExec(f.db,store.upsertRecordsSql([detail([child])]));
+  let scope=store.readScope(f.db,SCOPE),run=store.createRun(f.db,scope);
+  store.commitLarkListRun(f.db,scope,run,[],[root],1,{created_at_ms:f.start+60000},{initial_sync_start_ms:f.start,list_window_start_ms:f.start,list_window_end_ms:f.start+60000});
+  const finish=()=>{scope=store.readScope(f.db,SCOPE);run=store.createRun(f.db,scope);const task=store.readPendingLarkDetails(f.db,scope,{now:'2099-01-01T00:00:00Z'})[0];
+    return store.finishLarkDetailRun(f.db,scope,run,[{message_id:root.message_id,fingerprint:task.fingerprint,record:detail([freshChild])}]);};
+  assert.equal(finish().pending_details,1);const before=rows(f),cursor=store.readScope(f.db,SCOPE).cursor_json;
+  const deps={fetchChatMessageList:()=>({messages:[],detailRoots:[root],pages:1}),fetchMessageDetails:()=>expanded([freshChild])};
+  assert.equal(history(f,[],deps).conflicts,1);assert.deepEqual(rows(f),before);
+  assert.equal(history(f,[],deps).updated,1);
+  assert.equal(store.readScope(f.db,SCOPE).cursor_json,cursor);
+  assert.equal(store.sqliteQuery(f.db,'SELECT status FROM lark_im_detail_tasks;')[0].status,'pending');
+  const completed=finish();assert.equal(completed.full_cursor_promoted,true);assert.equal(completed.conflicts,undefined);
+  assert.equal(store.readScope(f.db,SCOPE).cursor.created_at_ms,f.start+60000);
+  assert.equal(JSON.parse(rows(f)[0].raw_json).raw_api_expansions.merge_forward.items[1].body.content,freshChild.body.content);
 });

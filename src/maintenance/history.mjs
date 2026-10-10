@@ -7,6 +7,8 @@ import { createMaintenanceRequestSession } from './request-session.mjs';
 import { readOnlySqliteJson } from '../storage/sqlite/readonly-query.mjs';
 import { captureRemoteAccountBinding, readRemoteAccountBinding, accountBindingAdmissionError } from '../diagnostics/remote-account-binding.mjs';
 import { commitBoundedReplayRecords, quoteSql, normalizeBoundedReplayRecords } from '../../dist/storage/sqlite/ingestion-store.js';
+import { stable } from '../../dist/core/lark-observation.js';
+import { SCOPE_CONFIG_POLICY, projectScopeConfig } from './scope-config-policy.mjs';
 
 const sha = text => createHash('sha256').update(text).digest('hex');
 const PROFILE = 'known_record_history/v1';
@@ -80,17 +82,27 @@ function executeLarkImHistory(options, deps = {}) {
   const endMs = Math.floor(row.occurred_at_ms / 1000) * 1000 + 1000;
   let records = [], pages = 1, fetchedCount = 0, error = null;
   try {
-    const fetched = (deps.fetchChatMessages || adapter.fetchChatMessages)(config.chat_id, startMs, endMs, fetchOptions);
-    if (!Array.isArray(fetched.messages) || fetched.messages.length > 100 || fetched.has_more === true
+    // Complete the list before selecting; unrelated merge roots never consume
+    // this known row's detail budget or turn their permission debt into ours.
+    const fetched = (deps.fetchChatMessageList || adapter.fetchChatMessageList)(config.chat_id, startMs, endMs, fetchOptions);
+    const detailRoots = fetched.detailRoots ?? [];
+    if (!Array.isArray(fetched.messages) || !Array.isArray(detailRoots)
+      || fetched.messages.length + detailRoots.length > 100 || fetched.has_more === true
       || !Number.isSafeInteger(fetched.pages) || fetched.pages < 1 || fetched.pages > 2) throw new Error('incomplete');
-    if (Buffer.byteLength(JSON.stringify(fetched.messages)) > 1024 * 1024) throw new Error('size_limit');
-    if (fetched.messages.some(message => chatId(message) && chatId(message) !== config.chat_id)) throw new Error('identity');
-    pages = fetched.pages; fetchedCount = fetched.messages.length;
-    const matches = fetched.messages.filter(message => messageId(message) === row.external_id);
-    if (matches.length !== 1) throw new Error(matches.length ? 'ambiguous' : 'missing');
-    const prepared = prepareChatWindowRecords(fetched.messages, scope.id, null, startMs, endMs, self.open_id, { self }, config);
-    normalizeBoundedReplayRecords(prepared, 'lark.im'); // validate all items before selecting
-    records = prepared.filter(record => record.external_id === row.external_id);
+    const listed = [...fetched.messages, ...detailRoots];
+    if (Buffer.byteLength(JSON.stringify(listed)) > 1024 * 1024) throw new Error('size_limit');
+    if (listed.some(message => chatId(message) && chatId(message) !== config.chat_id)) throw new Error('identity');
+    pages = fetched.pages; fetchedCount = listed.length;
+    const ordinary = fetched.messages.filter(message => messageId(message) === row.external_id);
+    const roots = detailRoots.filter(message => messageId(message) === row.external_id);
+    if (ordinary.length + roots.length !== 1) throw new Error(ordinary.length + roots.length ? 'ambiguous' : 'missing');
+    const selected = roots.length ? (deps.fetchMessageDetails || adapter.fetchMessageDetails)(roots[0], {
+      retries: 0, retryDelayMs: 0, detailMaxPages: 2, detailMaxItems: 100, detailBudgetMs: 30_000,
+    }) : ordinary[0];
+    if (Buffer.byteLength(JSON.stringify(selected)) > 1024 * 1024) throw new Error('size_limit');
+    records = prepareChatWindowRecords([selected], scope.id, null, startMs, endMs, self.open_id, { self }, config);
+    normalizeBoundedReplayRecords(records, 'lark.im');
+    if (records.some(record => record.external_id !== row.external_id)) throw new Error('identity');
     if (records.length !== 1 || records[0].occurred_at_ms !== row.occurred_at_ms || records[0].container_id !== row.container_id) throw new Error('identity');
     records = records.map(record => ({ ...record, expected_external_version: row.external_version }));
     session.assertReady();
@@ -113,7 +125,8 @@ function executeLarkImHistory(options, deps = {}) {
     attemptId, selfIdHash: sha(self.open_id), pages, fetchedCount, records,
     observationAcquisition: { attempt: attemptId, startedAtMs, basis: new Map([[row.external_id, target.observationGeneration]]), confirm: true,
       contextKey: sha(JSON.stringify({ profile: PROFILE, self: self.open_id, account: accountKey,
-        database: binding.database_key, source: sha(target.sourceConfigJson), scope: scope.id, chat: config.chat_id })) },
+        database: binding.database_key, source: sha(target.sourceConfigJson), scope: scope.id, chat: config.chat_id,
+        scopePolicy: SCOPE_CONFIG_POLICY, scopeConfig: sha(stable(projectScopeConfig(config))) })) },
     history: { ...target.checkpoint, startedAtMs, error, requestBudget },
     reviewBeforeCommit: checkBinding,
     reviewFence: { mode: 'replay', createdAtMs: startedAtMs, expiresAtMs: startedAtMs + 30 * 60 * 1000,

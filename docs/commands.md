@@ -294,7 +294,7 @@ Recheck one known historical record with a durable fixed-horizon checkpoint.
 | `--db` | path | — | 必填 | Database; default relative to installation root, explicit relative paths to cwd. |
 | `--format` | text/json | `text` | — | Output format. |
 | `--max-cli-attempts` | integer | `4` | ≥ 2；≤ 4 | Actual CLI budget, 2 to 4. |
-| `--max-seconds` | integer | `30` | ≥ 1；≤ 30 | Elapsed budget, 1 to 30 seconds. |
+| `--max-seconds` | integer | `30` | ≥ 1；≤ 30 | Remote-work budget, 1 to 30 seconds; not the whole subprocess wall time. |
 
 ### maintenance repair
 
@@ -384,6 +384,6 @@ Preview database compaction; --apply permits the write.
 
 ### 有界历史核验
 
-`maintenance history --db <path> --max-cli-attempts 4 --max-seconds 30` 处理一个已知原生历史记录，写入核验检查点和观察证据。worker 每轮在正常同步之后执行一次。它不推进发现或同步游标，不证明未入库历史消息已全部发现。停用来源或范围不会被重新启用。
+`maintenance history --db <path> --max-cli-attempts 4 --max-seconds 30` 处理一个已知原生历史记录，写入核验检查点和观察证据。worker 每轮在正常同步之后执行一次。先完成列表分页，再只展开选中合并消息；无关消息不耗用详情预算。30 秒限制远程工作，不是整个子进程墙钟期限。它不推进发现或同步游标，不证明未入库历史消息已全部发现。停用来源或范围不会被重新启用。
 
-消息 replay 的新私有审阅使用 v4：仅在完整来源证明和本地投影依赖一致时接受表示变化。旧 v1–v3 文件仍按原有精确规则验证。fresh proposal 被拒绝时，审阅文件旁最多保存三份仅本人可读的候选证据；这些文件不是批准文件，不能延长原 TTL。具体边界见 [数据变化契约](data-change-contract.md)。
+消息 replay 的新私有审阅使用 v4：仅在完整来源证明和本地投影依赖一致时接受表示变化。旧 v1–v3 文件仍按原有精确规则验证。review completion 拒绝完整 fresh proposal 时，每个审批摘要最多保存三份仅本人可读的候选证据；身份前检与最终 SQLite CAS 拒绝不在此留证范围；这些文件不是批准文件，不能延长原 TTL。具体边界见 [数据变化契约](data-change-contract.md)。

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { CARD_ID_NAMESPACES, resolveCardMention } from "./lark-card-reference.js";
 
 /** A comparison of saved parsed-CLI evidence, never a client-state assertion. */
 const OBSERVATION_POLICY = "lark_raw_observation/v1";
@@ -92,7 +93,7 @@ function nativeStructure(raw: ObjectValue): ObjectValue {
   return result;
 }
 const keysWithin = (value: ObjectValue, keys: string[]) => Object.keys(value).every(key => keys.includes(key));
-const namespaces = ["open_id", "user_id", "union_id", "app_id"];
+const namespaces = CARD_ID_NAMESPACES;
 
 /** A deliberately closed profile. A renderer can display more than this proof
  * understands. In particular, actions and unknown consumers are NOT ignored. */
@@ -103,7 +104,7 @@ function referenceNormalForm(raw: ObjectValue): ObjectValue | null {
       || !keysWithin(raw.body, ["content"]) || typeof raw.body.content !== "string" || !Array.isArray(raw.mentions)
       || raw.mentions.length > 100) return null;
     if (object(raw.sender) && !keysWithin(raw.sender, ["id", "id_type", "sender_type", "tenant_key"])) return null;
-    const definitions = new Map<string, Json[]>(), typed = new Map<string, Json[][]>();
+    const definitions = new Map<string, Json[]>(), typed = new Map<string, Map<string, Json[]>>();
     const identities = new Set<string>();
     const mentions = raw.mentions.map(mention => {
       if (!object(mention) || !keysWithin(mention, ["key", "id", "id_type", "name", "tenant_key"]) || typeof mention.key !== "string"
@@ -118,7 +119,8 @@ function referenceNormalForm(raw: ObjectValue): ObjectValue | null {
       const target: Json[] = ["typed_identity", kind, id];
       if (identities.has(stable(target))) throw new Error("duplicate_identity");
       identities.add(stable(target)); definitions.set(mention.key, target);
-      typed.set(id, [...(typed.get(id) || []), target]);
+      const namespace = typed.get(kind) || new Map<string, Json[]>();
+      namespace.set(id, target); typed.set(kind, namespace);
       return { ...mention, key: target };
     });
     if (!definitions.size) return null;
@@ -136,12 +138,21 @@ function referenceNormalForm(raw: ObjectValue): ObjectValue | null {
       }
       users[alias] = { ...entry, mention_key: target };
     }
-    const resolve = (label: Json): Json[] => {
-      if (typeof label !== "string") throw new Error("invalid_reference");
-      const candidates = [...(definitions.has(label) ? [definitions.get(label)!] : []), ...(typed.get(label) || []), ...(aliases.get(label) || [])];
-      const unique = new Map(candidates.map(target => [stable(target), target]));
-      if (unique.size !== 1) throw new Error("ambiguous_reference");
-      return [...unique.values()][0];
+    const resolve = (property: ObjectValue): Json[] => {
+      const target = resolveCardMention(property, {
+        read: (value, key) => object(value) ? value[key] : undefined,
+        id: value => typeof value === "string" && value ? value : null,
+        typed: (namespace, id) => typed.get(namespace)?.get(id),
+        mention: key => definitions.get(key),
+        hasAttachment: true,
+        native: alias => {
+          const candidates = aliases.get(alias);
+          if (!candidates?.length) return null;
+          return candidates.every(candidate => candidate === candidates[0]) ? candidates[0] : null;
+        },
+      });
+      if (!target) throw new Error("unresolved_reference");
+      return target;
     };
     let count = 0;
     const node = (input: Json, depth = 0): Json => {
@@ -150,7 +161,7 @@ function referenceNormalForm(raw: ObjectValue): ObjectValue | null {
         if (!keysWithin(input, ["tag", "property"]) || !object(input.property)) throw new Error("unknown_consumer");
         const fields = Object.keys(input.property);
         if (fields.length !== 1 || !["userID", "user_id"].includes(fields[0])) throw new Error("unknown_consumer");
-        return { ...input, property: { [fields[0]]: resolve(input.property[fields[0]]) } };
+        return { ...input, property: { [fields[0]]: resolve(input.property) } };
       }
       if (["plain_text", "text", "markdown", "lark_md", "md"].includes(input.tag)) {
         if (!keysWithin(input, ["tag", "content", "text"])) throw new Error("unknown_consumer");

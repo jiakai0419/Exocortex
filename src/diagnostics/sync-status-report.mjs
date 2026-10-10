@@ -204,7 +204,7 @@ function sanitizeStatusReportForPublicOutput(report) {
     ...(report?.source_observations ? { source_observations: {
       evidence: report?.source_observations?.evidence === "available" ? "available" : "legacy_unavailable",
       coverage: "processed_known_rows_not_source_completeness",
-      ...Object.fromEntries(["pending", "history_errors", "scopes_started", "processed_attempts", "completed_sweeps"].map(key =>
+      ...Object.fromEntries(["pending", "pending_unordered_versions", "history_errors", "scopes_started", "processed_attempts", "completed_sweeps"].map(key =>
         [key, publicCount(report?.source_observations?.[key])])),
     } } : {}),
     discovery: {
@@ -365,10 +365,12 @@ function readStatusSnapshot(dbPath, query) {
         COUNT(*) - COUNT(cursor_ms) AS invalid_cursor_scopes FROM cursors` },
   );
   if (names.has("record_observation_state") && names.has("lark_im_history_progress")) sections.push({
-    label: "read source observation totals", columns: ["pending", "history_errors", "scopes_started", "processed_attempts", "completed_sweeps"],
+    label: "read source observation totals", columns: ["pending", "pending_unordered_versions", "history_errors", "scopes_started", "processed_attempts", "completed_sweeps"],
     sql: `SELECT
       (SELECT COUNT(*) FROM record_observation_state o JOIN records r ON r.id=o.record_id
         WHERE r.source_id='lark.im' AND o.candidate_json IS NOT NULL) AS pending,
+      (SELECT COUNT(*) FROM record_observation_state o JOIN records r ON r.id=o.record_id
+        WHERE r.source_id='lark.im' AND o.candidate_json IS NOT NULL AND o.reason='source_version_unordered') AS pending_unordered_versions,
       (SELECT COUNT(*) FROM record_observation_state o JOIN records r ON r.id=o.record_id
         WHERE r.source_id='lark.im' AND o.history_error IS NOT NULL) AS history_errors,
       COUNT(*) AS scopes_started,COALESCE(SUM(generation),0) AS processed_attempts,COALESCE(SUM(completed_sweeps),0) AS completed_sweeps

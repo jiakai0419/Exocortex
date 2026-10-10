@@ -50,6 +50,10 @@ type SyncSummary = {
   partial?: boolean;
   incomplete?: boolean;
   details?: RunSummary[];
+  profile?: string;
+  outcome?: string;
+  request_budget?: JsonObject;
+  [key: string]: unknown;
 };
 
 type AdaptiveFairOptions = {
@@ -83,6 +87,20 @@ const TRANSPORT_OPERATIONS = new Set([
 const REQUIRED_CYCLE_STEPS = [
   "sent", "discover-hot", "received-hot", "discover-catchup", "discover-reconcile", "received-fair",
 ];
+
+function stepHealthy(step: WorkerEvent) {
+  return step.ok === true && step.summary?.received?.ok !== false &&
+    step.summary?.sent?.ok !== false && step.summary?.discovery?.ok !== false;
+}
+
+/** Optional maintenance has its own outcome. Its business debt cannot stand in
+ * for evidence that a forward step failed. Without receipts, keep the caller's
+ * conservative legacy cycle result. */
+function cycleHealthyWithoutHistory(steps: WorkerEvent[] | undefined, fallback: boolean) {
+  return steps === undefined ? fallback : REQUIRED_CYCLE_STEPS.every(name =>
+    steps.some(step => step.name === name && stepHealthy(step))) &&
+    steps.every(step => step.name === "history" || stepHealthy(step));
+}
 
 /** Version the added history slice so old six-step receipts are still readable. */
 function expectedCycleSteps(event: { step_count?: number; cycle_policy?: string }) {
@@ -171,7 +189,14 @@ function adaptiveFairDecision(
   const cycleMs = finiteNonNegative(observation.durationMs);
   const intervalMs = (opts.intervalSeconds ?? WORKER_DEFAULTS.intervalSeconds) * 1000;
   const targetMs = (opts.adaptiveTargetCycleSeconds ?? WORKER_DEFAULTS.adaptiveTargetCycleSeconds) * 1000;
-  const otherMs = fairMs === null ? cycleMs : Math.max(0, cycleMs - fairMs);
+  const historyMs = Math.min(cycleMs, steps.filter(step => step.name === "history").reduce((total, step) => {
+    const start = Date.parse(String(step.started_at || "")), end = Date.parse(String(step.finished_at || ""));
+    return total + (Number.isFinite(start) && Number.isFinite(end) && end >= start ? end - start : 0);
+  }, 0));
+  // The fair batch models forward work. A bounded optional history slice is
+  // measured separately, not charged as a throughput regression of that batch.
+  const forwardMs = Math.max(0, cycleMs - historyMs);
+  const otherMs = fairMs === null ? forwardMs : Math.max(0, forwardMs - fairMs);
   const fairBudgetMs = Math.max(0, Math.min(
     targetMs - intervalMs - otherMs,
     (opts.stepTimeoutSeconds ?? WORKER_DEFAULTS.stepTimeoutSeconds) * 1000 * 0.8,
@@ -188,14 +213,21 @@ function adaptiveFairDecision(
       // but retain pressure when only operation counters were available.
       pressure[field] += Math.max(transport?.[field] || 0, operationTotal);
     }
-    if (step.ok !== true || step.summary?.received?.ok === false || step.summary?.sent?.ok === false || step.summary?.discovery?.ok === false) {
+    if (step.name === "history" && ["rate_limited", "rate_cooldown"].includes(step.summary?.request_budget?.stop_reason)
+      && !Math.max(transport?.rate_limits || 0, Object.values(transport?.by_operation || {}).reduce<number>(
+        (total, values) => total + finiteNonNegative((values as JsonObject).rate_limits), 0))) {
+      // Maintenance has a smaller public budget receipt than sync. A real
+      // shared rate stop is still pressure, even without transport counters.
+      pressure.rate_limits += 1;
+    }
+    if (step.name !== "history" && !stepHealthy(step)) {
       pressure.failed_steps += 1;
     }
   }
   let next = state.batch;
   let healthyCycles = 0;
   let reason = "insufficient_observation";
-  if (!observation.ok || pressure.failed_steps > 0 || pressure.rate_limits > 0 || pressure.timeouts > 0 || pressure.exhausted > 0) {
+  if ((!steps.length && !observation.ok) || pressure.failed_steps > 0 || pressure.rate_limits > 0 || pressure.timeouts > 0 || pressure.exhausted > 0) {
     next = Math.max(min, Math.floor(state.batch / 2));
     reason = "transport_or_step_pressure";
   } else if (complete && fair?.ok === true && fair?.summary?.received?.ok === true && perScopeMs !== null) {
@@ -224,7 +256,8 @@ function adaptiveFairDecision(
       next_batch: next,
       reason,
       healthy_cycles: healthyCycles,
-      durations: { work_ms: cycleMs, interval_ms: intervalMs, target_cycle_ms: targetMs, fair_ms: fairMs, other_ms: otherMs, fair_budget_ms: fairBudgetMs, per_scope_ms: perScopeMs },
+      durations: { work_ms: cycleMs, ...(historyMs > 0 ? { history_ms: historyMs, forward_work_ms: forwardMs } : {}),
+        interval_ms: intervalMs, target_cycle_ms: targetMs, fair_ms: fairMs, other_ms: otherMs, fair_budget_ms: fairBudgetMs, per_scope_ms: perScopeMs },
       observed_fair_scopes: scopes,
       pressure,
     },
@@ -443,6 +476,35 @@ function compactSummary(summary: SyncSummary | null | undefined) {
   };
 }
 
+const HISTORY_OUTCOMES = new Set(["no_eligible_known_record", "processed", "pending_observation",
+  "incomplete", "size_limit", "identity", "ambiguous", "missing", "fetch_unavailable"]);
+const REQUEST_STOP_REASONS = new Set(["cli_budget", "time_budget", "clock_unavailable", "sync_busy", "lease_unavailable",
+  "rate_cooldown", "rate_limited", "shared_cooldown_unavailable"]);
+
+/** Strict public projection: never copy record IDs, raw/error payloads, arbitrary
+ * reasons or unknown nested fields into the worker's history receipt. */
+function compactHistorySummary(summary: SyncSummary | null | undefined) {
+  if (!summary || typeof summary !== "object" || Array.isArray(summary)) return null;
+  const budget = summary.request_budget;
+  const result: JsonObject = { ok: summary.ok === true };
+  if (summary.profile === "known_record_history/v1") result.profile = summary.profile;
+  if (HISTORY_OUTCOMES.has(summary.outcome || "")) result.outcome = summary.outcome;
+  if (summary.cursor_policy === "unchanged") result.cursor_policy = "unchanged";
+  if (summary.coverage === "known_rows_only") result.coverage = "known_rows_only";
+  const error = summary.error as JsonObject | undefined;
+  if (summary.schema_version === 1 && error && ["invalid_arguments", "execution_failed"].includes(error.code)) result.reason = error.code;
+  for (const field of ["inserted", "updated", "duplicate", "conflicts"]) {
+    if (typeof summary[field] === "number" && Number.isSafeInteger(summary[field]) && Number(summary[field]) >= 0) result[field] = summary[field];
+  }
+  if (budget && typeof budget === "object" && !Array.isArray(budget)) {
+    result.request_budget = Object.fromEntries(["max_cli_attempts", "cli_attempts", "max_seconds", "min_interval_ms", "elapsed_ms"]
+      .filter(field => typeof budget[field] === "number" && Number.isSafeInteger(budget[field]) && budget[field] >= 0)
+      .map(field => [field, budget[field]]));
+    if (budget.stop_reason === null || REQUEST_STOP_REASONS.has(budget.stop_reason)) result.request_budget.stop_reason = budget.stop_reason;
+  }
+  return result;
+}
+
 function cyclePayload(
   cycle: number,
   steps: WorkerEvent[],
@@ -556,11 +618,13 @@ export {
   buildCycleStepSpecs,
   compactRun,
   compactSummary,
+  compactHistorySummary,
   compactTransportCooldowns,
   compactTransportStats,
   createAdaptiveFairState,
   mergeTransportCooldowns,
   cyclePayload,
+  cycleHealthyWithoutHistory,
   runCycleWithRunner,
   summarizeWorkerEvents,
 };

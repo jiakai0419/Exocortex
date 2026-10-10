@@ -48,7 +48,8 @@ function prepareObservationRecords(dbPath, records, acquisition) {
             }
             else {
                 action = "conflict";
-                reason = comparison.representation === "unverified" ? "source_comparison_unverified" : "same_version_source_difference";
+                reason = comparison.version === "unordered" ? "source_version_unordered"
+                    : comparison.representation === "unverified" ? "source_comparison_unverified" : "same_version_source_difference";
                 // Only a later, separately acquired history observation may confirm an
                 // ambiguous source. A replay, retry or two entries in one page cannot.
                 if (acquisition?.confirm && acquisition.contextKey && state.candidate_context === acquisition.contextKey && comparison.version === "equal" && state.candidate_json

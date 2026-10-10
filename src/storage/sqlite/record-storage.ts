@@ -363,6 +363,12 @@ function recordWritesSql(normalizedRecords: StoredRecord[], now: string) {
 ${recordIdentityGuardSql(normalizedRecords)}
 ${observationEvidenceSql(normalizedRecords, "EXISTS (SELECT 1 FROM __run_fence_guard)")}
 ${incomingRecordsSql(normalizedRecords)}
+    -- Freeze one acceptance result for both record mutation and detail debt.
+    -- A no-op equivalent response is accepted; a conflicting response is not.
+    CREATE TEMP TABLE __record_acceptance AS
+      SELECT i.source_id, i.external_id, (r.id IS NULL OR ${canReplace}) AS accepted
+      FROM __incoming_records i LEFT JOIN records r
+        ON r.source_id=i.source_id AND r.external_id=i.external_id;
     CREATE TEMP TABLE __write_effects (
       inserted INTEGER NOT NULL,
       updated INTEGER NOT NULL,
@@ -372,10 +378,11 @@ ${incomingRecordsSql(normalizedRecords)}
     INSERT INTO __write_effects (inserted, updated, duplicate, conflicts)
     SELECT
       COALESCE(SUM(CASE WHEN r.id IS NULL THEN 1 ELSE 0 END), 0),
-      COALESCE(SUM(CASE WHEN r.id IS NOT NULL AND ${canReplace} AND ${differs} THEN 1 ELSE 0 END), 0),
-      COALESCE(SUM(CASE WHEN r.id IS NOT NULL AND COALESCE(i.allow_update,1)<>0 AND NOT (${canReplace} AND ${differs}) THEN 1 ELSE 0 END), 0),
+      COALESCE(SUM(CASE WHEN r.id IS NOT NULL AND a.accepted AND ${differs} THEN 1 ELSE 0 END), 0),
+      COALESCE(SUM(CASE WHEN r.id IS NOT NULL AND COALESCE(i.allow_update,1)<>0 AND NOT (a.accepted AND ${differs}) THEN 1 ELSE 0 END), 0),
       COALESCE(SUM(CASE WHEN r.id IS NOT NULL AND i.allow_update=0 THEN 1 ELSE 0 END), 0)
     FROM __incoming_records i
+    JOIN __record_acceptance a ON a.source_id=i.source_id AND a.external_id=i.external_id
     LEFT JOIN records r
       ON r.source_id = i.source_id
      AND r.external_id = i.external_id
@@ -393,8 +400,8 @@ ${incomingRecordsSql(normalizedRecords)}
     WHERE EXISTS (SELECT 1 FROM __run_fence_guard)
     ON CONFLICT(source_id, external_id) DO UPDATE SET
       ${recordUpdateSetSql()}
-    WHERE ${sourceCanReplaceSql("records", "excluded", "(SELECT expected_external_version FROM __incoming_records candidate WHERE candidate.source_id=excluded.source_id AND candidate.external_id=excluded.external_id)", false,
-      `(SELECT COALESCE(allow_update, (${strictlyNewerVersionSql("records", "excluded")} OR (records.external_version IS excluded.external_version AND records.raw_json IS excluded.raw_json))) FROM __incoming_records candidate WHERE candidate.source_id=excluded.source_id AND candidate.external_id=excluded.external_id)`)}
+    WHERE (SELECT accepted FROM __record_acceptance a
+      WHERE a.source_id=excluded.source_id AND a.external_id=excluded.external_id)
       AND ${recordDiffSql("records", "excluded")};
 `;
 }

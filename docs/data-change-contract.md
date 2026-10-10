@@ -44,6 +44,10 @@ closed, unambiguous typed graph. Preserve consumption position/order, identity
 namespace, name evidence, multiplicity and all remaining fields. Hidden actions,
 unknown consumers, dangling keys, duplicate definitions, same-name different
 people and namespace changes are counterexamples, not exceptions to ignore.
+The renderer and proof share consumer dispatch: a typed `user_id` does not look
+up a native alias or mention key. Native `userID` uses only the attachment bridge
+when attachment evidence exists; without it, the existing unambiguous legacy
+fallback applies. A string matching an ID in another namespace is not a proof.
 
 ## Shared acceptance
 
@@ -67,6 +71,25 @@ An explicit authoritative deletion flag is source evidence and follows these sam
 rules. Absence, 403/404, timeout or partial pages do not create a tombstone, clear
 names, erase a row, or prove a history window complete.
 
+Detail completion consumes the same materialized, transaction-fenced acceptance
+result as the record write. Accepted/equivalent complete responses can retire
+debt, including an equivalent no-op. Rejected observations remain pending with
+bounded backoff and `LarkDetailObservationConflict`; their scope's full-content
+cursor and completeness claim cannot advance, while healthy siblings and later
+list windows can progress. History selection does not retire detail debt: after
+history confirms a received record, a fresh accepted detail retry must still
+complete the queued descriptor. Sent records have no automatic historical
+confirmation in this slice; repeated equal-version conflicts remain explicit
+debt until a newer accepted observation or a separately designed authorized
+resolution, not a falsely complete cursor.
+
+Native rows without an ordered numeric version cannot automatically acquire a
+new numeric baseline from a different source observation. This conservative
+change from the old writer is surfaced as `source_version_unordered` and
+`pending_unordered_versions`; those rows are excluded from historical selection.
+Do not interpret null as zero or promise eventual automatic recovery. A fenced
+baseline-establishment or explicit authorization mode is future work.
+
 ## Failure evidence and approval compatibility
 
 A fully fetched candidate rejected during review completion survives a refused apply in an owner-only bounded
@@ -80,8 +103,10 @@ publication failures are explicit rejections; no record mutation is attempted.
 The v4 proof binds both observed and effective records, including every unknown
 canonical field and all non-source local dependencies. Names reviews remain v3;
 replay defaults to v4, while v1-v3 inputs retain their exact comparison and strict
-preview policy, enforced again as an additional commit gate for every member of a mixed approval. Early account/input/fetch failures are finite errors, not complete
-candidate artifacts; this slice does not promise an HTTP-wire failure archive.
+preview policy, enforced again as an additional commit gate for every member of a mixed approval. Early account/input/fetch failures and final SQLite CAS refusals are finite errors,
+not complete sidecar artifacts; this slice does not promise an all-stage failure
+archive or HTTP-wire capture. Three slots bound each approval digest, not the
+total lifetime size of a directory containing many approvals.
 
 ## Bounded known-record history
 
@@ -89,8 +114,13 @@ The worker reserves one small maintenance slice per cycle. It uses the normal
 source/account admission and shared actual-CLI budget, lease and cooldown. One
 native record with a numeric version is selected from its enabled first-seen
 received scope; its one-second creation window is read with at most two list pages,
-100 normalized messages, 1 MiB and a shared maximum of four actual CLI attempts
-and 30 seconds, including self verification and any detail expansion. No name lookup fanout is needed.
+100 listed items and 1 MiB before selection. Only the selected merge root is
+expanded, with a separate closure cap of two pages, 100 items and 1 MiB; unrelated
+merge roots cannot consume its detail budget. Truncated, denied or oversized
+target closures remain errors. Both list and details share a maximum of four
+actual CLI attempts and 30 seconds of remote work, including self verification;
+this is not an end-to-end subprocess wall-clock bound. Existing local database
+timeouts and the worker step timeout also apply. No name lookup fanout is needed.
 
 Persist a fixed maximum local record ID for each sweep, the processed position,
 attempt result and generation. New traffic cannot indefinitely move that horizon.
@@ -103,10 +133,22 @@ receipt distinguishes the extra history step from older six-step cycles and
 optional retention. Public status adds source-observation counts separately from
 list/detail coverage; processing a row does not prove it was verified.
 
+History business errors remain failed step/cycle results and retain finite reason
+and request-budget summaries. They do not by themselves shrink a healthy forward
+batch or indefinitely block diagnostic sampling. Forward health and actual shared
+transport pressure are evaluated separately; real rate limits/cooldowns still
+constrain related work. `adaptiveTargetCycleSeconds` excludes historical processing
+time from forward batch workload; `history_ms` is recorded separately. Existing
+retention timing and failure effects remain unchanged.
+
 For a finite reachable known-record inventory, eventually stable observations
 under the supported equivalence rules and recurring successful budget slices,
 every eligible record gets another turn; ambiguous equal-version selection needs
-two distinct historical observations in the same context. Ordinary ingestion candidates are retained but cannot supply the first historical confirmation. Persistent permission failure, saturation, unknown
+two distinct historical observations in the same account/profile/source context
+and scope-policy projection. That projection reuses the review policy: only
+`hot_rank`, `hot_seen_at` and `last_hot_snapshot_id` are excluded; unknown config
+fields reset confirmation. Every single commit still fences the full scope
+configuration. Ordinary ingestion candidates are retained but cannot supply the first historical confirmation. Persistent permission failure, saturation, unknown
 grammar or an unstable source has no finite convergence promise. This slice does
 not recover missing historical identities or claim client-state equivalence.
 

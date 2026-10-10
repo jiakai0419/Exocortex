@@ -68,6 +68,48 @@ test('ambiguous definitions, dangling aliases and unknown outer fields retain ra
     const a=card();mutate(a);assert.equal(sourceProof(JSON.stringify(a)).references,null);
   }
 });
+
+function consumerCard(field, label, idType='user_id') {
+  return {...native(),msg_type:'interactive',mentions:[
+    {key:'@_user_1',id:'typed-alice',id_type:idType,name:'Invented Alice'},
+  ],body:{content:JSON.stringify({
+    json_card:{elements:[{tag:'at',property:{[field]:label}}]},
+    json_attachment:{at_users:{bridge:{mention_key:'@_user_1',user_id:'native-alias',content:'Invented Alice'}}},
+  })}};
+}
+test('reference proofs preserve the consumer namespace and never resolve a dangling reference by another domain',()=>{
+  for(const [field,before,after] of [
+    ['user_id','typed-alice','bridge'],
+    ['user_id','typed-alice','native-alias'],
+    ['user_id','typed-alice','@_user_1'],
+    ['userID','bridge','typed-alice'],
+    ['userID','bridge','@_user_1'],
+    ['userID','bridge','missing-alias'],
+  ]) {
+    const a=consumerCard(field,before),b=consumerCard(field,after);
+    assert.equal(row(a).body,'@Invented Alice');assert.equal(row(b).body,'@未知用户');
+    assert.equal(sourceProof(JSON.stringify(b)).references,null,`${field}:${after}`);
+    assert.equal(relation(a,b),'different');assert.equal(compareObservation(row(a),row(b)).equivalent,false);
+  }
+  const crossNamespace=consumerCard('user_id','typed-alice','open_id');
+  assert.equal(row(crossNamespace).body,'@未知用户');
+  assert.equal(sourceProof(JSON.stringify(crossNamespace)).references,null);
+});
+test('an attachment alias may select a different typed identity with identical ID bytes and display name',()=>{
+  const a=consumerCard('userID','bridge'),b=clone(a);
+  for(const raw of [a,b])raw.mentions.push({key:'@_user_2',id:'typed-alice',id_type:'open_id',name:'Invented Alice'});
+  const content=JSON.parse(b.body.content);content.json_attachment.at_users.bridge.mention_key='@_user_2';
+  b.body.content=JSON.stringify(content);
+  assert.equal(row(a).body,row(b).body);assert.equal(row(a).body,'@Invented Alice');
+  assert.equal(relation(a,b),'different','equal bytes in different namespaces are different source identities');
+});
+test('valid native aliases retain their declared attachment target while mention keys are renamed',()=>{
+  const a=consumerCard('userID','bridge'),b=clone(a);
+  b.mentions[0].key='@_user_42';
+  const content=JSON.parse(b.body.content);content.json_attachment.at_users.bridge.mention_key='@_user_42';
+  content.json_card.elements[0].property.userID='native-alias';b.body.content=JSON.stringify(content);
+  assert.equal(row(a).body,row(b).body);assert.equal(relation(a,b),'reference_rename');
+});
 test('normal and replay batches reject equal-version source conflicts and select representation deterministically',()=>{
   const a=row(native({text:'A'})),b=row(native({text:'B'}));
   for(const normalize of [items=>normalizeStoredRecords(items,'lark.im'),items=>normalizeBoundedReplayRecords(items,'lark.im')]){

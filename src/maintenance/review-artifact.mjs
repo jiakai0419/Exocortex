@@ -10,13 +10,12 @@ import { renderCardContent } from '../adapters/lark-im/card-content.mjs';
 import { quoteSql, REVIEW_RECORD_COLUMNS, REVIEW_EFFECTIVE_COLUMNS } from '../../dist/storage/sqlite/ingestion-store.js';
 
 import { recordProof, compareObservation, OBSERVATION_POLICY } from '../../dist/core/lark-observation.js';
+import { SCOPE_CONFIG_POLICY, SCOPE_CONFIG_PROJECTION_SQL } from './scope-config-policy.mjs';
 
 const OBSERVATION_REVIEW_SCHEMA = 'exocortex_private_maintenance_review/v4';
 const REVIEW_SCHEMA = 'exocortex_private_maintenance_review/v1';
 const TEXT_REVIEW_SCHEMA = 'exocortex_private_maintenance_review/v2';
 const SCOPE_REVIEW_SCHEMA = 'exocortex_private_maintenance_review/v3';
-const SCOPE_CONFIG_POLICY = 'lark_im_scope_json_remove_hot/v1';
-const SCOPE_CONFIG_PROJECTION_SQL = "json_remove(config_json,'$.hot_rank','$.hot_seen_at','$.last_hot_snapshot_id')";
 const TEXT_REVIEW_TYPES = new Set(['text', 'post', 'system', 'general_calendar', 'video_chat']);
 const REVIEW_MAX_BYTES = 1024 * 1024;
 const REVIEW_RECORD_BYTES = 256 * 1024;

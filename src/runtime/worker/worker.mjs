@@ -10,9 +10,11 @@ import { fileURLToPath } from "node:url";
 import { createRemoteSampleController, readScheduledRemoteCooldowns } from "./remote-sample-scheduler.mjs";
 import {
   adaptiveFairDecision,
+  compactHistorySummary,
   compactSummary,
   compactTransportStats,
   createAdaptiveFairState,
+  cycleHealthyWithoutHistory,
   mergeTransportCooldowns,
   runCycleWithRunner,
 } from "../../../dist/runtime/worker/lark-im-worker-core.js";
@@ -178,7 +180,7 @@ function runStep(name, args, deps = {}) {
   const ok = result.status === 0 && validSummary && !processFailed;
   const partial = result.status === 2 && summary?.ok === false && summary?.partial === true && !processFailed;
   const transport = errorTransport || compactTransportStats(summary?.transport);
-  const outputSummary = compactSummary(summary);
+  const outputSummary = name === "history" ? compactHistorySummary(summary) : compactSummary(summary);
   let failureDetail = stderr.trim();
   if (result.guardian_diagnostic) {
     const stages = [result.guardian_diagnostic.primary?.stage, result.guardian_diagnostic.cleanup?.stage].filter(Boolean);
@@ -313,7 +315,9 @@ function runWorker(opts, deps = {}) {
       logScheduler(cycleOpts, { type: "lark_im_worker_scheduler", version: 1, instance_id: activity?.instanceId || null,
         database_key: activityDatabaseKey(opts.db), cycle, at: new Date(nowMs()).toISOString(), ...outcome.decision });
     }
-    if (cycleOk && sample && opts.remoteSampleIntervalSeconds !== 0) {
+    // History business debt remains in the cycle result but cannot indefinitely
+    // suppress independent diagnostics. Their own lease/cooldown gates remain.
+    if (cycleHealthyWithoutHistory(observedSteps, cycleOk) && sample && opts.remoteSampleIntervalSeconds !== 0) {
       try {
         const sampled = sample(opts, { nowMs, cooldownsByOperation: cooldowns });
         const merged = mergeTransportCooldowns(cooldowns, sampled.cooldownsByOperation, nowMs());

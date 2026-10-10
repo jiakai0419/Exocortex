@@ -1,11 +1,11 @@
 // @ts-check
+import { CARD_ID_NAMESPACES as ID_NAMESPACES, resolveCardMention, resolveNativeCardReference } from "../../../dist/core/lark-card-reference.js";
 
 const MAX_INPUT_CHARS = 256 * 1024;
 const MAX_OUTPUT_CHARS = 16_000;
 const MAX_NODES = 2048;
 const MAX_DEPTH = 24;
 const LOCALES = ["zh_cn", "en_us", "ja_jp"];
-const ID_NAMESPACES = ["open_id", "user_id", "union_id", "app_id"];
 const TEXT_TAGS = new Set(["text", "plain_text", "lark_md", "markdown", "md"]);
 const CONTAINER_TAGS = new Set(["div", "note", "action", "column_set", "column"]);
 // These controls can erase or join URL syntax when terminal text is cleaned.
@@ -342,20 +342,7 @@ function renderCardContent(content, mentions = [], options = {}) {
   }
 
   /** @param {string} id @returns {Identity | null} */
-  function nativeBinding(id) {
-    if (hasAttachment) return resolvedIdentity(nativeRefs.get(id));
-    // Compatibility is exact and only available without attachment evidence.
-    // The same bytes in multiple namespaces are ambiguous even if names match.
-    /** @type {Identity | null} */
-    let match = null;
-    let matches = 0;
-    for (const kind of [...ID_NAMESPACES, "literal"]) {
-      const identity = identities.get(kind)?.get(id);
-      if (identity) { matches += 1; match = resolvedIdentity(identity); }
-    }
-    if (mentionKeys.has(id)) { matches += 1; match = mentionBinding(id); }
-    return matches === 1 ? match : null;
-  }
+  function nativeBinding(id) { return resolveNativeCardReference(id, cardReferenceBindings()); }
 
   /** @param {unknown} value @param {number} depth */
   function attachment(value, depth) {
@@ -395,34 +382,20 @@ function renderCardContent(content, mentions = [], options = {}) {
    * attachment bridge or the narrowly defined legacy fallback.
    * @param {JsonObject} payload @returns {Identity | null} */
   function nodeMention(payload) {
-    const id = read(payload, "id");
-    const declaredType = read(payload, "id_type");
-    /** @type {Identity | null} */
-    let match = null;
-    let typed = false;
-    let valid = true;
-    /** @param {string} kind @param {unknown} value */
-    function consume(kind, value) {
-      typed = true;
-      const exact = boundedId(value);
-      const identity = exact ? resolvedIdentity(identities.get(kind)?.get(exact)) : null;
-      if (!identity || match && match !== identity) valid = false;
-      else match = identity;
-    }
-    if (declaredType !== undefined) {
-      const kind = boundedId(declaredType);
-      if (!kind || !ID_NAMESPACES.includes(kind)) { typed = true; valid = false; }
-      else consume(kind, id);
-    }
-    for (const kind of ID_NAMESPACES) {
-      const flat = read(payload, kind);
-      const nested = read(id, kind);
-      if (flat !== undefined) consume(kind, flat);
-      if (nested !== undefined) consume(kind, nested);
-    }
-    if (typed) return valid ? match : null;
-    const native = boundedId(read(payload, "userID"));
-    return native ? nativeBinding(native) : null;
+    return resolveCardMention(payload, cardReferenceBindings());
+  }
+
+  /** @returns {import("../../../dist/core/lark-card-reference.js").CardReferenceBindings<Identity>} */
+  function cardReferenceBindings() {
+    return {
+      read, id: boundedId, hasAttachment,
+      typed: (kind, id) => {
+        const identity = identities.get(kind)?.get(id);
+        return identity ? resolvedIdentity(identity) : undefined;
+      },
+      mention: key => mentionKeys.has(key) ? mentionBinding(key) : undefined,
+      native: alias => resolvedIdentity(nativeRefs.get(alias)),
+    };
   }
 
   /** A name is an independent source value, projected once without resolving
