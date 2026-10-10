@@ -423,3 +423,24 @@ test('history-confirmed received details remain coverage debt until a fresh acce
   assert.equal(store.readScope(f.db,SCOPE).cursor.created_at_ms,f.start+60000);
   assert.equal(JSON.parse(rows(f)[0].raw_json).raw_api_expansions.merge_forward.items[1].body.content,freshChild.body.content);
 });
+
+
+for(const [beforeValue,afterValue] of [
+  ['9007199254740992','9007199254740993'],
+  ['1.00000000000000001','1.00000000000000002'],
+])test(`history config context preserves unsafe numeric source text: ${beforeValue}`,t=>{
+  const f=fixture(t), changed=native(f,0,{body:{content:'{"text":"Invented numeric context candidate"}'}});
+  assert.equal(JSON.parse(beforeValue),JSON.parse(afterValue),'the JS numeric projection is intentionally identical');
+  const config=value=>`{"chat_id":"${CHAT}","chat_type":"group","unknown_future_id":${value}}`;
+  store.sqliteExec(f.db,`UPDATE sync_scopes SET config_json=${q(config(beforeValue))} WHERE id=${q(SCOPE)};`);
+  assert.equal(history(f,[changed]).conflicts,1);const before=rows(f),first=state(f)[0].candidate_context;
+  store.sqliteExec(f.db,`UPDATE sync_scopes SET config_json=${q(config(afterValue))} WHERE id=${q(SCOPE)};`);
+  assert.equal(history(f,[changed]).conflicts,1);assert.deepEqual(rows(f),before);
+  assert.notEqual(state(f)[0].candidate_context,first);
+  // In this fallback even hot-only changes reset confirmation: do not project
+  // any unverified JSON through rounded JS numbers to preserve the exception.
+  const hot=config(afterValue).slice(0,-1)+',"hot_rank":2}';
+  store.sqliteExec(f.db,`UPDATE sync_scopes SET config_json=${q(hot)} WHERE id=${q(SCOPE)};`);
+  assert.equal(history(f,[changed]).conflicts,1);assert.deepEqual(rows(f),before);
+  assert.equal(history(f,[changed]).updated,1,'two distinct reads under unchanged exact config can still confirm');
+});

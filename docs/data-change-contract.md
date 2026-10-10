@@ -146,8 +146,13 @@ under the supported equivalence rules and recurring successful budget slices,
 every eligible record gets another turn; ambiguous equal-version selection needs
 two distinct historical observations in the same account/profile/source context
 and scope-policy projection. That projection reuses the review policy: only
-`hot_rank`, `hot_seen_at` and `last_hot_snapshot_id` are excluded; unknown config
-fields reset confirmation. Every single commit still fences the full scope
+`hot_rank`, `hot_seen_at` and `last_hot_snapshot_id` are excluded after a strict,
+lossless supported parse. Unsafe numbers, duplicate keys, unsupported number
+forms or parser limits instead bind the exact original config text with a
+separate context policy; even hot-field or formatting changes then reset
+confirmation. This prevents the demonstrated JS-number rounding alias, not a
+claim that a cryptographic digest can never collide. Existing approvals retain
+their SQLite text projection and compatibility semantics. Every single commit still fences the full scope
 configuration. Ordinary ingestion candidates are retained but cannot supply the first historical confirmation. Persistent permission failure, saturation, unknown
 grammar or an unstable source has no finite convergence promise. This slice does
 not recover missing historical identities or claim client-state equivalence.

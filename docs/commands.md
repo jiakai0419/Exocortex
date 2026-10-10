@@ -167,7 +167,7 @@ Validate local runtime dependencies and install configuration without starting t
 | `--adaptive-fair` | boolean | `false` | — | Adapt the fair scope batch; not an HTTP rate limiter. |
 | `--adaptive-fair-min` | integer | `10` | — | Minimum adaptive fair batch. |
 | `--adaptive-fair-max` | integer | `50` | — | Maximum adaptive fair batch. |
-| `--adaptive-target-cycle-seconds` | integer | `90` | — | Target work plus interval duration. |
+| `--adaptive-target-cycle-seconds` | integer | `90` | — | Target work plus interval duration, excluding history time; retention accounting is unchanged. |
 | `--remote-sample-interval-seconds` | integer | `900` | ≥ 0；≤ 1800 | Bounded remote sample interval (900–1800 seconds; 0 disables). |
 | `--format` | text/json | `text` | — | Output format. |
 

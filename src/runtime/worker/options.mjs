@@ -50,7 +50,7 @@ export const WORKER_OPTION_SPECS = Object.freeze([
   { flag: "--adaptive-fair", key: "adaptiveFair", type: "boolean", default: defaults.adaptiveFair, description: "Adapt the fair scope batch; not an HTTP rate limiter." },
   { flag: "--adaptive-fair-min", key: "adaptiveFairMin", type: "integer", default: defaults.adaptiveFairMin, description: "Minimum adaptive fair batch." },
   { flag: "--adaptive-fair-max", key: "adaptiveFairMax", type: "integer", default: defaults.adaptiveFairMax, description: "Maximum adaptive fair batch." },
-  { flag: "--adaptive-target-cycle-seconds", key: "adaptiveTargetCycleSeconds", type: "integer", default: defaults.adaptiveTargetCycleSeconds, description: "Target work plus interval duration." },
+  { flag: "--adaptive-target-cycle-seconds", key: "adaptiveTargetCycleSeconds", type: "integer", default: defaults.adaptiveTargetCycleSeconds, description: "Target work plus interval duration, excluding history time; retention accounting is unchanged." },
   { flag: "--remote-sample-interval-seconds", key: "remoteSampleIntervalSeconds", type: "integer", min: 0, max: 1800, default: defaults.remoteSampleIntervalSeconds, description: "Bounded remote sample interval (900–1800 seconds; 0 disables)." },
 ]);
 

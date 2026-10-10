@@ -7,7 +7,7 @@ import { createMaintenanceRequestSession } from './request-session.mjs';
 import { readOnlySqliteJson } from '../storage/sqlite/readonly-query.mjs';
 import { captureRemoteAccountBinding, readRemoteAccountBinding, accountBindingAdmissionError } from '../diagnostics/remote-account-binding.mjs';
 import { commitBoundedReplayRecords, quoteSql, normalizeBoundedReplayRecords } from '../../dist/storage/sqlite/ingestion-store.js';
-import { stable } from '../../dist/core/lark-observation.js';
+import { parseEvidence, stable } from '../../dist/core/lark-observation.js';
 import { SCOPE_CONFIG_POLICY, projectScopeConfig } from './scope-config-policy.mjs';
 
 const sha = text => createHash('sha256').update(text).digest('hex');
@@ -78,6 +78,12 @@ function executeLarkImHistory(options, deps = {}) {
     throw new Error('history account identity unavailable');
   }
   const row = target.record, scope = target.scope, config = JSON.parse(scope.config_json);
+  // Never bind unknown config through a rounded JS Number. Only a verified
+  // parse permits the existing hot-field projection; otherwise exact source
+  // text (including hot fields) forms a distinct, conservative context.
+  let scopePolicy = SCOPE_CONFIG_POLICY, scopeConfig;
+  try { scopeConfig = stable(projectScopeConfig(parseEvidence(scope.config_json))); }
+  catch { scopePolicy = 'exact_scope_config/v1'; scopeConfig = scope.config_json; }
   const startMs = Math.max(target.baseline, Math.floor(row.occurred_at_ms / 1000) * 1000);
   const endMs = Math.floor(row.occurred_at_ms / 1000) * 1000 + 1000;
   let records = [], pages = 1, fetchedCount = 0, error = null;
@@ -126,7 +132,7 @@ function executeLarkImHistory(options, deps = {}) {
     observationAcquisition: { attempt: attemptId, startedAtMs, basis: new Map([[row.external_id, target.observationGeneration]]), confirm: true,
       contextKey: sha(JSON.stringify({ profile: PROFILE, self: self.open_id, account: accountKey,
         database: binding.database_key, source: sha(target.sourceConfigJson), scope: scope.id, chat: config.chat_id,
-        scopePolicy: SCOPE_CONFIG_POLICY, scopeConfig: sha(stable(projectScopeConfig(config))) })) },
+        scopePolicy, scopeConfig: sha(scopeConfig) })) },
     history: { ...target.checkpoint, startedAtMs, error, requestBudget },
     reviewBeforeCommit: checkBinding,
     reviewFence: { mode: 'replay', createdAtMs: startedAtMs, expiresAtMs: startedAtMs + 30 * 60 * 1000,
