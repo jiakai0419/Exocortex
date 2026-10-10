@@ -495,6 +495,8 @@ function syncListedScope(dbPath, opts, scopeId, selfProfile, direction, deps) {
     inserted: Number(listed.inserted || 0) + Number(retry.inserted || 0),
     updated: Number(listed.updated || 0) + Number(retry.updated || 0),
     duplicate: Number(listed.duplicate || 0) + Number(retry.duplicate || 0),
+    ...(Number(listed.conflicts || 0) + Number(retry.conflicts || 0) > 0
+      ? { conflicts: Number(listed.conflicts || 0) + Number(retry.conflicts || 0) } : {}),
     records: Number(listed.records || 0) + Number(retry.records || 0) };
 }
 

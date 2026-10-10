@@ -19,9 +19,14 @@ declare const REVIEW_EFFECTIVE_COLUMNS: string[];
  * strict upsert expression, including its SQL-side name merge, rather than a
  * JavaScript approximation of what incoming canonical JSON might become.
  * Callers must require one returned row per selected existing target. */
-declare function boundedReplayProjectionSql(records: StoredRecord[]): string;
+declare function boundedReplayProjectionSql(records: StoredRecord[], options?: {
+    dbPath?: string;
+    legacyStrict?: boolean;
+}): string;
 declare function upsertRecordsSql(records: StoredRecord[], options?: {
     strictVersionIncrease?: boolean;
+    dbPath?: string;
+    legacyApprovalGate?: boolean;
 }): string;
 declare function recordWritesSql(normalizedRecords: StoredRecord[], now: string): string;
 export { REVIEW_EFFECTIVE_COLUMNS, boundedReplayProjectionSql, encodeSourceVersion, normalizeExternalVersion, normalizeStoredRecords, normalizeBoundedReplayRecords, numericVersionSql, versionCanReplaceSql, upsertRecordsSql, recordWritesSql };

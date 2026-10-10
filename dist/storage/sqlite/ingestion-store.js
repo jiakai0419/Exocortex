@@ -4,6 +4,7 @@ import { quoteSql, sqlJson, sqliteExec, sqliteQuery, secureDatabasePaths } from 
 import { DEFAULT_HARD_LEASE_SECONDS, RUN_FENCE_METADATA_KEY, scopeCursorJson, validateRecordCursor, cursorCanAdvanceSql, checkedRunId, runFenceGuardSql } from "./sync-run-fence.js";
 import { DEFAULT_SYNC_LOCK_OWNER, acquireLock, acquireMaintenanceLock, releaseLock, releaseMaintenanceLock, isMaintenanceLocked, recoverStaleSyncState, ownerPid, ownerStartedAtMs, defaultOwnerState } from "./sync-locks.js";
 import { REVIEW_EFFECTIVE_COLUMNS, boundedReplayProjectionSql, encodeSourceVersion, normalizeStoredRecords, normalizeBoundedReplayRecords, normalizeExternalVersion, recordWritesSql, upsertRecordsSql } from "./record-storage.js";
+import { prepareObservationRecords } from "./observation-store.js";
 import { REVIEW_RECORD_COLUMNS, REVIEW_LIFETIME_MS, reviewFenceSql } from "./maintenance-review.js";
 import { larkRunMetadataEntriesSql, commitBoundedReplayRecords, commitLarkListRun, finishLarkDetailRun, readLarkListProgress, readPendingLarkDetails } from "./lark-ingestion.js";
 const DEFAULT_IMPLICIT_RUN_LOCK_SECONDS = 10 * 60;
@@ -188,7 +189,7 @@ function finishRecordRun(dbPath, scope, runId, records, scannedCount, cursor, me
     const id = checkedRunId(runId);
     validateRecordCursor(cursor, "record cursor");
     const cursorJsonSql = sqlJson(cursor);
-    const normalizedRecords = normalizeStoredRecords(records, scope.source_id);
+    const normalizedRecords = prepareObservationRecords(dbPath, normalizeStoredRecords(records, scope.source_id));
     const safeMetadata = { ...metadata };
     delete safeMetadata[RUN_FENCE_METADATA_KEY];
     const finishedAt = new Date();
@@ -207,7 +208,8 @@ ${recordWritesSql(normalizedRecords, now)}
         inserted_count = (SELECT inserted FROM __write_effects),
         updated_count = (SELECT updated FROM __write_effects),
         duplicate_count = (SELECT duplicate FROM __write_effects),
-        metadata_json = json_patch(COALESCE(metadata_json, '{}'), ${sqlJson(safeMetadata)})
+        metadata_json = json_patch(json_patch(COALESCE(metadata_json, '{}'), ${sqlJson(safeMetadata)}),
+          json_object('source_observation_conflicts',(SELECT conflicts FROM __write_effects)))
     WHERE id = ${id}
       AND EXISTS (SELECT 1 FROM __run_fence_guard);
     UPDATE sync_scopes
@@ -226,7 +228,8 @@ ${recordWritesSql(normalizedRecords, now)}
       (SELECT COUNT(*) FROM __run_fence_guard) AS fenced,
       COALESCE((SELECT inserted FROM __write_effects), 0) AS inserted,
       COALESCE((SELECT updated FROM __write_effects), 0) AS updated,
-      COALESCE((SELECT duplicate FROM __write_effects), 0) AS duplicate;
+      COALESCE((SELECT duplicate FROM __write_effects), 0) AS duplicate,
+      COALESCE((SELECT conflicts FROM __write_effects), 0) AS conflicts;
     COMMIT;
     `, `${error ? "fail" : "succeed"} record run ${id}`);
     if (Number(rows[0]?.fenced || 0) !== 1) {
@@ -236,6 +239,7 @@ ${recordWritesSql(normalizedRecords, now)}
         inserted: Number(rows[0]?.inserted || 0),
         updated: Number(rows[0]?.updated || 0),
         duplicate: Number(rows[0]?.duplicate || 0),
+        ...(Number(rows[0]?.conflicts) > 0 ? { conflicts: Number(rows[0].conflicts) } : {}),
     };
 }
 function succeedRecordRun(dbPath, scope, runId, records, scannedCount, cursor, metadata) {

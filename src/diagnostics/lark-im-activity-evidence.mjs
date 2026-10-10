@@ -9,7 +9,7 @@ const ACTIVITY_GRACE_MS = 5000;
 const ACTIVITY_GAP_MS = 30000;
 const MAX_ACTIVITY_INSTANCES = 32;
 const PHASES = new Set(["cycle", "between_steps", "step", "waiting", "sync", "stopped"]);
-const STEPS = new Set(["sent", "discover-hot", "received-hot", "discover-catchup", "discover-reconcile", "received-fair", "retention", "all", "discover", "received", "details"]);
+const STEPS = new Set(["sent", "discover-hot", "received-hot", "discover-catchup", "discover-reconcile", "received-fair", "history", "retention", "all", "discover", "received", "details"]);
 
 /** Bind phases to a concrete file, not merely its reusable pathname.
  * Missing/inaccessible files provide no positive identity evidence.

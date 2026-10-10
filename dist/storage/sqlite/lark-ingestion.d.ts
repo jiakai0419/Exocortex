@@ -2,13 +2,7 @@ import type { JsonObject, SyncScope, StoredRecord, WriteEffects, BoundedReplayOp
 /** Commit one completely fetched, explicitly bounded repair without touching
  * normal runs, scope cursors, or freshness markers. Remote work belongs outside
  * this method; only this short transaction holds a maintenance lease. */
-declare function commitBoundedReplayRecords(dbPath: string, options: BoundedReplayOptions): {
-    audit_id: string;
-    inserted: number;
-    updated: number;
-    duplicate: number;
-    conflicts: number;
-};
+declare function commitBoundedReplayRecords(dbPath: string, options: BoundedReplayOptions): any;
 type LarkDetailOutcome = {
     message_id: string;
     fingerprint: string;

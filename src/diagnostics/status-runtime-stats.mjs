@@ -2,7 +2,7 @@
 
 import { evaluateActivityEvent, validateActivityEventShape } from "./lark-im-activity-evidence.mjs";
 import { parseWorkerEventTimestamp as timestamp } from "./worker-event-time.mjs";
-import { REQUIRED_CYCLE_STEPS } from "../../dist/runtime/worker/lark-im-worker-core.js";
+import { expectedCycleSteps } from "../../dist/runtime/worker/lark-im-worker-core.js";
 
 /** @typedef {Record<string, any>} JsonObject */
 /** @typedef {"worker_unverified" | "log_unavailable" | "log_damaged" | "completion_unbound" | "completion_invalid" | "completion_conflict"} UnavailableReason */
@@ -35,11 +35,7 @@ function verifiedWorker(report, binding, nowMs) {
 }
 
 /** @param {JsonObject} event */
-function expectedSteps(event) {
-  if (event.step_count === REQUIRED_CYCLE_STEPS.length) return REQUIRED_CYCLE_STEPS;
-  if (event.step_count === REQUIRED_CYCLE_STEPS.length + 1) return [...REQUIRED_CYCLE_STEPS, "retention"];
-  return null;
-}
+function expectedSteps(event) { return expectedCycleSteps(event); }
 
 /** Completion counts stand independently of the optional detailed step trail.
  * @param {JsonObject} event @param {JsonObject} worker @param {number} nowMs */

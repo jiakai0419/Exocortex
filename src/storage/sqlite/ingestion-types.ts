@@ -30,12 +30,25 @@ export type StoredRecord = {
   content_hash: string;
   canonical_json: string;
   raw_json: string;
+  /** Internal, freshly computed local comparison. Never read from an approval. */
+  observation?: {
+    action: "accept" | "equivalent" | "conflict" | "older" | "stale";
+    reason: string;
+    before: Record<string, any> | null;
+    generation: number | null;
+    evidenceGeneration: number | null;
+    incoming: Record<string, any>;
+    attempt: string;
+    observedAtMs: number;
+    contextKey: string | null;
+  };
 };
 
 export type WriteEffects = {
   inserted: number;
   updated: number;
   duplicate: number;
+  conflicts?: number;
 };
 
 /** Trusted local snapshots rechecked inside an approved maintenance commit.
@@ -62,6 +75,14 @@ export type BoundedReplayOptions = {
   pages: number;
   fetchedCount: number;
   records: StoredRecord[];
+  observationAcquisition?: { attempt: string; startedAtMs: number; basis: Map<string, number>; confirm: boolean; contextKey: string };
+  /** Legacy approvals are an additional authorization gate, not source policy. */
+  legacyApprovalGate?: boolean;
+  history?: {
+    generation: number; afterId: number; sweepMaxId: number; completedSweeps: number;
+    selectedId: number; nextSweepMaxId: number; startedAtMs: number;
+    error: string | null; requestBudget: Record<string, number | string | null>;
+  };
   reviewFence?: MaintenanceReviewFence;
   /** Recheck local file/account binding after acquiring the maintenance lease. */
   reviewBeforeCommit?: () => void;

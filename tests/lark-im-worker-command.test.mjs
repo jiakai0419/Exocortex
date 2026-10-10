@@ -229,17 +229,17 @@ test("runCycle forwards cooldowns to later children without a global wait or mut
     } },
   });
   assert.equal(ok, true);
-  assert.equal(envs.length, 6);
+  assert.equal(envs.length, 7);
   assert.deepEqual(envs[0], {});
   for (const env of envs.slice(1)) assert.deepEqual(env, { contact_search: 8_000 });
   assert.deepEqual(cooldowns, { contact_search: 8_000 });
-  assert.equal(steps.length, 6);
+  assert.equal(steps.length, 7);
 });
 
 test("runCycle defers only the high-level steps whose own operation deadline is still active", () => {
   const cases = [
     ["message_search_bundle", ["sent"]],
-    ["message_history_bundle", ["received-hot", "received-fair"]],
+    ["message_history_bundle", ["received-hot", "received-fair", "history"]],
     ["chat_discovery_bundle", ["discover-hot", "discover-catchup", "discover-reconcile"]],
     ["contact_search", []],
     ["chat_members", []],
@@ -258,7 +258,7 @@ test("runCycle defers only the high-level steps whose own operation deadline is 
     });
     const deferred = observed.filter((step) => step.summary?.deferred);
     assert.deepEqual(deferred.map((step) => step.name), expectedDeferred, operation);
-    assert.equal(spawned, 6 - expectedDeferred.length);
+    assert.equal(spawned, 7 - expectedDeferred.length);
     assert.equal(ok, expectedDeferred.length === 0);
     for (const step of deferred) {
       assert.equal(step.ok, false);

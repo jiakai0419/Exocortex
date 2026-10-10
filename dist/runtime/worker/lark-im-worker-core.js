@@ -12,6 +12,17 @@ const TRANSPORT_OPERATIONS = new Set([
 const REQUIRED_CYCLE_STEPS = [
     "sent", "discover-hot", "received-hot", "discover-catchup", "discover-reconcile", "received-fair",
 ];
+/** Version the added history slice so old six-step receipts are still readable. */
+function expectedCycleSteps(event) {
+    if (event.cycle_policy !== undefined && event.cycle_policy !== "bounded_history/v1")
+        return null;
+    const base = event.cycle_policy === "bounded_history/v1" ? [...REQUIRED_CYCLE_STEPS, "history"] : REQUIRED_CYCLE_STEPS;
+    if (event.step_count === base.length)
+        return base;
+    if (event.step_count === base.length + 1)
+        return [...base, "retention"];
+    return null;
+}
 function finiteNonNegative(value) {
     return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER ? value : 0;
 }
@@ -220,6 +231,8 @@ function buildCycleStepSpecs(opts, cycle = 1) {
             ],
         },
     ];
+    steps.push({ name: "history", command: "maintenance",
+        args: ["history", "--db", opts.db, "--max-cli-attempts", "4", "--max-seconds", "30", "--format", "json"] });
     const retentionEveryCycles = Number(opts.retentionEveryCycles || WORKER_DEFAULTS.retentionEveryCycles);
     if (retentionEveryCycles > 0 && cycle % retentionEveryCycles === 0) {
         steps.push({
@@ -241,7 +254,7 @@ function compactRun(run) {
         inserted: run.inserted,
         updated: run.updated,
         duplicate: run.duplicate,
-        ...Object.fromEntries(["list_complete", "details_complete", "incomplete", "pending_details", "detail_attempts"]
+        ...Object.fromEntries(["list_complete", "details_complete", "incomplete", "pending_details", "detail_attempts", "conflicts"]
             .filter((key) => run[key] !== undefined).map((key) => [key, run[key]])),
     };
 }
@@ -285,6 +298,7 @@ function compactSummary(summary) {
             ? {
                 ok: receivedFailures.length === 0,
                 ...receivedTotals,
+                ...(received.some(run => Number(run.conflicts) > 0) ? { conflicts: received.reduce((sum, run) => sum + finiteNonNegative(run.conflicts), 0) } : {}),
                 ...(receivedSkipped > 0 ? { skipped: receivedSkipped } : {}),
                 ...(received.some((run) => run.pending_details !== undefined) ? {
                     pending_details: received.reduce((sum, run) => sum + finiteNonNegative(run.pending_details), 0),
@@ -303,6 +317,7 @@ function cyclePayload(cycle, steps, now = () => new Date().toISOString()) {
         ok: steps.length > 0 && steps.every((step) => step.ok === true),
         at: now(),
         step_count: steps.length,
+        ...(steps.some(step => step.name === "history") ? { cycle_policy: "bounded_history/v1" } : {}),
         failed_steps: steps.filter((step) => step.ok !== true).map((step) => step.name || "unknown"),
     };
 }
@@ -385,4 +400,4 @@ function summarizeWorkerEvents(events, nowMs = Date.now()) {
             : null,
     };
 }
-export { REQUIRED_CYCLE_STEPS, adaptiveFairDecision, buildCycleStepSpecs, compactRun, compactSummary, compactTransportCooldowns, compactTransportStats, createAdaptiveFairState, mergeTransportCooldowns, cyclePayload, runCycleWithRunner, summarizeWorkerEvents, };
+export { REQUIRED_CYCLE_STEPS, expectedCycleSteps, adaptiveFairDecision, buildCycleStepSpecs, compactRun, compactSummary, compactTransportCooldowns, compactTransportStats, createAdaptiveFairState, mergeTransportCooldowns, cyclePayload, runCycleWithRunner, summarizeWorkerEvents, };

@@ -63,6 +63,11 @@ type AdaptiveCycleObservation = {
     steps?: WorkerEvent[];
 };
 declare const REQUIRED_CYCLE_STEPS: string[];
+/** Version the added history slice so old six-step receipts are still readable. */
+declare function expectedCycleSteps(event: {
+    step_count?: number;
+    cycle_policy?: string;
+}): string[] | null;
 declare function compactTransportCooldowns(input: unknown): Record<string, number>;
 declare function mergeTransportCooldowns(previous: unknown, incoming: unknown, nowMs?: number): {
     [k: string]: number;
@@ -117,6 +122,7 @@ type WorkerCyclePayload = {
     ok: boolean;
     at: string;
     step_count: number;
+    cycle_policy?: string;
     failed_steps: string[];
 };
 type WorkerStepRunner = (name: string, args: string[], command?: "sync" | "maintenance") => WorkerEvent;
@@ -151,6 +157,7 @@ declare function compactSummary(summary: SyncSummary | null | undefined): {
         pending_details?: number | undefined;
         incomplete?: boolean | undefined;
         skipped?: number | undefined;
+        conflicts?: number | undefined;
         scopes: number;
         scanned: number;
         records: number;
@@ -203,4 +210,4 @@ declare function summarizeWorkerEvents(events: unknown[], nowMs?: number): {
         age_ms: number | null;
     } | null;
 };
-export { REQUIRED_CYCLE_STEPS, adaptiveFairDecision, buildCycleStepSpecs, compactRun, compactSummary, compactTransportCooldowns, compactTransportStats, createAdaptiveFairState, mergeTransportCooldowns, cyclePayload, runCycleWithRunner, summarizeWorkerEvents, };
+export { REQUIRED_CYCLE_STEPS, expectedCycleSteps, adaptiveFairDecision, buildCycleStepSpecs, compactRun, compactSummary, compactTransportCooldowns, compactTransportStats, createAdaptiveFairState, mergeTransportCooldowns, cyclePayload, runCycleWithRunner, summarizeWorkerEvents, };

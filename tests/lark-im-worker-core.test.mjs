@@ -39,7 +39,7 @@ function adaptiveOpts(overrides = {}) {
 function observation({ scopes = 25, fairMs = 20_000, otherMs = 10_000, transport, ok = true } = {}) {
   const emptyStats = { calls: 0, attempts: 0, rate_limits: 0, timeouts: 0, exhausted: 0 };
   const steps = buildCycleStepSpecs(opts()).map(({ name }) => ({ name, ok: true, summary: { transport: { ...emptyStats } } }));
-  Object.assign(steps.at(-1), {
+  Object.assign(steps.find(step => step.name === "received-fair"), {
     ok,
     started_at: new Date(0).toISOString(),
     finished_at: new Date(fairMs).toISOString(),
@@ -95,14 +95,14 @@ test("adaptive fair never treats locked or skipped scopes as successful throughp
     const skipped = observation();
     const runs = Array.from({ length: 25 }, (_, index) => index < skippedCount
       ? { skipped: true, reason: "scope_locked" } : { ok: true });
-    skipped.steps.at(-1).summary.received = compactSummary({ ok: true, received: runs }).received;
+    skipped.steps.find(step => step.name === "received-fair").summary.received = compactSummary({ ok: true, received: runs }).received;
     const result = adaptiveFairDecision({ batch: 25, healthyCycles: 1 }, skipped, options);
     assert.deepEqual(result.state, { batch: 25, healthyCycles: 0 });
     assert.equal(result.decision.pressure.failed_steps, 0);
     assert.equal(result.decision.observed_fair_scopes, 25 - skippedCount);
   }
   const permittedSkip = observation();
-  permittedSkip.steps.at(-1).summary.received = compactSummary({ ok: true,
+  permittedSkip.steps.find(step => step.name === "received-fair").summary.received = compactSummary({ ok: true,
     received: Array.from({ length: 25 }, () => ({ ok: true, skipped: true, reason: "restricted_mode" })),
   }).received;
   assert.deepEqual(adaptiveFairDecision({ batch: 25, healthyCycles: 1 }, permittedSkip, options).state,
@@ -157,6 +157,7 @@ test("worker cycle runs sent, hot lane, then fair steady-state lane in a stable 
     "discover-catchup",
     "discover-reconcile",
     "received-fair",
+    "history",
   ]);
 
   const hotDiscover = specs.find((spec) => spec.name === "discover-hot");
@@ -217,15 +218,15 @@ test("worker cycle logs every step plus one cycle event and reports failure", ()
   );
 
   assert.equal(ok, false);
-  assert.equal(calls.length, 6);
-  assert.equal(logs.length, 7);
-  assert.deepEqual(logs.slice(0, 6).map((log) => log.type), Array(6).fill("lark_im_worker_step"));
-  assert.equal(logs[6].type, "lark_im_worker_cycle");
-  assert.equal(logs[6].cycle, 42);
-  assert.equal(logs[6].ok, false);
-  assert.equal(logs[6].step_count, 6);
-  assert.deepEqual(logs[6].failed_steps, ["received-hot"]);
-  assert.equal("steps" in logs[6], false);
+  assert.equal(calls.length, 7);
+  assert.equal(logs.length, 8);
+  assert.deepEqual(logs.slice(0, 7).map((log) => log.type), Array(7).fill("lark_im_worker_step"));
+  assert.equal(logs[7].type, "lark_im_worker_cycle");
+  assert.equal(logs[7].cycle, 42);
+  assert.equal(logs[7].ok, false);
+  assert.equal(logs[7].step_count, 7);
+  assert.deepEqual(logs[7].failed_steps, ["received-hot"]);
+  assert.equal("steps" in logs[7], false);
   assert.equal(argValue(calls[2].args, "--received-scopes-per-run"), "7");
 });
 

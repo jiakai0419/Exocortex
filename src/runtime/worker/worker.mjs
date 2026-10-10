@@ -33,6 +33,7 @@ const STEP_OPERATIONS = {
   "discover-reconcile": "chat_discovery_bundle",
   "received-hot": "message_history_bundle",
   "received-fair": "message_history_bundle",
+  history: "message_history_bundle",
 };
 
 /**

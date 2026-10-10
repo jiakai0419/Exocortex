@@ -189,7 +189,7 @@ function executeLarkImReplay(opts, deps = {}) {
   if (review) {
     try {
       const records = staged[0].records;
-      const projections = readOnlySqliteJson(dbPath, boundedReplayProjectionSql(records), 'project reviewed replay');
+      const projections = readOnlySqliteJson(dbPath, boundedReplayProjectionSql(records, { dbPath, legacyStrict: review.legacyStrict }), 'project reviewed replay');
       if (projections.length !== targets.size) throw new MaintenanceReviewError('snapshot_changed');
       // Finish local preview queries before publication: a durable review is
       // followed only by its receipt, never another fallible SQLite read.
@@ -206,7 +206,8 @@ function executeLarkImReplay(opts, deps = {}) {
       else { summary.scopes.push(...previewScopes); return finish(); }
     } catch (error) {
       summary.ok = false;
-      summary.scopes.push({ ok: false, error: safeReplayError(error) });
+      summary.scopes.push({ ok: false, error: safeReplayError(error),
+        ...(/** @type {any} */ (error)?.failureEvidence ? { failure_evidence: /** @type {any} */ (error).failureEvidence } : {}) });
       return finish();
     }
   }
@@ -217,7 +218,7 @@ function executeLarkImReplay(opts, deps = {}) {
           scope: /** @type {any} */ (scope), initialSyncStartMs: baseline, startMs: opts.startMs, endMs: opts.endMs,
           planId, attemptId, selfIdHash: selfHash, pages: fetched.pages, fetchedCount: fetched.messages.length, records,
           ...(targets.size ? { exactTargets: /** @type {any} */ ([...targets.values()]) } : {}),
-          ...(reviewed?.fence ? { reviewFence: reviewed.fence, reviewBeforeCommit: reviewed.assertBinding } : {}),
+          ...(reviewed?.fence ? { reviewFence: reviewed.fence, reviewBeforeCommit: reviewed.assertBinding, legacyApprovalGate: review?.legacyStrict === true } : {}),
         });
         summary.scopes.push({ ...result, ...effects });
       } else {

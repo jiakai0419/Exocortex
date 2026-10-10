@@ -3,7 +3,7 @@ import { publicTimestamp } from "./public-safe.mjs";
 
 /** Finite explanations selected by the activity decision tree, never parsed
  * from an internal detail string or a remote/process error. */
-const STEPS = new Set(["sent", "discover-hot", "received-hot", "discover-catchup", "discover-reconcile", "received-fair", "retention", "all", "discover", "received", "details"]);
+const STEPS = new Set(["sent", "discover-hot", "received-hot", "discover-catchup", "discover-reconcile", "received-fair", "history", "retention", "all", "discover", "received", "details"]);
 const REASONS = Object.freeze({
   activity_evidence_unavailable: "activity evidence unavailable",
   sync_status_unavailable: "sync status unavailable",

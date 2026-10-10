@@ -201,6 +201,12 @@ function sanitizeStatusReportForPublicOutput(report) {
     scopes,
     details,
     list_progress: listProgress,
+    ...(report?.source_observations ? { source_observations: {
+      evidence: report?.source_observations?.evidence === "available" ? "available" : "legacy_unavailable",
+      coverage: "processed_known_rows_not_source_completeness",
+      ...Object.fromEntries(["pending", "history_errors", "scopes_started", "processed_attempts", "completed_sweeps"].map(key =>
+        [key, publicCount(report?.source_observations?.[key])])),
+    } } : {}),
     discovery: {
       cursor: discoveryCursor,
       cursor_updated_at: publicTimestamp(report?.discovery?.cursor_updated_at),
@@ -257,7 +263,7 @@ function sanitizeStatusReportForPublicOutput(report) {
 // Schema discovery selects only the SQL shape. Every health/readiness fact,
 // including schema validation, is then collected by one SELECT on one snapshot.
 const DETAIL_SCHEMA_SQL = `SELECT name, sql FROM sqlite_schema WHERE type = 'table'
-  AND name IN ('lark_im_list_progress', 'lark_im_detail_tasks', 'schema_migrations') ORDER BY name`;
+  AND name IN ('lark_im_list_progress', 'lark_im_detail_tasks', 'schema_migrations', 'record_observation_state', 'lark_im_history_progress') ORDER BY name`;
 const ENABLED_MESSAGE_SCOPE = "s.source_id = 'lark.im' AND s.enabled = 1 AND (s.id = 'lark.im.sent_by_me' OR s.id LIKE 'lark.im.received.chat.%')";
 
 /** @param {string} dbPath @param {(dbPath: string, sql: string, label: string) => Row[]} query */
@@ -358,6 +364,16 @@ function readStatusSnapshot(dbPath, query) {
       ) SELECT COUNT(*) AS scopes, MIN(cursor_ms) AS oldest_cursor_ms,
         COUNT(*) - COUNT(cursor_ms) AS invalid_cursor_scopes FROM cursors` },
   );
+  if (names.has("record_observation_state") && names.has("lark_im_history_progress")) sections.push({
+    label: "read source observation totals", columns: ["pending", "history_errors", "scopes_started", "processed_attempts", "completed_sweeps"],
+    sql: `SELECT
+      (SELECT COUNT(*) FROM record_observation_state o JOIN records r ON r.id=o.record_id
+        WHERE r.source_id='lark.im' AND o.candidate_json IS NOT NULL) AS pending,
+      (SELECT COUNT(*) FROM record_observation_state o JOIN records r ON r.id=o.record_id
+        WHERE r.source_id='lark.im' AND o.history_error IS NOT NULL) AS history_errors,
+      COUNT(*) AS scopes_started,COALESCE(SUM(generation),0) AS processed_attempts,COALESCE(SUM(completed_sweeps),0) AS completed_sweeps
+      FROM lark_im_history_progress`
+  });
   // A single SELECT also gives all julianday('now') evaluations one clock value.
   // Tagged aggregate arrays preserve empty result sets without multiple CLI JSON
   // documents. Labels/columns/SQL are application constants, never caller SQL.
@@ -439,6 +455,8 @@ function buildStatus(dbPath, deps = {}) {
   const reconcileCursor = parseMaybeJson(reconcileRow.cursor_json);
   return sanitizeStatusReportForPublicOutput({
     ...detailProgress,
+    source_observations: snapshot.has("read source observation totals") ? { evidence: "available", ...first(rows("read source observation totals")) }
+      : { evidence: "legacy_unavailable" },
     records: {
       total: Number(totals.count || 0),
       latest_ms: totals.latest_ms ?? null,

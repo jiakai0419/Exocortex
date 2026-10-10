@@ -6,6 +6,7 @@ import { executePreviewUnits, PreviewUnitsError } from '../maintenance/preview-u
 import { executeEnrichment, EnrichmentInputError } from "../maintenance/enrich.mjs";
 import { executeSyncRepair } from "../maintenance/repair.mjs";
 import { executeLarkImReplay, validateReplayOptions, safeReplayError, ReplayInputError } from "../maintenance/replay.mjs";
+import { executeLarkImHistory } from "../maintenance/history.mjs";
 import { MaintenanceRequestError } from "../maintenance/request-session.mjs";
 import { MaintenanceReviewError, reviewRequested } from '../maintenance/review-artifact.mjs';
 import { publicEnrichmentError } from "../maintenance/enrichment-commit.mjs";
@@ -29,6 +30,8 @@ function runMaintenanceCommand(options, context) {
         action, dryRun: options.apply !== true }, { ...deps, now: () => new Date(context.now()), cwd: context.root });
     } else if (action === 'preview') {
       report = (deps.executePreviewUnits || executePreviewUnits)(options, { ...deps, env: context.env, now: context.now });
+    } else if (action === "history") {
+      report = (deps.executeLarkImHistory || executeLarkImHistory)(options, { ...deps, env: context.env, now: context.now });
     } else if (action === "enrich") {
       report = (deps.executeEnrichment || executeEnrichment)(options, { ...deps, env: context.env, now: context.now });
     } else if (action === "repair") {

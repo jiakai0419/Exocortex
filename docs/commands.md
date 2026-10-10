@@ -2,7 +2,7 @@
 
 <!-- Generated from src/cli/registry.mjs through the public machine catalog. Update from registry; do not hand-edit option rows. -->
 
-公共规范入口：`node bin/exocortex.mjs`；人类快捷入口：`npm run exo --`。本表从 `--help --all --format json` 的 registry 目录生成，共 **6 个顶层命令、17 个执行路由**。默认帮助突出 messages、status 与帮助；开发和研究工具见 [Development](development.md)。
+公共规范入口：`node bin/exocortex.mjs`；人类快捷入口：`npm run exo --`。本表从 `--help --all --format json` 的 registry 目录生成，共 **6 个顶层命令、18 个执行路由**。默认帮助突出 messages、status 与帮助；开发和研究工具见 [Development](development.md)。
 
 默认路径相对安装 root，显式相对路径按 cwd 解析。`messages`、`sync` 与显式日志/unsafe 模式为私有输出；默认诊断只输出安全投影。`sync` 保留已有 JSON summary 契约，仅支持 JSON，可能包含私有路径与业务错误细节。域内参数关系仍由各命令校验，不因目录列出而自动允许任意组合。操作配方见 [Operations](operations.md)，行为变化与退役门槛见 [CLI migration](cli-migration.md)。
 
@@ -24,6 +24,7 @@
 | `maintenance backup` | Create and verify a private backup before publishing it. | backup-write, same-source-backup-cleanup | `public-safe` |
 | `maintenance enrich` | Preview enrichment of one target; apply commits through its own CAS. | local-read, remote-read | `public-safe` |
 | `maintenance preview` | Preview independent exact-target units with durable private reviews and locally validated resume. | local-read, remote-read, private-review-file-write, private-progress-file-write | `public-safe` |
+| `maintenance history` | Recheck one known historical record with a durable fixed-horizon checkpoint. | local-read, remote-read, database-write | `public-safe` |
 | `maintenance repair` | Preview structural recovery; apply uses existing fences. | local-read | `public-safe` |
 | `maintenance replay` | Preview replay of explicit scopes and a fixed interval. | local-read, remote-read | `public-safe` |
 | `maintenance prune-runs` | Preview run-history retention; applying can remove coverage evidence. | local-read | `public-safe` |
@@ -282,6 +283,19 @@ Preview independent exact-target units with durable private reviews and locally 
 | `--max-cli-attempts` | integer | `12` | ≥ 1；≤ 1000 | Hard command-wide lark-cli process-attempt cap, including pages and fallbacks; not an HTTP request count. |
 | `--max-seconds` | integer | `30` | ≥ 1；≤ 180 | Command-wide remote-work deadline; stops without committing a budget-interrupted lookup. |
 
+### maintenance history
+
+Recheck one known historical record with a durable fixed-horizon checkpoint.
+
+默认效果：`local-read, remote-read, database-write`；输出：`public-safe`。
+
+| 参数 | 类型/取值 | 默认 | 约束 | 说明 |
+| --- | --- | --- | --- | --- |
+| `--db` | path | — | 必填 | Database; default relative to installation root, explicit relative paths to cwd. |
+| `--format` | text/json | `text` | — | Output format. |
+| `--max-cli-attempts` | integer | `4` | ≥ 2；≤ 4 | Actual CLI budget, 2 to 4. |
+| `--max-seconds` | integer | `30` | ≥ 1；≤ 30 | Elapsed budget, 1 to 30 seconds. |
+
 ### maintenance repair
 
 Preview structural recovery; apply uses existing fences.
@@ -365,5 +379,11 @@ Preview database compaction; --apply permits the write.
 - service install 只保存配置；start 不强制更换已运行实例；restart 才明确重启。安装配置的参数关系由共同 WorkerConfig 校验，once/max-cycles 不允许固化。
 - enrich 必须指定 records 或 scopes；limit 默认分别为 1000、50，sender-only 为 50 且上限 100。probe-apps、unsafe-details、sender-only/sender-id 属于 records 模式。预览仍可能读取远端，apply 才提交。
 - replay 必须显式 DB、1–3 个不同 scope、带时区的固定 start/end；起点不得早于持久基线，终点不得晚于调用时刻。
-- init/backup 是明确写动词；其他维护动作默认预览。全局 apply 不存在，apply 不放宽范围、lease、身份或版本/CAS 校验。
+- init/backup/history 是明确写动词；其他维护动作默认预览。全局 apply 不存在，apply 不放宽范围、lease、身份或版本/CAS 校验。
 - 写命令完成为 0，明确部分失败或欠账为 2，无法执行为 1。sync 只输出既有 JSON summary；messages JSON 保持原数组及私有字段。
+
+### 有界历史核验
+
+`maintenance history --db <path> --max-cli-attempts 4 --max-seconds 30` 处理一个已知原生历史记录，写入核验检查点和观察证据。worker 每轮在正常同步之后执行一次。它不推进发现或同步游标，不证明未入库历史消息已全部发现。停用来源或范围不会被重新启用。
+
+消息 replay 的新私有审阅使用 v4：仅在完整来源证明和本地投影依赖一致时接受表示变化。旧 v1–v3 文件仍按原有精确规则验证。fresh proposal 被拒绝时，审阅文件旁最多保存三份仅本人可读的候选证据；这些文件不是批准文件，不能延长原 TTL。具体边界见 [数据变化契约](data-change-contract.md)。

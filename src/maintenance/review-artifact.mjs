@@ -1,6 +1,6 @@
 // @ts-check
 import { createHash, randomUUID } from 'node:crypto';
-import { constants, openSync, closeSync, fstatSync, lstatSync, realpathSync, writeFileSync, fsyncSync, linkSync, unlinkSync } from 'node:fs';
+import { constants, openSync, closeSync, fstatSync, lstatSync, realpathSync, writeFileSync, fsyncSync, linkSync, unlinkSync, existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { readStableJsonFile } from '../diagnostics/private-json-file.mjs';
 import { activityDatabaseKey } from '../diagnostics/lark-im-activity-evidence.mjs';
@@ -9,6 +9,9 @@ import { readOnlySqliteJson } from '../storage/sqlite/readonly-query.mjs';
 import { renderCardContent } from '../adapters/lark-im/card-content.mjs';
 import { quoteSql, REVIEW_RECORD_COLUMNS, REVIEW_EFFECTIVE_COLUMNS } from '../../dist/storage/sqlite/ingestion-store.js';
 
+import { recordProof, compareObservation, OBSERVATION_POLICY } from '../../dist/core/lark-observation.js';
+
+const OBSERVATION_REVIEW_SCHEMA = 'exocortex_private_maintenance_review/v4';
 const REVIEW_SCHEMA = 'exocortex_private_maintenance_review/v1';
 const TEXT_REVIEW_SCHEMA = 'exocortex_private_maintenance_review/v2';
 const SCOPE_REVIEW_SCHEMA = 'exocortex_private_maintenance_review/v3';
@@ -32,7 +35,7 @@ const REVIEW_DISCLOSURE = { opaque_columns: OPAQUE_FIELDS,
 const TEXT_REVIEW_DISCLOSURE = { ...REVIEW_DISCLOSURE,
   non_card_text: 'exact_stored_title_and_body_not_client_state; private_text_is_not_redacted' };
 const REASONS = new Set(['invalid_options', 'unsafe_path', 'invalid_file', 'approval_mismatch', 'expired', 'binding_unavailable',
-  'binding_changed', 'snapshot_changed', 'proposal_changed', 'too_large', 'incomplete_card', 'no_changes', 'publish_failed']);
+  'binding_changed', 'snapshot_changed', 'proposal_changed', 'too_large', 'incomplete_card', 'no_changes', 'publish_failed', 'evidence_capacity']);
 /** A finite local diagnostic; never expose file contents, IDs or filesystem errors. */
 class MaintenanceReviewError extends Error {
   constructor(reason) { super(`maintenance review rejected: ${REASONS.has(reason) ? reason : 'invalid_file'}`); this.name = 'MaintenanceReviewError'; }
@@ -84,10 +87,10 @@ function privateDestination(path) {
   return target;
 }
 
-function publish(path, artifact, { sync = fsyncSync } = {}) {
+function publish(path, artifact, { sync = fsyncSync, maxBytes = REVIEW_MAX_BYTES } = {}) {
   const target = privateDestination(path);
   const output = Buffer.from(`${JSON.stringify(artifact, null, 2)}\n`, 'utf8');
-  if (output.length > REVIEW_MAX_BYTES) fail('too_large');
+  if (output.length > maxBytes) fail('too_large');
   const temporary = join(dirname(target), `.maintenance-review-${randomUUID()}.tmp`);
   let fd, identity, published = false;
   try {
@@ -109,11 +112,12 @@ function publish(path, artifact, { sync = fsyncSync } = {}) {
 }
 
 function validateArtifact(value, now) {
-  const scopeReview = value?.schema === SCOPE_REVIEW_SCHEMA;
+  const observationReview = value?.schema === OBSERVATION_REVIEW_SCHEMA;
+  const scopeReview = value?.schema === SCOPE_REVIEW_SCHEMA || observationReview;
   const textReview = value?.schema === TEXT_REVIEW_SCHEMA || scopeReview;
   if (!exactKeys(value, ['schema', 'mode', 'created_at_ms', 'expires_at_ms', 'disclosure', 'binding', 'constraints', 'records'])
-    || ![REVIEW_SCHEMA, TEXT_REVIEW_SCHEMA, SCOPE_REVIEW_SCHEMA].includes(value.schema) || !['names', 'replay'].includes(value.mode)
-    || value.schema === TEXT_REVIEW_SCHEMA && value.mode !== 'replay'
+    || ![REVIEW_SCHEMA, TEXT_REVIEW_SCHEMA, SCOPE_REVIEW_SCHEMA, OBSERVATION_REVIEW_SCHEMA].includes(value.schema) || !['names', 'replay'].includes(value.mode)
+    || [TEXT_REVIEW_SCHEMA, OBSERVATION_REVIEW_SCHEMA].includes(value.schema) && value.mode !== 'replay'
     || !equal(value.disclosure, textReview ? TEXT_REVIEW_DISCLOSURE : REVIEW_DISCLOSURE)
     || !finite(value.created_at_ms) || value.expires_at_ms !== value.created_at_ms + REVIEW_AGE_MS) fail('invalid_file');
   if (now < value.created_at_ms || now >= value.expires_at_ms) fail('expired');
@@ -135,7 +139,7 @@ function validateArtifact(value, now) {
     || !Number.isSafeInteger(c.max_seconds) || c.max_seconds < 1 || c.max_seconds > 180) fail('invalid_file');
   if (!Array.isArray(value.records) || value.records.length !== c.targets.length) fail('invalid_file');
   for (const record of value.records) {
-    if (!exactKeys(record, ['id', 'external_id', 'outcome', 'exclusion', 'before_sha256', 'proposal_sha256', 'observed_sha256', 'changed_fields', 'display', 'opaque'])
+    if (!exactKeys(record, ['id', 'external_id', 'outcome', 'exclusion', 'before_sha256', 'proposal_sha256', 'observed_sha256', 'changed_fields', 'display', 'opaque', ...(observationReview ? ['proof'] : [])])
       || !Number.isSafeInteger(record.id) || record.id < 1 || typeof record.external_id !== 'string'
       || !['update', 'duplicate', 'conflict', 'unchanged', 'excluded', 'unresolved'].includes(record.outcome)
       || ![null, 'system_message', 'explicitly_cleared', 'known_name', 'unverified_identity'].includes(record.exclusion)
@@ -143,6 +147,13 @@ function validateArtifact(value, now) {
       || !Array.isArray(record.changed_fields) || record.changed_fields.some(key => !REVIEW_EFFECTIVE_COLUMNS.includes(key))
       || !exactKeys(record.display, ['before', 'after']) || !exactKeys(record.opaque, ['before', 'after', 'changed_fields'])
       || !Array.isArray(record.opaque.changed_fields) || record.opaque.changed_fields.some(field => !OPAQUE_FIELDS.includes(field))) fail('invalid_file');
+    if (observationReview) {
+      if (!exactKeys(record.proof, ['policy', 'observed', 'proposal']) || record.proof.policy !== OBSERVATION_POLICY) fail('invalid_file');
+      for (const p of [record.proof.observed, record.proof.proposal]) if (!exactKeys(p, ['policy', 'exact', 'structural', 'references'])
+        || p.policy !== OBSERVATION_POLICY || !hashValue(p.exact)
+        || ![p.structural, p.references].every(v => v === null || hashValue(v))) fail('invalid_file');
+      if (record.proof.proposal.exact !== record.proposal_sha256 || record.proof.observed.exact !== record.observed_sha256) fail('invalid_file');
+    }
     for (const side of ['before', 'after']) {
       const display = record.display[side];
       if (!exactKeys(display, ['fields', 'sender', 'canonical', 'card', ...(textReview ? ['non_card'] : [])]) || !exactKeys(display.fields, VISIBLE_FIELDS)
@@ -239,8 +250,9 @@ function beginMaintenanceReview(options, { db, mode, rows, scopes = [], now = Da
   const approval = options.reviewIn ? readApproval(options, now()) : null;
   // Legacy approvals retain both their original schema and full-byte binding;
   // a digest is never silently reinterpreted as a v3 projected configuration.
-  const schema = approval?.schema ?? SCOPE_REVIEW_SCHEMA;
-  const scopeReview = schema === SCOPE_REVIEW_SCHEMA;
+  const schema = approval?.schema ?? (mode === 'replay' ? OBSERVATION_REVIEW_SCHEMA : SCOPE_REVIEW_SCHEMA);
+  const observationReview = schema === OBSERVATION_REVIEW_SCHEMA;
+  const scopeReview = schema === SCOPE_REVIEW_SCHEMA || observationReview;
   if (options.reviewOut) privateDestination(options.reviewOut);
   const snapshots = rows.map(recordSnapshot).sort((a,b) => a.id - b.id);
   if (!snapshots.length || snapshots.length > 100 || new Set(snapshots.map(r => r.id)).size !== snapshots.length) fail('snapshot_changed');
@@ -262,7 +274,7 @@ function beginMaintenanceReview(options, { db, mode, rows, scopes = [], now = Da
     self = value;
   }
   /** @param {any[]} decisions @param {(() => void)=} beforePublish */
-  function finish(decisions, beforePublish) {
+  function finishChecked(decisions, beforePublish) {
     if (mode === 'replay' && !self) fail('binding_unavailable');
     const current = readOnlySqliteJson(db, `SELECT * FROM records WHERE id IN (${snapshots.map(row => row.id).join(',')});`, 'recheck review snapshot')
       .map(recordSnapshot).sort((a,b) => a.id - b.id);
@@ -308,6 +320,7 @@ function beginMaintenanceReview(options, { db, mode, rows, scopes = [], now = Da
         return [key, { sha256: sha(text), bytes: bytes(text) }];
       }));
       return { id: original.id, external_id: original.external_id, outcome, exclusion,
+        ...(observationReview ? { proof: { policy: OBSERVATION_POLICY, observed: recordProof(effectiveRecord(observed)), proposal: recordProof(effective) } } : {}),
         before_sha256: digest(original), proposal_sha256: digest(effective), observed_sha256: digest(effectiveRecord(observed)),
         changed_fields: REVIEW_EFFECTIVE_COLUMNS.filter(key => !equal(original[key] ?? null, effective[key])),
         display: { before: display(original), after: display(effective) }, opaque: { before: opaque(original), after: opaque(effective),
@@ -325,7 +338,7 @@ function beginMaintenanceReview(options, { db, mode, rows, scopes = [], now = Da
     if (bytes(`${JSON.stringify(artifact, null, 2)}\n`) > REVIEW_MAX_BYTES) fail('too_large');
     const changes = entries.filter(entry => entry.outcome === 'update').length;
     if (approval) {
-      if (!equal(approval, artifact)) fail('proposal_changed');
+      if (!(observationReview ? equivalentApproval(approval, artifact) : equal(approval, artifact))) fail('proposal_changed');
       if (!changes) fail('no_changes');
     }
     // Publication is the dry-run completion boundary, like a committed write.
@@ -343,7 +356,55 @@ function beginMaintenanceReview(options, { db, mode, rows, scopes = [], now = Da
       fence: approval ? { mode, createdAtMs: artifact.created_at_ms, expiresAtMs: artifact.expires_at_ms,
         sourceConfigJson: control.sourceConfigJson, sentActor: fresh.sentActor, records: snapshots, scopes } : undefined };
   }
-  return { finish, verifySelf };
+  function finish(decisions, beforePublish) {
+    try { return finishChecked(decisions, beforePublish); }
+    catch (error) {
+      // Fresh evidence is saved independently of the old approval. It is never
+      // executable approval input. Binding/self checks already preceded fetch.
+      if (approval && mode === 'replay' && self && decisions.length) {
+        const prefix = `.replay-rejected-${options.reviewSha256}-`;
+        const parent = dirname(privatePath(options.reviewIn));
+
+        const evidence = { schema: 'exocortex_rejected_observation/v1', policy: OBSERVATION_POLICY,
+          approval_sha256: options.reviewSha256, captured_at_ms: now(),
+          reason: error instanceof MaintenanceReviewError ? error.message : 'local_review_failure',
+          decisions: decisions.map(({ before, after, observed = after, outcome }) => ({
+            before: recordSnapshot(before), proposal: effectiveRecord(after), observed: effectiveRecord(observed), outcome,
+            comparison: compareObservation(before, observed) })) };
+        let saved = false;
+        // Three exclusive fixed slots remain bounded even for concurrent refusals.
+        for (let slot = 0; slot < 3; slot++) {
+          const file = `${prefix}${slot}.json`, path = join(parent, file);
+          if (existsSync(path)) continue;
+          try {
+            const receipt = publish(path, evidence, { maxBytes: REVIEW_TOTAL_BYTES });
+            if (error && typeof error === 'object') /** @type {any} */ (error).failureEvidence = { sha256: receipt, file, schema: evidence.schema };
+            saved = true; break;
+          } catch (failure) { if (!existsSync(path)) throw failure; }
+        }
+        if (!saved) fail('evidence_capacity');
+      }
+      throw error;
+    }
+  }
+  return { finish, verifySelf, legacyStrict: !observationReview };
+
+}
+
+/** Exact binding/display and complete record proofs; no ignored raw fields. */
+function equivalentApproval(approved, fresh) {
+  const top = value => ({ ...value, records: null });
+  if (!equal(top(approved), top(fresh)) || approved.records.length !== fresh.records.length) return false;
+  const sameProof = (a, b) => a.policy === b.policy && (a.exact === b.exact
+    || a.structural !== null && a.structural === b.structural || a.references !== null && a.references === b.references);
+  const spine = entry => {
+    const { proof, proposal_sha256, observed_sha256, opaque, ...rest } = entry;
+    return { ...rest, opaque: { before: opaque.before, changed_fields: opaque.changed_fields } };
+  };
+  return approved.records.every((a, i) => {
+    const b = fresh.records[i];
+    return equal(spine(a), spine(b)) && sameProof(a.proof.observed, b.proof.observed) && sameProof(a.proof.proposal, b.proof.proposal);
+  });
 }
 
 /** Reuse only unexpired, complete local evidence. This does not fetch or verify
@@ -381,4 +442,4 @@ function reuseMaintenanceReview(options, { db, mode, now = Date.now, expectedSha
 }
 
 export { beginMaintenanceReview, reuseMaintenanceReview, validateReviewOptions, reviewRequested, MaintenanceReviewError, recordSnapshot,
-  effectiveRecord, publish as publishReviewArtifact, REVIEW_SCHEMA, REVIEW_MAX_BYTES, REVIEW_RECORD_BYTES, REVIEW_TOTAL_BYTES, REVIEW_AGE_MS };
+  effectiveRecord, OBSERVATION_REVIEW_SCHEMA, publish as publishReviewArtifact, REVIEW_SCHEMA, REVIEW_MAX_BYTES, REVIEW_RECORD_BYTES, REVIEW_TOTAL_BYTES, REVIEW_AGE_MS };

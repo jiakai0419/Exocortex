@@ -59,7 +59,7 @@ for (const retention of [false, true]) test(`a real single-instance cycle is com
   for (const event of work) {
     assert.equal(event.version, 1); assert.equal(event.instance_id, worker.instance_id); assert.equal(event.database_key, worker.database_key);
   }
-  assert.deepEqual(work.filter(event => event.type === "lark_im_worker_step").map(event => event.step_index), retention ? [0, 1, 2, 3, 4, 5, 6] : [0, 1, 2, 3, 4, 5]);
+  assert.deepEqual(work.filter(event => event.type === "lark_im_worker_step").map(event => event.step_index), retention ? [0, 1, 2, 3, 4, 5, 6, 7] : [0, 1, 2, 3, 4, 5, 6]);
 });
 for (const sameDb of [false, true]) for (const includeFailedCurrent of [false, true]) {
   test(`foreign same-number success cannot satisfy current waiting: sameDb=${sameDb}, currentFailure=${includeFailedCurrent}`, t => {

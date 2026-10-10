@@ -1,5 +1,7 @@
 import { quoteSql } from "./sqlite-executor.js";
 import { mergeLarkNameProjectionSql } from "./lark-name-projection.js";
+import { compareObservation, isNativeRecord } from "../../core/lark-observation.js";
+import { observationAllowsSql, observationEvidenceSql, observationGuardSql, prepareObservationRecords } from "./observation-store.js";
 /** Encode adapter evidence without inferring ordering from a token's spelling.
  * Decimal revisions are ordered; opaque tokens retain exact string identity. */
 function encodeSourceVersion(value) {
@@ -38,6 +40,12 @@ function preferIncomingRecord(current, incoming) {
         return true;
     if (currentVersion !== null && incomingVersion === null)
         return false;
+    if (currentVersion === incomingVersion && isNativeRecord(current) && isNativeRecord(incoming)) {
+        if (!compareObservation(current, incoming).equivalent)
+            throw new Error("response contains ambiguous duplicate source observations");
+        // Selection must not depend on pagination or response order.
+        return JSON.stringify(incoming) < JSON.stringify(current);
+    }
     if (currentVersion === null && incomingVersion === null)
         return true;
     if (/^\d+$/.test(String(currentVersion)) && /^\d+$/.test(String(incomingVersion))) {
@@ -80,7 +88,8 @@ function normalizeBoundedReplayRecords(records, sourceId) {
     for (const original of records) {
         const incoming = { ...original, external_version: normalizeExternalVersion(original.external_version) };
         const current = seen.get(incoming.external_id);
-        if (current && (current.raw_json !== incoming.raw_json || current.content_hash !== incoming.content_hash)) {
+        if (current && !(isNativeRecord(current) && isNativeRecord(incoming) && compareObservation(current, incoming).equivalent)
+            && (current.raw_json !== incoming.raw_json || current.content_hash !== incoming.content_hash)) {
             const a = current.external_version;
             const b = incoming.external_version;
             if (a === null || b === null || !/^\d+$/.test(a) || !/^\d+$/.test(b) || a === b) {
@@ -164,26 +173,40 @@ function strictlyNewerVersionSql(existingAlias, incomingAlias) {
       )
   ))`;
 }
+/** A common source-selection predicate. Exact legacy approvals add their own
+ * authorization gate; they do not define a different native source policy. */
+function sourceCanReplaceSql(existing, incoming, expected = "NULL", strict = false, prepared = null) {
+    const native = `${incoming}.source_id='lark.im' AND ${incoming}.record_type='lark.im.message'
+    AND CASE WHEN json_valid(${incoming}.canonical_json) THEN json_extract(${incoming}.canonical_json,'$.source_api')='im.v1.messages' ELSE 0 END
+    AND CASE WHEN json_valid(${existing}.canonical_json) THEN json_extract(${existing}.canonical_json,'$.source_api')='im.v1.messages' ELSE 0 END`;
+    return `(CASE WHEN ${native} THEN (
+    ${existing}.record_type IS ${incoming}.record_type AND ${existing}.container_id IS ${incoming}.container_id
+    AND ${existing}.occurred_at_ms IS ${incoming}.occurred_at_ms AND
+    ${prepared ?? `(${strictlyNewerVersionSql(existing, incoming)} OR (${existing}.external_version IS ${incoming}.external_version AND ${existing}.raw_json IS ${incoming}.raw_json))`}
+  ) ELSE ${strict ? strictlyNewerVersionSql(existing, incoming) : versionCanReplaceSql(existing, incoming, expected)} END)`;
+}
 /** Read-only projection for existing exact replay targets. This is the actual
  * strict upsert expression, including its SQL-side name merge, rather than a
  * JavaScript approximation of what incoming canonical JSON might become.
  * Callers must require one returned row per selected existing target. */
-function boundedReplayProjectionSql(records) {
+function boundedReplayProjectionSql(records, options = {}) {
     if (!Array.isArray(records) || records.length < 1 || records.length > 100) {
         throw new Error("bounded replay review requires between 1 and 100 records");
     }
-    const normalized = normalizeBoundedReplayRecords(records, "lark.im");
+    const initial = normalizeBoundedReplayRecords(records, "lark.im");
+    const normalized = options.dbPath ? prepareObservationRecords(options.dbPath, initial) : initial;
     if (normalized.some((record) => record.record_type !== "lark.im.message" ||
         !Number.isSafeInteger(record.occurred_at_ms))) {
         throw new Error("invalid bounded replay review record");
     }
     const incomingColumns = ["source_id", "external_id", ...MUTABLE_RECORD_COLUMNS];
     const sameFact = "r.external_version IS i.external_version AND r.content_hash IS i.content_hash AND r.raw_json IS i.raw_json";
-    return `WITH i (${incomingColumns.join(",")}) AS (VALUES
+    const allow = options.legacyStrict ? strictlyNewerVersionSql("r", "i") : sourceCanReplaceSql("r", "i", "NULL", true, "COALESCE(i.allow_update, (" + strictlyNewerVersionSql("r", "i") + " OR (r.external_version IS i.external_version AND r.raw_json IS i.raw_json)))");
+    return `WITH i (${incomingColumns.join(",")},allow_update) AS (VALUES
       ${normalized.map((record) => `(${incomingColumns.map((column) => column === "occurred_at_ms"
-        ? String(record.occurred_at_ms) : quoteSql(record[column])).join(",")})`).join(",\n")}
+        ? String(record.occurred_at_ms) : quoteSql(record[column])).join(",")},${observationAllowsSql(record) ?? "NULL"})`).join(",\n")}
     ), projection AS MATERIALIZED (
-      SELECT r.*, CASE WHEN ${strictlyNewerVersionSql("r", "i")} AND ${recordDiffSql("r", "i")} THEN 1 ELSE 0 END AS should_update,
+      SELECT r.*, CASE WHEN ${allow} AND ${recordDiffSql("r", "i")} THEN 1 ELSE 0 END AS should_update,
         CASE WHEN ${sameFact} THEN 1 ELSE 0 END AS same_fact,
         ${MUTABLE_RECORD_COLUMNS.map((column) => `${column === "canonical_json"
         ? mergedCanonicalSql("r", "i") : `i.${column}`} AS incoming_${column}`).join(",\n")}
@@ -204,7 +227,8 @@ function recordUpdateSetSql() {
 function recordIdentityGuardSql(records) {
     if (!records.length)
         return "";
-    return `CREATE TEMP TABLE IF NOT EXISTS __record_identity_guard (allowed INTEGER NOT NULL CHECK (allowed = 1));
+    return `${observationGuardSql(records)}
+    CREATE TEMP TABLE IF NOT EXISTS __record_identity_guard (allowed INTEGER NOT NULL CHECK (allowed = 1));
     ${records.map((record) => {
         const identity = `source_id=${quoteSql(record.source_id)} AND external_id=${quoteSql(record.external_id)}`;
         const expected = record.expected_external_version;
@@ -218,8 +242,9 @@ function recordIdentityGuardSql(records) {
     }).join("\n")}`;
 }
 function upsertRecordsSql(records, options = {}) {
-    const normalized = normalizeStoredRecords(records);
-    return recordIdentityGuardSql(normalized) + normalized
+    const initial = normalizeStoredRecords(records);
+    const normalized = options.dbPath ? prepareObservationRecords(options.dbPath, initial) : initial;
+    return recordIdentityGuardSql(normalized) + observationEvidenceSql(normalized) + normalized
         .map((record) => `
 INSERT INTO records (
   source_id,
@@ -259,8 +284,8 @@ VALUES (
 )
 ON CONFLICT(source_id, external_id) DO UPDATE SET
   ${recordUpdateSetSql()}
-WHERE ${options.strictVersionIncrease ? strictlyNewerVersionSql("records", "excluded")
-        : versionCanReplaceSql("records", "excluded", quoteSql(record.expected_external_version))}
+WHERE ${sourceCanReplaceSql("records", "excluded", quoteSql(record.expected_external_version), options.strictVersionIncrease, observationAllowsSql(record))}
+  AND ${options.legacyApprovalGate ? strictlyNewerVersionSql("records", "excluded") : "1"}
   AND ${recordDiffSql("records", "excluded")};
 `)
         .join("\n");
@@ -270,7 +295,7 @@ function incomingRecordsSql(records) {
         .map((record) => `INSERT INTO __incoming_records (
   source_id, first_seen_scope_id, external_id, external_version, record_type,
   occurred_at, occurred_at_ms, actor_id, container_id, direction, title, body,
-  content_hash, canonical_json, raw_json, expected_external_version
+  content_hash, canonical_json, raw_json, expected_external_version, allow_update
 ) VALUES (
   ${quoteSql(record.source_id)},
   ${quoteSql(record.first_seen_scope_id)},
@@ -287,7 +312,8 @@ function incomingRecordsSql(records) {
   ${quoteSql(record.content_hash)},
   ${quoteSql(record.canonical_json)},
   ${quoteSql(record.raw_json)},
-  ${quoteSql(record.expected_external_version)}
+  ${quoteSql(record.expected_external_version)},
+  ${observationAllowsSql(record) ?? "NULL"}
 );`)
         .join("\n");
     return `
@@ -308,27 +334,31 @@ CREATE TEMP TABLE __incoming_records (
   canonical_json TEXT,
   raw_json TEXT NOT NULL,
   expected_external_version TEXT,
+  allow_update INTEGER,
   PRIMARY KEY (source_id, external_id)
 );
 ${inserts}
 `;
 }
 function recordWritesSql(normalizedRecords, now) {
-    const canReplace = versionCanReplaceSql("r", "i", "i.expected_external_version");
+    const canReplace = sourceCanReplaceSql("r", "i", "i.expected_external_version", false, `COALESCE(i.allow_update, (${strictlyNewerVersionSql("r", "i")} OR (r.external_version IS i.external_version AND r.raw_json IS i.raw_json)))`);
     const differs = recordDiffSql("r", "i");
     return `
 ${recordIdentityGuardSql(normalizedRecords)}
+${observationEvidenceSql(normalizedRecords, "EXISTS (SELECT 1 FROM __run_fence_guard)")}
 ${incomingRecordsSql(normalizedRecords)}
     CREATE TEMP TABLE __write_effects (
       inserted INTEGER NOT NULL,
       updated INTEGER NOT NULL,
-      duplicate INTEGER NOT NULL
+      duplicate INTEGER NOT NULL,
+      conflicts INTEGER NOT NULL
     );
-    INSERT INTO __write_effects (inserted, updated, duplicate)
+    INSERT INTO __write_effects (inserted, updated, duplicate, conflicts)
     SELECT
       COALESCE(SUM(CASE WHEN r.id IS NULL THEN 1 ELSE 0 END), 0),
       COALESCE(SUM(CASE WHEN r.id IS NOT NULL AND ${canReplace} AND ${differs} THEN 1 ELSE 0 END), 0),
-      COALESCE(SUM(CASE WHEN r.id IS NOT NULL AND NOT (${canReplace} AND ${differs}) THEN 1 ELSE 0 END), 0)
+      COALESCE(SUM(CASE WHEN r.id IS NOT NULL AND COALESCE(i.allow_update,1)<>0 AND NOT (${canReplace} AND ${differs}) THEN 1 ELSE 0 END), 0),
+      COALESCE(SUM(CASE WHEN r.id IS NOT NULL AND i.allow_update=0 THEN 1 ELSE 0 END), 0)
     FROM __incoming_records i
     LEFT JOIN records r
       ON r.source_id = i.source_id
@@ -347,7 +377,7 @@ ${incomingRecordsSql(normalizedRecords)}
     WHERE EXISTS (SELECT 1 FROM __run_fence_guard)
     ON CONFLICT(source_id, external_id) DO UPDATE SET
       ${recordUpdateSetSql()}
-    WHERE ${versionCanReplaceSql("records", "excluded", "(SELECT expected_external_version FROM __incoming_records candidate WHERE candidate.source_id=excluded.source_id AND candidate.external_id=excluded.external_id)")}
+    WHERE ${sourceCanReplaceSql("records", "excluded", "(SELECT expected_external_version FROM __incoming_records candidate WHERE candidate.source_id=excluded.source_id AND candidate.external_id=excluded.external_id)", false, `(SELECT COALESCE(allow_update, (${strictlyNewerVersionSql("records", "excluded")} OR (records.external_version IS excluded.external_version AND records.raw_json IS excluded.raw_json))) FROM __incoming_records candidate WHERE candidate.source_id=excluded.source_id AND candidate.external_id=excluded.external_id)`)}
       AND ${recordDiffSql("records", "excluded")};
 `;
 }

@@ -1,6 +1,6 @@
 // @ts-check
 
-import { isDeepStrictEqual } from "node:util";
+import { sourceRelation } from "../../../dist/core/lark-observation.js";
 
 import {
   assertValidLarkMessage,
@@ -336,7 +336,7 @@ function assertRefreshedRoot(queued, refreshed) {
       const { create_time, update_time, upper_message_id, ...source } = root;
       return source;
     };
-    if (!isDeepStrictEqual(payload(queued), payload(refreshed))) {
+    if (!["exact", "json_representation", "reference_rename"].includes(sourceRelation(JSON.stringify(payload(queued)), JSON.stringify(payload(refreshed))))) {
       throw new MessageDetailError("source_version_conflict");
     }
   }

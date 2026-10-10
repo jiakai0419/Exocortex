@@ -145,8 +145,11 @@ function legacyApproval(f, options, preview, schema) {
   const input = approved(options, preview);
   input.reviewSha256 = rewrite(options.reviewOut, artifact => {
     artifact.schema = `exocortex_private_maintenance_review/${schema}`;
-    delete artifact.binding.scope_config_policy;
-    for (const scope of artifact.binding.scopes) scope.config_sha256 = hash(scopeConfigText(f));
+    for (const record of artifact.records) delete record.proof;
+    if (schema !== 'v3') {
+      delete artifact.binding.scope_config_policy;
+      for (const scope of artifact.binding.scopes) scope.config_sha256 = hash(scopeConfigText(f));
+    }
     if (schema === 'v1') {
       delete artifact.disclosure.non_card_text;
       for (const record of artifact.records) for (const side of ['before', 'after']) delete record.display[side].non_card;
@@ -159,7 +162,7 @@ for (const [mode, kind] of [['names', 'text'], ['names', 'interactive'], ['card'
   test(`v3 ${mode} (${kind}) approval survives only the three fields changed by formal hot discovery`, t => {
     const f = fixture(t, 2, kind); initializeHotScope(f);
     const w = scopeWorkflow(f, mode), preview = w.run(), artifact = readArtifact(w.options.reviewOut);
-    assert.equal(artifact.schema, 'exocortex_private_maintenance_review/v3');
+    assert.equal(artifact.schema, `exocortex_private_maintenance_review/${mode === 'names' ? 'v3' : 'v4'}`);
     assert.equal(artifact.binding.scope_config_policy, SCOPE_POLICY);
     assert.equal(artifact.expires_at_ms - artifact.created_at_ms, REVIEW_AGE_MS);
     for (const r of artifact.records) if (mode !== 'text') assert.equal(r.display.after.non_card, null);
@@ -329,7 +332,7 @@ test('card review uses final SQL merge, refetches without extra API, binds opaqu
   assert.equal(preview.ok, true); assert.equal(preview.review.changes, 2); assert.equal(f.calls.length, 2);
   assert.deepEqual(readFileSync(f.db), bytes);
   const artifact = readArtifact(opts.reviewOut);
-  assert.equal(artifact.schema, 'exocortex_private_maintenance_review/v3');
+  assert.equal(artifact.schema, 'exocortex_private_maintenance_review/v4');
   assert.equal(artifact.binding.verified_self_sha256, hash(SELF.open_id));
   for (const record of artifact.records) {
     assert.match(record.display.before.card.text, /Synthetic card before/);
@@ -351,7 +354,7 @@ test('card review uses final SQL merge, refetches without extra API, binds opaqu
 });
 
 for (const kind of ['text', 'post', 'system', 'general_calendar', 'video_chat']) {
-  test(`${kind} exact replay publishes complete stored text in v3 and approved apply preserves the reviewed result`, t => {
+  test(`${kind} exact replay publishes complete stored text in v4 and approved apply preserves the reviewed result`, t => {
     const f = fixture(t, 1, kind), before = ro(f), dbBytes = readFileSync(f.db), opts = replayOptions(f);
     const messages = [message(f, 0, kind, { update_time: String(f.start + 20_000),
       body: { content: JSON.stringify(nonCardContent(kind, 'Synthetic non-card after\n完整正文🙂')) } })];
@@ -359,7 +362,7 @@ for (const kind of ['text', 'post', 'system', 'general_calendar', 'video_chat'])
     assert.equal(preview.ok, true); assert.equal(preview.review.changes, 1); assert.equal(f.calls.length, 2);
     assert.deepEqual(readFileSync(f.db), dbBytes); noWrites(f, before);
     const artifact = readArtifact(opts.reviewOut), record = artifact.records[0];
-    assert.equal(artifact.schema, 'exocortex_private_maintenance_review/v3');
+    assert.equal(artifact.schema, 'exocortex_private_maintenance_review/v4');
     assert.equal(preview.review.schema, artifact.schema);
     assert.match(artifact.disclosure.non_card_text, /exact_stored_title_and_body/);
     assert.deepEqual(record.display.before.non_card, { title: before[0].title, body: before[0].body });
@@ -394,7 +397,7 @@ test('mixed replay retains strict interactive rendering and cannot disguise a ca
   const messages = [message(f, 0, false, { update_time: String(f.start + 20_000) }), incoming(f, 1)];
   const preview = replay(f, messages, opts); assert.equal(preview.ok, true);
   const artifact = readArtifact(opts.reviewOut);
-  assert.equal(artifact.schema, 'exocortex_private_maintenance_review/v3');
+  assert.equal(artifact.schema, 'exocortex_private_maintenance_review/v4');
   assert.equal(artifact.records[1].display.after.non_card, null);
   assert.match(artifact.records[1].display.after.card.text, /Synthetic card after/);
   const malformed = replay(f, [messages[0], incoming(f, 1, '', { body: { content: JSON.stringify({ unsupported: true }) } })],

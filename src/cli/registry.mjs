@@ -105,6 +105,11 @@ export const COMMANDS = Object.freeze([
     bool('--resume', 'resume', 'Reuse valid unexpired local reviews without remote revalidation; this explicit invocation receives a new budget.'),
     ...maintenanceBudget,
   ], ['local-read', 'remote-read', 'private-review-file-write', 'private-progress-file-write']),
+  route("maintenance.history", "Recheck one known historical record with a durable fixed-horizon checkpoint.", [
+    { ...db, default: undefined, required: true }, format,
+    option('--max-cli-attempts', 'maxCliAttempts', 'integer', 'Actual CLI budget, 2 to 4.', { min: 2, max: 4, default: 4 }),
+    option('--max-seconds', 'maxSeconds', 'integer', 'Elapsed budget, 1 to 30 seconds.', { min: 1, max: 30, default: 30 }),
+  ], ['local-read', 'remote-read', 'database-write']),
   route("maintenance.repair", "Preview structural recovery; apply uses existing fences.", [db, format, apply], ["local-read"], "public-safe", [{ when: "--apply", effects: ["database-write"] }]),
   route("maintenance.replay", "Preview replay of explicit scopes and a fixed interval.", [
     { ...db, default: undefined, required: true }, format, apply,

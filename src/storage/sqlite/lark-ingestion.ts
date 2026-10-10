@@ -8,6 +8,8 @@ import { acquireMaintenanceLock, releaseMaintenanceLock } from "./sync-locks.js"
 import { RUN_FENCE_METADATA_KEY, scopeCursorJson, validateRecordCursor, cursorCanAdvanceSql, checkedRunId, runFenceGuardSql } from "./sync-run-fence.js";
 import { normalizeStoredRecords, normalizeBoundedReplayRecords, normalizeExternalVersion, numericVersionSql, versionCanReplaceSql, upsertRecordsSql, recordWritesSql } from "./record-storage.js";
 import { reviewFenceSql } from "./maintenance-review.js";
+import { sourceProof } from "../../core/lark-observation.js";
+import { prepareObservationRecords } from "./observation-store.js";
 
 /** Commit one completely fetched, explicitly bounded repair without touching
  * normal runs, scope cursors, or freshness markers. Remote work belongs outside
@@ -31,10 +33,34 @@ function commitBoundedReplayRecords(dbPath: string, options: BoundedReplayOption
   if (!Number.isSafeInteger(pages) || pages < 1 || !Number.isSafeInteger(fetchedCount) || fetchedCount < 0) {
     throw new Error("invalid bounded replay fetch evidence");
   }
-  const records = normalizeBoundedReplayRecords(options.records, scope.source_id);
+  if (options.legacyApprovalGate && !options.reviewFence) throw new Error("legacy approval gate requires a review fence");
+  const history = options.history;
+  if (options.observationAcquisition && !history) throw new Error("history acquisition requires its checkpoint fence");
+  const historyKey = history ? createHash("sha256").update(JSON.stringify({ scope, history, attemptId, records: options.records, initialSyncStartMs, startMs, endMs, planId, selfIdHash, pages, fetchedCount,
+    reviewFence: options.reviewFence, acquisition: options.observationAcquisition ? { ...options.observationAcquisition, basis: [...options.observationAcquisition.basis] } : null })).digest("hex") : null;
+  if (history) {
+    if (![history.generation, history.afterId, history.sweepMaxId, history.completedSweeps, history.selectedId,
+      history.nextSweepMaxId, history.startedAtMs].every(n => Number.isSafeInteger(n) && n >= 0)
+      || history.selectedId < 1 || history.selectedId > history.nextSweepMaxId
+      || options.records.length > 1 || !options.reviewFence || options.observationAcquisition?.attempt !== attemptId
+      || options.observationAcquisition.confirm !== true || options.observationAcquisition.startedAtMs !== history.startedAtMs
+      || !/^[a-f0-9]{64}$/.test(options.observationAcquisition.contextKey)
+      || options.reviewFence.records.length !== 1 || options.reviewFence.records[0].id !== history.selectedId
+      || options.records.some(record => record.external_id !== options.reviewFence!.records[0].external_id)
+      || ![null, "incomplete", "size_limit", "identity", "ambiguous", "missing", "fetch_unavailable"].includes(history.error)) {
+      throw new Error("invalid historical recheck fence");
+    }
+    const receipt = sqliteQuery(dbPath, `SELECT last_attempt_id,last_result_json FROM lark_im_history_progress WHERE scope_id=${quoteSql(scope.id)};`, "read history receipt")[0];
+    if (receipt?.last_attempt_id === attemptId) {
+      const saved = JSON.parse(receipt.last_result_json);
+      if (saved.history_key !== historyKey) throw new Error("history acquisition identity reused");
+      return saved.effects;
+    }
+  }
+  const records = prepareObservationRecords(dbPath, normalizeBoundedReplayRecords(options.records, scope.source_id), options.observationAcquisition);
   if (options.reviewFence?.mode === "names") throw new Error("bounded replay rejects a names review fence");
   const reviewFence = options.reviewFence === undefined ? "" : reviewFenceSql(options.reviewFence);
-  if (options.reviewFence && (options.reviewFence.records.length !== records.length || records.some((record) =>
+  if (options.reviewFence && !history && (options.reviewFence.records.length !== records.length || records.some((record) =>
     !options.reviewFence!.records.some((before) => before.source_id === record.source_id && before.external_id === record.external_id)))) {
     throw new Error("bounded replay review fence must cover every candidate exactly");
   }
@@ -75,7 +101,7 @@ function commitBoundedReplayRecords(dbPath: string, options: BoundedReplayOption
              EXISTS (SELECT 1 FROM records WHERE source_id=${quoteSql(record.source_id)} AND external_id=${quoteSql(record.external_id)}
                AND external_version IS ${quoteSql(record.external_version)}
                AND content_hash IS ${quoteSql(record.content_hash)} AND raw_json IS ${quoteSql(record.raw_json)});
-      ${upsertRecordsSql([record], { strictVersionIncrease: true })}
+      ${upsertRecordsSql([record], { strictVersionIncrease: true, legacyApprovalGate: options.legacyApprovalGate })}
       INSERT INTO __replay_effects (changed, existed, same_fact)
       SELECT changes(), existed, same_fact FROM __replay_before;
     `).join("\n");
@@ -99,9 +125,17 @@ function commitBoundedReplayRecords(dbPath: string, options: BoundedReplayOption
           AND container_id IS ${quoteSql(target.container_id)} AND occurred_at_ms IS ${target.occurred_at_ms}
           AND external_version IS ${quoteSql(target.external_version)}
       ) THEN 1 ELSE 0 END;`).join("\n")}
+      ${history ? `INSERT INTO __replay_guard SELECT CASE WHEN
+        COALESCE((SELECT generation FROM lark_im_history_progress WHERE scope_id=${quoteSql(scope.id)}),0)=${history.generation}
+        AND COALESCE((SELECT after_id FROM lark_im_history_progress WHERE scope_id=${quoteSql(scope.id)}),0)=${history.afterId}
+        AND COALESCE((SELECT sweep_max_id FROM lark_im_history_progress WHERE scope_id=${quoteSql(scope.id)}),0)=${history.sweepMaxId}
+        THEN 1 ELSE 0 END;` : ""}
       CREATE TEMP TABLE __replay_before (existed INTEGER NOT NULL, same_fact INTEGER NOT NULL);
       CREATE TEMP TABLE __replay_effects (changed INTEGER NOT NULL, existed INTEGER NOT NULL, same_fact INTEGER NOT NULL);
       ${statements}
+      ${history ? `DELETE FROM bounded_replay_runs WHERE scope_id=${quoteSql(scope.id)} AND id=(
+        SELECT json_extract(last_result_json,'$.effects.audit_id') FROM lark_im_history_progress WHERE scope_id=${quoteSql(scope.id)}
+      );` : ""}
       INSERT INTO bounded_replay_runs (
         id,plan_id,attempt_id,source_id,scope_id,initial_sync_start_ms,window_start_ms,window_end_ms,self_id_hash,
         page_count,fetched_count,candidate_count,inserted_count,updated_count,duplicate_count,conflict_count,finished_at
@@ -110,6 +144,16 @@ function commitBoundedReplayRecords(dbPath: string, options: BoundedReplayOption
         COALESCE(SUM(changed=1 AND existed=0),0), COALESCE(SUM(changed=1 AND existed=1),0),
         COALESCE(SUM(changed=0 AND same_fact=1),0), COALESCE(SUM(changed=0 AND same_fact=0),0),
         strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM __replay_effects;
+      ${history ? `UPDATE record_observation_state SET history_error=${quoteSql(history.error)} WHERE record_id=${history.selectedId};
+        INSERT INTO lark_im_history_progress(scope_id,generation,sweep_max_id,after_id,last_attempt_at_ms,last_attempt_id,last_result_json,completed_sweeps)
+        SELECT ${quoteSql(scope.id)},${history.generation + 1},${history.nextSweepMaxId},${history.selectedId},${history.startedAtMs},${quoteSql(attemptId)},
+          json_object('history_key',${quoteSql(historyKey)},'error',${quoteSql(history.error)},'request_budget',json(${quoteSql(JSON.stringify(history.requestBudget))}),
+            'effects',json_object('audit_id',id,'inserted',inserted_count,'updated',updated_count,'duplicate',duplicate_count,'conflicts',conflict_count)),
+          ${history.completedSweeps + (history.selectedId === history.nextSweepMaxId ? 1 : 0)}
+        FROM bounded_replay_runs WHERE id=${quoteSql(auditId)}
+        ON CONFLICT(scope_id) DO UPDATE SET generation=excluded.generation,sweep_max_id=excluded.sweep_max_id,after_id=excluded.after_id,
+          last_attempt_at_ms=excluded.last_attempt_at_ms,last_attempt_id=excluded.last_attempt_id,last_result_json=excluded.last_result_json,
+          completed_sweeps=excluded.completed_sweeps;` : ""}
       SELECT id AS audit_id,inserted_count AS inserted,updated_count AS updated,
         duplicate_count AS duplicate,conflict_count AS conflicts FROM bounded_replay_runs WHERE id=${quoteSql(auditId)};
       COMMIT;
@@ -211,7 +255,7 @@ function larkDetailRoot(raw: JsonObject, requireMerge = true) {
     delete source.upper_message_id;
   }
   return { message_id: root.message_id, raw_json: stableJson(root),
-    fingerprint: createHash("sha256").update(stableJson(source)).digest("hex"),
+    fingerprint: sourceProof(JSON.stringify(source)).structural || createHash("sha256").update(stableJson(source)).digest("hex"),
     occurred_at_ms: occurredAtMs, external_version: externalVersion };
 }
 
@@ -231,7 +275,7 @@ function commitLarkProgress(dbPath: string, scope: SyncScope, runId: number, rec
   scannedCount: number, metadata: JsonObject, mutationSql: string, phase: "list" | "details"): LarkProgressEffects {
   requireLarkScope(scope);
   if (!Number.isSafeInteger(scannedCount) || scannedCount < 0) throw new Error("invalid Lark scanned count");
-  const normalized = normalizeStoredRecords(records, scope.source_id);
+  const normalized = prepareObservationRecords(dbPath, normalizeStoredRecords(records, scope.source_id));
   if (normalized.some((record) => record.first_seen_scope_id !== scope.id || record.record_type !== "lark.im.message")) {
     throw new Error("detail progress record does not belong to this Lark scope");
   }
@@ -269,7 +313,7 @@ function commitLarkProgress(dbPath: string, scope: SyncScope, runId: number, rec
         json_remove(COALESCE(metadata_json, '{}'), '$.window_start', '$.window_end', '$.window_start_ms', '$.window_end_ms',
           '$.coverage_mode', '$.window_complete', '$.details_complete', '$.list_complete', '$.pending_detail_count', '$.lark_progress'),
         json_patch(${sqlJson(safeMetadata)}, json_patch(
-          json_object('list_complete', json('true'), 'details_complete', json(CASE WHEN (SELECT pending FROM __lark_finish) = 0 THEN 'true' ELSE 'false' END),
+          json_object('source_observation_conflicts',(SELECT conflicts FROM __write_effects),'list_complete', json('true'), 'details_complete', json(CASE WHEN (SELECT pending FROM __lark_finish) = 0 THEN 'true' ELSE 'false' END),
             'window_complete', json(CASE WHEN (SELECT pending FROM __lark_finish) = 0 THEN 'true' ELSE 'false' END),
             'pending_detail_count', (SELECT pending FROM __lark_finish),
             'lark_progress', json_object('version', 1, 'phase', ${quoteSql(phase)},
@@ -305,6 +349,7 @@ function commitLarkProgress(dbPath: string, scope: SyncScope, runId: number, rec
   const row = rows[0];
   if (!row) throw new Error("Lark progress commit returned no evidence");
   return { inserted: Number(row.inserted), updated: Number(row.updated), duplicate: Number(row.duplicate),
+    ...(Number(row.conflicts) > 0 ? { conflicts: Number(row.conflicts) } : {}),
     pending_details: Number(row.pending_details), full_cursor_promoted: row.full_cursor_promoted === 1,
     list_cursor: JSON.parse(row.cursor_json) };
 }

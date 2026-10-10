@@ -11,13 +11,13 @@ import { publicFailureKind, publicTimestamp } from "./public-safe.mjs";
 import { publicActivity } from "./public-activity.mjs";
 import { summarizeRuntimeStats } from "./status-runtime-stats.mjs";
 import { parseWorkerEventTimestamp as timestamp } from "./worker-event-time.mjs";
-import { REQUIRED_CYCLE_STEPS } from "../../dist/runtime/worker/lark-im-worker-core.js";
+import { expectedCycleSteps } from "../../dist/runtime/worker/lark-im-worker-core.js";
 
 /** @typedef {Record<string, any>} JsonObject */
 const choice = (/** @type {unknown} */ value, /** @type {string[]} */ values) => values.includes(String(value)) ? String(value) : "unknown";
 const count = (/** @type {unknown} */ value) => Number.isSafeInteger(value) && Number(value) >= 0 ? Number(value) : null;
 
-const WORKER_STEPS = ["sent", "discover-hot", "received-hot", "discover-catchup", "discover-reconcile", "received-fair", "retention", "received-catchup"];
+const WORKER_STEPS = ["sent", "discover-hot", "received-hot", "discover-catchup", "discover-reconcile", "received-fair", "history", "retention", "received-catchup"];
 const LEASE_REASONS = ["invalid_timestamp", "invalid_interval", "future_start", "hard_limit_exceeded", "expired"];
 const HEALTH_REASONS = ["service_state_unavailable", "service_stopped", "sync_status_unavailable", "detail_evidence_unavailable",
   "list_progress_unavailable", "initial_sync_unverified", "no_successful_runs", "unfinished_runs_unverified", "last_cycle_failed",
@@ -168,8 +168,8 @@ function waitWorkerSummary(report, binding) {
   const ends = steps.map((/** @type {JsonObject} */ step) => timestamp(step.finished_at));
   const at = timestamp(cycle?.at);
   const updatedAt = timestamp(worker?.updated_at);
-  const expectedNames = cycle?.step_count === REQUIRED_CYCLE_STEPS.length + 1 ? [...REQUIRED_CYCLE_STEPS, "retention"] : REQUIRED_CYCLE_STEPS;
-  const complete = Boolean(worker && binding.phase?.state === "waiting" && cycle && bound(cycle) && cycle.ok === true &&
+  const expectedNames = cycle ? expectedCycleSteps(cycle) : null;
+  const complete = Boolean(expectedNames && worker && binding.phase?.state === "waiting" && cycle && bound(cycle) && cycle.ok === true &&
     worker.cycle === cycle.cycle && Array.isArray(cycle.failed_steps) && cycle.failed_steps.length === 0 &&
     cycle.step_count === expectedNames.length && steps.length === cycle.step_count &&
     rows.filter((/** @type {JsonObject} */ event) => event.type === "lark_im_worker_cycle").length === 1 &&

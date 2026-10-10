@@ -414,7 +414,7 @@ test("exact replay transaction fence rejects deletion, version and same-version 
     if(kind==="same_version_time") changed.occurred_at_ms=END_MS+1000;
     const mutation=kind==="deleted" ? "DELETE FROM records WHERE external_id='om_target';" : kind==="updated"
       ? `UPDATE records SET external_version='${START_MS+7000}' WHERE external_id='om_target';`
-      : upsertRecordsSql([changed]);
+      : `UPDATE records SET container_id=${quoteSql(changed.container_id)},occurred_at_ms=${changed.occurred_at_ms} WHERE external_id='om_target';`;
     installCommitInterleaving(dir,db,mutation);
     const priorPath=process.env.PATH;
     let result;
@@ -540,7 +540,7 @@ test("a changed second exact target blocks every selected record in the same tra
   seedRecords(db,records(ids.map((id)=>message(id))));
   const firstBefore=ro(db,"SELECT * FROM records WHERE external_id='om_target_first';")[0];
   const moved=records([message(ids[1])])[0]; moved.container_id="oc_concurrent_move";
-  installCommitInterleaving(dir,db,upsertRecordsSql([moved]));
+  installCommitInterleaving(dir,db,`UPDATE records SET container_id=${quoteSql(moved.container_id)} WHERE external_id=${quoteSql(moved.external_id)};`);
   const priorPath=process.env.PATH;
   let result;
   try {
