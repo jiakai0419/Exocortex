@@ -20,6 +20,39 @@ Compare ID/source/type/container first. Coverage history, detail debt and candid
 
 Compare versions only when timestamps and native source semantics are usable. Detect explicit native identity, message-type and retraction contradictions. Compare static text/post API body JSON with canonical object-key ordering, retaining array order. Exclude sender names, renderer output and full raw-record hashes. Dynamic cards, merged forwards, legacy source shapes and unavailable versions explicitly count as content unverified. A newer local version is a race/unverified result. A newer remote version or same-version native static-body difference is a candidate discrepancy, not a claim that the client presentation was lost.
 
+Each retained target can owe several independent proofs. Its private `debts`
+object has only six allowed keys: `missing`, `version`, `deleted`, `type`, `body`
+and `legacy_content`. Missing stores its own first-observed time; version and
+content dimensions store the greatest observed source version, preventing an
+older matching response from clearing newer evidence. No body or raw identity
+is stored. Equal native versions settle version debt even if a dynamic body is
+unverified. Deletion debt requires both sides to explicitly agree on deletion;
+an omitted field proves nothing. Type and static-body debt require their own
+positive comparison. One target closes only after all its dimensions settle.
+
+The private summary kind has the fixed precedence `missing`, then `version`,
+then `content`. Public counts retain the existing v3 contract: the current
+comparison contributes one primary discrepancy category, regardless of how many
+debts its target retains. `unresolved_prior` counts retained prior targets not
+already reported as a current missing/version/content discrepancy; a touched
+but unverified or local-newer target can still be prior unresolved. These are
+target counts, not dimension counts. Evidence age and revisit order retain
+their separate `last_seen` and `last_checked` clocks.
+
+Kind-only schedule observations remain readable and migrate on successful
+collection: missing retains its confirmation clock, version has an unknown
+version floor (`0`), and old content becomes `legacy_content: 0`. Because the
+old content dimension was not recorded, it requires equal type, explicit equal
+deletion state and positively equal static content before closure. Dynamic
+content alone cannot supply that proof. This may leave legacy content unresolved
+until stronger evidence is available; it must not be cleared by editing state.
+The state still fits its existing 200-target and 96-KiB bounds, and no API,
+schedule, public-cache schema or business-database migration is introduced.
+Older binaries reject the added private `debts` field as `state_invalid`, rather
+than silently consuming or dropping it. A code downgrade therefore needs a
+compatible state reader or a forward fix; stripping debt or restoring an old
+schedule file is not a safe rollback.
+
 ## Account binding and concurrency
 
 An authenticated `open_id` alone does not prove DB ownership. Local evidence must either be a matching persisted binding from an initially empty DB whose list/discovery commit confirmed its account association, or explicit, single, nonconflicting sent-self history matching the current principal. A pending source reservation constrains write admission but supplies no positive sampling evidence. Unknown/mixed/mismatched identity fails closed. The evidence source is reported; this is account association evidence, not proof that every historical record belongs to one account. The sampler does not adopt an old DB, change permissions, or broaden OAuth scopes. Re-read identity and DB file context before accepting a result. A verified account/database namespace change invalidates the old observations/cache; an unverified alternate account cannot erase prior namespace debt.
@@ -117,4 +150,4 @@ A retained observation may carry a salted scope hash and a last-attempt time, ne
 
 Coverage compares the expected chat identity and enabled source/scope in the same read-only SQLite snapshot as records. An actual failed historical request may advance only the existing target's attempt-order timestamp, after strong database/account/source checks; it cannot refresh evidence age or remove debt. Unverified alternate accounts preserve the previous account's observations and overflow together. Only successful verified namespace changes can replace that ownership. Cache publication rollback restores this state together, and public projection, cache parsing and live-check success use the same historical metadata validity rules.
 
-Matching an eligible fresh response closes that retained observation. Absent, restricted or unroutable targets remain unresolved. Truncation is explicit; a selected target returned on a valid page can close on a match without proving complete window coverage. Static content is compared where supported; matching a card's API version does not prove its client interaction state. The existing explicitly reviewed replay remains the repair path. No-cache live checks do not clear scheduled observations, and manual cache-writing checks obey the existing due gate. Operators must distinguish exact repair verification from later natural cache closure and must not edit schedule state to accelerate acceptance. This mechanism does not sweep unobserved historical edits or alter synchronization cursors.
+An eligible fresh response closes a retained observation only when it settles all known debt dimensions. Absent, restricted or unroutable targets remain unresolved. Truncation is explicit; a selected target returned on a valid page can close on a match without proving complete window coverage. Static content is compared where supported; matching a card's API version does not prove its client interaction state. The existing explicitly reviewed replay remains the repair path. No-cache live checks do not clear scheduled observations, and manual cache-writing checks obey the existing due gate. Operators must distinguish exact repair verification from later natural cache closure and must not edit schedule state to accelerate acceptance. This mechanism does not sweep unobserved historical edits or alter synchronization cursors.

@@ -47,7 +47,7 @@ except Exception:
     print(json.dumps({'outcome':'failed','reason':'scheduler_unavailable'})); sys.exit(2)
 `;
 
-/** @typedef {{first_seen:number,last_seen:number,run_finished:number,target:number,kind:'missing'|'version'|'content',scope_hash?:string,last_checked?:number}} Observation */
+/** @typedef {{first_seen:number,last_seen:number,run_finished:number,target:number,kind:'missing'|'version'|'content',scope_hash?:string,last_checked?:number,debts?:Record<string,number>}} Observation */
 /** @typedef {Record<string, Observation>} Observations */
 /** @typedef {{kind:string,database_key:string,account_key:string|null,written_at:number,next_due:number,failures:number,rotation:number,observations:Observations,observation_overflow?:boolean,last_outcome:string,cooldowns:Record<string,number>,blocked_reason:string|null}} ScheduleState */
 /** @typedef {{db:string,logDir:string,remoteSampleIntervalSeconds?:number,publication?:Record<string,any>}} ScheduleOptions */
@@ -77,15 +77,25 @@ export function sanitizeRemoteObservations(value, now, _dropExpired = false) {
   const safe = /** @type {Observations} */ ({});
   for (const [key, item] of Object.entries(value)) {
     if (!HASH.test(key) || !plainObject(item) || !exactKeys(item,
-      ["first_seen", "last_seen", "run_finished", "target", "kind", ...["scope_hash", "last_checked"].filter(field => Object.hasOwn(item, field))]) ||
+      ["first_seen", "last_seen", "run_finished", "target", "kind", ...["scope_hash", "last_checked", "debts"].filter(field => Object.hasOwn(item, field))]) ||
       !["missing", "version", "content"].includes(item.kind) ||
       ![item.first_seen, item.last_seen, item.run_finished, item.target].every(integer) ||
       item.first_seen > item.last_seen || item.last_seen > now || item.run_finished > now || item.target > now ||
       Object.hasOwn(item, 'scope_hash') && !HASH.test(item.scope_hash) ||
       Object.hasOwn(item, 'last_checked') && (!integer(item.last_checked) || item.last_checked > now)) return null;
+    if (Object.hasOwn(item, 'debts')) {
+      if (!plainObject(item.debts) || Object.keys(item.debts).length === 0 ||
+        Object.entries(item.debts).some(([dimension, floor]) =>
+          !['missing', 'version', 'deleted', 'type', 'body', 'legacy_content'].includes(dimension) || !integer(floor) ||
+          (dimension === 'missing' ? floor < item.first_seen || floor > item.last_seen :
+            dimension === 'legacy_content' ? floor !== 0 :
+              !(dimension === 'version' && floor === 0) && (floor > 253402300799999 || floor < 100000000000))) ||
+        item.kind !== (Object.hasOwn(item.debts, 'missing') ? 'missing' : Object.hasOwn(item.debts, 'version') ? 'version' : 'content')) return null;
+    }
     safe[key] = { first_seen: item.first_seen, last_seen: item.last_seen, run_finished: item.run_finished, target: item.target, kind: item.kind,
       ...(Object.hasOwn(item, 'scope_hash') ? { scope_hash: item.scope_hash } : {}),
-      ...(Object.hasOwn(item, 'last_checked') ? { last_checked: item.last_checked } : {}) };
+      ...(Object.hasOwn(item, 'last_checked') ? { last_checked: item.last_checked } : {}),
+      ...(Object.hasOwn(item, 'debts') ? { debts: { ...item.debts } } : {}) };
   }
   return safe;
 }
