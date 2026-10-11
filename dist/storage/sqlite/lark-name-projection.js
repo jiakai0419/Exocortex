@@ -155,11 +155,15 @@ function mergeLarkNameProjectionSql(existingJson, incomingJson, existingActor, i
     // Restoring a previously absent field may move its JSON property position.
     // Compare paths and typed scalar values, so equivalent projections keep the
     // stored bytes and updated_at instead of recording a formatting-only update.
+    // Numbers must use -> (JSON text), never atom/json_extract's numeric scalar:
+    // distinct values outside int64 or decimal precision can otherwise compare
+    // equal and cause a legitimate incoming unknown value to be discarded.
+    const comparable = (json) => `SELECT fullkey, type,
+    CASE WHEN type IN ('integer', 'real') THEN ${json} -> fullkey ELSE atom END
+    FROM json_tree(${json})`;
     return `(WITH ${stages.join(',\n')} SELECT CASE WHEN
-    NOT EXISTS (SELECT fullkey, type, atom FROM json_tree(next)
-      EXCEPT SELECT fullkey, type, atom FROM json_tree(old))
-    AND NOT EXISTS (SELECT fullkey, type, atom FROM json_tree(old)
-      EXCEPT SELECT fullkey, type, atom FROM json_tree(next))
+    NOT EXISTS (${comparable('next')} EXCEPT ${comparable('old')})
+    AND NOT EXISTS (${comparable('old')} EXCEPT ${comparable('next')})
     THEN old ELSE next END FROM n${index})`;
 }
 export { larkSenderNameIsUnknownSql, larkSenderNamespaceSql, mergeLarkNameProjectionSql };

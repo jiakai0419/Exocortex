@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { CARD_ID_NAMESPACES, resolveCardMention } from "./lark-card-reference.js";
+import { mergeJsonObjectText } from "./json-text-patch.js";
 /** A comparison of saved parsed-CLI evidence, never a client-state assertion. */
 const OBSERVATION_POLICY = "lark_raw_observation/v1";
 const object = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
@@ -295,27 +296,15 @@ function compareObservation(before, incoming) {
         projection: before.body === incoming.body && before.title === incoming.title ? "equal" : "different" };
 }
 const DERIVED_CANONICAL_FIELDS = ["content", "content_rendering", "sender_name", "sender_name_state", "sender_name_source",
-    "sender_name_confidence", "sender_name_resolution_status", "sender_name_resolution_reason", "chat_name", "chat_name_source", "chat_type"];
+    "sender_name_confidence", "sender_name_resolution_status", "sender_name_resolution_reason", "sender_name_observed_at",
+    "sender_name_verification", "chat_name", "chat_name_source", "chat_type"];
 /** Keep one representative of an equivalent source; name merge remains SQL's
  * responsibility. Do not let alias allocation churn canonical source fields. */
 function retainSourceRepresentation(before, incoming) {
-    const old = JSON.parse(before.canonical_json), next = JSON.parse(incoming.canonical_json);
-    if (!object(old) || !object(next))
-        return incoming;
-    const canonical = { ...old, ...next };
-    // Only these source representations are proven aliases of the retained raw.
-    // Unknown canonical fields from either side must not disappear.
-    for (const key of ["mentions", "create_time", "update_time"]) {
-        if (Object.hasOwn(old, key))
-            canonical[key] = old[key];
-    }
-    for (const key of DERIVED_CANONICAL_FIELDS) {
-        if (Object.hasOwn(next, key))
-            canonical[key] = next[key];
-        else
-            delete canonical[key];
-    }
-    return { ...incoming, raw_json: before.raw_json, content_hash: before.content_hash, canonical_json: JSON.stringify(canonical) };
+    const canonical = mergeJsonObjectText(before.canonical_json, incoming.canonical_json, {
+        retain: ["mentions", "create_time", "update_time"], deleteMissing: DERIVED_CANONICAL_FIELDS,
+    });
+    return { ...incoming, raw_json: before.raw_json, content_hash: before.content_hash, canonical_json: canonical };
 }
 /** Approval proof binds every effective field and canonical dependency. Native
  * redundant mentions may be represented by the graph proof only when they equal

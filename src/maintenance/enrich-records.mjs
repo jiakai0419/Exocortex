@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 import { quoteSql } from "../../dist/storage/sqlite/ingestion-store.js";
 import { readOnlySqliteJson as sqliteJson } from "../storage/sqlite/readonly-query.mjs";
 import { commitEnrichmentUpdates, publicEnrichmentError } from "./enrichment-commit.mjs";
+import { patchJsonText, validateJsonObjectText } from "../../dist/core/json-text-patch.js";
 
 import { larkSenderNameIsUnknownSql, larkSenderNamespaceSql, mergeLarkNameProjectionSql } from "../../dist/storage/sqlite/lark-name-projection.js";
 import { createNameResolver, NAME_LOOKUP_RETRY_BUDGET_MS, uniqueAppIds } from "../adapters/lark-im/name-resolver.mjs";
@@ -19,6 +20,37 @@ function parseMaybeJson(value) {
   } catch {
     return null;
   }
+}
+
+// These are this workflow's complete mutation rights. Unknown canonical fields
+// never pass through JSON.stringify; absent owned fields explicitly mean delete.
+const SENDER_FIELDS = ['sender_id', 'sender_id_type', 'sender_name', 'sender_name_state', 'sender_name_source',
+  'sender_name_confidence', 'sender_name_resolution_status', 'sender_name_resolution_reason',
+  'sender_name_authority_source', 'sender_name_account_key', 'sender_name_observed_at', 'sender_name_verification'];
+const RECORD_FIELDS = [...SENDER_FIELDS, 'sender_type', 'chat_id', 'chat_type', 'chat_name', 'chat_name_state', 'chat_name_source', 'deleted'];
+const PARTNER_FIELDS = ['open_id', 'name', 'name_state'];
+function patchEnrichmentProjection(row, next, senderOnly) {
+  const fields = senderOnly ? SENDER_FIELDS : RECORD_FIELDS;
+  const changed = (before, after, key) => Object.hasOwn(before, key) !== Object.hasOwn(after, key) || !Object.is(before[key], after[key]);
+  const patches = fields.filter(key => changed(row.canonical, next, key))
+    .map(key => ({ path: [key], value: Object.hasOwn(next, key) ? JSON.stringify(next[key]) : undefined }));
+  const allowed = fields.map(key => [key]);
+  if (!senderOnly && next.chat_partner && typeof next.chat_partner === 'object' && !Array.isArray(next.chat_partner)) {
+    if (row.canonical.chat_partner && typeof row.canonical.chat_partner === 'object' && !Array.isArray(row.canonical.chat_partner)) {
+      for (const key of PARTNER_FIELDS) {
+        const path = ['chat_partner', key]; allowed.push(path);
+        if (changed(row.canonical.chat_partner, next.chat_partner, key)) {
+          patches.push({ path, value: Object.hasOwn(next.chat_partner, key) ? JSON.stringify(next.chat_partner[key]) : undefined });
+        }
+      }
+    } else {
+      // A previously absent/null partner has no unknown object children to keep.
+      const path = ['chat_partner']; allowed.push(path);
+      patches.push({ path, value: JSON.stringify(Object.fromEntries(PARTNER_FIELDS.filter(key => Object.hasOwn(next.chat_partner, key))
+        .map(key => [key, next.chat_partner[key]]))) });
+    }
+  }
+  return patchJsonText(row.canonical_json, patches, allowed);
 }
 
 const executeLark = createLarkCliRunner({ timeoutMs: NAME_LOOKUP_RETRY_BUDGET_MS, state: createTransportState() });
@@ -287,6 +319,7 @@ function runSenderOnly(dbPath, opts, runLark, assertReady) {
   const rows = candidates.slice(0, opts.limit).map((row) => ({
     ...row, canonical: parseMaybeJson(row.canonical_json) || {}, raw: nativeRow(parseMaybeJson(row.raw_json) || {}),
   }));
+  for (const row of rows) validateJsonObjectText(row.canonical_json);
   if (rows.some((row) => senderOpenId(row.raw) !== opts.senderId)) throw new Error('sender candidate identity validation failed');
   const remote = { calls: 0, member_pages: 0, member_chats: 0, failures: 0,
     budget_exhausted: false, page_limit_reached: false, chat_limit_reached: false };
@@ -344,7 +377,7 @@ function runSenderOnly(dbPath, opts, runLark, assertReady) {
       sender_name_source: direct ? 'message_sender' : member ? 'chat_member' : 'contact', sender_name_confidence: 'high' };
     delete next.sender_name_authority_source;
     delete next.sender_name_account_key;
-    proposals.push({ id: row.id, old: row.canonical_json, next: JSON.stringify(next),
+    proposals.push({ id: row.id, old: row.canonical_json, next: patchEnrichmentProjection(row, next, true),
       actor: row.actor_id, container: row.container_id, body: row.body, raw: row.raw_json });
   }
   const { updates } = prepareUpdates(dbPath, rows, proposals, true);
@@ -399,6 +432,7 @@ function enrichRecords(opts, deps = {}) {
     raw: nativeRow(parseMaybeJson(row.raw_json) || {}),
     config: parseMaybeJson(row.scope_config_json) || {},
   }));
+  for (const row of selected) validateJsonObjectText(row.canonical_json);
   const scopeIds = reviewRequested(opts) ? [...new Set(selected.map(row => row.first_seen_scope_id))] : [];
   const reviewScopes = scopeIds.length ? sqliteJson(dbPath,
     `SELECT id,source_id,enabled,config_json FROM sync_scopes WHERE id IN (${scopeIds.map(quoteSql).join(',')});`, 'read review scopes')
@@ -629,7 +663,7 @@ function enrichRecords(opts, deps = {}) {
     }
 
     const body = opts.namesOnly ? row.body : normalizedBody(row, next, row.raw);
-    const proposedJson = JSON.stringify(next);
+    const proposedJson = patchEnrichmentProjection(row, next, opts.namesOnly);
     if (proposedJson !== row.canonical_json || body !== row.body) {
       proposals.push({ id: row.id, old: row.canonical_json, next: proposedJson,
         actor: row.actor_id, container: row.container_id, body, raw: row.raw_json });

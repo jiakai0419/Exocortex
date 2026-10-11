@@ -2,7 +2,8 @@
 /** @typedef {Record<string, any>} JsonObject */
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
-import { quoteSql, sqlJson } from "../../dist/storage/sqlite/ingestion-store.js";
+import { quoteSql } from "../../dist/storage/sqlite/ingestion-store.js";
+import { patchJsonText, validateJsonObjectText } from "../../dist/core/json-text-patch.js";
 import { readOnlySqliteJson as sqliteJson } from "../storage/sqlite/readonly-query.mjs";
 import { commitEnrichmentUpdates, publicEnrichmentError } from "./enrichment-commit.mjs";
 import { fetchChatMetadata } from "../adapters/lark-im/adapter.mjs";
@@ -33,11 +34,13 @@ function enrichScopes(opts, deps = {}) {
   for (const scope of scopes) {
     if (!scope.config.chat_id) continue;
     try {
+      validateJsonObjectText(scope.config_json);
       const { chat_name: chatName } = (deps.fetchChatMetadata || fetchChatMetadata)(scope.config.chat_id);
       if (!chatName) continue;
-      const nextConfig = { ...scope.config, chat_name: chatName };
+      const nextConfig = patchJsonText(scope.config_json,
+        [{ path: ['chat_name'], value: JSON.stringify(chatName) }], [['chat_name']]);
       updates.push(`UPDATE sync_scopes
-        SET config_json = ${sqlJson(nextConfig)},
+        SET config_json = ${quoteSql(nextConfig)},
             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
         WHERE id = ${quoteSql(scope.id)}
           AND source_id IS ${quoteSql(scope.source_id)}
