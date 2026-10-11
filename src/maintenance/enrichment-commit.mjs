@@ -39,8 +39,8 @@ function commitWithLock(dbPath, updates, options) {
     throw new EnrichmentContentionError("maintenance lock unavailable: held by another maintenance command");
   }
   try {
-    admissionBeforeCommit?.();
     reviewBeforeCommit?.();
+    admissionBeforeCommit?.();
     const effects = sqliteQuery(dbPath, `
       BEGIN IMMEDIATE;
       ${writeAdmission ? larkWriteAdmissionSql(writeAdmission) : ""}

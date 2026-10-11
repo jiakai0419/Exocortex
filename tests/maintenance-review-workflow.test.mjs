@@ -542,6 +542,8 @@ test('JSON null canonical of an excluded row is represented as missing without a
   const preview = names(f, opts); assert.equal(preview.partial, true);
   const row = readArtifact(opts.reviewOut).records[0];
   assert.equal(row.outcome, 'excluded'); assert.deepEqual(row.display.before.sender.sender_name, { present: false, value: null });
+  assert.equal(f.calls.length, 0);
+  assert.equal(ro(f)[0].canonical_json, 'null');
 });
 
 test('CLI requires explicit budgets, rejects incompatible modes and never echoes private review fields', t => {

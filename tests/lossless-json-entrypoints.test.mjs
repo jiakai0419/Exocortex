@@ -106,7 +106,9 @@ for (const target of ['records', 'scopes']) test(`real ${target} CLI rejects nes
   const f = fixture(t);
   const table = target === 'records' ? 'records' : 'sync_scopes', field = target === 'records' ? 'canonical_json' : 'config_json';
   const before = target === 'records' ? rows(f)[0] : scope(f);
-  const duplicate = before[field].slice(0, -1) + ',"ambiguous":[{"key":1,"\\u006bey":2}]}';
+  const eligible = target === 'records'
+    ? patchJsonText(before[field], [{ path: ['sender_name'], value: 'null' }], [['sender_name']]) : before[field];
+  const duplicate = eligible.slice(0, -1) + ',"ambiguous":[{"key":1,"\\u006bey":2}]}';
   store.sqliteExec(f.db, `UPDATE ${table} SET ${field}=${q(duplicate)} ${target === 'scopes' ? `WHERE id=${q(SCOPE)}` : ''};`);
   const result = cli(f, target, target === 'records' ? ['--names-only', '--record-id', String(before.id), '--apply'] : ['--apply']);
   if (target === 'records') { assert.equal(result.status, 1); assert.match(result.stdout, /enrichment failed/); }

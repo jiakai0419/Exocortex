@@ -455,7 +455,6 @@ function enrichRecords(opts, deps = {}) {
     raw: nativeRow(parseMaybeJson(row.raw_json) || {}),
     config: parseMaybeJson(row.scope_config_json) || {},
   }));
-  for (const row of selected) validateJsonObjectText(row.canonical_json);
   const scopeIds = reviewRequested(opts) ? [...new Set(selected.map(row => row.first_seen_scope_id))] : [];
   const reviewScopes = scopeIds.length ? sqliteJson(dbPath,
     `SELECT id,source_id,enabled,config_json FROM sync_scopes WHERE id IN (${scopeIds.map(quoteSql).join(',')});`, 'read review scopes')
@@ -469,6 +468,9 @@ function enrichRecords(opts, deps = {}) {
     if (reason) exclusions[reason]++;
     return !reason;
   }) : selected;
+  // Excluded review rows are display-only, including legacy JSON null. Every
+  // eligible mutation is still checked losslessly before any remote lookup.
+  for (const row of rows) validateJsonObjectText(row.canonical_json);
   const knownChatNames = opts.namesOnly ? new Map() : loadKnownChatNames(dbPath);
 
   const self = opts.namesOnly ? { open_id: '', name: '' } : getSelfProfile(run);
