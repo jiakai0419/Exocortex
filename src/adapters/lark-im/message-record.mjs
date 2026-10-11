@@ -2,7 +2,7 @@
 
 import { createHash } from "node:crypto";
 import { renderSystemContent } from "./system-content.mjs";
-import { personName, senderIdentity, senderNameFromSource } from "./sender-identity.mjs";
+import { personName, senderIdentity, senderLookupNamespace, senderNameFromSource } from "./sender-identity.mjs";
 
 /**
  * @typedef {"sent" | "received"} MessageDirection
@@ -319,9 +319,10 @@ function recordFromMessage(message, scopeId, direction, context = {}, scopeConfi
   const senderDirectName = senderIdentityConflict ? "" : senderName(message);
   // Person lookup maps contain open IDs only. A user_id with the same spelling
   // cannot consume those names, even when it starts with a familiar prefix.
-  const senderContext = senderIdentityConflict ? {} : identity.verified && identity.type === "open_id"
+  const lookupNamespace = senderLookupNamespace(message);
+  const senderContext = lookupNamespace === "open_id"
     ? { contacts: context.contacts, chat_members: context.chat_members, self: context.self }
-    : identity.type === "app_id" || !identity.type && senderType(message) === "app"
+    : lookupNamespace === "app_id"
       ? { apps: context.apps, app_fallbacks: context.app_fallbacks } : {};
   /** @type {NameDetails | null} */
   const senderNameDetails = senderDirectName
@@ -330,7 +331,7 @@ function recordFromMessage(message, scopeId, direction, context = {}, scopeConfi
   const senderDisplayName = senderNameDetails?.name || "";
   // Source names and supplied self profiles have no independent lookup time.
   // Do not invent one from normalization time or the message timestamp.
-  const nameObservation = !senderDirectName && !senderIdentityConflict
+  const nameObservation = !senderDirectName && Boolean(lookupNamespace)
     ? context.sender_name_observations?.get(JSON.stringify([containerId, actorId, identity.type])) : null;
   const partnerDirectName = chatPartner?.name || chatPartner?.display_name || "";
   /** @type {NameDetails | null} */

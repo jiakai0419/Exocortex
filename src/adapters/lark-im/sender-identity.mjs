@@ -86,6 +86,19 @@ function senderOpenId(message) {
   return identity.verified && identity.type === "open_id" && identity.id.startsWith("ou_") ? identity.id : "";
 }
 
+/** Select an existing name lookup family using native identity and actor kind.
+ * A contradictory actor kind cannot borrow another message's lookup result.
+ * Untyped app compatibility never authorizes person-contact requests.
+ * @param {unknown} message @returns {string} */
+function senderLookupNamespace(message) {
+  const identity = senderIdentity(message), sender = sourceSender(message);
+  const kind = sender.sender_type || sender.type;
+  if (identity.conflict || kind === 'app' && identity.type && identity.type !== 'app_id'
+    || kind === 'user' && identity.type === 'app_id') return '';
+  if (identity.verified && ['open_id', 'app_id'].includes(identity.type || '')) return identity.type || '';
+  return !identity.type && (kind === 'app' || !kind && identity.id.startsWith('cli_')) ? 'app_id' : '';
+}
+
 /** Empty values and echoed identifiers are unknown, never resolved names.
  * @param {unknown} value @param {unknown[]} [identifiers]
  */
@@ -106,4 +119,4 @@ function displayNameFromUser(user, aliases = []) {
   return "";
 }
 
-export { displayNameFromUser, personName, senderAliasesByOpenId, senderIdentity, senderNameFromSource, senderOpenId };
+export { displayNameFromUser, personName, senderAliasesByOpenId, senderIdentity, senderLookupNamespace, senderNameFromSource, senderOpenId };
