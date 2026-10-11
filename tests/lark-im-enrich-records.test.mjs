@@ -19,6 +19,7 @@ const LAB = Object.freeze({
 });
 const FIXTURE_EPOCH = Date.UTC(2042, 1, 3, 4, 5, 6);
 const CONCURRENT_AT = new Date(FIXTURE_EPOCH + 86_400_000).toISOString();
+const TEST_STARTED_AT_MS = Date.now();
 const SAFE_PATH = [...new Set([dirname(process.execPath), "/usr/bin", "/bin"])].join(":");
 
 function assertJsonExecutionError(result, message) {
@@ -907,9 +908,28 @@ function aliasEnrichmentFixture(t, senderOverrides = {}, remoteOverrides = {}, c
 function assertAliasSourcePreserved(before, after) {
   for (const field of ["raw_json", "content_hash", "external_version", "body", "actor_id", "container_id"])
     assert.equal(after[field], before[field], field);
+  const previous = JSON.parse(before.canonical_json), current = JSON.parse(after.canonical_json);
+  const adoptedLookup = current.sender_name && current.sender_name !== previous.sender_name
+    && ["contact", "chat_member"].includes(current.sender_name_source);
+  if (adoptedLookup) {
+    const observation = current.sender_name_verification;
+    assert.equal(observation?.status, "resolved", "a newly adopted lookup has independent successful evidence");
+    assert.equal(observation.name, current.sender_name);
+    assert.equal(observation.source, current.sender_name_source);
+    assert.equal(observation.cached, false, "each CLI fixture uses its fresh lookup");
+    assert.equal(observation.observed_at, current.sender_name_observed_at);
+    const time = Date.parse(observation.observed_at);
+    assert.ok(time >= TEST_STARTED_AT_MS && time <= Date.now(), "observation time belongs to the current lookup");
+    assert.equal(new Date(time).toISOString(), observation.observed_at);
+  } else {
+    assert.equal(current.sender_name_observed_at, previous.sender_name_observed_at,
+      "stored or unchanged names cannot invent a lookup observation time");
+    assert.deepEqual(current.sender_name_verification, previous.sender_name_verification);
+  }
   const omitName = value => Object.fromEntries(Object.entries(value)
-    .filter(([key]) => !["sender_id_type", "sender_name", "sender_name_source", "sender_name_confidence"].includes(key)));
-  assert.deepEqual(omitName(JSON.parse(after.canonical_json)), omitName(JSON.parse(before.canonical_json)));
+    .filter(([key]) => !["sender_id_type", "sender_name", "sender_name_source", "sender_name_confidence",
+      "sender_name_observed_at", "sender_name_verification"].includes(key)));
+  assert.deepEqual(omitName(current), omitName(previous));
 }
 
 for (const aliasType of ["user_id", "union_id"]) {
