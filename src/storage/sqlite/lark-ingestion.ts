@@ -11,6 +11,31 @@ import { reviewFenceSql } from "./maintenance-review.js";
 import { sourceProof } from "../../core/lark-observation.js";
 import { prepareObservationRecords } from "./observation-store.js";
 
+/** A historical acceptance may supersede a queued root, but never supplies
+ * forward-window coverage. Rebase only the descriptor selected before fetching;
+ * leave a concurrently changed task/list generation untouched. A normal detail
+ * retry must still validate and complete the debt before the full cursor moves. */
+function historyDetailCoordinationSql(scope: SyncScope, history: NonNullable<BoundedReplayOptions["history"]>, records: StoredRecord[]) {
+  const task = history.detailTask, record = records[0];
+  if (!task || !record || !["accept", "equivalent"].includes(record.observation?.action || "")) return "";
+  const root = larkDetailRoot(JSON.parse(record.raw_json), false);
+  if (root.fingerprint === task.fingerprint) return "";
+  return `UPDATE lark_im_detail_tasks SET raw_root_json=${quoteSql(root.raw_json)},fingerprint=${quoteSql(root.fingerprint)},
+      external_version=${quoteSql(root.external_version)},occurred_at_ms=${root.occurred_at_ms},
+      retry_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),last_error_type=NULL,last_error_message=NULL,
+      updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    WHERE scope_id=${quoteSql(scope.id)} AND message_id=${quoteSql(record.external_id)} AND status='pending'
+      AND fingerprint=${quoteSql(task.fingerprint)} AND raw_root_json IS ${quoteSql(task.raw_root_json)}
+      AND external_version IS ${quoteSql(task.external_version)} AND occurred_at_ms=${task.occurred_at_ms}
+      AND (SELECT generation FROM lark_im_list_progress WHERE scope_id=${quoteSql(scope.id)})=${task.list_generation}
+      AND EXISTS(SELECT 1 FROM records WHERE id=${history.selectedId} AND raw_json IS ${quoteSql(record.raw_json)}
+        AND external_version IS ${quoteSql(record.external_version)})
+      AND EXISTS(SELECT 1 FROM (SELECT ${quoteSql(root.external_version)} AS external_version) incoming
+        WHERE ${versionCanReplaceSql("lark_im_detail_tasks", "incoming")});
+    UPDATE lark_im_list_progress SET generation=generation+1,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE scope_id=${quoteSql(scope.id)} AND changes()>0;`;
+}
+
 /** Commit one completely fetched, explicitly bounded repair without touching
  * normal runs, scope cursors, or freshness markers. Remote work belongs outside
  * this method; only this short transaction holds a maintenance lease. */
@@ -39,6 +64,11 @@ function commitBoundedReplayRecords(dbPath: string, options: BoundedReplayOption
   const historyKey = history ? createHash("sha256").update(JSON.stringify({ scope, history, attemptId, records: options.records, initialSyncStartMs, startMs, endMs, planId, selfIdHash, pages, fetchedCount,
     reviewFence: options.reviewFence, acquisition: options.observationAcquisition ? { ...options.observationAcquisition, basis: [...options.observationAcquisition.basis] } : null })).digest("hex") : null;
   if (history) {
+    const task = history.detailTask;
+    if (task != null && (!/^[a-f0-9]{64}$/.test(task.fingerprint) || typeof task.raw_root_json !== "string"
+      || !Number.isSafeInteger(task.occurred_at_ms) || task.occurred_at_ms < 0
+      || !Number.isSafeInteger(task.list_generation) || task.list_generation < 1
+      || (task.external_version !== null && !/^\d+$/.test(task.external_version)))) throw new Error("invalid historical detail descriptor");
     if (![history.generation, history.afterId, history.sweepMaxId, history.completedSweeps, history.selectedId,
       history.nextSweepMaxId, history.startedAtMs].every(n => Number.isSafeInteger(n) && n >= 0)
       || history.selectedId < 1 || history.selectedId > history.nextSweepMaxId
@@ -133,6 +163,7 @@ function commitBoundedReplayRecords(dbPath: string, options: BoundedReplayOption
       CREATE TEMP TABLE __replay_before (existed INTEGER NOT NULL, same_fact INTEGER NOT NULL);
       CREATE TEMP TABLE __replay_effects (changed INTEGER NOT NULL, existed INTEGER NOT NULL, same_fact INTEGER NOT NULL);
       ${statements}
+      ${history ? historyDetailCoordinationSql(scope, history, records) : ""}
       ${history ? `DELETE FROM bounded_replay_runs WHERE scope_id=${quoteSql(scope.id)} AND id=(
         SELECT json_extract(last_result_json,'$.effects.audit_id') FROM lark_im_history_progress WHERE scope_id=${quoteSql(scope.id)}
       );` : ""}

@@ -41,6 +41,8 @@ export type StoredRecord = {
     attempt: string;
     observedAtMs: number;
     contextKey: string | null;
+    /** Ordinary equivalent retries keep, but cannot refresh, a historical candidate. */
+    preserveCandidate?: boolean;
   };
 };
 
@@ -82,6 +84,9 @@ export type BoundedReplayOptions = {
     generation: number; afterId: number; sweepMaxId: number; completedSweeps: number;
     selectedId: number; nextSweepMaxId: number; startedAtMs: number;
     error: string | null; requestBudget: Record<string, number | string | null>;
+    /** Selected before remote acquisition; descriptor CAS also fences list ABA. */
+    detailTask?: { fingerprint: string; raw_root_json: string; external_version: string | null;
+      occurred_at_ms: number; list_generation: number } | null;
   };
   reviewFence?: MaintenanceReviewFence;
   /** Recheck local file/account binding after acquiring the maintenance lease. */

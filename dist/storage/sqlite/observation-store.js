@@ -19,6 +19,7 @@ function prepareObservationRecords(dbPath, records, acquisition) {
         const { observation: ignored, ...incoming } = original;
         const state = byId.get(original.external_id), before = state?.before || null;
         let record = { ...incoming }, action = "accept", reason = "new_observation";
+        let preserveCandidate = false;
         // Missing native provenance is a legacy row, not inferred from its shape.
         // Its original version/repair behavior stays intact until an explicit newer
         // native observation replaces it.
@@ -61,10 +62,21 @@ function prepareObservationRecords(dbPath, records, acquisition) {
                         reason = "repeated_observation_not_latest_proof";
                     }
                 }
+                // An ordinary retry cannot count as confirmation, replace its attempt,
+                // or refresh its timestamp. Preserve only an equivalent, generation-
+                // qualified history candidate. The next history observation still has
+                // to match the *current* account/scope context before it can confirm.
+                if (!acquisition?.confirm && action === "conflict" && comparison.version === "equal"
+                    && state.candidate_context && state.candidate_json
+                    && typeof state.candidate_attempt === "string" && state.candidate_attempt.length > 0
+                    && Number.isSafeInteger(state.candidate_observed_at_ms) && state.candidate_observed_at_ms >= 0
+                    && state.candidate_generation === state.generation && state.candidate_policy === OBSERVATION_POLICY) {
+                    preserveCandidate = compareObservation(JSON.parse(state.candidate_json), incoming).equivalent;
+                }
             }
         }
         return { ...record, observation: { action, reason, before, generation: state?.generation ?? null, evidenceGeneration: state?.evidenceGeneration ?? null,
-                incoming, attempt, observedAtMs, contextKey: acquisition?.contextKey || null } };
+                incoming, attempt, observedAtMs, contextKey: acquisition?.contextKey || null, preserveCandidate } };
     });
 }
 /** The preparation basis is checked even for a no-op, so preview and commit
@@ -95,12 +107,12 @@ function observationEvidenceSql(records, admission = "1") {
         return `UPDATE record_observation_state SET evidence_generation=evidence_generation+1,
       last_observed_json=${quoteSql(candidate)},
       previous_json=${o.action === "accept" ? quoteSql(JSON.stringify(o.before)) : "previous_json"},
-      candidate_json=${accepted ? "NULL" : quoteSql(candidate)},
-      candidate_generation=${accepted || o.action === "stale" ? "NULL" : String(o.generation)},
-      candidate_attempt=${accepted ? "NULL" : quoteSql(o.attempt)},
-      candidate_policy=${accepted ? "NULL" : quoteSql(OBSERVATION_POLICY)},
-      candidate_context=${accepted ? "NULL" : quoteSql(o.contextKey)},
-      candidate_observed_at_ms=${accepted ? "NULL" : o.observedAtMs},
+      candidate_json=${o.preserveCandidate ? "candidate_json" : accepted ? "NULL" : quoteSql(candidate)},
+      candidate_generation=${o.preserveCandidate ? "candidate_generation" : accepted || o.action === "stale" ? "NULL" : String(o.generation)},
+      candidate_attempt=${o.preserveCandidate ? "candidate_attempt" : accepted ? "NULL" : quoteSql(o.attempt)},
+      candidate_policy=${o.preserveCandidate ? "candidate_policy" : accepted ? "NULL" : quoteSql(OBSERVATION_POLICY)},
+      candidate_context=${o.preserveCandidate ? "candidate_context" : accepted ? "NULL" : quoteSql(o.contextKey)},
+      candidate_observed_at_ms=${o.preserveCandidate ? "candidate_observed_at_ms" : accepted ? "NULL" : o.observedAtMs},
       reason=${quoteSql(o.reason)}, observed_at_ms=${o.observedAtMs}
       WHERE record_id=${Number(o.before.id)} AND (${admission});`;
     }).join("\n");

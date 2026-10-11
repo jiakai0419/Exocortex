@@ -357,13 +357,12 @@ test("native merge rejects duplicate, orphan, cyclic, invalid-parent and overdee
     rejectsSafely(() => h.received(), /merge-forward/);
     assert.equal(h.calls.length, 2);
   }
-  for (const changedRoot of [merge(root.message_id, { update_time: String(BASE_MS + 9_999) }),
-    merge(root.message_id, { body: { content: PRIVATE } })]) {
+  for (const changedRoot of [merge(root.message_id, { body: { content: PRIVATE } })]) {
     const h = harness((call) => call.path === LIST ? page([root]) : details([changedRoot, raw("om_child")]));
     assert.throws(() => h.received(), (error) => {
       assert.ok(error instanceof MessageDetailsIncompleteError);
       assert.deepEqual(error.messages, []);
-      assert.equal(error.missingDetails[0].reason, "source_changed");
+      assert.equal(error.missingDetails[0].reason, "source_version_conflict");
       assert.doesNotMatch(error.message, new RegExp(PRIVATE));
       return true;
     });

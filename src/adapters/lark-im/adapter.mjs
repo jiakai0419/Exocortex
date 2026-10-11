@@ -1,6 +1,6 @@
 // @ts-check
 
-import { sourceRelation } from "../../../dist/core/lark-observation.js";
+import { mergeRootRelation } from "./merge-root.mjs";
 
 import {
   assertValidLarkMessage,
@@ -330,16 +330,26 @@ function assertRefreshedRoot(queued, refreshed) {
     throw new MessageDetailError("source_version_regressed");
   }
   if (previousVersion === nextVersion) {
-    // Compare complete native source evidence; JSON object key ordering is not
-    // a content edit. Detail-only empty parent metadata is not source content.
-    const payload = (/** @type {JsonObject} */ root) => {
-      const { create_time, update_time, upper_message_id, ...source } = root;
-      return source;
-    };
-    if (!["exact", "json_representation", "reference_rename"].includes(sourceRelation(JSON.stringify(payload(queued)), JSON.stringify(payload(refreshed))))) {
+    if (!["exact", "json_representation", "reference_rename"].includes(mergeRootRelation(queued, refreshed))) {
       throw new MessageDetailError("source_version_conflict");
     }
   }
+}
+
+/** Assemble one complete authoritative root and its subtree for every route.
+ * A refreshed newer root is used in full, never mixed with the queued sender.
+ * @param {JsonObject} queued @param {JsonObject[]} items
+ */
+function normalizeDetailSnapshot(queued, items) {
+  assertMergeTree(queued.message_id, items);
+  const refreshed = /** @type {JsonObject} */ (items.find(item => item.message_id === queued.message_id));
+  assertRefreshedRoot(queued, refreshed);
+  if (refreshed.msg_type !== "merge_forward") {
+    if (items.length !== 1) throw new MessageDetailError("invalid_or_unavailable_details");
+    return normalizeApiMessage(refreshed);
+  }
+  if (items.length === 1) throw new MessageDetailError("details_not_expanded");
+  return normalizeApiMessage(refreshed, { mergeItems: items });
 }
 
 /**
@@ -435,7 +445,7 @@ function createLarkImAdapter({ run = runLark, clock = Date.now } = {}) {
           items = collected;
           mergeCache.set(message.message_id, items);
         }
-        return normalizeApiMessage(message, { mergeItems: items });
+        return normalizeDetailSnapshot(message, items);
       } catch (error) {
         // A detail denial says nothing about list access to this chat. Keep
         // reading ordinary messages; do not turn a partial merge into a record
@@ -610,7 +620,8 @@ function createLarkImAdapter({ run = runLark, clock = Date.now } = {}) {
   function fetchMessageDetails(rawRoot, opts = {}) {
     try {
       assertRawMessagePage([rawRoot], "queued-message-details");
-      if (rawRoot.msg_type !== "merge_forward") throw new MessageDetailError("invalid_or_unavailable_details");
+      // History may have accepted an ordinary replacement for a former merge
+      // root. Its pending task still needs a fresh, complete detail receipt.
       const boundedOption = (/** @type {number | undefined} */ value, /** @type {number} */ cap) => {
         if (value !== undefined && (!Number.isSafeInteger(value) || value < 1)) {
           throw new MessageDetailError("invalid_detail_options");
@@ -659,15 +670,7 @@ function createLarkImAdapter({ run = runLark, clock = Date.now } = {}) {
         if (!page.has_more) break;
         token = page.page_token;
       }
-      assertMergeTree(rawRoot.message_id, items);
-      const refreshed = /** @type {JsonObject} */ (items.find((item) => item.message_id === rawRoot.message_id));
-      assertRefreshedRoot(rawRoot, refreshed);
-      if (refreshed.msg_type !== "merge_forward") {
-        if (items.length !== 1) throw new MessageDetailError("invalid_or_unavailable_details");
-        return normalizeApiMessage(refreshed);
-      }
-      if (items.length === 1) throw new MessageDetailError("details_not_expanded");
-      return normalizeApiMessage(refreshed, { mergeItems: items });
+      return normalizeDetailSnapshot(rawRoot, items);
     } catch (error) {
       throw error instanceof MessageDetailError ? error : new MessageDetailError(detailFailureReason(error));
     }

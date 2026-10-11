@@ -3,6 +3,7 @@
 import { renderSystemContent } from "./system-content.mjs";
 import { renderCardContent } from "./card-content.mjs";
 import { personName } from "./sender-identity.mjs";
+import { mergeRootRelation } from "./merge-root.mjs";
 
 const SOURCE_API = "im.v1.messages";
 const RENDER_VERSION = 1;
@@ -267,7 +268,7 @@ function renderMerge(item, mergeItems) {
         || seen.has(child.message_id)) throw new Error("invalid or duplicate merge-forward detail item");
     seen.add(child.message_id);
     if (child.message_id === item.message_id) {
-      if (child.update_time !== item.update_time || JSON.stringify(child.body) !== JSON.stringify(item.body)) {
+      if (!["exact", "json_representation", "reference_rename"].includes(mergeRootRelation(item, child))) {
         throw new Error("merge-forward source changed during detail retrieval");
       }
       continue;

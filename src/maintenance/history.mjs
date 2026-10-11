@@ -49,8 +49,13 @@ function selectHistoryTarget(db) {
   if (!selected) return null;
   const { observation_generation, ...record } = selected;
   const { history_generation, history_after, history_max, history_sweeps, current_max, ...selectedScope } = scope;
+  const detailTask = readOnlySqliteJson(db, `SELECT d.fingerprint,d.raw_root_json,d.external_version,d.occurred_at_ms,
+    p.generation AS list_generation FROM lark_im_detail_tasks d
+    JOIN lark_im_list_progress p ON p.scope_id=d.scope_id
+    WHERE d.scope_id=${quoteSql(scope.id)} AND d.message_id=${quoteSql(record.external_id)} AND d.status='pending';`,
+  'read selected history detail descriptor')[0] || null;
   return { sourceConfigJson: source.config_json, baseline, scope: selectedScope, record, observationGeneration: observation_generation,
-    checkpoint: { generation: history_generation, afterId: history_after, sweepMaxId: history_max,
+    checkpoint: { detailTask, generation: history_generation, afterId: history_after, sweepMaxId: history_max,
       completedSweeps: history_sweeps, selectedId: record.id, nextSweepMaxId: horizon } };
 }
 
