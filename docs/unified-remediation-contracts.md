@@ -85,3 +85,7 @@ correctly. Schema compatibility alone does not make an older writer safe for the
 new convergence rules. Preserve current data and evidence during rollback; use
 a writer compatible with the retained state, or quiesce writers while arranging
 one. Never restore an older database or remove debt fields to force acceptance.
+
+The [acceptance and unresolved-work matrix](acceptance-closure.md) separates
+these fourteen delivered mechanisms from deployment verification and closure
+of a specific name, display or historical-data problem.
