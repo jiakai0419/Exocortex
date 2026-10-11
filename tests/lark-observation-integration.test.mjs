@@ -277,13 +277,18 @@ test('private rejection evidence is bounded and cannot be used as approval input
 for(const mode of ['complete','cli_budget','deadline','rate_limit'])test(`history uses the real shared request session with ${mode}, no lookup fanout or uncounted retries`,t=>{
   const f=fixture(t), before=rows(f), calls=[];
   let tick=0, held=false, releases=0, cooldownWrites=0;
+  const leases=[];
   const result=executeLarkImHistory({db:f.db,maxCliAttempts:mode==='cli_budget'?2:4,maxSeconds:30},{requestSessionDeps:{
     env:{LARK_CLI:'synthetic-cli'},monotonicClock:()=>tick,now:()=>Date.now(),
     sleep:ms=>{assert.equal(held,false);tick+=ms;},
-    tryAcquireLease:opts=>{assert.equal(opts.role,'probe');assert.equal(held,false);held=true;return {state:'acquired',release(){held=false;releases++;}};},
+    tryAcquireLease:opts=>{
+      assert.equal(opts.role,'probe');assert.equal(held,false);held=true;
+      const lease={spawns:0,released:false};leases.push(lease);
+      return {state:'acquired',release(){held=false;releases++;lease.released=true;}};
+    },
     readSharedCooldown:()=>({state:'ready'}),writeSharedCooldown:()=>{assert.equal(held,true);cooldownWrites++;return true;},
     spawnSync:(_command,args,settings)=>{
-      assert.equal(held,true);assert.ok(settings.timeout<=30000);calls.push(args);
+      assert.equal(held,true);leases.at(-1).spawns++;assert.ok(settings.timeout<=30000);calls.push(args);
       if(calls.length===1)return {status:0,stdout:JSON.stringify(SELF),stderr:''};
       assert.equal(args[2],'/open-apis/im/v1/messages');
       const params=JSON.parse(args[args.indexOf('--params')+1]);assert.equal(params.card_msg_content_type,'raw_card_content');
@@ -292,9 +297,23 @@ for(const mode of ['complete','cli_budget','deadline','rate_limit'])test(`histor
       return {status:0,stdout:JSON.stringify({code:0,data:{items:f.messages,has_more:mode==='cli_budget',page_token:mode==='cli_budget'?'invented-next':''}}),stderr:''};
     }
   }});
-  assert.equal(result.ok,mode==='complete',JSON.stringify(result));assert.equal(calls.length,2);assert.equal(releases,2);assert.equal(held,false);
+  assert.equal(result.ok,mode==='complete',JSON.stringify(result));
+  assert.equal(calls.length,2,'self and history list remain the only API attempts');
+  assert.deepEqual(leases.map(lease=>lease.spawns),[1,1,0],'two API leases followed by one local commit lease');
+  assert.equal(releases,3);assert.ok(leases.every(lease=>lease.released));assert.equal(held,false);
   assert.equal(result.request_budget.cli_attempts,2);assert.deepEqual(rows(f),before);
-  if(mode!=='complete')assert.equal(result.request_budget.stop_reason,{cli_budget:'cli_budget',deadline:'time_budget',rate_limit:'rate_limited'}[mode]);
+  const expectedStop=mode==='complete'?null:{cli_budget:'cli_budget',deadline:'time_budget',rate_limit:'rate_limited'}[mode];
+  assert.equal(result.request_budget.stop_reason,expectedStop);
+  const progress=store.sqliteQuery(f.db,'SELECT after_id,completed_sweeps,last_result_json FROM lark_im_history_progress;')[0];
+  assert.equal(progress.after_id,before[0].id);assert.equal(progress.completed_sweeps,1,'success and bounded failures both rotate the selected row');
+  const receipt=JSON.parse(progress.last_result_json);
+  assert.equal(receipt.request_budget.cli_attempts,2);assert.equal(receipt.request_budget.stop_reason,expectedStop);
+  assert.equal(receipt.error,mode==='complete'?null:'fetch_unavailable');
+  assert.equal(state(f)[0].history_error,receipt.error);
+  if(mode!=='complete') {
+    assert.equal(receipt.effects.inserted,0);assert.equal(receipt.effects.updated,0);
+    assert.equal(receipt.effects.duplicate,0);assert.equal(receipt.effects.conflicts,0);
+  }
   assert.equal(cooldownWrites,mode==='rate_limit'?1:0);
   assert.doesNotMatch(JSON.stringify(result),/secret|oc_invented|om_invented/);
 });

@@ -117,6 +117,10 @@ test("CLI acquires before initialization/API, refuses contention and always rele
         tryAcquireLarkApiLease: () => { calls.push("acquire"); return { state: "acquired", release() { calls.push("release"); } }; },
         readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
         reserveSyncAccountBinding: () => false,
+        captureLarkWriteAdmission: (_db, options) => {
+          calls.push("admission"); assert.equal(options.selfOpenId, self);
+          return { fence: {}, assertCurrent() {} };
+        },
       ensureInitialized: () => calls.push("initialize"), ensureSourceInitialSyncStart: (_db, _source, ms) => ms,
         captureRemoteAccountBinding: () => null,
         getSelfProfile: () => { calls.push("profile"); if (fail) throw new Error("synthetic failure"); return { open_id: self, name: "Synthetic" }; },
@@ -124,7 +128,7 @@ test("CLI acquires before initialization/API, refuses contention and always rele
       },
     });
     assert.equal(code, fail ? 1 : 0);
-    assert.deepEqual(calls, fail ? ["acquire", "initialize", "profile", "release"] : ["acquire", "initialize", "profile", "sync", "release"]);
+    assert.deepEqual(calls, fail ? ["acquire", "initialize", "profile", "release"] : ["acquire", "initialize", "profile", "admission", "sync", "release"]);
   }
   const code = runLarkImSyncCli(["--scope", "sent"], {
     stdout: { write() {} }, stderr: { write() {} }, deps: {
@@ -145,6 +149,9 @@ test("sync persists new binding only after an actual successful non-skipped run"
       stdout: { write() {} }, stderr: { write() {} }, deps: {
         readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound", database_key: before.database_key }),
         reserveSyncAccountBinding: () => false,
+        captureLarkWriteAdmission: (_db, options) => {
+          assert.equal(options.selfOpenId, self); return { fence: {}, assertCurrent() {} };
+        },
         ensureInitialized: () => {}, ensureSourceInitialSyncStart: (_db, _source, ms) => ms,
         captureRemoteAccountBinding: (options) => { assert.equal(options.emptyOnly, true); return before; },
         getSelfProfile: () => ({ open_id: self, name: "Synthetic" }),
