@@ -68,17 +68,22 @@ function inspectSampleMessage(remote, local) {
   if (!remoteVersion || !localVersion || epoch(raw.update_time) !== localVersion) return unverified('incomparable');
   if (remoteVersion < localVersion) return unverified('local_newer');
   const dimensions = { version: remoteVersion, different: /** @type {string[]} */ ([]), equal: ['missing'] };
-  const finish = comparison => ({ comparison, dimensions });
-  if (remoteVersion > localVersion) {
-    dimensions.different.push('version');
-    return finish({ kind: 'version', content: 'unverified', version: remoteVersion });
-  }
-  dimensions.equal.push('version');
+  const newer = remoteVersion > localVersion;
+  // Public precedence must not suppress contradictions in independent fields.
+  // Positive content proof, however, requires the same source version on both
+  // sides; an older local row cannot borrow the remote version's proof floor.
+  const finish = comparison => ({ comparison: newer
+    ? { kind: 'version', content: 'unverified', version: remoteVersion } : comparison, dimensions });
+  (newer ? dimensions.different : dimensions.equal).push('version');
+  const compareDimension = (dimension, different) => {
+    if (different) dimensions.different.push(dimension);
+    else if (!newer) dimensions.equal.push(dimension);
+  };
   const differentType = raw.msg_type !== remote.msg_type;
   const differentDeletion = typeof remote.deleted === 'boolean' && typeof raw.deleted === 'boolean' && remote.deleted !== raw.deleted;
-  (differentType ? dimensions.different : dimensions.equal).push('type');
+  compareDimension('type', differentType);
   if (typeof raw.deleted === 'boolean' && typeof remote.deleted === 'boolean') {
-    (differentDeletion ? dimensions.different : dimensions.equal).push('deleted');
+    compareDimension('deleted', differentDeletion);
   }
   if (differentType || differentDeletion) return finish({ kind: 'content', content: 'different', version: remoteVersion });
   if (!['text', 'post'].includes(remote.msg_type) || remote.deleted || raw.deleted) return finish({ kind: 'match', content: 'unverified' });
@@ -88,7 +93,7 @@ function inspectSampleMessage(remote, local) {
     dimensions.different.push('body');
     return finish({ kind: 'content', content: 'different', version: remoteVersion });
   }
-  dimensions.equal.push('body');
+  compareDimension('body', false);
   // A kind-only content entry might have meant deletion, type or body. Its
   // origin is unknown, so all three positive proofs are required for closure.
   if (dimensions.equal.includes('deleted')) dimensions.equal.push('legacy_content');

@@ -14,22 +14,25 @@ import { SCOPE_CONFIG_POLICY, projectScopeConfig } from './scope-config-policy.m
 const sha = text => createHash('sha256').update(text).digest('hex');
 const PROFILE = 'known_record_history/v1';
 
-/** Read-only selection. The fixed horizon excludes records arriving during this
- * sweep. Coverage here means processed known rows, never missing-source coverage. */
-function selectHistoryTarget(db) {
-  const source = readOnlySqliteJson(db, "SELECT enabled,config_json FROM sources WHERE id='lark.im';", 'read history source')[0];
+/** Read-only selection. A discovered chat routes all its known native records;
+ * first-seen scope is immutable provenance, including sent-first ingestion.
+ * The fixed horizon excludes records arriving during this sweep. Coverage here
+ * means processed known rows, never missing-source coverage. */
+function selectHistoryTarget(db, deps = {}) {
+  const query = deps.sqliteJson || readOnlySqliteJson;
+  const source = query(db, "SELECT enabled,config_json FROM sources WHERE id='lark.im';", 'read history source')[0];
   if (source?.enabled !== 1) return null;
   const baseline = JSON.parse(source.config_json).initial_sync_start_ms;
   if (!Number.isSafeInteger(baseline) || baseline < 100_000_000_000) throw new Error('history baseline unavailable');
-  const eligible = `r.source_id='lark.im' AND r.record_type='lark.im.message' AND r.first_seen_scope_id=s.id
+  const eligible = `r.source_id='lark.im' AND r.record_type='lark.im.message'
     AND r.occurred_at_ms>=${baseline} AND r.external_version IS NOT NULL
     AND r.external_version<>'' AND r.external_version NOT GLOB '*[^0-9]*'
     AND CASE WHEN json_valid(r.canonical_json) THEN json_extract(r.canonical_json,'$.source_api')='im.v1.messages' ELSE 0 END
     AND r.container_id=json_extract(s.config_json,'$.chat_id')`;
-  const scope = readOnlySqliteJson(db, `SELECT s.*, COALESCE(p.generation,0) AS history_generation,
+  const scope = query(db, `SELECT s.*, COALESCE(p.generation,0) AS history_generation,
     COALESCE(p.after_id,0) AS history_after, COALESCE(p.sweep_max_id,0) AS history_max,
     COALESCE(p.completed_sweeps,0) AS history_sweeps,
-    (SELECT MAX(r.id) FROM records r WHERE ${eligible}) AS current_max
+    (SELECT MAX(r.id) FROM records r INDEXED BY records_history_container_id WHERE ${eligible}) AS current_max
     FROM sync_scopes s LEFT JOIN lark_im_history_progress p ON p.scope_id=s.id
     WHERE s.source_id='lark.im' AND s.enabled=1 AND s.id LIKE 'lark.im.received.chat.%'
     AND CASE WHEN json_valid(s.config_json) THEN json_type(s.config_json,'$.chat_id')='text' ELSE 0 END
@@ -38,11 +41,11 @@ function selectHistoryTarget(db) {
   if (!scope) return null;
   if (chatScopeId(JSON.parse(scope.config_json).chat_id) !== scope.id) throw new Error("history scope identity unavailable");
   const recordWhere = `r.source_id='lark.im' AND r.record_type='lark.im.message'
-    AND r.first_seen_scope_id=${quoteSql(scope.id)} AND r.container_id=${quoteSql(JSON.parse(scope.config_json).chat_id)}
+    AND r.container_id=${quoteSql(JSON.parse(scope.config_json).chat_id)}
     AND r.occurred_at_ms>=${baseline} AND r.external_version<>'' AND r.external_version NOT GLOB '*[^0-9]*'
     AND CASE WHEN json_valid(r.canonical_json) THEN json_extract(r.canonical_json,'$.source_api')='im.v1.messages' ELSE 0 END`;
-  const read = (after, max) => readOnlySqliteJson(db, `SELECT r.*,o.generation AS observation_generation
-    FROM records r JOIN record_observation_state o ON o.record_id=r.id
+  const read = (after, max) => query(db, `SELECT r.*,o.generation AS observation_generation
+    FROM records r INDEXED BY records_history_container_id JOIN record_observation_state o ON o.record_id=r.id
     WHERE ${recordWhere} AND r.id>${after} AND r.id<=${max} ORDER BY r.id LIMIT 1;`, 'select history record')[0];
   let horizon = scope.history_max;
   let selected = read(scope.history_after, horizon);
@@ -50,7 +53,7 @@ function selectHistoryTarget(db) {
   if (!selected) return null;
   const { observation_generation, ...record } = selected;
   const { history_generation, history_after, history_max, history_sweeps, current_max, ...selectedScope } = scope;
-  const detailTask = readOnlySqliteJson(db, `SELECT d.fingerprint,d.raw_root_json,d.external_version,d.occurred_at_ms,
+  const detailTask = query(db, `SELECT d.fingerprint,d.raw_root_json,d.external_version,d.occurred_at_ms,
     p.generation AS list_generation FROM lark_im_detail_tasks d
     JOIN lark_im_list_progress p ON p.scope_id=d.scope_id
     WHERE d.scope_id=${quoteSql(scope.id)} AND d.message_id=${quoteSql(record.external_id)} AND d.status='pending';`,

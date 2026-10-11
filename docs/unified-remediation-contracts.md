@@ -41,6 +41,18 @@ mutually exclusive per target. `unresolved_prior` excludes targets already shown
 as a current difference, including when a revisited target still has another
 unresolved dimension. Private state remains bounded to 200 targets and 96 KiB.
 
+One response may establish several independent contradictions. A newer remote
+version must retain any explicit deletion or type difference, and any comparable
+static-body difference, from that same response. Each contradiction raises its
+own version floor. The public category still gives version drift precedence;
+it does not discard the other debts. Cross-version equality cannot settle a
+content debt: the local and remote versions must agree at or above its floor.
+Native identity and comparable version evidence can settle missing debt
+independently. Unreadable or
+dynamic card bodies supply no body proof; mention rendering is not an edit
+signal, and unknown calendar fields are not normalized away. No new request,
+queue slot, schema field or higher budget is required for this accounting.
+
 ## Names and display
 
 An adopted name and its original observation time are separate from the latest
@@ -79,7 +91,10 @@ Exclusions from a directed manual repair constrain that repair only. Normal sync
 and history continue their verified admission rules. No permanent hold, default
 service stop or absolute record freeze is introduced by this candidate.
 
-No database schema migration is added. The remote-finding private state gains
+The history-routing follow-up adds an index-only migration; existing tables and
+observation fields are unchanged. Its routing, upgrade and remaining detail
+boundaries are described in [Known-record history routing](history-routing-contract.md).
+The remote-finding private state gains
 bounded debt fields; older code rejects that state rather than interpreting it
 correctly. Schema compatibility alone does not make an older writer safe for the
 new convergence rules. Preserve current data and evidence during rollback; use

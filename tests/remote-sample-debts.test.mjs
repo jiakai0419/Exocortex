@@ -35,14 +35,14 @@ test('one target retains deletion and version debt through three observations, c
   assert.deepEqual(first.observations[key].debts, { deleted: CREATED });
   const edited = { ...original, update_time: String(CREATED + 1000), deleted: true };
   const second = evaluate(edited, local(), first.observations, NOW + SAMPLE_POLICY.intervalMs);
-  assert.deepEqual(second.observations[key].debts, { deleted: CREATED, version: CREATED + 1000 });
+  assert.deepEqual(second.observations[key].debts, { deleted: CREATED + 1000, version: CREATED + 1000 });
   assert.equal(second.observations[key].kind, 'version');
   assert.equal(second.counts.stale_version, 1);
   assert.equal(second.counts.content_mismatch, 0);
   assert.equal(second.counts.unresolved_prior, 0);
   const caughtUp = local({ ...original, update_time: edited.update_time });
   const third = evaluate(withoutDeleted(edited), caughtUp, second.observations, NOW + 2 * SAMPLE_POLICY.intervalMs);
-  assert.deepEqual(third.observations[key].debts, { deleted: CREATED });
+  assert.deepEqual(third.observations[key].debts, { deleted: CREATED + 1000 });
   assert.equal(third.observations[key].kind, 'content');
   assert.equal(third.counts.stale_version, 0);
   assert.equal(third.counts.content_mismatch, 0);
@@ -222,7 +222,7 @@ test('collector → durable schedule → real publication → reload preserves m
   const third = await f.round(withoutDeleted(edited), caughtUp);
   assert.equal(third.cache.status, 'delayed'); assert.equal(third.cache.ok, false);
   assert.equal(third.cache.findings.unresolved_prior, 1);
-  assert.deepEqual(third.persisted.observations[f.observedKey].debts, { deleted: CREATED });
+  assert.deepEqual(third.persisted.observations[f.observedKey].debts, { deleted: CREATED + 1000 });
   const fourth = await f.round({ ...edited, deleted: false }, caughtUp);
   assert.deepEqual(fourth.persisted.observations, {});
   assert.equal(fourth.cache.status, 'healthy'); assert.equal(fourth.cache.ok, true);
@@ -230,6 +230,55 @@ test('collector → durable schedule → real publication → reload preserves m
   assert.equal(statSync(f.paths.state).mode & 0o777, 0o600);
   for (const path of [f.paths.state, f.paths.cache]) {
     assert.doesNotMatch(readFileSync(path, 'utf8'), /om_invented|oc_invented|ou_invented|invented_tenant|"card"/);
+  }
+});
+
+test('first-observation version, type and deletion debts survive partial proof through real cache publication', async t => {
+  const f = publicationFixture(t);
+  const changed = { ...original, update_time: String(CREATED + 1000), msg_type: 'text', deleted: true };
+  const first = await f.round(changed);
+  assert.equal(first.result.outcome, 'ok'); assert.equal(first.cache.status, 'needs_attention');
+  assert.deepEqual(first.persisted.observations[f.observedKey].debts,
+    { version: CREATED + 1000, type: CREATED + 1000, deleted: CREATED + 1000 });
+  assert.equal(first.cache.findings.stale_version, 1);
+  assert.equal(first.cache.findings.content_mismatch, 0);
+  const caughtUp = { ...changed, deleted: false };
+  const second = await f.round(withoutDeleted(changed), local(caughtUp));
+  assert.equal(second.cache.status, 'delayed'); assert.equal(second.cache.ok, false);
+  assert.equal(second.cache.findings.stale_version, 0);
+  assert.equal(second.cache.findings.unresolved_prior, 1);
+  assert.deepEqual(second.persisted.observations[f.observedKey].debts, { deleted: CREATED + 1000 });
+  const third = await f.round(caughtUp, local(caughtUp));
+  assert.deepEqual(third.persisted.observations, {});
+  assert.equal(third.cache.status, 'healthy'); assert.equal(third.cache.ok, true);
+  assert.equal(third.injectedCalls, 9, 'same bounded three synthetic API responses per round');
+  for (const path of [f.paths.state, f.paths.cache]) {
+    assert.doesNotMatch(readFileSync(path, 'utf8'), /om_invented|oc_invented|ou_invented|invented_tenant|"card"/);
+  }
+});
+
+test('first-observation newer static-body debt survives unreadable proof through real cache publication', async t => {
+  const f = publicationFixture(t);
+  const stored = { ...original, msg_type: 'text', body: { content: '{"text":"Invented simultaneous alpha"}' } };
+  const changed = { ...stored, update_time: String(CREATED + 1000), body: { content: '{"text":"Invented simultaneous beta"}' } };
+  const first = await f.round(changed, local(stored));
+  assert.deepEqual(first.persisted.observations[f.observedKey].debts,
+    { version: CREATED + 1000, body: CREATED + 1000 });
+  assert.equal(first.cache.findings.stale_version, 1);
+  assert.equal(first.cache.findings.content_mismatch, 0);
+  const caughtUpVersion = { ...stored, update_time: changed.update_time };
+  const second = await f.round({ ...changed, body: { content: 'invented invalid JSON' } }, local(caughtUpVersion));
+  assert.equal(second.cache.status, 'delayed'); assert.equal(second.cache.ok, false);
+  assert.equal(second.cache.findings.unresolved_prior, 1);
+  assert.equal(second.cache.findings.content_unverified, 1);
+  assert.deepEqual(second.persisted.observations[f.observedKey].debts, { body: CREATED + 1000 });
+  const third = await f.round(changed, local(changed));
+  assert.deepEqual(third.persisted.observations, {});
+  assert.equal(third.cache.status, 'healthy'); assert.equal(third.cache.ok, true);
+  assert.equal(third.cache.findings.content_equal, 1);
+  assert.equal(third.injectedCalls, 9);
+  for (const path of [f.paths.state, f.paths.cache]) {
+    assert.doesNotMatch(readFileSync(path, 'utf8'), /om_invented|oc_invented|ou_invented|invented_tenant|simultaneous alpha|simultaneous beta/);
   }
 });
 
