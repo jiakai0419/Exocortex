@@ -44,7 +44,7 @@ function project(record, fields) {
   return { ...record, canonical_json: JSON.stringify({ ...JSON.parse(record.canonical_json), ...fields }) };
 }
 
-test("lookup success then permission failure preserves names and provenance at identical raw/hash/version with updated=0", (t) => {
+test("lookup failure preserves adopted names and source facts while recording latest verification", (t) => {
   const db = fixture(t);
   let denied = false;
   let now = 0;
@@ -62,8 +62,17 @@ test("lookup success then permission failure preserves names and provenance at i
   assert.ok(failures > 0);
   for (const key of ["raw_json", "content_hash", "external_version", "body"]) assert.equal(second[key], first[key]);
   assert.equal(JSON.parse(second.canonical_json).sender_name, null);
+  assert.deepEqual(write(db, second), { inserted: 0, updated: 1, duplicate: 0 });
+  const after = stored(db);
+  for (const key of Object.keys(before).filter(key => !['canonical_json', 'updated_at'].includes(key)))
+    assert.equal(after[key], before[key], key);
+  const { sender_name_verification: oldCheck, ...oldProjection } = JSON.parse(before.canonical_json);
+  const { sender_name_verification: newCheck, ...newProjection } = JSON.parse(after.canonical_json);
+  assert.deepEqual(newProjection, oldProjection);
+  assert.equal(oldCheck.status, 'resolved');
+  assert.equal(newCheck.status, 'failed');
+  assert.equal(newCheck.observed_at, new Date(now).toISOString());
   assert.deepEqual(write(db, second), { inserted: 0, updated: 0, duplicate: 1 });
-  assert.deepEqual(stored(db), before);
 });
 
 test("same-version lookup improvement and rename update once without changing source facts", (t) => {

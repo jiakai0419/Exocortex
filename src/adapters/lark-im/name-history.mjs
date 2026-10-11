@@ -1,5 +1,6 @@
 // @ts-check
 import { createHash } from 'node:crypto';
+import { patchJsonText } from '../../../dist/core/json-text-patch.js';
 import { quoteSql } from '../../../dist/storage/sqlite/ingestion-store.js';
 import { larkSenderNameIsUnknownSql, larkSenderNamespaceSql } from '../../../dist/storage/sqlite/lark-name-projection.js';
 import { readRemoteAccountBinding } from '../../diagnostics/remote-account-binding.mjs';
@@ -31,7 +32,8 @@ function bindCurrentSenderNames(records, selfProfile) {
         || !personName(canonical.sender_name, identity.identifiers)
         || !(identity.type === 'open_id' && ['contact', 'self', 'chat_member'].includes(source)
           || identity.type === 'app_id' && ['application_api', 'chat_bot_app_id'].includes(source))) return record;
-      return { ...record, canonical_json: JSON.stringify({ ...canonical, sender_name_account_key: accountKey }) };
+      return { ...record, canonical_json: patchJsonText(record.canonical_json,
+        [{ path: ['sender_name_account_key'], value: JSON.stringify(accountKey) }], [['sender_name_account_key']]) };
     } catch { return record; }
   });
 }
@@ -82,6 +84,7 @@ function reuseKnownSenderNames(dbPath, records, selfProfile, budgetMs = 4500) {
         json_extract(canonical_json, '$.sender_name_source') AS source,
         json_extract(canonical_json, '$.sender_name_confidence') AS confidence,
         json_extract(canonical_json, '$.sender_name_state') AS state,
+        json_extract(canonical_json, '$.sender_name_observed_at') AS observed_at,
         ${larkSenderNamespaceSql('canonical_json', 'raw_json', 'actor_id', false)} AS namespace,
         ${larkSenderNameIsUnknownSql('canonical_json', 'raw_json', 'actor_id')} AS unknown
       FROM records WHERE source_id='lark.im' AND record_type='lark.im.message'
@@ -98,7 +101,7 @@ function reuseKnownSenderNames(dbPath, records, selfProfile, budgetMs = 4500) {
           OR json_extract(canonical_json, '$.sender_name_state')='cleared')
     ) SELECT DISTINCT actor_id, namespace,
       CASE WHEN source IN (${[...GLOBAL_SOURCES].map(quoteSql).join(',')}) THEN NULL ELSE container_id END AS chat,
-      name, source, state FROM candidates WHERE namespace IS NOT NULL
+      name, source, state, observed_at FROM candidates WHERE namespace IS NOT NULL
         AND (state='cleared' OR NOT unknown AND confidence='high' AND typeof(name)='text'
           AND (namespace='typed:open_id' AND source IN ('contact','self','chat_member')
             OR namespace='typed:app_id' AND source IN ('application_api','chat_bot_app_id')))
@@ -117,9 +120,11 @@ function reuseKnownSenderNames(dbPath, records, selfProfile, budgetMs = 4500) {
       if (names.size !== 1) continue;
       // Prefer a global official result when both global and scoped evidence agree.
       const authority = evidence.find((row) => GLOBAL_SOURCES.has(row.source)) || evidence[0];
-      replacements.set(record, { ...record, canonical_json: JSON.stringify({ ...canonical,
-        sender_name: authority.name, sender_name_source: 'local_history', sender_name_confidence: 'high',
-        sender_name_authority_source: authority.source }) });
+      const fields = { sender_name: authority.name, sender_name_source: 'local_history', sender_name_confidence: 'high',
+        sender_name_authority_source: authority.source, sender_name_observed_at: authority.observed_at || undefined };
+      replacements.set(record, { ...record, canonical_json: patchJsonText(record.canonical_json,
+        Object.entries(fields).map(([key, value]) => ({ path: [key], value: value === undefined ? undefined : JSON.stringify(value) })),
+        Object.keys(fields).map(key => [key])) });
     }
     return records.map((record) => replacements.get(record) || record);
   } catch { return records; }

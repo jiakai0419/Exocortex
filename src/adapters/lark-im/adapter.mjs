@@ -104,6 +104,7 @@ import {
  *
  * @typedef {object} LarkImAdapter
  * @property {(opts?: AdapterOptions) => SelfProfile} getSelfProfile
+ * @property {import("./name-resolver.mjs").NameResolver["verifySenderName"]} verifySenderName
  * @property {(openIds: unknown[], opts: AdapterOptions, seed?: Map<string, string>) => Map<string, string>} resolveContactNames
  * @property {(chatIdValue: string, openIds: unknown[], opts: AdapterOptions) => Map<string, string>} resolveChatMemberNames
  * @property {(appIds: unknown[], opts: AdapterOptions) => Map<string, string>} resolveApplicationNames
@@ -496,6 +497,7 @@ function createLarkImAdapter({ run = runLark, clock = Date.now } = {}) {
     resolveChatBotAppFallbackNames,
     resolveChatMemberNames,
     resolveContactNames,
+    verifySenderName,
   } = nameResolver;
 
   /**
@@ -751,6 +753,7 @@ function createLarkImAdapter({ run = runLark, clock = Date.now } = {}) {
     resolveContactNames,
     resolveApplicationNames,
     resolveChatBotAppFallbackNames,
+    verifySenderName,
   };
 }
 
@@ -785,6 +788,10 @@ const resolveApplicationNames = (appIds, opts) => defaultAdapter.resolveApplicat
 const resolveChatBotAppFallbackNames = (appIdsByChat, officialApps, opts) =>
   defaultAdapter.resolveChatBotAppFallbackNames(appIdsByChat, officialApps, opts);
 
+/** @type {LarkImAdapter["verifySenderName"]} */
+const verifySenderName = (message, adoptedName, selfProfile, opts) =>
+  defaultAdapter.verifySenderName(message, adoptedName, selfProfile, opts);
+
 export {
   buildPeopleContext,
   createLarkImAdapter,
@@ -812,4 +819,5 @@ export {
   runLark,
   uniqueAppIds,
   uniqueOpenIds,
+  verifySenderName,
 };

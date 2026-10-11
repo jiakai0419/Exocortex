@@ -1,12 +1,13 @@
 // @ts-check
 
+import { createHash } from "node:crypto";
 import {
   chatId,
   senderId,
   senderName,
   senderType,
 } from "./core.mjs";
-import { displayNameFromUser, personName, senderAliasesByOpenId, senderOpenId } from "./sender-identity.mjs";
+import { displayNameFromUser, personName, senderAliasesByOpenId, senderIdentity, senderOpenId } from "./sender-identity.mjs";
 
 /**
  * @typedef {Record<string, any>} JsonObject
@@ -23,7 +24,8 @@ import { displayNameFromUser, personName, senderAliasesByOpenId, senderOpenId } 
  * @typedef {object} AdapterOptions
  * @property {number=} retries
  * @property {number=} retryDelayMs
- * @property {boolean=} forceRefresh Bypass application-name cache for an explicit probe.
+ * @property {boolean=} forceRefresh Bypass name caches for an explicit probe.
+ * @property {number=} memberPageLimit Optional tighter bound for an exact verification.
  * @property {number=} nameLookupDeadlineMs Shared absolute deadline for optional detail enrichment.
  *
  * @typedef {object} SelfProfile
@@ -45,12 +47,15 @@ import { displayNameFromUser, personName, senderAliasesByOpenId, senderOpenId } 
  * @property {Map<string, string>} chatMemberNames
  * @property {Map<string, string>} appNames
  * @property {Map<string, NameDetails>} appFallbackNames
+ * @property {Map<string, JsonObject>} sender_name_observations
  *
  * @typedef {object} NameResolver
  * @property {(openIds: unknown[], opts: AdapterOptions, seed?: Map<string, string>, aliases?: Map<string, string[]>) => Map<string, string>} resolveContactNames
  * @property {(chatIdValue: string, openIds: unknown[], opts: AdapterOptions, aliases?: Map<string, string[]>) => Map<string, string>} resolveChatMemberNames
  * @property {(appIds: unknown[], opts: AdapterOptions) => Map<string, string>} resolveApplicationNames
  * @property {(appIdsByChat: Map<string, Set<string>>, officialApps: Map<string, string>, opts: AdapterOptions) => Map<string, NameDetails>} resolveChatBotAppFallbackNames
+ * @property {(message: JsonObject, adoptedName: unknown, selfProfile: SelfProfile, opts?: AdapterOptions) => JsonObject} verifySenderName
+ * @property {(id: string, chat?: string) => JsonObject | null} senderNameObservation
  * @property {(messages: any[], opts: AdapterOptions, selfProfile: SelfProfile | null, scopeConfig?: JsonObject) => PeopleContext} buildPeopleContext
  */
 
@@ -129,9 +134,30 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
   // failed lookups. Reads refresh LRU order, not the five-minute rename TTL.
   const cacheTtlMs = 5 * 60 * 1000;
   const cacheMaxEntries = 1000;
-  /** @type {Map<string, {name: string, expiresAt: number}>} */
+  /** @type {Map<string, {name: string, expiresAt: number, observed_at: string}>} */
   const nameCache = new Map();
   let contextAccount = '';
+  // One bounded latest result per lookup route, not a profile history. Cache
+  // reuse carries the original observation time and is never a fresh check.
+  /** @type {Map<string, JsonObject>} */
+  const observations = new Map();
+  /** @param {string} key @param {JsonObject} value */
+  function observe(key, value) {
+    observations.delete(key);
+    observations.set(key, { observed_at: new Date(now()).toISOString(), cached: false,
+      ...(contextAccount ? { account_key: createHash('sha256').update(`lark.im\0${contextAccount}`).digest('hex') } : {}), ...value });
+    if (observations.size > cacheMaxEntries) { const oldest = observations.keys().next().value; if (oldest !== undefined) observations.delete(oldest); }
+  }
+  /** @param {string} id @param {string} [chat] */
+  function senderNameObservation(id, chat = '') {
+    const keys = id.startsWith('cli_') ? [`app:${id}`, `bot:${JSON.stringify([chat, id])}`]
+      : [`user:${id}`, `member:${JSON.stringify([chat, id])}`];
+    const values = keys.map(key => observations.get(key)).filter(Boolean);
+    const selected = values.find(value => value?.status === 'conflict')
+      || values.find(value => value?.status === 'resolved')
+      || values.find(value => value?.status === 'failed') || values.at(-1);
+    return selected ? { ...selected } : null;
+  }
 
   /** @param {string} key */
   function cachedName(key) {
@@ -140,6 +166,7 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
     nameCache.delete(key);
     if (entry.expiresAt <= now()) return "";
     nameCache.set(key, entry);
+    observe(key, { status: 'resolved', name: entry.name, source: key.startsWith('user:') ? 'contact' : key.startsWith('member:') ? 'chat_member' : 'application_api', observed_at: entry.observed_at, cached: true });
     return entry.name;
   }
 
@@ -150,7 +177,7 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
   function cacheName(key, name) {
     if (typeof name !== "string" || !name.trim()) return;
     nameCache.delete(key);
-    nameCache.set(key, { name, expiresAt: now() + cacheTtlMs });
+    nameCache.set(key, { name, expiresAt: now() + cacheTtlMs, observed_at: new Date(now()).toISOString() });
     if (nameCache.size > cacheMaxEntries) {
       const oldestKey = nameCache.keys().next().value;
       if (oldestKey !== undefined) nameCache.delete(oldestKey);
@@ -167,6 +194,7 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
     const names = new Map([...seed].filter(([id, name]) => personName(name, [id, ...(aliases.get(id) || [])])));
     const unresolved = uniqueOpenIds(openIds).filter((id) => {
       if (names.has(id)) return false;
+      if (opts.forceRefresh) nameCache.delete(`user:${id}`);
       const name = personName(cachedName(`user:${id}`), [id, ...(aliases.get(id) || [])]);
       if (name) names.set(id, name);
       else nameCache.delete(`user:${id}`);
@@ -200,19 +228,24 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
         const users = firstArray(json?.users, json?.data?.users);
         /** @type {Map<string, string | null>} */
         const responseNames = new Map();
+        const conflicts = new Set();
         for (const user of users) {
           const openId = user?.open_id;
           if (!ids.includes(openId)) continue;
           const name = displayNameFromUser(user, aliases.get(openId));
           const previous = responseNames.get(openId);
+          if (responseNames.has(openId) && previous !== name) conflicts.add(openId);
           responseNames.set(openId, !name || responseNames.has(openId) && previous !== name ? null : name);
         }
-        for (const [openId, name] of responseNames) {
+        for (const openId of ids) {
+          const name = responseNames.get(openId);
+          observe(`user:${openId}`, { status: name ? 'resolved' : conflicts.has(openId) ? 'conflict' : 'unresolved', source: 'contact', ...(name ? { name } : {}) });
           if (!name) { nameCache.delete(`user:${openId}`); continue; }
           names.set(openId, name);
           cacheName(`user:${openId}`, name);
         }
       } catch {
+        for (const id of ids) observe(`user:${id}`, { status: 'failed', source: 'contact' });
         // Name enrichment is best-effort; message sync correctness must not depend on it.
       }
     }
@@ -226,12 +259,13 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
    * @param {Map<string, string[]>} [aliases]
    */
   function resolveChatMemberNames(chatIdValue, openIds, opts, aliases = new Map()) {
-    const targetIds = new Set(uniqueOpenIds(openIds));
+    const targetIds = new Set(uniqueOpenIds(openIds).filter(id => observations.get(`user:${id}`)?.status !== 'conflict'));
     const names = new Map();
     if (!chatIdValue || targetIds.size === 0) return names;
 
     for (const id of targetIds) {
       const key = `member:${JSON.stringify([chatIdValue, id])}`;
+      if (opts.forceRefresh) nameCache.delete(key);
       const name = personName(cachedName(key), [id, ...(aliases.get(id) || [])]);
       if (name) {
         names.set(id, name);
@@ -243,7 +277,9 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
     const requestedIds = new Set(targetIds);
     /** @type {Map<string, string | null>} */
     const responseNames = new Map();
-    for (let page = 0; page < 50 && targetIds.size > 0; page += 1) {
+    const conflicts = new Set();
+    for (const id of requestedIds) observe(`member:${JSON.stringify([chatIdValue, id])}`, { status: 'unresolved', source: 'chat_member' });
+    for (let page = 0; page < Math.min(50, opts.memberPageLimit ?? 50) && targetIds.size > 0; page += 1) {
       const params = {
         chat_id: chatIdValue,
         member_id_type: "open_id",
@@ -278,10 +314,13 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
           const name = item?.member_id_type && item.member_id_type !== "open_id" ? ""
             : displayNameFromUser(item, aliases.get(memberId));
           const previous = responseNames.get(memberId);
+          if (item?.member_id_type && item.member_id_type !== 'open_id'
+            || responseNames.has(memberId) && previous !== name) conflicts.add(memberId);
           responseNames.set(memberId, !name || responseNames.has(memberId) && previous !== name ? null : name);
         }
         for (const [memberId, name] of responseNames) {
           const key = `member:${JSON.stringify([chatIdValue, memberId])}`;
+          observe(key, { status: name ? 'resolved' : conflicts.has(memberId) ? 'conflict' : 'unresolved', source: 'chat_member', ...(name ? { name } : {}) });
           if (!name) { names.delete(memberId); nameCache.delete(key); targetIds.add(memberId); continue; }
           names.set(memberId, name);
           cacheName(key, name);
@@ -291,6 +330,10 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
         pageToken = json?.page_token || json?.data?.page_token || "";
         if (!hasMore || !pageToken) break;
       } catch {
+        for (const id of targetIds) {
+          const key = `member:${JSON.stringify([chatIdValue, id])}`;
+          if (observations.get(key)?.status !== 'conflict') observe(key, { status: 'failed', source: 'chat_member' });
+        }
         break;
       }
     }
@@ -305,7 +348,7 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
     const names = new Map();
     for (const appId of uniqueAppIds(appIds)) {
       if (opts.forceRefresh) nameCache.delete(`app:${appId}`);
-      const cached = cachedName(`app:${appId}`);
+      const cached = personName(cachedName(`app:${appId}`), [appId]);
       if (cached) {
         names.set(appId, cached);
         reportLookup({ kind: "application", app_id: appId, status: "resolved", name: cached, cached: true });
@@ -332,7 +375,12 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
           opts,
         );
         const app = json?.data?.app || json?.app;
-        const name = app?.app_name || firstArray(app?.i18n).find((item) => item?.i18n_key === "zh_cn")?.name || "";
+        const identityConflict = [app?.app_id, app?.application_id].some(id => id != null && id !== appId);
+        const name = identityConflict ? '' : [app?.app_name,
+          firstArray(app?.i18n).find((item) => item?.i18n_key === "zh_cn")?.name]
+          .map(value => personName(value, [appId])).find(Boolean) || '';
+        observe(`app:${appId}`, { status: identityConflict ? 'conflict' : name ? 'resolved' : 'unresolved',
+          source: 'application_api', ...(name ? { name } : {}) });
         if (name) {
           names.set(appId, name);
           cacheName(`app:${appId}`, name);
@@ -341,6 +389,7 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
           reportLookup({ kind: "application", app_id: appId, status: "missing_name", cached: false });
         }
       } catch (error) {
+        observe(`app:${appId}`, { status: 'failed', source: 'application_api' });
         reportLookup({ kind: "application", app_id: appId, status: "failed", error, cached: false });
         // App-name enrichment is best-effort. If permission is missing, leave it unresolved.
       }
@@ -356,7 +405,8 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
   function resolveChatBotAppFallbackNames(appIdsByChat, officialApps, opts) {
     const names = new Map();
     for (const [chatIdValue, ids] of appIdsByChat.entries()) {
-      const pendingIds = uniqueAppIds([...ids]).filter((id) => !officialApps.has(id));
+      const pendingIds = uniqueAppIds([...ids]).filter((id) => !personName(officialApps.get(id), [id])
+        && observations.get(`app:${id}`)?.status !== 'conflict');
       if (pendingIds.length === 0) continue;
       try {
         const json = lookup(
@@ -379,23 +429,28 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
           },
           opts,
         );
-        const bots = firstArray(json?.items, json?.data?.items).filter((bot) => botName(bot));
+        const bots = firstArray(json?.items, json?.data?.items).filter((bot) => personName(botName(bot), [botAppId(bot), bot?.bot_id, bot?.open_id]));
         const directMatches = new Set();
-        for (const bot of bots) {
-          const appId = botAppId(bot);
-          if (pendingIds.includes(appId)) {
+        const conflicting = new Set();
+        for (const appId of pendingIds) {
+          const matching = bots.filter(bot => botAppId(bot) === appId);
+          const candidates = new Set(matching.map(bot => personName(botName(bot), [appId])));
+          const key = `bot:${JSON.stringify([chatIdValue, appId])}`;
+          if (candidates.size > 1) {
+            conflicting.add(appId);
+            observe(key, { status: 'conflict', source: 'chat_bot_app_id' });
+          } else if (candidates.size === 1) {
+            const name = [...candidates][0];
             directMatches.add(appId);
-            names.set(`${chatIdValue}:${appId}`, {
-              name: botName(bot),
-              source: "chat_bot_app_id",
-              confidence: "high",
-            });
-          }
+            names.set(`${chatIdValue}:${appId}`, { name, source: 'chat_bot_app_id', confidence: 'high' });
+            observe(key, { status: 'resolved', name, source: 'chat_bot_app_id' });
+          } else observe(key, { status: 'unresolved', source: 'chat_bot_app_id' });
         }
 
-        const remainingIds = pendingIds.filter((id) => !directMatches.has(id));
-        const remainingBots = bots.filter((bot) => !directMatches.has(botAppId(bot)));
-        const uniqueFallback = remainingIds.length === 1 && remainingBots.length === 1;
+        const remainingIds = pendingIds.filter((id) => !directMatches.has(id) && !conflicting.has(id));
+        const remainingBots = bots.filter((bot) => !directMatches.has(botAppId(bot)) && !conflicting.has(botAppId(bot)));
+        const uniqueFallback = remainingIds.length === 1 && remainingBots.length === 1
+          && Boolean(personName(botName(remainingBots[0]), [remainingIds[0]]));
         if (uniqueFallback) {
           names.set(`${chatIdValue}:${remainingIds[0]}`, {
             name: botName(remainingBots[0]),
@@ -408,6 +463,7 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
           status: ambiguous ? "ambiguous" : directMatches.size > 0 || uniqueFallback ? "resolved" : "unresolved",
           pending_app_ids: remainingIds.length, bot_candidates: remainingBots.length });
       } catch (error) {
+        for (const id of pendingIds) observe(`bot:${JSON.stringify([chatIdValue, id])}`, { status: 'failed', source: 'chat_bot_app_id' });
         reportLookup({ kind: "chat_bots", chat_id: chatIdValue, status: "failed", error });
         // Fallback display-name enrichment must never block message sync.
       }
@@ -424,6 +480,7 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
   function buildPeopleContext(messages, opts, selfProfile, scopeConfig = {}) {
     // A resolver may be reused in one process; never attribute another account's
     // cached authority to the current sync account when persisting provenance.
+    observations.clear();
     const account = selfProfile?.open_id || '';
     if (account !== contextAccount) { nameCache.clear(); contextAccount = account; }
     const aliases = senderAliasesByOpenId(messages);
@@ -467,6 +524,17 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
     }
     const apps = resolveApplicationNames(appIds, opts);
     const appFallbacks = resolveChatBotAppFallbackNames(appIdsByChat, apps, opts);
+    /** @type {Map<string, JsonObject>} */
+    const senderObservations = new Map();
+    for (const message of messages) {
+      const id = senderId(message), chat = chatId(message) || scopeConfig.chat_id || '';
+      const observation = senderNameObservation(id, chat);
+      if (!observation) continue;
+      if (senderObservations.size < cacheMaxEntries) senderObservations.set(JSON.stringify([chat, id]), observation);
+      if (observation.status === 'conflict') {
+        contacts.delete(id); chatMembers.delete(`${chat}:${id}`); apps.delete(id); appFallbacks.delete(`${chat}:${id}`);
+      }
+    }
     return {
       self: selfProfile || null,
       contacts,
@@ -477,7 +545,41 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
       chatMemberNames: chatMembers,
       appNames: apps,
       appFallbackNames: appFallbacks,
+      sender_name_observations: senderObservations,
     };
+  }
+
+  /** Exact, read-only verification using existing lookup routes. No scan, no
+   * persistence, no inferred identity and no unbound/unique bot inference.
+   * @param {JsonObject} message @param {unknown} adoptedName @param {SelfProfile} selfProfile @param {AdapterOptions} [opts] */
+  function verifySenderName(message, adoptedName, selfProfile, opts = {}) {
+    const identity = senderIdentity(message);
+    const native = message.raw_api && typeof message.raw_api === 'object' && !Array.isArray(message.raw_api) ? message.raw_api : message;
+    const chat = chatId(native);
+    if (chatId(message) && chatId(message) !== chat
+      || !/^ou_[A-Za-z0-9_-]+$/.test(selfProfile?.open_id || '')
+      || !identity.verified || identity.conflict || !['open_id', 'app_id'].includes(identity.type || '')) {
+      return { status: 'conflict', reason: 'unverified_identity', adopted_name: adoptedName, observation: null };
+    }
+    observations.clear();
+    if (contextAccount !== selfProfile.open_id) nameCache.clear();
+    contextAccount = selfProfile.open_id;
+    const bounded = { ...opts, forceRefresh: true, retries: 0, retryDelayMs: 0, memberPageLimit: 2,
+      nameLookupDeadlineMs: Math.min(opts.nameLookupDeadlineMs ?? Infinity, Date.now() + 15_000) };
+    if (identity.type === 'open_id') {
+      const aliases = senderAliasesByOpenId([message]);
+      const contacts = resolveContactNames([identity.id], bounded, new Map(), aliases);
+      if (!contacts.has(identity.id) && chat && (native.chat_type || native.chat?.chat_type) !== 'p2p')
+        resolveChatMemberNames(chat, [identity.id], bounded, aliases);
+    } else {
+      const apps = resolveApplicationNames([identity.id], bounded);
+      if (!apps.has(identity.id) && chat)
+        resolveChatBotAppFallbackNames(new Map([[chat, new Set([identity.id])]]), apps, bounded);
+    }
+    const observation = senderNameObservation(identity.id, chat);
+    return { status: observation?.status === 'resolved'
+      ? observation.name === adoptedName ? 'same' : 'changed' : observation?.status || 'unresolved',
+    adopted_name: adoptedName, observation };
   }
 
   return {
@@ -486,6 +588,8 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
     resolveChatBotAppFallbackNames,
     resolveChatMemberNames,
     resolveContactNames,
+    senderNameObservation,
+    verifySenderName,
   };
 }
 

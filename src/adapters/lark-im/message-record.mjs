@@ -43,6 +43,7 @@ import { personName, senderIdentity, senderNameFromSource } from "./sender-ident
  * @typedef {string | NameDetails | Record<string, any>} NameValue
  *
  * @typedef {object} PeopleContext
+ * @property {Map<string, Record<string, any>>=} sender_name_observations
  * @property {Map<string, NameValue>=} apps
  * @property {Map<string, NameValue>=} app_fallbacks
  * @property {Map<string, NameValue>=} chat_members
@@ -327,6 +328,10 @@ function recordFromMessage(message, scopeId, direction, context = {}, scopeConfi
     ? { name: senderDirectName, source: "message_sender", confidence: "high" }
     : lookupDisplayNameDetails(senderContext, actorId, containerId, identity.identifiers);
   const senderDisplayName = senderNameDetails?.name || "";
+  // Source names and supplied self profiles have no independent lookup time.
+  // Do not invent one from normalization time or the message timestamp.
+  const nameObservation = !senderDirectName && !senderIdentityConflict
+    ? context.sender_name_observations?.get(JSON.stringify([containerId, actorId])) : null;
   const partnerDirectName = chatPartner?.name || chatPartner?.display_name || "";
   /** @type {NameDetails | null} */
   const partnerNameDetails = partnerDirectName
@@ -346,6 +351,10 @@ function recordFromMessage(message, scopeId, direction, context = {}, scopeConfi
     ...(senderNameDetails?.state === "cleared" ? { sender_name_state: "cleared" } : {}),
     sender_name_source: senderDisplayName || senderNameDetails?.state === "cleared" ? senderNameDetails?.source || null : null,
     sender_name_confidence: senderDisplayName || senderNameDetails?.state === "cleared" ? senderNameDetails?.confidence || null : null,
+    ...(nameObservation ? { sender_name_verification: nameObservation } : {}),
+    ...(nameObservation?.status === 'resolved' && nameObservation.name === senderDisplayName
+      && nameObservation.source === senderNameDetails?.source
+      ? { sender_name_observed_at: nameObservation.observed_at } : {}),
     sender_type: senderType(message),
     chat_id: containerId,
     chat_type: chatType,

@@ -117,7 +117,7 @@ function mergeLarkNameProjectionSql(
       historical: `json_extract(next, '$.sender_name_source') = 'local_history'`,
       fields: ['$.sender_name', '$.sender_name_source', '$.sender_name_confidence',
         '$.sender_name_state', '$.sender_name_resolution_status', '$.sender_name_resolution_reason',
-        '$.sender_name_authority_source', '$.sender_name_account_key'],
+        '$.sender_name_authority_source', '$.sender_name_account_key', '$.sender_name_observed_at'],
     },
     {
       identity: sameContainer,
@@ -165,6 +165,18 @@ function mergeLarkNameProjectionSql(
         ELSE next END AS next FROM ${previous})`);
     }
   }
+  // A lookup failure preserves the adopted name but records its own latest
+  // result. No lookup must not erase an earlier result or invent a new time.
+  const previous = `n${index}`;
+  index += 1;
+  stages.push(`n${index} AS MATERIALIZED (SELECT old, CASE
+    WHEN (${sameActor}) AND (${sameContainer})
+      AND json_type(next, '$.sender_name_verification') IS NULL
+      AND json_type(old, '$.sender_name_verification') = 'object'
+      AND json_extract(old, '$.sender_name_verification.account_key')
+        IS json_extract(${incomingJson}, '$.sender_name_account_key')
+    THEN json_set(next, '$.sender_name_verification', json_extract(old, '$.sender_name_verification'))
+    ELSE next END AS next FROM ${previous})`);
   // Restoring a previously absent field may move its JSON property position.
   // Compare paths and typed scalar values, so equivalent projections keep the
   // stored bytes and updated_at instead of recording a formatting-only update.
