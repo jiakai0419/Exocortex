@@ -399,7 +399,7 @@ function runSenderOnly(dbPath, opts, runLark, assertReady, withCommit) {
       sender_name_source: direct ? 'message_sender' : member ? 'chat_member' : 'contact', sender_name_confidence: 'high' };
     delete next.sender_name_authority_source;
     delete next.sender_name_account_key;
-    setAdoptedNameObservation(next, direct || reviewRequested(opts) ? null : resolver.senderNameObservation(opts.senderId, row.container_id));
+    setAdoptedNameObservation(next, direct || reviewRequested(opts) ? null : resolver.senderNameObservation(opts.senderId, row.container_id, 'open_id'));
     proposals.push({ id: row.id, old: row.canonical_json, next: patchEnrichmentProjection(row, next, true),
       actor: row.actor_id, container: row.container_id, body: row.body, raw: row.raw_json });
   }
@@ -659,7 +659,7 @@ function enrichRecords(opts, deps = {}) {
       || !existingSenderName && (memberName || contactName) || opts.namesOnly && existingSenderName) {
       delete next.sender_name_account_key;
       setAdoptedNameObservation(next, reviewRequested(opts) || opts.namesOnly && existingSenderName
-        ? null : resolver.senderNameObservation(sid, cid));
+        ? null : resolver.senderNameObservation(sid, cid, isAppSender ? 'app_id' : 'open_id'));
     }
     if (!opts.namesOnly) {
       if (!next.sender_type && String(sid || "").startsWith("cli_")) next.sender_type = "app";

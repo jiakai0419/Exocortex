@@ -55,7 +55,7 @@ import { displayNameFromUser, personName, senderAliasesByOpenId, senderIdentity,
  * @property {(appIds: unknown[], opts: AdapterOptions) => Map<string, string>} resolveApplicationNames
  * @property {(appIdsByChat: Map<string, Set<string>>, officialApps: Map<string, string>, opts: AdapterOptions) => Map<string, NameDetails>} resolveChatBotAppFallbackNames
  * @property {(message: JsonObject, adoptedName: unknown, selfProfile: SelfProfile, opts?: AdapterOptions) => JsonObject} verifySenderName
- * @property {(id: string, chat?: string) => JsonObject | null} senderNameObservation
+ * @property {(id: string, chat: string, namespace: string) => JsonObject | null} senderNameObservation
  * @property {(messages: any[], opts: AdapterOptions, selfProfile: SelfProfile | null, scopeConfig?: JsonObject) => PeopleContext} buildPeopleContext
  */
 
@@ -148,9 +148,14 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
       ...(contextAccount ? { account_key: createHash('sha256').update(`lark.im\0${contextAccount}`).digest('hex') } : {}), ...value });
     if (observations.size > cacheMaxEntries) { const oldest = observations.keys().next().value; if (oldest !== undefined) observations.delete(oldest); }
   }
-  /** @param {string} id @param {string} [chat] */
-  function senderNameObservation(id, chat = '') {
-    const keys = id.startsWith('cli_') ? [`app:${id}`, `bot:${JSON.stringify([chat, id])}`]
+  // Lookup evidence is bound to the explicitly selected route. Identifier
+  // spelling can reject an unsupported route, but cannot select another one.
+  /** @param {string} id @param {string} chat @param {string} namespace */
+  function senderNameObservation(id, chat, namespace) {
+    if (namespace !== 'open_id' && namespace !== 'app_id'
+      || namespace === 'open_id' && !id.startsWith('ou_')
+      || namespace === 'app_id' && !id.startsWith('cli_')) return null;
+    const keys = namespace === 'app_id' ? [`app:${id}`, `bot:${JSON.stringify([chat, id])}`]
       : [`user:${id}`, `member:${JSON.stringify([chat, id])}`];
     const values = keys.map(key => observations.get(key)).filter(Boolean);
     const selected = values.find(value => value?.status === 'conflict')
@@ -493,8 +498,10 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
     const appIdsByChat = new Map();
     for (const message of messages) {
       const id = senderId(message);
-      const isAppSender = senderType(message) === "app" || String(id || "").startsWith("cli_");
-      const openId = senderOpenId(message);
+      const identity = senderIdentity(message);
+      const isAppSender = !identity.conflict && (identity.verified && identity.type === 'app_id'
+        || !identity.type && senderType(message) === 'app') && id.startsWith('cli_');
+      const openId = senderType(message) === "app" ? "" : senderOpenId(message);
       if (openId && !senderName(message) && !isAppSender) contactIds.push(openId);
       const effectiveChatId = chatId(message) || scopeConfig.chat_id || "";
       if (id && !senderName(message) && isAppSender) {
@@ -528,11 +535,12 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
     const senderObservations = new Map();
     for (const message of messages) {
       const identity = senderIdentity(message);
-      const eligible = identity.verified && ['open_id', 'app_id'].includes(identity.type || '')
+      const eligible = identity.verified && (identity.type === 'app_id'
+        || identity.type === 'open_id' && senderType(message) !== 'app')
         || !identity.conflict && !identity.type && senderType(message) === 'app';
       if (!eligible) continue;
       const id = senderId(message), chat = chatId(message) || scopeConfig.chat_id || '';
-      const observation = senderNameObservation(id, chat);
+      const observation = senderNameObservation(id, chat, identity.type || 'app_id');
       if (!observation) continue;
       if (senderObservations.size < cacheMaxEntries) senderObservations.set(JSON.stringify([chat, id, identity.type]), observation);
       if (observation.status === 'conflict') {
@@ -580,7 +588,7 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
       if (!apps.has(identity.id) && chat)
         resolveChatBotAppFallbackNames(new Map([[chat, new Set([identity.id])]]), apps, bounded);
     }
-    const observation = senderNameObservation(identity.id, chat);
+    const observation = senderNameObservation(identity.id, chat, identity.type || '');
     return { status: observation?.status === 'resolved'
       ? observation.name === adoptedName ? 'same' : 'changed' : observation?.status || 'unresolved',
     adopted_name: adoptedName, observation };

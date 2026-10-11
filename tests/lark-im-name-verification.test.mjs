@@ -230,7 +230,7 @@ test('standalone resolver and people-context callers both stop fallback after co
   assert.equal(resolver.resolveContactNames([ID], {}).size, 0);
   assert.equal(resolver.resolveChatMemberNames(CHAT, [ID], {}).size, 0);
   assert.deepEqual(calls, ['contact']);
-  assert.equal(resolver.senderNameObservation(ID, CHAT).status, 'conflict');
+  assert.equal(resolver.senderNameObservation(ID, CHAT, 'open_id').status, 'conflict');
 });
 
 test('an observation for an open_id cannot be borrowed by equal user_id bytes in the same batch and chat', () => {
@@ -304,5 +304,45 @@ for (const mode of ['same_account', 'different_account', 'legacy_unknown']) {
       assert.equal(projection.sender_name_observed_at, canonical(adopted).sender_name_observed_at);
       assert.equal(projection.sender_name_account_key, canonical(adopted).sender_name_account_key);
     }
+  });
+}
+
+for (const [id, expectedType, expectedName, expectedSource] of [
+  [ID, 'open_id', 'Synthetic Contact', 'contact'],
+  [APP, 'app_id', 'Synthetic Application', 'application_api'],
+]) {
+  test(`typed lookup and persisted verification cannot cross namespace for ${expectedType} bytes`, t => {
+    const db = fixture(t), calls = [];
+    const resolver = createNameResolver({ run(args) {
+      calls.push(args[0]);
+      if (args[0] === 'contact') return { users: [{ open_id: id, name: 'Synthetic Contact' }] };
+      if (args[0] === 'api') return { app: { app_id: id, app_name: 'Synthetic Application' } };
+      assert.fail('no fallback is needed for a resolved synthetic route');
+    } });
+    const rows = ['open_id', 'app_id'].map((type, i) => ({
+      ...message({ id, id_type: type, sender_type: type === 'open_id' ? 'user' : 'app' }),
+      message_id: `om_synthetic_route_${i}`,
+    }));
+    // A mismatched explicit namespace alone cannot authorize the other API.
+    const mismatched = rows.find(row => row.sender.id_type !== expectedType);
+    const empty = resolver.buildPeopleContext([mismatched], {}, SELF);
+    assert.deepEqual(calls, []);
+    assert.equal(empty.sender_name_observations.size, 0);
+    const context = resolver.buildPeopleContext(rows, {}, SELF);
+    const records = rows.map(row => recordFromMessage(row, 'lark.im.sent_by_me', 'sent', context));
+    sqliteExec(db, upsertRecordsSql(records));
+    const saved = sqliteQuery(db, 'SELECT canonical_json FROM records ORDER BY external_id;').map(canonical);
+    for (const value of saved) {
+      const supported = value.sender_id_type === expectedType;
+      assert.equal(value.sender_name, supported ? expectedName : null);
+      assert.equal(value.sender_name_verification?.source, supported ? expectedSource : undefined);
+      assert.equal(Boolean(value.sender_name_observed_at), supported);
+    }
+    assert.deepEqual(calls, [expectedType === 'open_id' ? 'contact' : 'api']);
+    const before = calls.length;
+    const report = resolver.verifySenderName(mismatched, 'Synthetic Adopted', SELF);
+    assert.equal(report.status, 'unresolved');
+    assert.equal(report.observation, null);
+    assert.equal(calls.length, before, 'explicit verification also cannot change namespace based on spelling');
   });
 }
