@@ -233,6 +233,35 @@ test('collector → durable schedule → real publication → reload preserves m
   }
 });
 
+for (const [label, unsafeLocal, unsafeRemote] of [
+  ['unsafe integer', '{"text":"Invented","unknown":9007199254740992}', '{"text":"Invented","unknown":9007199254740993}'],
+  ['duplicate key', '{"text":"Invented B"}', '{"text":"Invented A","text":"Invented B"}'],
+  ['nested duplicate key', '{"text":"Invented","unknown":{"x":2}}', '{"text":"Invented","unknown":{"x":1,"x":2}}'],
+  ['rounded decimal', '{"text":"Invented","unknown":1}', '{"text":"Invented","unknown":1.00000000000000001}'],
+]) test(`persisted body debt survives ${label}; independent version equality and safe JSON reordering still work`, async t => {
+  const f = publicationFixture(t);
+  const stored = { ...original, msg_type: 'text', body: { content: '{"text":"Invented A"}' } };
+  const changed = { ...stored, body: { content: '{"text":"Invented B"}' } };
+  const first = await f.round(changed, local(stored));
+  assert.equal(first.cache.findings.content_mismatch, 1);
+  assert.deepEqual(first.persisted.observations[f.observedKey].debts, { body: CREATED });
+  const newer = { ...stored, update_time: String(CREATED + 1000), body: { content: unsafeRemote } };
+  const second = await f.round(newer, local(stored));
+  assert.deepEqual(second.persisted.observations[f.observedKey].debts, { body: CREATED, version: CREATED + 1000 });
+  const third = await f.round(newer, local({ ...newer, body: { content: unsafeLocal } }));
+  assert.equal(third.cache.ok, false); assert.equal(third.cache.status, 'delayed');
+  assert.equal(third.cache.findings.content_equal, 0);
+  assert.equal(third.cache.findings.content_unverified, 1);
+  assert.equal(third.cache.findings.unresolved_prior, 1);
+  assert.equal(third.cache.findings.stale_version, 0, 'version debt settles independently of unsafe body evidence');
+  assert.deepEqual(third.persisted.observations[f.observedKey].debts, { body: CREATED });
+  const safeLocal = { ...newer, body: { content: '{"text":"Invented","unknown":{"alpha":1,"beta":[2,3]}}' } };
+  const safeRemote = { ...newer, body: { content: ' { "unknown" : { "beta" : [2,3], "alpha" : 1 }, "text" : "Invented" } ' } };
+  const fourth = await f.round(safeRemote, local(safeLocal));
+  assert.equal(fourth.cache.ok, true); assert.equal(fourth.cache.findings.content_equal, 1);
+  assert.deepEqual(fourth.persisted.observations, {});
+});
+
 test('publication failure and a failed request keep all prior dimensions; verified account change starts a separate namespace', async t => {
   const f = publicationFixture(t);
   const first = await f.round({ ...original, deleted: true });

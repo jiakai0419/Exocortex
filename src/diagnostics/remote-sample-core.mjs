@@ -1,12 +1,16 @@
 // @ts-check
 import { chatScopeId } from '../adapters/lark-im/core.mjs';
 import { createHash } from 'node:crypto';
+import { parseEvidence } from '../../dist/core/lark-observation.js';
 
 export const SAMPLE_POLICY = Object.freeze({ version: 1, intervalMs: 900000, ttlMs: 1800000,
   stableBufferMs: 600000, windowMs: 86400000, chats: 5, hot: 2, pages: 2, pageSize: 20,
   calls: 12, gapMs: 1000, deadlineMs: 55000, requestMs: 4000, observationTtlMs: 604800000, observations: 200 });
 
 export function jsonValue(value) { try { return typeof value === 'string' ? JSON.parse(value) : value; } catch { return null; } }
+// A body match is positive evidence that can retire persistent debt. Do not
+// manufacture it by rounding unknown numbers or collapsing duplicate JSON keys.
+function bodyEvidence(value) { try { return typeof value === 'string' ? parseEvidence(value) : null; } catch { return null; } }
 export function digest(value) { return createHash('sha256').update(JSON.stringify(value)).digest('hex'); }
 export function sampleScopeHash(binding, chatId) { return digest([binding.database_key, binding.account_key, chatId]); }
 export function canonical(value) {
@@ -78,7 +82,7 @@ function inspectSampleMessage(remote, local) {
   }
   if (differentType || differentDeletion) return finish({ kind: 'content', content: 'different', version: remoteVersion });
   if (!['text', 'post'].includes(remote.msg_type) || remote.deleted || raw.deleted) return finish({ kind: 'match', content: 'unverified' });
-  const a = jsonValue(remote.body?.content); const b = jsonValue(raw.body?.content);
+  const a = bodyEvidence(remote.body?.content); const b = bodyEvidence(raw.body?.content);
   if (!a || !b || typeof a !== 'object' || typeof b !== 'object') return finish({ kind: 'incomparable', content: 'unverified' });
   if (JSON.stringify(canonical(a)) !== JSON.stringify(canonical(b))) {
     dimensions.different.push('body');

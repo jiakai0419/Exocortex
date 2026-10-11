@@ -29,6 +29,10 @@ is stored. Equal native versions settle version debt even if a dynamic body is
 unverified. Deletion debt requires both sides to explicitly agree on deletion;
 an omitted field proves nothing. Type and static-body debt require their own
 positive comparison. One target closes only after all its dimensions settle.
+Static-body equality uses the existing strict evidence parser: duplicate keys,
+unsafe numbers and exceeded parsing limits supply no body proof. Other verified
+dimensions can still settle independently. Safe object-key/whitespace reordering
+remains equal; no additional reference equivalence is introduced.
 
 The private summary kind has the fixed precedence `missing`, then `version`,
 then `content`. Public counts retain the existing v3 contract: the current
