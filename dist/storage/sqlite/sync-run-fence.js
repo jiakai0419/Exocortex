@@ -1,4 +1,5 @@
 import { quoteSql } from "./sqlite-executor.js";
+import { larkWriteAdmissionSql } from "./lark-write-admission.js";
 const DEFAULT_HARD_LEASE_SECONDS = 20 * 60;
 const RUN_FENCE_METADATA_KEY = "__run_fence";
 function scopeCursorJson(scope) {
@@ -55,7 +56,10 @@ function runFenceGuardSql(scope, runId, finishedAtIso, options = {}) {
     const table = options.guardTable || "__run_fence_guard";
     if (!/^__[a-z_]+$/.test(table))
         throw new Error("invalid run fence table");
+    if (options.requireEnabled !== false)
+        scope.assertWriteAdmission?.();
     return `
+    ${options.requireEnabled !== false && scope.writeAdmission ? larkWriteAdmissionSql(scope.writeAdmission, `${table}_account`) : ""}
     CREATE TEMP TABLE ${table} (
       allowed INTEGER PRIMARY KEY CHECK (allowed = 1), lock_owner TEXT NOT NULL,
       lock_acquired_at TEXT NOT NULL, implicit INTEGER NOT NULL

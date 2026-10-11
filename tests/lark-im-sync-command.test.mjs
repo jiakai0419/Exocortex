@@ -32,6 +32,7 @@ test("sync CLI preserves recovered transport pressure in its successful JSON", (
       getSelfProfile: () => ({ open_id: "ou_synthetic", name: "Synthetic" }),
       readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
       reserveSyncAccountBinding: () => false,
+      captureLarkWriteAdmission: () => ({ fence: {}, assertCurrent() {} }),
       ensureInitialized: () => {}, ensureSourceInitialSyncStart: (_db, _source, ms) => ms,
       syncRunner: { syncDiscovery: () => ({ ok: true }) },
     },
@@ -53,6 +54,7 @@ test("sync CLI emits aggregate transport pressure when profile loading fails", (
       resetTransportStats: () => {}, getTransportStats: () => transport,
       readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
       reserveSyncAccountBinding: () => false,
+      captureLarkWriteAdmission: () => ({ fence: {}, assertCurrent() {} }),
       ensureInitialized: () => {}, ensureSourceInitialSyncStart: (_db, _source, ms) => ms,
       getSelfProfile: () => { throw new Error("kind=rate_limited code=99991400"); },
     },
@@ -73,6 +75,7 @@ test("lark im sync command renders help without touching dependencies", () => {
     deps: {
       readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
       reserveSyncAccountBinding: () => false,
+      captureLarkWriteAdmission: () => ({ fence: {}, assertCurrent() {} }),
       ensureInitialized: () => {
         throw new Error("should not initialize");
       },
@@ -109,6 +112,7 @@ test("lark im sync command executes sent scope through injected deps", () => {
         resolvePath: (dbPath) => `/abs/${dbPath}`,
         readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
         reserveSyncAccountBinding: () => false,
+      captureLarkWriteAdmission: () => ({ fence: {}, assertCurrent() {} }),
       ensureInitialized: (dbPath) => calls.push(["init", dbPath]),
         ensureSourceInitialSyncStart: (dbPath, sourceId, startMs, options) => {
           calls.push(["baseline", dbPath, sourceId, startMs, options.explicit]);
@@ -159,6 +163,7 @@ test("lark im sync command returns nonzero and safe JSON on dependency errors", 
     deps: {
       readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
       reserveSyncAccountBinding: () => false,
+      captureLarkWriteAdmission: () => ({ fence: {}, assertCurrent() {} }),
       ensureInitialized: () => {},
       ensureSourceInitialSyncStart: (_dbPath, _sourceId, startMs) => startMs,
       getSelfProfile: () => ({ open_id: "", name: "" }),
@@ -351,6 +356,7 @@ test("lark im sync command checks the account before baseline mutation and resol
     resolvePath: () => "/fake/baseline.sqlite",
     readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
     reserveSyncAccountBinding: () => false,
+      captureLarkWriteAdmission: () => ({ fence: {}, assertCurrent() {} }),
       ensureInitialized: () => calls.push("init"),
     ensureSourceInitialSyncStart: (dbPath, sourceId, startMs, options) => {
       assert.equal(dbPath, "/fake/baseline.sqlite");
@@ -400,6 +406,7 @@ test("lark im sync command rejects an unusable baseline after account validation
       resolvePath: () => "/fake/legacy.sqlite",
       readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
       reserveSyncAccountBinding: () => false,
+      captureLarkWriteAdmission: () => ({ fence: {}, assertCurrent() {} }),
       ensureInitialized: () => calls.push("init"),
       ensureSourceInitialSyncStart: () => {
         calls.push("baseline");
@@ -429,6 +436,7 @@ test("discovery-only commands validate the current profile before persisting the
     resolvePath: () => "/fake/discovery.sqlite",
     readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
     reserveSyncAccountBinding: () => false,
+      captureLarkWriteAdmission: () => ({ fence: {}, assertCurrent() {} }),
       ensureInitialized: () => calls.push("init"),
     ensureSourceInitialSyncStart: (_dbPath, sourceId, candidateMs, options) => {
       assert.equal(sourceId, "lark.im");
@@ -462,6 +470,7 @@ test("details-only CLI has a capped positive batch limit and never dispatches li
     resolvePath: (value) => value,
     readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
     reserveSyncAccountBinding: () => false,
+      captureLarkWriteAdmission: () => ({ fence: {}, assertCurrent() {} }),
       ensureInitialized: () => {},
     ensureSourceInitialSyncStart: (_db, _source, value) => value,
     getSelfProfile: () => ({ open_id: "invented-self", name: "Invented Self" }),

@@ -171,7 +171,20 @@ function createMaintenanceRequestSession(options = {}, deps = {}) {
       elapsed_ms: Number.isFinite(elapsed) ? Math.max(0, Math.floor(elapsed)) : null,
       stop_reason: stopped?.reason || null };
   }
-  return { runLark, assertReady, summary };
+  /** Keep cooperating sync/sidecar publishers out of the local admission and
+   * transaction interval. No CLI is spawned or charged by this local lease. */
+  function withCommit(action, { allowStoppedForFailure = false } = {}) {
+    // Remote deadlines forbid more remote work, not completing already fetched
+    // local transactions. The lease helper itself remains bounded to 2 seconds.
+    if (stopped && !allowStoppedForFailure) stop(stopped.reason);
+    let lease;
+    try { lease = acquire({ db: options.db, role: "probe", monotonicDeadlineMs: elapsedNow() + 2000 }); }
+    catch { stop("lease_unavailable"); }
+    if (lease?.state !== "acquired") stop(lease?.state === "busy" ? "sync_busy" : "lease_unavailable");
+    try { return action(); }
+    finally { lease.release(); }
+  }
+  return { runLark, assertReady, summary, withCommit };
 }
 
 export { createMaintenanceRequestSession, MaintenanceRequestError, MAINTENANCE_REQUEST_GAP_MS };

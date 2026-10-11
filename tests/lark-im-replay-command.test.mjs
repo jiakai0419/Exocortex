@@ -471,7 +471,7 @@ test("exact replay shares self/list actual-attempt budget and permits exactly th
     {createRequestSession:transport.createRequestSession,now:()=>END_MS+1000});
   assert.equal(result.ok,true); assert.equal(result.scopes[0].updated,1);
   assert.equal(result.request_budget.cli_attempts,2); assert.equal(result.request_budget.stop_reason,null);
-  assert.equal(transport.attempts(),2); assert.equal(transport.releases(),2);
+  assert.equal(transport.attempts(),2); assert.equal(transport.releases(),3, "two request leases and one local commit lease");
   assert.equal(ro(db,"SELECT count(*) AS n FROM records;")[0].n,1);
 });
 

@@ -133,6 +133,7 @@ test("sync success retains its summary and maintenance retains nonzero business 
     captureRemoteAccountBinding: () => ({ empty: true, binding_absent: true }),
     readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound" }),
     reserveSyncAccountBinding: () => false,
+      captureLarkWriteAdmission: () => ({ fence: {}, assertCurrent() {} }),
     recordSuccessfulSyncBinding() {}, ensureSourceInitialSyncStart: (_db, _source, start) => start,
     getSelfProfile: () => ({ open_id: "ou_synthetic", name: "Invented User" }),
     syncRunner: { syncSent: () => sent },

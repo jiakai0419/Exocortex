@@ -54,6 +54,7 @@ import {
  * @typedef {Record<string, any>} JsonObject
  *
  * @typedef {object} SyncOptions
+ * @property {ReturnType<typeof import("../../diagnostics/lark-write-admission.mjs").captureLarkWriteAdmission>=} writeAdmission
  * @property {number} startMs
  * @property {number} endMs
  * @property {number} pageSize
@@ -295,6 +296,11 @@ function syncScope(dbPath, scopeId, opts, worker, deps = defaultDeps) {
     // Another contender may have advanced or disabled the scope while this
     // process waited for the lock. Only the post-lock snapshot is authoritative.
     const scope = /** @type {ScopeRow} */ (deps.readScope(dbPath, scopeId));
+    if (opts.writeAdmission) {
+      scope.writeAdmission = { ...opts.writeAdmission.fence, scopes: [{ id: scope.id, source_id: scope.source_id,
+        enabled: scope.enabled, config_json: scope.config_json }] };
+      scope.assertWriteAdmission = opts.writeAdmission.assertCurrent;
+    }
     if (!scope.enabled) {
       outcome = { scope_id: scopeId, skipped: true, reason: "scope_disabled" };
     } else if (scope.source_enabled === 0) {

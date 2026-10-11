@@ -54,9 +54,10 @@ function executeEnrichment(options, deps = {}) {
     timeoutMs: Math.min(NAME_LOOKUP_RETRY_BUDGET_MS, Number(settings.timeoutMs || NAME_LOOKUP_RETRY_BUDGET_MS)),
     retryBudgetMs: Math.min(NAME_LOOKUP_RETRY_BUDGET_MS, Number(settings.retryBudgetMs || NAME_LOOKUP_RETRY_BUDGET_MS)) });
   const assertReady = session?.assertReady || deps.assertReady || (() => {});
+  const withCommit = session?.withCommit || deps.withCommit;
   const report = opts.target === "records"
-    ? (deps.enrichRecords || enrichRecords)(opts, { runLark, assertReady, now: deps.now })
-    : (deps.enrichScopes || enrichScopes)(opts, { assertReady, fetchChatMetadata: deps.fetchChatMetadata || createLarkImAdapter({ run: runLark }).fetchChatMetadata });
+    ? (deps.enrichRecords || enrichRecords)(opts, { runLark, assertReady, withCommit, now: deps.now })
+    : (deps.enrichScopes || enrichScopes)(opts, { assertReady, withCommit, fetchChatMetadata: deps.fetchChatMetadata || createLarkImAdapter({ run: runLark }).fetchChatMetadata });
   return { ...report, target: opts.target,
     ...(session ? { request_budget: session.summary() } : {}),
     partial: Boolean(report.partial || report.failed > 0 || report.skipped_conflicts > 0),

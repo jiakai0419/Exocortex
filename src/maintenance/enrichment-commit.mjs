@@ -1,3 +1,4 @@
+import { larkWriteAdmissionSql } from "../../dist/storage/sqlite/lark-write-admission.js";
 import { randomUUID } from "node:crypto";
 import { acquireMaintenanceLock, quoteSql, releaseMaintenanceLock, reviewFenceSql, sqliteQuery }
   from "../../dist/storage/sqlite/ingestion-store.js";
@@ -18,10 +19,16 @@ function publicEnrichmentError(error, label) {
 // local commit. Each update carries its original-snapshot CAS and records one
 // changes() value in __enrichment_effects. The lease check must stay inside the
 // same BEGIN IMMEDIATE transaction as those updates.
-/** @param {{dryRun:boolean,reason:string,label:string,reviewFence?:any,reviewBeforeCommit?:()=>void}} options */
+/** @param {{dryRun:boolean,reason:string,label:string,reviewFence?:any,reviewBeforeCommit?:()=>void,writeAdmission?:any,admissionBeforeCommit?:()=>void,withCommit?:(action:()=>any)=>any}} options */
 function commitEnrichmentUpdates(dbPath, updates, options) {
-  const { dryRun, reason, label, reviewFence, reviewBeforeCommit } = options;
+  const { dryRun, reviewFence } = options;
   if (dryRun || updates.length === 0 && reviewFence === undefined) return { updated: 0, skippedConflicts: 0 };
+  const commit = () => commitWithLock(dbPath, updates, options);
+  return options.withCommit ? options.withCommit(commit) : commit();
+}
+
+function commitWithLock(dbPath, updates, options) {
+  const { reason, label, reviewFence, reviewBeforeCommit, writeAdmission, admissionBeforeCommit } = options;
   const reviewSql = reviewFence === undefined ? "" : reviewFenceSql(reviewFence);
   const owner = `pid:${process.pid}:${reason}:${randomUUID()}`;
   const lock = acquireMaintenanceLock(dbPath, { owner, ttlSeconds: 60, reason });
@@ -32,9 +39,11 @@ function commitEnrichmentUpdates(dbPath, updates, options) {
     throw new EnrichmentContentionError("maintenance lock unavailable: held by another maintenance command");
   }
   try {
+    admissionBeforeCommit?.();
     reviewBeforeCommit?.();
     const effects = sqliteQuery(dbPath, `
       BEGIN IMMEDIATE;
+      ${writeAdmission ? larkWriteAdmissionSql(writeAdmission) : ""}
       ${reviewSql}
       CREATE TEMP TABLE __enrichment_fence (allowed INTEGER NOT NULL CHECK (allowed = 1));
       INSERT INTO __enrichment_fence (allowed)

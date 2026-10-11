@@ -67,11 +67,14 @@ function fixture(t, options = {}) {
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const dbPath = join(dir, "shape.sqlite");
   sqlite(dbPath, `
+    CREATE TABLE sources(id TEXT PRIMARY KEY, enabled INTEGER DEFAULT 1, config_json TEXT DEFAULT '{}');
+    INSERT INTO sources(id) VALUES ('lark.im');
+    CREATE TABLE sync_runs(source_id TEXT);
     CREATE TABLE sync_scopes (
       id TEXT PRIMARY KEY, source_id TEXT NOT NULL, config_json TEXT NOT NULL,
-      updated_at TEXT, cursor_json TEXT, cursor_updated_at TEXT
+      updated_at TEXT, cursor_json TEXT, cursor_updated_at TEXT, enabled INTEGER DEFAULT 1
     );
-    CREATE TABLE records (id INTEGER PRIMARY KEY, first_seen_scope_id TEXT NOT NULL);
+    CREATE TABLE records (id INTEGER PRIMARY KEY, first_seen_scope_id TEXT NOT NULL, source_id TEXT DEFAULT 'lark.im', direction TEXT, actor_id TEXT, canonical_json TEXT);
     CREATE TABLE sync_locks (scope_id TEXT PRIMARY KEY);
     CREATE TABLE maintenance_locks (
       name TEXT PRIMARY KEY, owner TEXT NOT NULL, acquired_at TEXT NOT NULL,
@@ -86,7 +89,7 @@ function fixture(t, options = {}) {
 function addScope(dbPath, suffix, overrides = {}) {
   const config = { chat_id: `oc_shape_${suffix}`, chat_type: "group", chat_name: null, marker: "preserve", ...overrides };
   sqlite(dbPath, `
-    INSERT INTO sync_scopes VALUES (
+    INSERT INTO sync_scopes(id,source_id,config_json,updated_at,cursor_json,cursor_updated_at) VALUES (
       ${sqlValue(`lark.im.received.chat.${suffix}`)}, 'lark.im', ${sqlValue(JSON.stringify(config))},
       '2027-01-01T00:00:00.000Z', '{"created_at_ms":1800000000000}', '2027-01-01T00:00:00.000Z'
     );

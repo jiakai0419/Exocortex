@@ -7,6 +7,7 @@ import { localIsoFromMs, parseLarkTimeMs, SOURCE_ID } from "./core.mjs";
 import { SYNC_DEFAULTS } from "./sync-options.mjs";
 import { ensureInitialized, ensureSourceInitialSyncStart, validateInitialSyncStartMs } from "../../../dist/storage/sqlite/ingestion-store.js";
 import { captureRemoteAccountBinding, readRemoteAccountBinding, recordSuccessfulSyncBinding, accountBindingAdmissionError, reserveSyncAccountBinding } from "../../diagnostics/remote-account-binding.mjs";
+import { captureLarkWriteAdmission } from "../../diagnostics/lark-write-admission.mjs";
 
 /**
  * @typedef {"all" | "sent" | "discover" | "received" | "details"} SyncScopeOption
@@ -42,6 +43,7 @@ import { captureRemoteAccountBinding, readRemoteAccountBinding, recordSuccessful
  * @property {number} endMs
  * @property {number} stableHorizonMs
  * @property {boolean=} help
+ * @property {ReturnType<typeof captureLarkWriteAdmission>=} writeAdmission
  *
  * @typedef {{open_id: string, name: string}} SelfProfile
  *
@@ -68,6 +70,7 @@ import { captureRemoteAccountBinding, readRemoteAccountBinding, recordSuccessful
  * @property {typeof readRemoteAccountBinding=} readRemoteAccountBinding
  * @property {typeof reserveSyncAccountBinding=} reserveSyncAccountBinding
  * @property {typeof recordSuccessfulSyncBinding=} recordSuccessfulSyncBinding
+ * @property {typeof captureLarkWriteAdmission=} captureLarkWriteAdmission
  *
  * @typedef {object} CliIo
  * @property {{write: (text: string) => unknown}=} stdout
@@ -175,6 +178,9 @@ function executeLarkImSync(opts, deps = {}) {
   if (opts.endMs < baseline) throw new CliExecutionError("--end must be after the persisted initial sync baseline");
 
   (deps.reserveSyncAccountBinding || reserveSyncAccountBinding)({ db: dbPath, selfOpenId: selfProfile.open_id, before: bindingBefore });
+  // Carry the request identity through every success path, including discovery.
+  const writeAdmission = (deps.captureLarkWriteAdmission || captureLarkWriteAdmission)(dbPath, { selfOpenId: selfProfile.open_id });
+  opts = { ...opts, writeAdmission };
 
   /** @type {JsonObject & {sent: RunResult | null, discovery: RunResult | null, received: RunResult[]}} */
   const summary = {

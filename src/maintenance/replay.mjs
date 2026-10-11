@@ -7,6 +7,7 @@ import { chatId, chatScopeId, messageId } from "../adapters/lark-im/core.mjs";
 import { prepareChatWindowRecords } from "../adapters/lark-im/sync-runner.mjs";
 import { readOnlySqliteJson } from "../storage/sqlite/readonly-query.mjs";
 import { readRemoteAccountBinding, accountBindingAdmissionError } from "../diagnostics/remote-account-binding.mjs";
+import { captureLarkWriteAdmission } from "../diagnostics/lark-write-admission.mjs";
 import { publicDiagnosticError } from "../diagnostics/public-safe.mjs";
 import { createMaintenanceRequestSession, MaintenanceRequestError } from "./request-session.mjs";
 import { beginMaintenanceReview, validateReviewOptions, reviewRequested, MaintenanceReviewError } from './review-artifact.mjs';
@@ -111,6 +112,9 @@ function executeLarkImReplay(opts, deps = {}) {
     return /** @type {ReplayScope} */ ({ ...row, config });
   });
   const targets = readExactTargets(dbPath, opts, scopes);
+  let admission;
+  try { admission = captureLarkWriteAdmission(dbPath, { scopeIds: opts.scopeIds }); }
+  catch { throw new ReplayInputError("Lark account binding cannot be verified; inspect the existing database binding before retrying"); }
   const review = beginMaintenanceReview(opts, { db: dbPath, mode: 'replay', rows: [...targets.values()],
     scopes: scopes.map(({ id, source_id, enabled, config_json }) => ({ id, source_id, enabled, config_json })), now: deps.now || Date.now });
   // Existing fully injected domain tests remain isolated from process-global
@@ -124,6 +128,7 @@ function executeLarkImReplay(opts, deps = {}) {
   if (!self || typeof self.open_id !== "string" || !self.open_id.startsWith("ou_")) throw new ReplayInputError("self identity could not be verified");
   const admissionError = accountBindingAdmissionError(readRemoteAccountBinding({ db: dbPath, selfOpenId: self.open_id }));
   if (admissionError) throw new ReplayInputError(admissionError);
+  admission.setSelf(self.open_id);
   const selfHash = createHash("sha256").update(self.open_id).digest("hex");
   review?.verifySelf(selfHash);
   const planId = createHash("sha256").update(JSON.stringify({ kind: "bounded_replay/v1", scopes: [...opts.scopeIds].sort(),
@@ -214,12 +219,15 @@ function executeLarkImReplay(opts, deps = {}) {
   for (const { scope, records, fetched, result } of staged) {
     try {
       if (opts.apply) {
-        const effects = (deps.commitBoundedReplayRecords || commitBoundedReplayRecords)(dbPath, {
+        const commit = () => (deps.commitBoundedReplayRecords || commitBoundedReplayRecords)(dbPath, {
           scope: /** @type {any} */ (scope), initialSyncStartMs: baseline, startMs: opts.startMs, endMs: opts.endMs,
           planId, attemptId, selfIdHash: selfHash, pages: fetched.pages, fetchedCount: fetched.messages.length, records,
+          writeAdmission: admission.fence,
           ...(targets.size ? { exactTargets: /** @type {any} */ ([...targets.values()]) } : {}),
-          ...(reviewed?.fence ? { reviewFence: reviewed.fence, reviewBeforeCommit: reviewed.assertBinding, legacyApprovalGate: review?.legacyStrict === true } : {}),
+          ...(reviewed?.fence ? { reviewFence: reviewed.fence, legacyApprovalGate: review?.legacyStrict === true } : {}),
+          reviewBeforeCommit() { admission.assertCurrent(); reviewed?.assertBinding?.(); },
         });
+        const effects = session?.withCommit ? session.withCommit(commit) : commit();
         summary.scopes.push({ ...result, ...effects });
       } else {
         const existing = records.length === 0 ? 0 : readOnlySqliteJson(dbPath,

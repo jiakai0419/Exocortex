@@ -1,5 +1,7 @@
 // @ts-check
 /** @typedef {Record<string, any>} JsonObject */
+import { larkScopeAdmissionSql } from "../../dist/storage/sqlite/lark-write-admission.js";
+import { captureLarkWriteAdmission } from "../diagnostics/lark-write-admission.mjs";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { quoteSql } from "../../dist/storage/sqlite/ingestion-store.js";
@@ -28,7 +30,9 @@ function loadScopes(dbPath, limit) {
 function enrichScopes(opts, deps = {}) {
   const dbPath = resolve(opts.db);
   if (!existsSync(dbPath)) throw new Error(`database not found: ${dbPath}`);
+  const admission = captureLarkWriteAdmission(dbPath);
   const scopes = loadScopes(dbPath, opts.limit);
+  admission.bindScopes(scopes.map(scope => scope.id));
   let failed = 0;
   const updates = [];
   for (const scope of scopes) {
@@ -45,7 +49,8 @@ function enrichScopes(opts, deps = {}) {
         WHERE id = ${quoteSql(scope.id)}
           AND source_id IS ${quoteSql(scope.source_id)}
           AND config_json IS ${quoteSql(scope.config_json)}
-          AND updated_at IS ${quoteSql(scope.updated_at)};
+          AND updated_at IS ${quoteSql(scope.updated_at)}
+          AND ${larkScopeAdmissionSql(admission.fence.scopes.find(selected => selected.id === scope.id))};
         INSERT INTO __enrichment_effects (updated) VALUES (changes());`);
     } catch {
       failed += 1;
@@ -56,6 +61,7 @@ function enrichScopes(opts, deps = {}) {
   // A newer discovery/reconcile snapshot must survive the remote lookup.
   const { updated, skippedConflicts } = commitEnrichmentUpdates(dbPath, updates, {
     dryRun: opts.dryRun, reason: "lark-im-enrich-scopes", label: "update scopes",
+    writeAdmission: { ...admission.fence, scopes: [] }, admissionBeforeCommit: admission.assertCurrent, withCommit: deps.withCommit,
   });
   return {
     ok: true,

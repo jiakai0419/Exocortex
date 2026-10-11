@@ -6,6 +6,7 @@ import { prepareChatWindowRecords } from '../adapters/lark-im/sync-runner.mjs';
 import { createMaintenanceRequestSession } from './request-session.mjs';
 import { readOnlySqliteJson } from '../storage/sqlite/readonly-query.mjs';
 import { captureRemoteAccountBinding, readRemoteAccountBinding, accountBindingAdmissionError } from '../diagnostics/remote-account-binding.mjs';
+import { captureLarkWriteAdmission } from '../diagnostics/lark-write-admission.mjs';
 import { commitBoundedReplayRecords, quoteSql, normalizeBoundedReplayRecords } from '../../dist/storage/sqlite/ingestion-store.js';
 import { parseEvidence, stable } from '../../dist/core/lark-observation.js';
 import { SCOPE_CONFIG_POLICY, projectScopeConfig } from './scope-config-policy.mjs';
@@ -83,6 +84,7 @@ function executeLarkImHistory(options, deps = {}) {
     throw new Error('history account identity unavailable');
   }
   const row = target.record, scope = target.scope, config = JSON.parse(scope.config_json);
+  const writeAdmission = captureLarkWriteAdmission(db, { selfOpenId: self.open_id, requireVerified: true, scopeIds: [scope.id] });
   // Never bind unknown config through a rounded JS Number. Only a verified
   // parse permits the existing hot-field projection; otherwise exact source
   // text (including hot fields) forms a distinct, conservative context.
@@ -125,15 +127,17 @@ function executeLarkImHistory(options, deps = {}) {
     records = [];
   }
   const checkBinding = () => {
+    writeAdmission.assertCurrent();
     if (JSON.stringify(captureRemoteAccountBinding({ db })) !== JSON.stringify(binding)
       || accountBindingAdmissionError(readRemoteAccountBinding({ db, selfOpenId: self.open_id }))) throw new Error('history account binding changed');
   };
   checkBinding();
   const requestBudget = session.summary();
-  const effects = (deps.commit || commitBoundedReplayRecords)(db, {
+  const commit = () => (deps.commit || commitBoundedReplayRecords)(db, {
     scope, initialSyncStartMs: target.baseline, startMs, endMs,
     planId: sha(JSON.stringify({ profile: PROFILE, scope: scope.id, horizon: target.checkpoint.nextSweepMaxId })),
     attemptId, selfIdHash: sha(self.open_id), pages, fetchedCount, records,
+    writeAdmission: writeAdmission.fence,
     observationAcquisition: { attempt: attemptId, startedAtMs, basis: new Map([[row.external_id, target.observationGeneration]]), confirm: true,
       contextKey: sha(JSON.stringify({ profile: PROFILE, self: self.open_id, account: accountKey,
         database: binding.database_key, source: sha(target.sourceConfigJson), scope: scope.id, chat: config.chat_id,
@@ -144,6 +148,7 @@ function executeLarkImHistory(options, deps = {}) {
       sourceConfigJson: target.sourceConfigJson, sentActor: binding.sent_actor || null, records: [row],
       scopes: [{ id: scope.id, source_id: scope.source_id, enabled: scope.enabled, config_json: scope.config_json }] },
   });
+  const effects = session.withCommit ? session.withCommit(commit, { allowStoppedForFailure: error !== null && records.length === 0 }) : commit();
   return { ok: error === null, profile: PROFILE, outcome: error || (effects.conflicts ? 'pending_observation' : 'processed'),
     ...effects, request_budget: requestBudget, cursor_policy: 'unchanged', coverage: 'known_rows_only' };
 }

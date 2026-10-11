@@ -17,6 +17,7 @@ async function invoke(mode) {
     captureRemoteAccountBinding: () => ({ database_key: "invented-binding", empty: true, binding_absent: true }),
     readRemoteAccountBinding: () => ({ state: "unverified", reason: "account_database_unbound", database_key: "invented-binding" }),
     reserveSyncAccountBinding() {}, recordSuccessfulSyncBinding() {},
+    captureLarkWriteAdmission: () => ({ fence: {}, assertCurrent() {} }),
     getSelfProfile: () => ({ open_id: "ou_invented_self", name: "Invented Self" }),
     resetTransportStats() {}, getTransportStats: () => ({ calls: 0 }),
     syncRunner: { syncReceived: (_db, options) => {

@@ -49,15 +49,18 @@ function fixture(t, remote = { contact: "success" }) {
     remote: join(dir, "remote.json"), cli: join(dir, "fake-lark-cli.mjs"),
     audit: join(dir, "spawn-audit.jsonl"), preload: join(dir, "audit-spawn.cjs") };
   sql(value.db, `
-    CREATE TABLE sync_scopes (id TEXT PRIMARY KEY, source_id TEXT NOT NULL, config_json TEXT NOT NULL);
+    CREATE TABLE sources(id TEXT PRIMARY KEY, enabled INTEGER DEFAULT 1, config_json TEXT DEFAULT '{}');
+    INSERT INTO sources(id) VALUES ('lark.im');
+    CREATE TABLE sync_runs(source_id TEXT);
+    CREATE TABLE sync_scopes (id TEXT PRIMARY KEY, source_id TEXT NOT NULL, config_json TEXT NOT NULL, enabled INTEGER DEFAULT 1, cursor_json TEXT);
     CREATE TABLE sync_locks (scope_id TEXT PRIMARY KEY);
     CREATE TABLE maintenance_locks (name TEXT PRIMARY KEY, owner TEXT NOT NULL,
       acquired_at TEXT NOT NULL, expires_at TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '');
     CREATE TABLE records (id INTEGER PRIMARY KEY, source_id TEXT NOT NULL, first_seen_scope_id TEXT NOT NULL,
       external_id TEXT NOT NULL, external_version TEXT, content_hash TEXT, actor_id TEXT,
       container_id TEXT, body TEXT NOT NULL, canonical_json TEXT NOT NULL, raw_json TEXT NOT NULL,
-      record_type TEXT NOT NULL, occurred_at_ms INTEGER NOT NULL, updated_at TEXT);
-    INSERT INTO sync_scopes VALUES ('lark.im.sent_by_me', 'lark.im', '{}');
+      record_type TEXT NOT NULL, occurred_at_ms INTEGER NOT NULL, updated_at TEXT, direction TEXT);
+    INSERT INTO sync_scopes(id,source_id,config_json) VALUES ('lark.im.sent_by_me', 'lark.im', '{}');
   `);
   setRemote(value, remote);
   writeFileSync(value.cli, `#!/usr/bin/env node

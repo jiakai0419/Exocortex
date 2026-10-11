@@ -1,4 +1,5 @@
 import { confirmInitialLarkAccountSql } from "./lark-account-binding.js";
+import { larkWriteAdmissionSql } from "./lark-write-admission.js";
 import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { resolve } from "node:path";
@@ -146,6 +147,7 @@ function commitBoundedReplayRecords(dbPath, options) {
         options.reviewBeforeCommit?.();
         const rows = sqliteQuery(dbPath, `
       BEGIN IMMEDIATE;
+      ${options.writeAdmission ? larkWriteAdmissionSql(options.writeAdmission) : ""}
       ${reviewFence}
       CREATE TEMP TABLE __replay_guard (allowed INTEGER NOT NULL CHECK (allowed=1));
       INSERT INTO __replay_guard SELECT CASE WHEN EXISTS (

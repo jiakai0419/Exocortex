@@ -166,3 +166,37 @@ test("legacy sent-self evidence permits its account and rejects a different acco
   const before = snapshot(f); f.profile = B;
   assert.equal((await invoke(f, "discover")).code, 1); assert.deepEqual(snapshot(f), before);
 });
+
+for (const phase of ['sent', 'received', 'details', 'discover']) {
+  test(`a concurrent foreign sent actor rejects ${phase} at the commit boundary`, async t => {
+    const f=fixture(t);assert.equal((await invoke(f,'discover')).code,0);
+    const foreign=()=>sqliteExec(f.db,`INSERT INTO records(source_id,first_seen_scope_id,external_id,record_type,direction,actor_id,raw_json)
+      VALUES('lark.im','lark.im.sent_by_me','om_foreign_contender','lark.im.message','sent','${B.open_id}','{}');`);
+    const incoming=message('om_stale_request',A.open_id);
+    let calls=0;
+    const fetched=()=>{calls++;foreign();return {messages:[incoming],detailRoots:[],pages:1};};
+    const deps={fetchSentMessageList:fetched,fetchChatMessageList:fetched,
+      fetchChatDiscoveryPage:()=>{calls++;foreign();return {chats:[{chat_id:'oc_unadmitted',chat_type:'group',name:'Must not publish'}],has_more:false,page_token:''};},
+      buildPeopleContext:()=>({self:A})};
+    if(phase==='details') {
+      const root=normalizeApiMessage({...incoming.raw_api,msg_type:'merge_forward',body:{content:'{}'}});
+      f.runner=createSyncRunner({fetchSentMessageList:()=>({messages:[],detailRoots:[root],pages:1}),
+        buildPeopleContext:()=>({self:A}),fetchMessageDetails:()=>{throw new Error('synthetic deferred');}});
+      const seeded=await invoke(f,'sent');assert.equal(seeded.code,2,seeded.stdout);
+      sqliteExec(f.db,"UPDATE lark_im_detail_tasks SET retry_at='2000-01-01T00:00:00.000Z'");
+      deps.fetchMessageDetails=()=>{calls++;foreign();return incoming;};
+    }
+    if(phase==='discover') sqliteExec(f.db,"UPDATE sync_scopes SET cursor_json=NULL WHERE id='lark.im.unmuted_chat_reconcile'");
+    const stableRows=table=>sqliteQuery(f.db,`SELECT * FROM ${table} ORDER BY rowid`).map(row=>{
+      if(table==='sync_scopes'){const {last_error_run_id,updated_at,...business}=row;return business;}return row;
+    });
+    const before=Object.fromEntries(['sync_scopes','lark_im_list_progress','lark_im_detail_tasks'].map(table=>[table,stableRows(table)]));
+    f.runner=createSyncRunner(deps);
+    const result=await invoke(f,phase,{},6);
+    assert.notEqual(result.code,0,result.stdout);assert.equal(calls,1);
+    assert.equal(sqliteQuery(f.db,"SELECT COUNT(*) n FROM records WHERE external_id='om_stale_request'")[0].n,0);
+    for(const [table,rows] of Object.entries(before)) assert.deepEqual(stableRows(table),rows);
+    assert.equal(sqliteQuery(f.db,"SELECT COUNT(*) n FROM sync_runs WHERE status='running'")[0].n,0,'owned failed-run cleanup remains possible');
+    assert.equal(sqliteQuery(f.db,'SELECT COUNT(*) n FROM sync_locks')[0].n,0);
+  });
+}

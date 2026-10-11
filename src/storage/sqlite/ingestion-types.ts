@@ -10,6 +10,9 @@ export type SyncScope = {
   cursor_json?: string | null;
   config?: JsonObject;
   cursor?: JsonObject | null;
+  /** Current command admission, never persisted as a scope configuration. */
+  writeAdmission?: import("./lark-write-admission.js").LarkWriteAdmission;
+  assertWriteAdmission?: () => void;
 };
 
 export type StoredRecord = {
@@ -77,6 +80,7 @@ export type BoundedReplayOptions = {
   pages: number;
   fetchedCount: number;
   records: StoredRecord[];
+  writeAdmission?: import("./lark-write-admission.js").LarkWriteAdmission;
   observationAcquisition?: { attempt: string; startedAtMs: number; basis: Map<string, number>; confirm: boolean; contextKey: string };
   /** Legacy approvals are an additional authorization gate, not source policy. */
   legacyApprovalGate?: boolean;

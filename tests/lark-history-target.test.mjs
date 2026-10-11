@@ -58,7 +58,7 @@ test('unrelated merge roots never consume the selected ordinary history target b
   t.diagnostic(JSON.stringify({outcomes,progress,historyError:store.sqliteQuery(db,'SELECT history_error FROM record_observation_state;')[0]}));
 });
 
-for(const mode of ['complete','incomplete','permission','page_limit','item_limit','size_limit'])
+for(const mode of ['complete','incomplete','permission','page_limit','item_limit','size_limit','budget'])
 test(`selected history merge uses only its bounded complete detail closure: ${mode}`,t=>{
   const dir=realpathSync(mkdtempSync(join(tmpdir(),'synthetic-history-selected-')));chmodSync(dir,0o700);
   t.after(()=>rmSync(dir,{recursive:true,force:true}));
@@ -78,7 +78,7 @@ test(`selected history merge uses only its bounded complete detail closure: ${mo
   store.sqliteExec(db,store.upsertRecordsSql(prepareChatWindowRecords([selected],scope,null,start,start+60000,self.open_id,{self},{chat_id:chat,chat_type:'group'})));
   const before=store.sqliteQuery(db,'SELECT * FROM records;'),calls=[];
   let tick=0,held=false;
-  const result=executeLarkImHistory({db,maxCliAttempts:4,maxSeconds:30},{requestSessionDeps:{
+  const result=executeLarkImHistory({db,maxCliAttempts:mode==='budget'?2:4,maxSeconds:30},{requestSessionDeps:{
     env:{LARK_CLI:'synthetic-never-spawned'},monotonicClock:()=>tick,now:()=>Date.now(),sleep:ms=>{assert.equal(held,false);tick+=ms;},
     tryAcquireLease:()=>{assert.equal(held,false);held=true;return {state:'acquired',release(){held=false;}};},
     readSharedCooldown:()=>({state:'ready'}),writeSharedCooldown:()=>true,
@@ -100,10 +100,14 @@ test(`selected history merge uses only its bounded complete detail closure: ${mo
       return {status:0,stdout:JSON.stringify({code:0,data}),stderr:''};
     },
   }});
-  assert.equal(held,false);assert.equal(calls.length,mode==='page_limit'?4:3);
+  assert.equal(held,false);assert.equal(calls.length,mode==='budget'?2:mode==='page_limit'?4:3);
   assert.equal(result.request_budget.cli_attempts,calls.length);
   assert.equal(result.ok,mode==='complete');assert.deepEqual(store.sqliteQuery(db,'SELECT * FROM records;'),before);
   const evidence=store.sqliteQuery(db,'SELECT * FROM record_observation_state;')[0];
+  if(mode==='budget') {
+    assert.equal(result.request_budget.stop_reason,'cli_budget');
+    assert.equal(store.sqliteQuery(db,'SELECT completed_sweeps FROM lark_im_history_progress')[0].completed_sweeps,1, 'failed bounded request still rotates the selected historical row');
+  }
   if(mode==='complete') {
     assert.equal(result.outcome,'pending_observation');
     const saved=JSON.parse(JSON.parse(evidence.candidate_json).raw_json);

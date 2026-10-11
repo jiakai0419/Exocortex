@@ -1,5 +1,7 @@
 // @ts-check
 /** @typedef {Record<string, any>} JsonObject */
+import { larkScopeAdmissionSql } from "../../dist/storage/sqlite/lark-write-admission.js";
+import { captureLarkWriteAdmission } from "../diagnostics/lark-write-admission.mjs";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { quoteSql } from "../../dist/storage/sqlite/ingestion-store.js";
@@ -181,7 +183,7 @@ function loadRows(dbPath, limit, recordIds, review = false) {
   const rows = sqliteJson(
     dbPath,
     `SELECT ${review ? 'r.*,' : ''}
-       r.id,
+       r.id, r.first_seen_scope_id,
        r.external_id,
        r.external_version,
        r.content_hash,
@@ -252,7 +254,7 @@ function scalarDiagnostics(diagnostics) {
   };
 }
 
-function prepareUpdates(dbPath, rows, proposals, senderOnly = false) {
+function prepareUpdates(dbPath, rows, proposals, senderOnly, admission) {
   const merged = proposals.length === 0 ? [] : sqliteJson(dbPath, `
     WITH proposals AS (
       SELECT json_extract(value, '$.id') AS id, json_extract(value, '$.old') AS old,
@@ -286,16 +288,20 @@ function prepareUpdates(dbPath, rows, proposals, senderOnly = false) {
          AND container_id IS ${quoteSql(row.container_id)}
          AND raw_json IS ${quoteSql(row.raw_json)}
          AND canonical_json IS ${quoteSql(row.canonical_json)}
-         AND body IS ${quoteSql(row.body)};
+         AND body IS ${quoteSql(row.body)}
+         AND ${larkScopeAdmissionSql(admission.fence.scopes.find(scope => scope.id === row.first_seen_scope_id))};
        INSERT INTO __enrichment_effects (updated) VALUES (changes());`);
   }
   return { updates, projections, projectionJson };
 }
 
-/** @param {any} reviewFence @param {any} reviewBeforeCommit */
-function commitUpdates(dbPath, updates, dryRun, reviewFence = undefined, reviewBeforeCommit = undefined) {
+/** @param {any} reviewFence @param {any} reviewBeforeCommit
+ * @param {ReturnType<typeof captureLarkWriteAdmission>} [admission]
+ * @param {(action:()=>any)=>any} [withCommit] */
+function commitUpdates(dbPath, updates, dryRun, reviewFence = undefined, reviewBeforeCommit = undefined, admission = undefined, withCommit = undefined) {
   return commitEnrichmentUpdates(dbPath, updates, {
     dryRun, reason: "lark-im-enrich-records", label: "update records", reviewFence, reviewBeforeCommit,
+    writeAdmission: admission ? { ...admission.fence, scopes: [] } : undefined, admissionBeforeCommit: admission?.assertCurrent, withCommit,
   });
 }
 
@@ -309,7 +315,8 @@ function rowOpenId(row) {
     && (!row.canonical.sender_id_type || row.canonical.sender_id_type === 'open_id') ? id : '';
 }
 
-function runSenderOnly(dbPath, opts, runLark, assertReady) {
+function runSenderOnly(dbPath, opts, runLark, assertReady, withCommit) {
+  const admission = captureLarkWriteAdmission(dbPath);
   // All selection guards precede LIMIT, so recent unrelated rows cannot hide
   // an eligible historical sender. An extra row reports the bounded coverage.
   const candidates = sqliteJson(dbPath, `
@@ -334,6 +341,7 @@ function runSenderOnly(dbPath, opts, runLark, assertReady) {
     ...row, canonical: parseMaybeJson(row.canonical_json) || {}, raw: nativeRow(parseMaybeJson(row.raw_json) || {}),
   }));
   for (const row of rows) validateJsonObjectText(row.canonical_json);
+  admission.bindScopes(rows.map(row => row.first_seen_scope_id));
   if (rows.some((row) => senderOpenId(row.raw) !== opts.senderId)) throw new Error('sender candidate identity validation failed');
   const remote = { calls: 0, member_pages: 0, member_chats: 0, failures: 0,
     budget_exhausted: false, page_limit_reached: false, chat_limit_reached: false };
@@ -395,9 +403,9 @@ function runSenderOnly(dbPath, opts, runLark, assertReady) {
     proposals.push({ id: row.id, old: row.canonical_json, next: patchEnrichmentProjection(row, next, true),
       actor: row.actor_id, container: row.container_id, body: row.body, raw: row.raw_json });
   }
-  const { updates } = prepareUpdates(dbPath, rows, proposals, true);
+  const { updates } = prepareUpdates(dbPath, rows, proposals, true, admission);
   assertReady?.();
-  const { updated, skippedConflicts } = commitUpdates(dbPath, updates, opts.dryRun);
+  const { updated, skippedConflicts } = commitUpdates(dbPath, updates, opts.dryRun, undefined, undefined, admission, withCommit);
   const unresolved = rows.length - proposals.length;
   return {
     ok: true, mode: 'sender-only', dry_run: opts.dryRun, scanned: rows.length,
@@ -436,7 +444,7 @@ function enrichRecords(opts, deps = {}) {
   const run = deps.runLark || runLark;
   const dbPath = resolve(opts.db);
   if (!existsSync(dbPath)) throw new Error(`database not found: ${dbPath}`);
-  if (opts.senderOnly) return runSenderOnly(dbPath, opts, run, deps.assertReady);
+  if (opts.senderOnly) return runSenderOnly(dbPath, opts, run, deps.assertReady, deps.withCommit);
   if (opts.namesOnly && !opts.recordIds?.length) throw new Error("names-only enrichment requires exact records");
   if (opts.recordIds?.length && !opts.namesOnly) throw new Error("exact records require names-only enrichment");
 
@@ -454,6 +462,7 @@ function enrichRecords(opts, deps = {}) {
     .map(row => ({ id: row.id, source_id: row.source_id, enabled: row.enabled, config_json: row.config_json })) : [];
   if (reviewRequested(opts) && reviewScopes.length !== scopeIds.length) throw new MaintenanceReviewError('binding_unavailable');
   const review = beginMaintenanceReview(opts, { db: dbPath, mode: 'names', rows: selected, scopes: reviewScopes, now: deps.now || Date.now });
+  const admission = captureLarkWriteAdmission(dbPath, { scopeIds: selected.map(row => row.first_seen_scope_id) });
   const exclusions = { system_message: 0, explicitly_cleared: 0, known_name: 0, unverified_identity: 0 };
   const rows = opts.namesOnly ? selected.filter((row) => {
     const reason = namesOnlyExclusion(row);
@@ -463,6 +472,7 @@ function enrichRecords(opts, deps = {}) {
   const knownChatNames = opts.namesOnly ? new Map() : loadKnownChatNames(dbPath);
 
   const self = opts.namesOnly ? { open_id: '', name: '' } : getSelfProfile(run);
+  if (self.open_id) admission.setSelf(self.open_id);
   const seed = new Map();
   if (self.open_id && self.name) seed.set(self.open_id, self.name);
 
@@ -679,7 +689,7 @@ function enrichRecords(opts, deps = {}) {
     }
   }
 
-  const { updates, projections, projectionJson } = prepareUpdates(dbPath, rows, proposals, opts.namesOnly);
+  const { updates, projections, projectionJson } = prepareUpdates(dbPath, rows, proposals, opts.namesOnly, admission);
   const unresolved = opts.namesOnly ? rows.filter((row) => !personName(projections.get(row.id)?.sender_name,
     [row.actor_id, ...senderIdentity(row.raw).identifiers])).length : 0;
   const unresolvedNameTargets = new Set();
@@ -703,7 +713,7 @@ function enrichRecords(opts, deps = {}) {
     return { before: row, after, exclusion, outcome: exclusion ? 'excluded' : after.canonical_json !== row.canonical_json ? 'update' : resolved ? 'unchanged' : 'unresolved' };
   }), deps.assertReady);
   if (!opts.dryRun || !reviewed) deps.assertReady?.();
-  const { updated, skippedConflicts } = commitUpdates(dbPath, updates, opts.dryRun, reviewed?.fence, reviewed?.assertBinding);
+  const { updated, skippedConflicts } = commitUpdates(dbPath, updates, opts.dryRun, reviewed?.fence, reviewed?.assertBinding, admission, deps.withCommit);
   const appFallbacksById = new Map();
   for (const [key, fallback] of appFallbackNames.entries()) {
     const separatorIndex = key.lastIndexOf(":");

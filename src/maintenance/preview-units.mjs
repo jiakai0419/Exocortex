@@ -246,7 +246,7 @@ function executePreviewUnits(options, deps = {}) {
             const before = actualAttempts;
             try { return session.runLark(args, settings); }
             finally { if (actualAttempts !== before) lastFinished = elapsed(); }
-          }, assertReady: ready, summary: session.summary };
+          }, assertReady: ready, summary: session.summary, withCommit: session.withCommit };
           let report, failure;
           try {
             report = plan.units[index].mode === 'names'

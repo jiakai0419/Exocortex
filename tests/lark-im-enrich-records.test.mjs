@@ -178,10 +178,13 @@ process.exit(1);
 function installSchema(dbPath) {
   sqliteExec(
     dbPath,
-    `CREATE TABLE sync_scopes (
+    `CREATE TABLE sources(id TEXT PRIMARY KEY, enabled INTEGER DEFAULT 1, config_json TEXT DEFAULT '{}');
+     INSERT INTO sources(id) VALUES ('lark.im');
+     CREATE TABLE sync_runs(source_id TEXT);
+     CREATE TABLE sync_scopes (
        id TEXT PRIMARY KEY,
        source_id TEXT NOT NULL,
-       config_json TEXT NOT NULL
+       config_json TEXT NOT NULL, enabled INTEGER DEFAULT 1, cursor_json TEXT
      );
      CREATE TABLE sync_locks (
        scope_id TEXT PRIMARY KEY
@@ -207,7 +210,7 @@ function installSchema(dbPath) {
        raw_json TEXT NOT NULL,
        record_type TEXT NOT NULL,
        occurred_at_ms INTEGER NOT NULL,
-       updated_at TEXT
+       updated_at TEXT, direction TEXT
      );`,
     "install schema",
   );
