@@ -6,6 +6,7 @@ const PLACEHOLDER = /\{(\w+)\}/g;
 // not a renamed group, an invitation destination, or another historical group.
 const CONTAINER_GROUP_TEMPLATES = new Set([
   "{name} joined {group_name}. New members can view all chat history.",
+  "{to_chatters} joined {group_name}. New members can view all chat history.",
 ]);
 
 /** @param {unknown} value @returns {string | null} */
@@ -13,10 +14,15 @@ function nonEmptyString(value) {
   return typeof value === "string" && value.trim() ? value : null;
 }
 
+/** @param {unknown} value @param {string} key @returns {boolean} */
+function hasOwnField(value, key) {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value)
+    && Object.prototype.hasOwnProperty.call(value, key));
+}
+
 /** @param {unknown} value @param {string} key @returns {unknown} */
 function ownField(value, key) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-  return Object.prototype.hasOwnProperty.call(value, key)
+  return hasOwnField(value, key)
     ? /** @type {Record<string, unknown>} */ (value)[key]
     : undefined;
 }
@@ -42,8 +48,10 @@ function parameterText(parameters, key) {
  * text, never evidence of sender/actor identity. No input is mutated.
  *
  * @param {unknown} content
- * @param {unknown} [context] Explicit source and temporal evidence; a message
- * snapshot alone is not evidence of the group name at the event's time.
+ * @param {unknown} [context] Explicit source and temporal evidence. Event-time
+ * group evidence can fill a missing historical parameter. A current_group
+ * scope title only adds a separately labelled current-local context; neither
+ * that title nor a message snapshot establishes the event-time group name.
  */
 function renderSystemProjection(content, context) {
   let parameters = content;
@@ -62,6 +70,7 @@ function renderSystemProjection(content, context) {
 
   const missing = new Set();
   const contextual = new Set();
+  const containerGroupTemplate = CONTAINER_GROUP_TEMPLATES.has(template.trim());
   const group = ownField(context, "group");
   const groupName = ownField(group, "source") === "message_event" && ownField(group, "time_basis") === "event"
     && Number.isSafeInteger(ownField(context, "event_time_ms")) && Number(ownField(context, "event_time_ms")) >= 0
@@ -69,11 +78,25 @@ function renderSystemProjection(content, context) {
     && ["group", "topic"].includes(String(ownField(group, "chat_type")))
     && nonEmptyString(ownField(context, "chat_id")) !== null && ownField(group, "chat_id") === ownField(context, "chat_id")
     ? nonEmptyString(ownField(group, "name")) : null;
+  const currentGroup = ownField(context, "current_group");
+  const currentGroupName = ownField(currentGroup, "source") === "scope_config"
+    && ownField(currentGroup, "time_basis") === "current_local"
+    && ownField(currentGroup, "observed_at") === null
+    && (ownField(currentGroup, "chat_type") === "group" || ownField(currentGroup, "chat_type") === "topic")
+    && nonEmptyString(ownField(context, "chat_id")) !== null
+    && ownField(currentGroup, "chat_id") === ownField(context, "chat_id")
+    ? nonEmptyString(ownField(currentGroup, "name")) : null;
+  let currentContextApplied = false;
   const result = (text) => ({ text, status: missing.size ? "partial" : "rendered",
     reason: missing.size ? "system_parameters_missing" : null, version: 1,
     missing_parameters: [...missing], context_parameters: [...contextual],
     context_source: contextual.size ? "message_event" : null, context_time_basis: contextual.size ? "event" : null,
-    context_status: contextual.size ? "applied" : ownField(group, "time_basis") === "message_snapshot" ? "snapshot_only" : "not_applied" });
+    context_status: contextual.size ? "applied" : currentContextApplied ? "current_context_applied"
+      : ownField(group, "time_basis") === "message_snapshot" ? "snapshot_only" : "not_applied",
+    current_group_context: currentContextApplied ? {
+      chat_id: ownField(currentGroup, "chat_id"), chat_type: ownField(currentGroup, "chat_type"),
+      name: currentGroupName, source: "scope_config", time_basis: "current_local", observed_at: null,
+    } : null });
 
   // For this evidenced event only, the absent name is an unknown operator.
   // Other templates can use {name} for a group or another non-person value.
@@ -86,9 +109,17 @@ function renderSystemProjection(content, context) {
     if (explicit !== null) return explicit;
     // An explicit malformed/empty field is not permission to replace it with
     // unrelated context. Only the absent container-group parameter may borrow.
-    if (key === "group_name" && CONTAINER_GROUP_TEMPLATES.has(template.trim())
-      && ownField(parameters, key) === undefined && groupName !== null) {
-      contextual.add(key); return groupName;
+    if (key === "group_name" && containerGroupTemplate && !hasOwnField(parameters, key)) {
+      if (groupName !== null) {
+        contextual.add(key); return groupName;
+      }
+      if (currentGroupName !== null) {
+        // This label describes the current local scope, not the unknown name
+        // at the event's time. Keep the original missing-parameter debt.
+        missing.add(key);
+        currentContextApplied = true;
+        return `this group (current local title: ${currentGroupName})`;
+      }
     }
     missing.add(key); return `[未知参数：${key}]`;
   });

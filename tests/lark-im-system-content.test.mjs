@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { renderSystemContent } from "../src/adapters/lark-im/system-content.mjs";
+import { renderSystemContent, renderSystemProjection } from "../src/adapters/lark-im/system-content.mjs";
 import { bodyFromMessage, recordFromMessage } from "../src/adapters/lark-im/message-record.mjs";
 import { prepareRecords } from "../src/adapters/lark-im/core.mjs";
 
@@ -200,4 +200,168 @@ test("the existing source constant retains its dedicated missing-name branch con
     assert.equal(canonical.sender_name, null);
     assert.deepEqual(canonical.content, JSON.parse(JSON.stringify(content)));
   }
+});
+
+const JOIN_SUFFIX = " joined {group_name}. New members can view all chat history.";
+const LAB_CHAT = "oc_parameter_lab_room";
+
+function localGroupContext() {
+  return {
+    chat_id: LAB_CHAT,
+    current_group: {
+      chat_id: LAB_CHAT, chat_type: "group", name: "Synthetic copper room",
+      source: "scope_config", time_basis: "current_local", observed_at: null,
+    },
+  };
+}
+
+function eventGroupContext() {
+  return {
+    event_time_ms: LAB_TIME,
+    group: {
+      chat_id: LAB_CHAT, chat_type: "group", name: "Synthetic event room",
+      source: "message_event", time_basis: "event", effective_at_ms: LAB_TIME,
+    },
+  };
+}
+
+test("both closed join templates label the current local group without resolving the historical parameter", () => {
+  for (const actor of ["name", "to_chatters"]) {
+    const content = {
+      template: `{${actor}}${JOIN_SUFFIX}`,
+      [actor]: actor === "name" ? "Synthetic dial" : ["Synthetic dial", "Synthetic gauge"],
+    };
+    const label = actor === "name" ? "Synthetic dial" : "Synthetic dial, Synthetic gauge";
+    for (const input of [content, JSON.stringify(content)]) {
+      for (const chat_type of ["group", "topic"]) {
+        const context = localGroupContext();
+        context.current_group.chat_type = chat_type;
+        const projected = renderSystemProjection(input, context);
+        assert.equal(projected.text, `${label} joined this group (current local title: Synthetic copper room). New members can view all chat history.`);
+        assert.equal(projected.status, "partial");
+        assert.equal(projected.reason, "system_parameters_missing");
+        assert.deepEqual(projected.missing_parameters, ["group_name"]);
+        assert.deepEqual(projected.context_parameters, []);
+        assert.equal(projected.context_source, null);
+        assert.equal(projected.context_time_basis, null);
+        assert.equal(projected.context_status, "current_context_applied");
+        assert.deepEqual(projected.current_group_context, context.current_group);
+        assert.notEqual(projected.current_group_context, context.current_group);
+        assert.equal(projected.current_group_context.observed_at, null);
+      }
+    }
+  }
+});
+
+test("explicit native group names and valid event-time evidence take precedence over current titles", () => {
+  for (const actor of ["name", "to_chatters"]) {
+    const content = { template: `{${actor}}${JOIN_SUFFIX}`, [actor]: "Synthetic dial" };
+    const context = { ...localGroupContext(), ...eventGroupContext() };
+    const native = renderSystemProjection({ ...content, group_name: "Synthetic native room" }, context);
+    assert.equal(native.text, "Synthetic dial joined Synthetic native room. New members can view all chat history.");
+    assert.equal(native.status, "rendered");
+    assert.equal(native.current_group_context, null);
+    assert.deepEqual(native.context_parameters, []);
+
+    const historical = renderSystemProjection(content, context);
+    assert.equal(historical.text, "Synthetic dial joined Synthetic event room. New members can view all chat history.");
+    assert.equal(historical.status, "rendered");
+    assert.deepEqual(historical.missing_parameters, []);
+    assert.deepEqual(historical.context_parameters, ["group_name"]);
+    assert.equal(historical.context_source, "message_event");
+    assert.equal(historical.context_time_basis, "event");
+    assert.equal(historical.context_status, "applied");
+    assert.equal(historical.current_group_context, null);
+  }
+});
+
+test("present empty or malformed historical group fields cannot be hidden by either context", () => {
+  const content = { template: `{to_chatters}${JOIN_SUFFIX}`, to_chatters: ["Synthetic dial"] };
+  for (const group_name of [undefined, null, "", " \t", 37, false, [], ["Synthetic array room"], { name: "Synthetic object room" }]) {
+    for (const context of [localGroupContext(), { ...localGroupContext(), ...eventGroupContext() }]) {
+      const projected = renderSystemProjection({ ...content, group_name }, context);
+      assert.equal(projected.text, `Synthetic dial joined ${missing("group_name")}. New members can view all chat history.`);
+      assert.equal(projected.status, "partial");
+      assert.deepEqual(projected.missing_parameters, ["group_name"]);
+      assert.deepEqual(projected.context_parameters, []);
+      assert.equal(projected.current_group_context, null);
+      assert.equal(projected.context_status, "not_applied");
+    }
+  }
+});
+
+test("current group labels require exact identity, source, type, temporal basis, and explicitly unknown observation time", () => {
+  const content = { template: `{to_chatters}${JOIN_SUFFIX}`, to_chatters: ["Synthetic dial"] };
+  const invalidGroups = [
+    { chat_id: "oc_parameter_lab_other" }, { chat_id: null }, { chat_id: "" },
+    { chat_type: "p2p" }, { chat_type: "unknown" }, { chat_type: { toString: () => "group" } },
+    { name: "" }, { name: " \t" }, { name: ["Synthetic room"] }, { name: { text: "Synthetic room" } },
+    { source: "message_event" }, { source: "message" }, { source: undefined },
+    { time_basis: "event" }, { time_basis: "message_snapshot" }, { time_basis: undefined },
+    { observed_at: undefined }, { observed_at: LAB_TIME }, { observed_at: "2033-05-18T03:33:20.000Z" },
+  ];
+  const invalidContexts = invalidGroups.map((change) => {
+    const context = localGroupContext();
+    return { ...context, current_group: { ...context.current_group, ...change } };
+  });
+  for (const field of ["chat_id", "chat_type", "name", "source", "time_basis", "observed_at"]) {
+    const context = localGroupContext();
+    delete context.current_group[field];
+    invalidContexts.push(context);
+  }
+  for (const chat_id of [undefined, null, "", "oc_parameter_lab_other"]) {
+    invalidContexts.push({ ...localGroupContext(), chat_id });
+  }
+  invalidContexts.push({ ...localGroupContext(), current_group: Object.create(localGroupContext().current_group) });
+  invalidContexts.push(Object.create(localGroupContext()));
+  for (const [index, context] of invalidContexts.entries()) {
+    const projected = renderSystemProjection(content, context);
+    assert.equal(projected.text, `Synthetic dial joined ${missing("group_name")}. New members can view all chat history.`, index);
+    assert.equal(projected.current_group_context, null, index);
+    assert.equal(projected.context_status, "not_applied", index);
+  }
+});
+
+test("only the closed join templates can use current titles and no actor parameter borrows them", () => {
+  const context = localGroupContext();
+  for (const template of [
+    "{operator} joined {group_name}. New members can view all chat history.",
+    "{to_chatters} joined {group_name}.",
+    "{name} renamed {group_name}.",
+    "{to_chatters} invited {name} to {group_name}.",
+  ]) {
+    const projected = renderSystemProjection({ template }, context);
+    assert.ok(projected.text.includes(missing("group_name")), template);
+    assert.equal(projected.current_group_context, null, template);
+    assert.equal(projected.context_status, "not_applied", template);
+  }
+  for (const actor of ["name", "to_chatters"]) {
+    const projected = renderSystemProjection({ template: `{${actor}}${JOIN_SUFFIX}` }, context);
+    assert.equal(projected.text, `${missing(actor)} joined this group (current local title: Synthetic copper room). New members can view all chat history.`);
+    assert.deepEqual(projected.missing_parameters, [actor, "group_name"]);
+    assert.equal(projected.status, "partial");
+  }
+});
+
+test("current title reprojection is display-only and does not expand title placeholders or claim snapshot history", () => {
+  const content = Object.freeze({ template: `{to_chatters}${JOIN_SUFFIX}`, to_chatters: Object.freeze(["Synthetic dial"]) });
+  const context = localGroupContext();
+  context.current_group.name = "Synthetic title $& {group_name}";
+  Object.freeze(context.current_group);
+  const evidence = Object.freeze({ ...context, group: Object.freeze({
+    chat_id: LAB_CHAT, chat_type: "group", name: "Synthetic snapshot room",
+    source: "message", time_basis: "message_snapshot",
+  }) });
+  const record = labRecord(labEvent({ sequence: 51, content }));
+  const before = JSON.stringify({ content, evidence, record });
+  const projected = renderSystemProjection(content, evidence);
+  assert.equal(projected.text, "Synthetic dial joined this group (current local title: Synthetic title $& {group_name}). New members can view all chat history.");
+  assert.equal(projected.context_status, "current_context_applied");
+  assert.deepEqual(projected.context_parameters, []);
+  assert.equal(projected.context_source, null);
+  assert.equal(projected.context_time_basis, null);
+  assert.deepEqual(projected.missing_parameters, ["group_name"]);
+  assert.equal(record.body, `Synthetic dial joined ${missing("group_name")}. New members can view all chat history.`);
+  assert.equal(JSON.stringify({ content, evidence, record }), before);
+  assert.equal(renderSystemProjection(content).current_group_context, null);
 });

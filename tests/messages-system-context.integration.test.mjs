@@ -51,7 +51,7 @@ function fixture(t, entries) {
   return { records, run };
 }
 
-test('normalize → SQLite → messages binds group context to the same source snapshot without rewriting storage', t => {
+test('normalize → SQLite → messages separates the local scope title from historical parameters without rewriting storage', t => {
   const params = { template: TEMPLATE, name: 'Synthetic Alder {phase}' };
   const f = fixture(t, [
     { raw: message('context', params) },
@@ -73,19 +73,27 @@ test('normalize → SQLite → messages binds group context to the same source s
     for (const key of ['raw_json', 'canonical_json', 'body']) assert.equal(got[key], stored[key]);
   }
   const good = byId.get('om_synthetic_context');
-  assert.equal(good.display.body, 'Synthetic Alder {phase} joined [未知参数：group_name]. New members can view all chat history.');
+  assert.equal(good.display.body, 'Synthetic Alder {phase} joined this group (current local title: CURRENT SCOPE NAME MUST NOT BECOME EVENT NAME). New members can view all chat history.');
   assert.equal(good.display.chat, 'Synthetic snapshot room');
   assert.equal(good.canonical.content_rendering.status, 'partial');
   assert.equal(good.display.system.status, 'partial');
   assert.deepEqual(good.display.system.context_parameters, []);
   assert.equal(good.display.system.context_source, null);
   assert.equal(good.display.system.context_time_basis, null);
-  assert.equal(good.display.system.context_status, 'snapshot_only');
+  assert.equal(good.display.system.context_status, 'current_context_applied');
+  assert.equal(good.display.system.current_group_context.source, 'scope_config');
+  assert.equal(good.display.system.current_group_context.observed_at, null);
   assert.deepEqual(good.display.system.missing_parameters, ['group_name']);
   const explicit = byId.get('om_synthetic_explicit');
   assert.match(explicit.display.body, /Explicit historical room/);
   assert.deepEqual(explicit.display.system.context_parameters, []);
-  for (const key of ['scope_only', 'unknown_type', 'p2p', 'other_chat', 'other_time', 'contradictory_metadata', 'unknown_template', 'explicit_empty', 'operator']) {
+  for (const key of ['scope_only', 'unknown_type']) {
+    const row = byId.get(`om_synthetic_${key}`);
+    assert.match(row.display.body, /joined this group \(current local title:/, key);
+    assert.equal(row.display.system.status, 'partial', key);
+    assert.deepEqual(row.display.system.missing_parameters, ['group_name'], key);
+  }
+  for (const key of ['p2p', 'other_chat', 'other_time', 'contradictory_metadata', 'unknown_template', 'explicit_empty', 'operator']) {
     const row = byId.get(`om_synthetic_${key}`);
     assert.match(row.display.body, /\[未知参数：group_name\]/, key);
     assert.equal(row.display.system.status, 'partial', key);
@@ -94,6 +102,9 @@ test('normalize → SQLite → messages binds group context to the same source s
   assert.match(byId.get('om_synthetic_operator').display.body, /\[未知参数：operator\]/);
   const text = f.run('text');
   assert.match(text, /Synthetic snapshot room/);
+  assert.match(text, /current local title:\s+CURRENT SCOPE NAME MUST NOT BECOME EVENT NAME/);
+  assert.match(text, /当前本地标题来源\s+会话配置；观察时间未知/);
+  assert.doesNotMatch(text, /群名来源/);
   assert.match(text, /Explicit historical room/);
   assert.match(text, /\[未知参数：group_name\]/);
 });

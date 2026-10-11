@@ -173,11 +173,20 @@ function displayBody(body, canonical, raw) {
   return body;
 }
 
-/** Derive only message-local container metadata. The event timestamp binds the
- * snapshot to this record; it does not claim the name was current at retrieval
- * or reconstruct a historical rename. Scope/canonical caches are never sources.
- * @param {Row} row @param {Row} canonical @param {Row} raw */
-function systemContext(row, canonical, raw) {
+/** Normalize group metadata without treating visibility (public/private) as a
+ * conversation mode. A contradictory private-chat declaration fails closed.
+ * @param {unknown} type @param {unknown} [mode] */
+function groupType(type, mode) {
+  if (type === "p2p") return null;
+  const kind = mode ?? type;
+  return kind === "group" || kind === "topic" ? kind : null;
+}
+
+/** Bind both contexts to this native message, but keep their time meanings
+ * separate. A scope title is the current local value, not an event parameter.
+ * Scope update/hot-seen timestamps do not attest when that title was observed.
+ * @param {Row} row @param {Row} canonical @param {Row} raw @param {Row} config */
+function systemContext(row, canonical, raw, config) {
   const native = raw.raw_api && typeof raw.raw_api === "object" && !Array.isArray(raw.raw_api) ? raw.raw_api : raw;
   if (canonical.source_api !== "im.v1.messages" || native.message_id !== row.external_id
     || typeof native.chat_id !== "string" || !native.chat_id || native.chat_id !== row.container_id
@@ -186,15 +195,33 @@ function systemContext(row, canonical, raw) {
   if (!(typeof time === "string" && /^\d{1,15}$/.test(time) || typeof time === "number" && Number.isSafeInteger(time) && time >= 0)) return undefined;
   const n = BigInt(time), at = n < 10000000000n ? n * 1000n : n;
   if (!Number.isSafeInteger(row.occurred_at_ms) || at !== BigInt(row.occurred_at_ms)) return undefined;
+  if (native.chat?.chat_id !== undefined && native.chat.chat_id !== native.chat_id
+    || native.chat?.id !== undefined && native.chat.id !== native.chat_id) return undefined;
+
+  /** @type {Row} */
+  const context = { chat_id: native.chat_id };
+  const currentType = groupType(config.chat_type, config.chat_mode);
+  const declaredTypes = [
+    [canonical.chat_type, canonical.chat_mode],
+    [native.chat_type, native.chat_mode],
+    [native.chat?.chat_type, native.chat?.chat_mode],
+  ];
+  if (config.chat_id === native.chat_id && currentType
+    && typeof config.chat_name === "string" && config.chat_name.trim()
+    && canonical.chat_name_state !== "cleared"
+    && declaredTypes.every(([type, mode]) => type == null && mode == null || groupType(type, mode) === currentType)) {
+    context.current_group = { chat_id: native.chat_id, chat_type: currentType,
+      name: config.chat_name.trim(), source: "scope_config", time_basis: "current_local", observed_at: null };
+  }
   const type = native.chat_type ?? native.chat?.chat_type, name = native.chat_name ?? native.chat?.name;
-  if (!["group", "topic"].includes(type) || typeof name !== "string" || !name.trim()
-    || native.chat?.chat_id !== undefined && native.chat.chat_id !== native.chat_id
-    || native.chat?.id !== undefined && native.chat.id !== native.chat_id
-    || native.chat?.chat_type !== undefined && native.chat.chat_type !== type
-    || native.chat?.name !== undefined && native.chat.name !== name
-    || canonical.chat_type != null && canonical.chat_type !== type) return undefined;
-  return { chat_id: native.chat_id, group: { chat_id: native.chat_id, name, chat_type: type,
-    source: "message", time_basis: "message_snapshot" } };
+  if (["group", "topic"].includes(type) && typeof name === "string" && name.trim()
+    && (native.chat?.chat_type === undefined || native.chat.chat_type === type)
+    && (native.chat?.name === undefined || native.chat.name === name)
+    && (canonical.chat_type == null || canonical.chat_type === type)) {
+    context.group = { chat_id: native.chat_id, name, chat_type: type,
+      source: "message", time_basis: "message_snapshot" };
+  }
+  return context.current_group || context.group ? context : undefined;
 }
 
 /** @param {unknown} body @param {Row} canonical @param {Row} raw @param {unknown} [context] */
@@ -269,7 +296,7 @@ function enrichRow(row) {
   const p2pPartnerId = partnerId || chatId;
   const isP2p = chatType === "p2p";
   const isGroupLike = !isP2p;
-  const system = messageType === "system" ? displaySystem(row.body, canonical, raw, systemContext(row, canonical, raw)) : null;
+  const system = messageType === "system" ? displaySystem(row.body, canonical, raw, systemContext(row, canonical, raw, config)) : null;
   return {
     ...row,
     canonical,

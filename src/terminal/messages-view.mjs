@@ -78,6 +78,9 @@ function renderMessagesText(messages, options = {}) {
     field("发送人", message.display.sender, 2);
     if (message.display.recipient) field("接收人", message.display.recipient, 2);
     if (message.display.chat) field("群", message.display.chat, 6);
+    if (message.display.system?.current_group_context) {
+      field("当前本地标题来源", "会话配置；观察时间未知", 2);
+    }
     field("类型", `${message.display.sender_type} / ${message.display.message_type}`, 4);
     if (message.display.card) {
       // Never feed a failed card projection back into the legacy raw-JSON body

@@ -79,7 +79,13 @@ worker 在子命令非零退出且没有 stderr 原因时，从已识别的错�
 
 普通正文保留原有 240 UTF-16 单位预算，超限时先回退到完整 Unicode 字素边界再加省略号；emoji、肤色、组合音标和 ZWJ 序列不会被截成半个字符。JSON 正文不截断。
 
-系统消息的只读展示诊断位于可选 `display.system`，与 `display.body` 来自同一次渲染；历史 `canonical.content_rendering` 与 raw/body/canonical 不改写。源模板的显式参数优先。上下文补全限于明确容器语义的模板，且须有同一 chat、群类型和事件时间的明确来源证据。同条消息的 `chat_name` 与 `create_time` 仅构成消息快照，不证明事件当时群名；当前适配器因此继续保留缺失 `group_name`，并可在独立群字段显示快照名。scope 当前名不能冒充历史名，operator/name 不借用其他身份，参数只替换一次。
+系统消息的只读展示诊断位于可选 `display.system`，与 `display.body` 来自同一次渲染；历史 `canonical.content_rendering` 与 raw/body/canonical 不改写。源模板的显式参数优先。历史群名补全仍要求同一 chat、群类型和事件时间的明确来源证据。同条消息的 `chat_name` 与 `create_time` 仅构成消息快照，不证明事件当时群名。
+
+明确容器语义的入群模板包括 `{name} joined {group_name}. New members can view all chat history.` 和 `{to_chatters} joined {group_name}. New members can view all chat history.`。当历史 `group_name` 真正缺失、消息身份和时间与存储行一致，且同一群的 `scope.config.chat_name` 可用时，展示为 `… joined this group (current local title: …). New members can view all chat history.`。这是当前本地会话标题的说明，不是填回历史事件群名；保留源模板的英语，不增加翻译流程。显式空或畸形参数、其他模板、身份或群类型冲突均不套用。
+
+这条展示路径保留 `missing_parameters: ["group_name"]` 和 `status: "partial"`，历史 `context_parameters` 仍为空。独立 `current_group_context` 标明 `source: "scope_config"`、`time_basis: "current_local"`、标题和精确会话；终端同时显示“当前本地标题来源：会话配置；观察时间未知”，仅说明正文中的当前本地标题，原“群”字段仍可能显示历史消息快照标题。现有 scope 没有可靠的标题观察时间，因此 `observed_at` 为 `null`，不会用消息时间、scope 更新时间、hot-seen 时间或读取时刻代替。`scope.name` 是同步范围标识，不是群标题。`messages` 仍只读本地库，不联网、不写入或刷新范围配置。
+
+原生明确非空群名优先于上下文。operator/name 不借用其他身份，参数只替换一次；会话的当前标题不会被记作 `message_event`。已有发送人名称也不会因这条系统消息展示规则改变。API 返回的名称、空联系人结果与客户端显示是不同证据，不能据此推断权限问题或替换另一条消息的姓名。
 
 ## 改造范围
 
