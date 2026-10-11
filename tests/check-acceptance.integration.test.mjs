@@ -81,16 +81,18 @@ test('actual CLI exposes successful collection with remaining history debt and o
   assert.equal(first.outcome, 'ok');
   assert.equal(first.report.findings.stale_version, 1);
   assert.equal(first.report.findings.unresolved_prior, 0, 'current listed difference is excluded, not cleared');
-  assert.deepEqual(Object.values(first.observations)[0].debts, { deleted: CREATED, version: CREATED + 1000 });
+  // The newer response repeats the deletion contradiction, so both independent
+  // debts require proof at that response's version.
+  assert.deepEqual(Object.values(first.observations)[0].debts, { deleted: CREATED + 1000, version: CREATED + 1000 });
   const { deleted, ...partialRemote } = edited;
   const caughtUp = { ...original, update_time: edited.update_time };
   const partial = sample(partialRemote, caughtUp, first.observations);
   assert.equal(partial.outcome, 'ok');
-  assert.deepEqual(Object.values(partial.observations)[0].debts, { deleted: CREATED });
+  assert.deepEqual(Object.values(partial.observations)[0].debts, { deleted: CREATED + 1000 });
   assert.equal(partial.report.findings.unresolved_prior, 1);
   const absent = sample(null, caughtUp, partial.observations);
   assert.equal(absent.report.history.messages_checked, 0);
-  assert.deepEqual(Object.values(absent.observations)[0].debts, { deleted: CREATED });
+  assert.deepEqual(Object.values(absent.observations)[0].debts, { deleted: CREATED + 1000 });
   const resolved = sample(caughtUp, caughtUp, absent.observations);
   assert.deepEqual(resolved.observations, {});
   for (const [result, expectedCode] of [[first, 2], [partial, 2], [absent, 2], [resolved, 0]]) {
