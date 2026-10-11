@@ -36,7 +36,7 @@ test('real check CLI identifies missing Python, exits error, and never calls Lar
   for (const cache of [false, true]) for (const format of ['text', 'json']) {
     const result = spawnSync(process.execPath, [join(ROOT, 'bin/exocortex.mjs'), 'check', '--db', db, '--live',
       ...(cache ? ['--write-live-cache', '--log-dir', join(dir, 'logs')] : []), '--format', format], {
-      cwd: dir, env: { PATH: bin, HOME: dir, NO_COLOR: '1', SYNTHETIC_NETWORK_MARKER: marker }, encoding: 'utf8', timeout: 10000,
+      cwd: dir, env: { PATH: bin, TMPDIR: dir, NO_COLOR: '1', SYNTHETIC_NETWORK_MARKER: marker }, encoding: 'utf8', timeout: 10000,
     });
     assert.equal(result.status, 1, result.stderr); assert.equal(result.stderr, '');
     if (format === 'json') {
