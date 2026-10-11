@@ -675,3 +675,21 @@ test('raw-only incoming drift is refused even when visible card text and version
   assert.equal(result.ok, false); assert.match(JSON.stringify(result), /proposal_changed/);
   publicReport(result); noWrites(f, before);
 });
+
+test('reviewed name replacement clears unrelated timing but keeps full proposal hashes stable across refetches', t => {
+  const f = fixture(t, 1);
+  sql(f, `UPDATE records SET canonical_json=json_set(canonical_json,
+    '$.sender_name_observed_at','2040-01-01T00:00:00.000Z',
+    '$.sender_name_verification',json('{"status":"resolved","source":"contact","name":"Synthetic Former Name","observed_at":"2040-01-01T00:00:00.000Z"}'));`);
+  const before = ro(f), opts = nameOptions(f);
+  const preview = names(f, opts);
+  assert.equal(preview.updated, 0);
+  assert.deepEqual(ro(f), before);
+  const result = names(f, approved(opts, preview));
+  assert.equal(result.updated, 1);
+  const projection = JSON.parse(ro(f)[0].canonical_json);
+  assert.equal(projection.sender_name, 'Synthetic Reader 0');
+  assert.equal(projection.sender_name_observed_at, undefined, 'reviewed canonical has no invented stable timestamp');
+  assert.equal(projection.sender_name_verification, undefined);
+  assert.equal(f.calls.length, 2, 'apply independently re-fetches the exact identity');
+});

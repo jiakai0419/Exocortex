@@ -331,7 +331,7 @@ function recordFromMessage(message, scopeId, direction, context = {}, scopeConfi
   // Source names and supplied self profiles have no independent lookup time.
   // Do not invent one from normalization time or the message timestamp.
   const nameObservation = !senderDirectName && !senderIdentityConflict
-    ? context.sender_name_observations?.get(JSON.stringify([containerId, actorId])) : null;
+    ? context.sender_name_observations?.get(JSON.stringify([containerId, actorId, identity.type])) : null;
   const partnerDirectName = chatPartner?.name || chatPartner?.display_name || "";
   /** @type {NameDetails | null} */
   const partnerNameDetails = partnerDirectName

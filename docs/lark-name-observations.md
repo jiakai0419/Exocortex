@@ -24,7 +24,7 @@ Normal existing synchronization lookups may update this slot while retaining an
 older adopted name on failure or conflict. They may adopt a new authoritative
 name at the same message version without changing raw message data, its hash, or
 source version. Latest-result inheritance requires the same actor, namespace,
-chat and account marker; it does not follow a changed identity. This is diagnostic
+chat, account marker and adopted value/source; it does not follow a changed identity. This is diagnostic
 metadata, so a new lookup result can update a row even when its adopted name is
 unchanged.
 
@@ -51,5 +51,16 @@ cannot resolve an explicit verification.
 
 This adds no CLI, scheduled name refresh, global people table, or network activity
 to `messages`. Existing names-only repair still selects unknown names and does
-not silently become a refresh of all known names. Callers must retain their
+not silently become a refresh of all known names. Successful unreviewed maintenance lookups
+record their own observation time; a name recovered only from stored message
+data clears unrelated old timing instead of inventing a fresh API observation.
+An unresolved names-only target still makes no proposal or metadata write. Callers must retain their
 existing account, request lease, scope and total API-budget checks.
+
+Reviewed names preview/apply is deliberately narrower: its complete canonical
+proposal remains hash-bound. It omits new volatile lookup timestamps and removes
+timing or verification metadata belonging to a replaced name. The resulting
+reviewed name has unknown observation time; a fresh apply still refetches and
+checks the entire approved proposal. This does not relax proposal matching or
+extend approval expiry. Explicit read-only verification can provide a current
+report separately without changing the review protocol.

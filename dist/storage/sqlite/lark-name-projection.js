@@ -97,9 +97,16 @@ function mergeLarkNameProjectionSql(existingJson, incomingJson, existingActor, i
     AND ${existingContainer} IS ${incomingContainer}
     AND json_extract(old, '$.chat_id') IS ${existingContainer}
     AND json_extract(next, '$.chat_id') IS ${incomingContainer}`;
+    // Legacy unknown account evidence remains compatible; two explicit, different
+    // account markers cannot lend adopted names across a received-only old DB.
+    const oldAccount = `COALESCE(json_extract(old, '$.sender_name_account_key'),
+    json_extract(old, '$.sender_name_verification.account_key'))`;
+    const nextAccount = `COALESCE(json_extract(next, '$.sender_name_account_key'),
+    json_extract(next, '$.sender_name_verification.account_key'))`;
+    const compatibleNameAccount = `(${oldAccount} IS NULL OR ${nextAccount} IS NULL OR ${oldAccount} IS ${nextAccount})`;
     const groups = [
         {
-            identity: `(${sameActor}) AND (${sameContainer})`,
+            identity: `(${sameActor}) AND (${sameContainer}) AND (${compatibleNameAccount})`,
             name: '$.sender_name', state: '$.sender_name_state',
             historical: `json_extract(next, '$.sender_name_source') = 'local_history'`,
             fields: ['$.sender_name', '$.sender_name_source', '$.sender_name_confidence',
@@ -160,6 +167,8 @@ function mergeLarkNameProjectionSql(existingJson, incomingJson, existingActor, i
     WHEN (${sameActor}) AND (${sameContainer})
       AND json_type(next, '$.sender_name_verification') IS NULL
       AND json_type(old, '$.sender_name_verification') = 'object'
+      AND json_extract(old, '$.sender_name') IS json_extract(next, '$.sender_name')
+      AND json_extract(old, '$.sender_name_source') IS json_extract(next, '$.sender_name_source')
       AND json_extract(old, '$.sender_name_verification.account_key')
         IS json_extract(${incomingJson}, '$.sender_name_account_key')
     THEN json_set(next, '$.sender_name_verification', json_extract(old, '$.sender_name_verification'))

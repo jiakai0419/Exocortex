@@ -177,7 +177,7 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
   function cacheName(key, name) {
     if (typeof name !== "string" || !name.trim()) return;
     nameCache.delete(key);
-    nameCache.set(key, { name, expiresAt: now() + cacheTtlMs, observed_at: new Date(now()).toISOString() });
+    nameCache.set(key, { name, expiresAt: now() + cacheTtlMs, observed_at: observations.get(key)?.observed_at || new Date(now()).toISOString() });
     if (nameCache.size > cacheMaxEntries) {
       const oldestKey = nameCache.keys().next().value;
       if (oldestKey !== undefined) nameCache.delete(oldestKey);
@@ -527,10 +527,14 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
     /** @type {Map<string, JsonObject>} */
     const senderObservations = new Map();
     for (const message of messages) {
+      const identity = senderIdentity(message);
+      const eligible = identity.verified && ['open_id', 'app_id'].includes(identity.type || '')
+        || !identity.conflict && !identity.type && senderType(message) === 'app';
+      if (!eligible) continue;
       const id = senderId(message), chat = chatId(message) || scopeConfig.chat_id || '';
       const observation = senderNameObservation(id, chat);
       if (!observation) continue;
-      if (senderObservations.size < cacheMaxEntries) senderObservations.set(JSON.stringify([chat, id]), observation);
+      if (senderObservations.size < cacheMaxEntries) senderObservations.set(JSON.stringify([chat, id, identity.type]), observation);
       if (observation.status === 'conflict') {
         contacts.delete(id); chatMembers.delete(`${chat}:${id}`); apps.delete(id); appFallbacks.delete(`${chat}:${id}`);
       }

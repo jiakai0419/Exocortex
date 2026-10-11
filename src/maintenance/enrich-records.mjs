@@ -148,6 +148,20 @@ function recordLookupDiagnostic(diagnostics, event) {
   }
 }
 
+/** A changed/adopted value cannot keep a different lookup's time. Reading a
+ * name from stored raw data is not a new API observation. */
+// Reviewed canonical proposals omit volatile times so fresh revalidation can
+// still reproduce the complete approved value without weakening its hash.
+function setAdoptedNameObservation(next, observation) {
+  delete next.sender_name_observed_at;
+  delete next.sender_name_verification;
+  if (observation?.status === 'resolved' && observation.name === next.sender_name
+    && observation.source === next.sender_name_source) {
+    next.sender_name_observed_at = observation.observed_at;
+    next.sender_name_verification = observation;
+  }
+}
+
 function isInvalidRenderedContent(value) {
   return /^\[Invalid .+ JSON\]$/.test(String(value || "").trim());
 }
@@ -377,6 +391,7 @@ function runSenderOnly(dbPath, opts, runLark, assertReady) {
       sender_name_source: direct ? 'message_sender' : member ? 'chat_member' : 'contact', sender_name_confidence: 'high' };
     delete next.sender_name_authority_source;
     delete next.sender_name_account_key;
+    setAdoptedNameObservation(next, direct || reviewRequested(opts) ? null : resolver.senderNameObservation(opts.senderId, row.container_id));
     proposals.push({ id: row.id, old: row.canonical_json, next: patchEnrichmentProjection(row, next, true),
       actor: row.actor_id, container: row.container_id, body: row.body, raw: row.raw_json });
   }
@@ -516,8 +531,6 @@ function enrichRecords(opts, deps = {}) {
   // Request construction, response validation and seed priority have one
   // implementation shared with ingestion and the bounded sender-only mode.
   const resolver = createNameResolver({ onLookup(event) {
-    if (opts.namesOnly && event.kind === 'application' && event.status === 'resolved'
-      && !personName(event.name, [event.app_id])) event = { ...event, status: 'missing_name' };
     recordLookupDiagnostic(diagnostics, event);
     if (event.status !== "failed") return;
     if (event.kind === "application") failedAppIds.add(event.app_id);
@@ -546,12 +559,6 @@ function enrichRecords(opts, deps = {}) {
   }
   diagnostics.app_ids_requested = uniqueAppIds(appIds).length;
   const appNames = resolver.resolveApplicationNames(appIds, { ...lookupOpts, forceRefresh: opts.probeApps });
-  if (opts.namesOnly) {
-    for (const [id, name] of appNames) {
-      const display = personName(name, [id]);
-      if (display) appNames.set(id, display); else appNames.delete(id);
-    }
-  }
   const appFallbackNames = resolver.resolveChatBotAppFallbackNames(appIdsByChat, appNames, lookupOpts);
   if (opts.namesOnly) {
     // Exact records are only a subset of a chat. Apparent uniqueness among
@@ -639,6 +646,8 @@ function enrichRecords(opts, deps = {}) {
     if (appName || appFallbackName && (opts.probeApps || !existingSenderName)
       || !existingSenderName && (memberName || contactName) || opts.namesOnly && existingSenderName) {
       delete next.sender_name_account_key;
+      setAdoptedNameObservation(next, reviewRequested(opts) || opts.namesOnly && existingSenderName
+        ? null : resolver.senderNameObservation(sid, cid));
     }
     if (!opts.namesOnly) {
       if (!next.sender_type && String(sid || "").startsWith("cli_")) next.sender_type = "app";

@@ -9,7 +9,7 @@ import { ensureInitialized, quoteSql, sqliteExec, sqliteQuery } from "../dist/st
 // Fresh authored rows and injected transport only. No real API, account, lease,
 // source database, captured message, or service is used by this test file.
 const START = Date.parse("2044-07-08T09:10:11.000Z");
-const SENDER_FIELDS = new Set(["sender_id_type", "sender_name", "sender_name_state", "sender_name_source",
+const SENDER_FIELDS = new Set(["sender_name_observed_at", "sender_name_verification", "sender_id_type", "sender_name", "sender_name_state", "sender_name_source",
   "sender_name_confidence", "sender_name_resolution_status", "sender_name_resolution_reason"]);
 function fixture(t) {
   const directory = mkdtempSync(join(tmpdir(), "exocortex-exact-names-"));
@@ -244,4 +244,52 @@ test('a concurrent authoritative name clear wins the exact row snapshot comparis
   assert.equal(report.skipped_conflicts, 1);
   assert.equal(report.partial, true);
   assert.deepEqual(rows(f), changed);
+});
+
+for (const mode of ['contact', 'member', 'exact_bot', 'raw_name']) {
+  test(`successful ${mode} enrichment replaces stale name timing with only its own evidence`, t => {
+    const f = fixture(t);
+    const app = mode === 'exact_bot';
+    const sender = app ? 'cli_synthetic_timing_cart' : 'ou_synthetic_timing_grower';
+    const chat = 'oc_synthetic_timing_garden';
+    const raw = mode === 'raw_name' ? { sender: { id: sender, id_type: 'open_id', sender_type: 'user', name: 'Synthetic Stored Grower' } } : {};
+    insert(f, 1, { app, sender, chat, raw, canonical: {
+      sender_name_observed_at: '2040-01-01T00:00:00.000Z',
+      sender_name_verification: { status: 'resolved', source: 'contact', name: 'Synthetic Previous', observed_at: '2040-01-01T00:00:00.000Z' },
+    } });
+    const before = rows(f)[0];
+    const startedAt = Date.now();
+    const report = run(f, [1], { runLark: api(f, args => {
+      if (args[0] === 'contact') return { users: mode === 'contact' ? [{ open_id: sender, name: 'Synthetic Current Grower' }] : [] };
+      if (args[0] === 'api') return { app: { app_id: sender, app_name: sender } };
+      if (args[2] === 'bots') return { items: [{ app_id: sender, bot_name: 'Synthetic Current Cart' }] };
+      return { items: [{ member_id: sender, member_id_type: 'open_id', name: 'Synthetic Current Member' }], has_more: false };
+    }) });
+    assert.equal(report.updated, 1);
+    const after = rows(f)[0], projection = JSON.parse(after.canonical_json);
+    assertNamesOnly(before, after);
+    if (mode === 'raw_name') {
+      assert.equal(f.calls.length, 0);
+      assert.equal(projection.sender_name_source, 'message_sender');
+      assert.equal(projection.sender_name_observed_at, undefined);
+      assert.equal(projection.sender_name_verification, undefined);
+    } else {
+      assert.equal(projection.sender_name_verification.name, projection.sender_name);
+      assert.equal(projection.sender_name_verification.source, projection.sender_name_source);
+      assert.equal(projection.sender_name_verification.status, 'resolved');
+      assert.equal(projection.sender_name_verification.cached, false);
+      assert.equal(projection.sender_name_verification.observed_at, projection.sender_name_observed_at);
+      assert.ok(Date.parse(projection.sender_name_observed_at) >= startedAt);
+    }
+  });
+}
+
+test('failed exact lookup neither adopts a value nor rewrites old name metadata', t => {
+  const f = fixture(t);
+  insert(f, 1, { canonical: { sender_name_observed_at: '2040-01-01T00:00:00.000Z',
+    sender_name_verification: { status: 'failed', observed_at: '2041-01-01T00:00:00.000Z' } } });
+  const before = rows(f);
+  const result = run(f, [1], { runLark: api(f, () => { throw new Error('synthetic unavailable'); }) });
+  assert.equal(result.updated, 0);
+  assert.deepEqual(rows(f), before);
 });

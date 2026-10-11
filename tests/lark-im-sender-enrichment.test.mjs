@@ -14,7 +14,7 @@ const PERSON = "Synthetic Ceramic Reader";
 const CHAT = "oc_synthetic_sender_workshop";
 const EPOCH = Date.UTC(2047, 2, 19, 8, 9, 10);
 const SAFE_PATH = [...new Set([dirname(process.execPath), "/usr/bin", "/bin"])].join(":");
-const SENDER_FIELDS = new Set(["sender_id_type", "sender_name", "sender_name_source", "sender_name_confidence"]);
+const SENDER_FIELDS = new Set(["sender_name_observed_at", "sender_name_verification", "sender_id_type", "sender_name", "sender_name_source", "sender_name_confidence"]);
 
 function sqlString(value) {
   return value == null ? "NULL" : `'${String(value).replaceAll("'", "''")}'`;

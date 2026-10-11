@@ -297,7 +297,7 @@ function compareObservation(before, incoming) {
 }
 const DERIVED_CANONICAL_FIELDS = ["content", "content_rendering", "sender_name", "sender_name_state", "sender_name_source",
     "sender_name_confidence", "sender_name_resolution_status", "sender_name_resolution_reason", "sender_name_observed_at",
-    "sender_name_verification", "chat_name", "chat_name_source", "chat_type"];
+    "sender_name_verification", "sender_name_account_key", "sender_name_authority_source", "chat_name", "chat_name_source", "chat_type"];
 /** Keep one representative of an equivalent source; name merge remains SQL's
  * responsibility. Do not let alias allocation churn canonical source fields. */
 function retainSourceRepresentation(before, incoming) {

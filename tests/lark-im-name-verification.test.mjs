@@ -7,8 +7,11 @@ import test from 'node:test';
 import { createNameResolver } from '../src/adapters/lark-im/name-resolver.mjs';
 import { createLarkImAdapter } from '../src/adapters/lark-im/adapter.mjs';
 import { recordFromMessage } from '../src/adapters/lark-im/message-record.mjs';
+import { normalizeApiMessage } from '../src/adapters/lark-im/raw-message.mjs';
+import { chatScopeId } from '../src/adapters/lark-im/core.mjs';
+import { runLarkImSyncCli } from './helpers/sync-command.mjs';
 import { bindCurrentSenderNames } from '../src/adapters/lark-im/name-history.mjs';
-import { ensureInitialized, sqliteExec, sqliteQuery, upsertRecordsSql } from '../dist/storage/sqlite/ingestion-store.js';
+import { ensureInitialized, quoteSql, sqliteExec, sqliteQuery, upsertRecordsSql } from '../dist/storage/sqlite/ingestion-store.js';
 
 // New synthetic fixtures only; no captured names, identifiers, or responses.
 const SELF = { open_id: 'ou_synthetic_verification_owner', name: 'Synthetic Owner' };
@@ -90,6 +93,9 @@ test('people context → record → SQLite keeps adopted name/time separate from
   assert.equal(canonical(cached).sender_name_verification.cached, true);
   assert.equal(canonical(cached).sender_name_verification.account_key,
     createHash('sha256').update(`lark.im\0${SELF.open_id}`).digest('hex'));
+  now++;
+  assert.deepEqual(store(), cached, 'repeated cache use is byte stable and does not advance an observation time');
+  assert.equal(calls, 1);
   mode = 'rename'; now += 300_000;
   const renamed = store();
   assert.equal(canonical(renamed).sender_name, 'Synthetic Arborist');
@@ -201,8 +207,8 @@ test('switching accounts clears positive caches before an explicit current verif
   const first = resolver.buildPeopleContext([message()], {}, SELF);
   const other = { open_id: 'ou_synthetic_verification_other_owner', name: 'Other' };
   const second = resolver.buildPeopleContext([message()], {}, other);
-  const a = first.sender_name_observations.get(JSON.stringify([CHAT, ID]));
-  const b = second.sender_name_observations.get(JSON.stringify([CHAT, ID]));
+  const a = first.sender_name_observations.get(JSON.stringify([CHAT, ID, 'open_id']));
+  const b = second.sender_name_observations.get(JSON.stringify([CHAT, ID, 'open_id']));
   assert.notEqual(a.account_key, b.account_key);
   assert.equal(b.cached, false);
   assert.equal(calls, 2);
@@ -226,3 +232,77 @@ test('standalone resolver and people-context callers both stop fallback after co
   assert.deepEqual(calls, ['contact']);
   assert.equal(resolver.senderNameObservation(ID, CHAT).status, 'conflict');
 });
+
+test('an observation for an open_id cannot be borrowed by equal user_id bytes in the same batch and chat', () => {
+  let calls = 0;
+  const resolver = createNameResolver({ run() { calls++; return { users: [{ open_id: ID, name: 'Synthetic Contact' }] }; } });
+  const open = message();
+  const user = { ...message({ id: ID, id_type: 'user_id', sender_type: 'user' }), message_id: 'om_synthetic_other_namespace' };
+  const context = resolver.buildPeopleContext([open, user], {}, SELF);
+  const openRecord = recordFromMessage(open, 'lark.im.sent_by_me', 'sent', context);
+  const userRecord = recordFromMessage(user, 'lark.im.sent_by_me', 'sent', context);
+  assert.equal(calls, 1);
+  assert.equal(canonical(openRecord).sender_name_verification.status, 'resolved');
+  assert.equal(canonical(userRecord).sender_name, null);
+  assert.equal(canonical(userRecord).sender_name_verification, undefined);
+  assert.equal(canonical(userRecord).sender_name_observed_at, undefined);
+});
+
+test('advancing clock does not shift original observation time when the positive cache is reused', () => {
+  let time = EPOCH, calls = 0;
+  const resolver = createNameResolver({ now: () => time++, run() {
+    calls++;
+    return { users: [{ open_id: ID, name: 'Synthetic Contact' }] };
+  } });
+  const build = () => recordFromMessage(message(), 'lark.im.sent_by_me', 'sent',
+    resolver.buildPeopleContext([message()], {}, SELF));
+  const first = canonical(build());
+  const second = canonical(build());
+  assert.equal(calls, 1);
+  assert.equal(second.sender_name_observed_at, first.sender_name_observed_at);
+  assert.equal(second.sender_name_verification.observed_at, first.sender_name_verification.observed_at);
+  assert.equal(second.sender_name_verification.cached, true);
+});
+
+for (const mode of ['same_account', 'different_account', 'legacy_unknown']) {
+  test(`real sync in a received-only legacy DB preserves adopted names only within ${mode} evidence`, t => {
+    const db = fixture(t), scope = chatScopeId(CHAT);
+    sqliteExec(db, `UPDATE sources SET config_json=${quoteSql(JSON.stringify({ initial_sync_start_ms: EPOCH - 1000 }))} WHERE id='lark.im';
+      INSERT INTO sync_scopes(id,source_id,name,config_json) VALUES(${quoteSql(scope)},'lark.im','Synthetic Garden',
+        ${quoteSql(JSON.stringify({ chat_id: CHAT, chat_type: 'group' }))});`);
+    const raw = { ...message(), body: { content: '{"text":"Synthetic seed ledger"}' } };
+    delete raw.content;
+    const normalized = normalizeApiMessage(raw);
+    const resolver = createNameResolver({ now: () => EPOCH, run: () => ({ users: [{ open_id: ID, name: 'Synthetic Adopted' }] }) });
+    const adopted = mode === 'legacy_unknown'
+      ? recordFromMessage(normalized, scope, 'received', { contacts: new Map([[ID, 'Synthetic Adopted']]) })
+      : bindCurrentSenderNames([recordFromMessage(normalized, scope, 'received',
+        resolver.buildPeopleContext([normalized], {}, SELF))], SELF)[0];
+    sqliteExec(db, upsertRecordsSql([adopted]));
+    const nextSelf = mode === 'different_account' ? { open_id: 'ou_synthetic_verification_other_owner', name: 'Other' } : SELF;
+    const unavailable = createNameResolver({ run() { throw new Error('Synthetic name lookup unavailable'); } });
+    let stdout = '', stderr = '';
+    const code = runLarkImSyncCli(['--db', db, '--scope', 'received', '--start', new Date(EPOCH - 1000).toISOString(),
+      '--end', new Date(EPOCH + 60_000).toISOString()], {
+      stdout: { write: text => { stdout += text; } }, stderr: { write: text => { stderr += text; } },
+      deps: { getSelfProfile: () => nextSelf, syncRunnerDeps: {
+        fetchChatMessageList: () => ({ messages: [normalized], detailRoots: [], pages: 1 }),
+        buildPeopleContext: mode === 'legacy_unknown' ? () => ({}) : unavailable.buildPeopleContext,
+      } },
+    });
+    assert.equal(code, 0, stderr || stdout);
+    const saved = sqliteQuery(db, 'SELECT * FROM records;')[0], projection = canonical(saved);
+    for (const key of ['raw_json', 'content_hash', 'external_version', 'body']) assert.equal(saved[key], adopted[key], key);
+    if (mode === 'different_account') {
+      assert.equal(projection.sender_name, null);
+      assert.equal(projection.sender_name_observed_at, undefined);
+      assert.equal(projection.sender_name_account_key, undefined);
+      assert.equal(projection.sender_name_verification.status, 'failed');
+      assert.notEqual(projection.sender_name_verification.account_key, canonical(adopted).sender_name_account_key);
+    } else {
+      assert.equal(projection.sender_name, 'Synthetic Adopted');
+      assert.equal(projection.sender_name_observed_at, canonical(adopted).sender_name_observed_at);
+      assert.equal(projection.sender_name_account_key, canonical(adopted).sender_name_account_key);
+    }
+  });
+}
