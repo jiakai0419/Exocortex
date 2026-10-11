@@ -9,6 +9,9 @@ import {
   isBotUserOutOfChatError,
   isRestrictedModeError,
 } from "./adapter.mjs";
+import { captureLarkWriteAdmission } from "../../diagnostics/lark-write-admission.mjs";
+import { activityDatabaseKey } from "../../diagnostics/lark-im-activity-evidence.mjs";
+import { pendingDetailContextKey } from "../../../dist/storage/sqlite/pending-detail-observation.js";
 import { isExhaustedLarkTransportFailure } from "./transport.mjs";
 import { bindCurrentSenderNames, reuseKnownSenderNames } from "./name-history.mjs";
 import {
@@ -390,12 +393,40 @@ function retryScopeDetails(dbPath, opts, scope, selfProfile, deps, limit = 5,
   if (!due.length) return { ok: false, skipped: true, reason: "details_not_due", detail_attempts: 0 };
   return syncScope(dbPath, scope.id, opts, (lockedScope, runId) => {
     const tasks = deps.readPendingLarkDetails(dbPath, lockedScope, { limit, now: deps.nowIso() });
+    // Only the no-record path needs the stronger confirmation admission. A
+    // missing verified binding leaves the existing strict retry behavior intact.
+    let orphanAdmission = null, databaseKey = null;
+    if (tasks.some(task => task.record_exists === 0)) {
+      try {
+        orphanAdmission = captureLarkWriteAdmission(dbPath, { selfOpenId: selfProfile.open_id,
+          requireVerified: true, scopeIds: [lockedScope.id] });
+        orphanAdmission.assertCurrent();
+        databaseKey = activityDatabaseKey(dbPath);
+      } catch { orphanAdmission = null; }
+    }
+    if (orphanAdmission && databaseKey) {
+      const assertOriginal = lockedScope.assertWriteAdmission, originalAdmission = lockedScope.writeAdmission;
+      // Strengthen verification without replacing the command's source basis.
+      // Initial binding confirmation remains the sole allowed config transition
+      // under the existing SQL admission rule.
+      if (originalAdmission?.accountKey && originalAdmission.accountKey !== orphanAdmission.fence.accountKey)
+        throw new Error("pending detail request account changed");
+      lockedScope.writeAdmission = { ...orphanAdmission.fence,
+        sourceConfigJson: originalAdmission?.sourceConfigJson ?? orphanAdmission.fence.sourceConfigJson };
+      lockedScope.assertWriteAdmission = () => { assertOriginal?.(); orphanAdmission.assertCurrent(); };
+    }
     const outcomes = [];
     for (const task of tasks) {
       const remaining = Math.floor(deadline - deps.nowMs());
       if (remaining <= 0) break;
+      const acquisition = task.record_exists === 0 && orphanAdmission && databaseKey ? {
+        task, attempt: `detail-run:${runId}`, startedAtMs: Date.now(), databaseKey,
+        contextKey: pendingDetailContextKey(databaseKey, lockedScope),
+      } : undefined;
       try {
+        lockedScope.assertWriteAdmission?.();
         const message = deps.fetchMessageDetails(task.raw_root, {
+          captureSameVersionConflict: Boolean(acquisition),
           retries: opts.retries, retryDelayMs: opts.retryDelayMs,
           detailBudgetMs: Math.min(30_000, remaining),
           detailMaxPages: opts.detailMaxPages, detailMaxItems: opts.detailMaxItems,
@@ -410,14 +441,14 @@ function retryScopeDetails(dbPath, opts, scope, selfProfile, deps, limit = 5,
         if ('app_fallbacks' in context) context.app_fallbacks = new Map(
           [...context.app_fallbacks].filter(([, value]) => value.source === 'chat_bot_app_id' && value.confidence === 'high'));
         const record = recordFromMessage(message, lockedScope.id, direction, context, lockedScope.config || {});
-        outcomes.push({ message_id: task.message_id, fingerprint: task.fingerprint, record });
+        outcomes.push({ message_id: task.message_id, fingerprint: task.fingerprint, record, acquisition });
       } catch (error) {
         const reason = error && typeof error === "object" && "detailReason" in error
           ? String(error.detailReason) : "invalid_or_unavailable_details";
         const safeReason = /^[a-z_]{1,80}$/.test(reason) ? reason : "invalid_or_unavailable_details";
         const failure = new Error(`message detail retry failed: kind=${safeReason}`);
         failure.name = "MessageDetailError";
-        outcomes.push({ message_id: task.message_id, fingerprint: task.fingerprint, error: failure });
+        outcomes.push({ message_id: task.message_id, fingerprint: task.fingerprint, error: failure, acquisition });
       }
     }
     if (!outcomes.length) throw new Error("detail retry budget exhausted before a task could be attempted");

@@ -57,13 +57,9 @@ significant, and absence never proves deletion. Manual exclusions constrain a
 directed repair only; this routing rule adds no permanent hold to normal sync
 or history.
 
-History still covers stored records only. A first-seen merge root that has a
-pending detail descriptor but no stored record cannot currently use history to
-reconcile an equal-version root conflict. The retained detail task stays pending
-and full-content coverage stays incomplete; this change neither hides that debt
-nor introduces placeholder records. Fixing that separate state requires its own
-descriptor observation and commit contract.
-The regression for this known limitation asserts that two history attempts find
-no eligible stored target and that a subsequent detail retry still retains the
-conflict, original descriptor and incomplete full-content cursor. It verifies
-conservative debt retention, not successful convergence.
+History still covers stored records only. A first-seen merge root with no stored
+record is handled by the [pending detail confirmation contract](pending-detail-confirmation-contract.md).
+Two history attempts still find no eligible target; two qualified independent
+complete detail acquisitions can now resolve that separate debt. The first only
+stores a candidate and retains incomplete coverage, while the second can create
+the record and finish the real detail receipt atomically.

@@ -1,4 +1,5 @@
 import type { JsonObject, SyncScope, StoredRecord, WriteEffects, BoundedReplayOptions } from "./ingestion-types.js";
+import { type PendingDetailAcquisition } from "./pending-detail-observation.js";
 /** Commit one completely fetched, explicitly bounded repair without touching
  * normal runs, scope cursors, or freshness markers. Remote work belongs outside
  * this method; only this short transaction holds a maintenance lease. */
@@ -9,6 +10,7 @@ type LarkDetailOutcome = {
     record?: StoredRecord;
     error?: Error;
     retry_at?: string;
+    acquisition?: PendingDetailAcquisition;
 };
 type PendingLarkDetail = JsonObject & {
     message_id: string;

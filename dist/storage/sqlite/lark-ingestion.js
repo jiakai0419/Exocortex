@@ -10,6 +10,7 @@ import { normalizeStoredRecords, normalizeBoundedReplayRecords, normalizeExterna
 import { reviewFenceSql } from "./maintenance-review.js";
 import { sourceProof } from "../../core/lark-observation.js";
 import { prepareObservationRecords } from "./observation-store.js";
+import { pendingDetailGuardSql, preparePendingDetailObservation } from "./pending-detail-observation.js";
 /** A historical acceptance may supersede a queued root, but never supplies
  * forward-window coverage. Rebase only the descriptor selected before fetching;
  * leave a concurrently changed task/list generation untouched. A normal detail
@@ -235,8 +236,9 @@ function readPendingLarkDetails(dbPath, scope, { limit = 8, now = new Date() } =
     const date = now instanceof Date ? now : new Date(now);
     if (!Number.isFinite(date.getTime()))
         throw new Error("invalid detail retry clock");
-    return sqliteQuery(dbPath, `SELECT * FROM lark_im_detail_tasks WHERE scope_id = ${quoteSql(scope.id)}
-       AND status = 'pending' AND retry_at <= ${quoteSql(date.toISOString())}
+    return sqliteQuery(dbPath, `SELECT d.*, EXISTS(SELECT 1 FROM records r WHERE r.source_id='lark.im' AND r.external_id=d.message_id) AS record_exists
+     FROM lark_im_detail_tasks d WHERE scope_id = ${quoteSql(scope.id)}
+       AND status = 'pending' AND descriptor_generation >= 0 AND retry_at <= ${quoteSql(date.toISOString())}
      ORDER BY retry_at, occurred_at_ms, message_id LIMIT ${limit};`, "read pending Lark details")
         .map((row) => ({ ...row, raw_root: JSON.parse(row.raw_root_json), raw: JSON.parse(row.raw_root_json) }));
 }
@@ -287,7 +289,7 @@ function larkRunFenceSql(scope, runId, now) {
     CREATE TEMP TABLE __lark_guard (allowed INTEGER NOT NULL CHECK (allowed = 1));`;
 }
 /** Finish list or detail work using only durable coverage and debt as evidence. */
-function commitLarkProgress(dbPath, scope, runId, records, scannedCount, metadata, mutationSql, phase) {
+function commitLarkProgress(dbPath, scope, runId, records, scannedCount, metadata, mutationSql, phase, beforeWriteSql = "") {
     requireLarkScope(scope);
     if (!Number.isSafeInteger(scannedCount) || scannedCount < 0)
         throw new Error("invalid Lark scanned count");
@@ -305,6 +307,7 @@ function commitLarkProgress(dbPath, scope, runId, records, scannedCount, metadat
     const rows = sqliteQuery(dbPath, `
     BEGIN IMMEDIATE;
     ${larkRunFenceSql(scope, runId, now)}
+    ${beforeWriteSql}
     CREATE TEMP TABLE __lark_attempts (failed INTEGER NOT NULL CHECK (failed IN (0, 1)));
     ${phase === "list" ? mutationSql : ""}
     ${recordWritesSql(normalized, now)}
@@ -440,6 +443,7 @@ function finishLarkDetailRun(dbPath, scope, runId, outcomes, metadata = {}) {
         throw new Error("duplicate detail outcomes");
     const now = new Date().toISOString();
     const records = [];
+    const guards = [];
     const statements = outcomes.map((outcome) => {
         if (!outcome.message_id || !/^[a-f0-9]{64}$/.test(outcome.fingerprint) || Boolean(outcome.record) === Boolean(outcome.error)) {
             throw new Error("detail outcome needs exactly one complete record or error");
@@ -449,6 +453,12 @@ function finishLarkDetailRun(dbPath, scope, runId, outcomes, metadata = {}) {
         if (outcome.retry_at && !Number.isFinite(Date.parse(outcome.retry_at)))
             throw new Error("invalid detail retry timestamp");
         let resolvedRoot = null;
+        let accepted = Boolean(outcome.record), evidenceSql = "", failureReason;
+        if (outcome.acquisition) {
+            if (outcome.acquisition.task.message_id !== outcome.message_id || outcome.acquisition.task.fingerprint !== outcome.fingerprint)
+                throw new Error("detail acquisition descriptor mismatch");
+            guards.push(pendingDetailGuardSql(scope, runId, outcome.acquisition));
+        }
         if (outcome.record) {
             const raw = JSON.parse(outcome.record.raw_json);
             if (raw.message_id !== outcome.message_id ||
@@ -458,14 +468,17 @@ function finishLarkDetailRun(dbPath, scope, runId, outcomes, metadata = {}) {
                 throw new Error("detail outcome lacks complete source evidence");
             }
             resolvedRoot = larkDetailRoot(raw, false);
-            records.push(outcome.record);
+            if (outcome.acquisition)
+                ({ accepted, evidenceSql, failureReason } = preparePendingDetailObservation(scope, outcome.record, outcome.acquisition, resolvedRoot));
+            if (accepted)
+                records.push(outcome.record);
         }
         const recordVersion = normalizeExternalVersion(outcome.record?.external_version);
         const taskCondition = `scope_id = ${quoteSql(scope.id)} AND message_id = ${quoteSql(outcome.message_id)}
       AND fingerprint = ${quoteSql(outcome.fingerprint)} AND status = 'pending'`;
         // Consume the exact acceptance result used by the record write, including
         // equal-version source conflicts. No independent detail selection policy.
-        const completeSql = outcome.record ? `EXISTS (
+        const completeSql = accepted ? `EXISTS (
       SELECT 1 FROM __record_acceptance a WHERE a.source_id=${quoteSql(scope.source_id)}
         AND a.external_id=${quoteSql(outcome.message_id)} AND a.accepted
     )` : "0";
@@ -474,6 +487,7 @@ function finishLarkDetailRun(dbPath, scope, runId, outcomes, metadata = {}) {
       ${outcome.record ? `INSERT INTO __lark_guard SELECT CASE WHEN EXISTS (
         SELECT 1 FROM lark_im_detail_tasks t CROSS JOIN (SELECT ${quoteSql(recordVersion)} AS external_version) incoming
         WHERE ${taskCondition} AND ${versionCanReplaceSql("t", "incoming")}) THEN 1 ELSE 0 END;` : ""}
+      ${evidenceSql}
       UPDATE lark_im_detail_tasks SET status = CASE WHEN ${completeSql} THEN 'complete' ELSE 'pending' END, attempt_count = attempt_count + 1,
         raw_root_json = CASE WHEN ${completeSql} THEN ${quoteSql(resolvedRoot?.raw_json)} ELSE raw_root_json END,
         fingerprint = CASE WHEN ${completeSql} THEN ${quoteSql(resolvedRoot?.fingerprint)} ELSE fingerprint END,
@@ -481,9 +495,9 @@ function finishLarkDetailRun(dbPath, scope, runId, outcomes, metadata = {}) {
         occurred_at_ms = CASE WHEN ${completeSql} THEN ${resolvedRoot?.occurred_at_ms ?? "NULL"} ELSE occurred_at_ms END,
         retry_at = ${outcome.retry_at ? quoteSql(new Date(outcome.retry_at).toISOString())
             : `strftime('%Y-%m-%dT%H:%M:%fZ', ${quoteSql(now)}, '+' || min(86400, 60 * (1 << min(attempt_count, 11))) || ' seconds')`},
-        last_error_type = CASE WHEN ${completeSql} THEN NULL ELSE ${quoteSql(outcome.error?.name || (outcome.error ? "Error" : "LarkDetailObservationConflict"))} END,
+        last_error_type = CASE WHEN ${completeSql} THEN NULL ELSE ${quoteSql(outcome.error?.name || (outcome.error ? "Error" : failureReason ? "LarkDetailEvidenceLimit" : "LarkDetailObservationConflict"))} END,
         last_error_message = CASE WHEN ${completeSql} THEN NULL ELSE ${quoteSql(outcome.error
-            ? String(outcome.error.message).slice(0, 4000) : "Detail observation was not accepted; complete-content debt remains pending")} END,
+            ? String(outcome.error.message).slice(0, 4000) : failureReason || "Detail observation was not accepted; complete-content debt remains pending")} END,
         updated_at = ${quoteSql(now)}, completed_at = CASE WHEN ${completeSql} THEN ${quoteSql(now)} ELSE NULL END WHERE ${taskCondition};
       INSERT INTO __lark_attempts SELECT status = 'pending' FROM lark_im_detail_tasks
         WHERE scope_id = ${quoteSql(scope.id)} AND message_id = ${quoteSql(outcome.message_id)};
@@ -494,7 +508,7 @@ function finishLarkDetailRun(dbPath, scope, runId, outcomes, metadata = {}) {
     const mutationSql = `${statements.join("\n")}
     UPDATE lark_im_list_progress SET generation = generation + 1, updated_at = ${quoteSql(now)}
       WHERE scope_id = ${quoteSql(scope.id)};`;
-    return commitLarkProgress(dbPath, scope, runId, records, outcomes.length, { ...metadata, detail_retry: true }, mutationSql, "details");
+    return commitLarkProgress(dbPath, scope, runId, records, outcomes.length, { ...metadata, detail_retry: true }, mutationSql, "details", guards.join("\n"));
 }
 function larkRunMetadataEntriesSql() {
     return `, '$.${RUN_FENCE_METADATA_KEY}.list_generation', COALESCE((SELECT generation FROM lark_im_list_progress WHERE scope_id = s.id), 0),

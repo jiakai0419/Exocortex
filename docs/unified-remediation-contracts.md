@@ -91,9 +91,12 @@ Exclusions from a directed manual repair constrain that repair only. Normal sync
 and history continue their verified admission rules. No permanent hold, default
 service stop or absolute record freeze is introduced by this candidate.
 
-The history-routing follow-up adds an index-only migration; existing tables and
-observation fields are unchanged. Its routing, upgrade and remaining detail
-boundaries are described in [Known-record history routing](history-routing-contract.md).
+The history follow-up adds the container-routing index in migration 011 and
+bounded pending-detail observation fields and a descriptor-invalidation trigger
+in migration 012. Both require explicit initialization before the new workers
+run. The routing and upgrade boundaries are described in
+[Known-record history routing](history-routing-contract.md) and the
+[pending-detail confirmation contract](pending-detail-confirmation-contract.md).
 The remote-finding private state gains
 bounded debt fields; older code rejects that state rather than interpreting it
 correctly. Schema compatibility alone does not make an older writer safe for the
@@ -104,3 +107,5 @@ one. Never restore an older database or remove debt fields to force acceptance.
 The [acceptance and unresolved-work matrix](acceptance-closure.md) separates
 these fourteen delivered mechanisms from deployment verification and closure
 of a specific name, display or historical-data problem.
+
+Pending details without a stored record use the [shared observation confirmation contract](pending-detail-confirmation-contract.md); history remains record-only and existing-record ordinary detail retries remain non-confirming.

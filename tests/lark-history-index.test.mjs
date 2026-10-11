@@ -32,7 +32,7 @@ function fixture(t, legacy = false) {
     WHERE id='lark.im';
     ${[CHAT, OTHER].map(chat => `INSERT INTO sync_scopes(id,source_id,name,config_json)
       VALUES(${q(chatScopeId(chat))},'lark.im',${q(chat)},${q(JSON.stringify({ chat_id: chat }))});`).join('\n')}`);
-  return { db };
+  return { db, migrationOptions: options };
 }
 function seed(f, perChat = 1) {
   store.sqliteExec(f.db, `WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<${perChat * 2})
@@ -83,11 +83,14 @@ test('010-only history fails before any API without migrating; explicit 011 upgr
   assert.deepEqual(businessSnapshot(f.db), before);
   assert.deepEqual(store.sqliteQuery(f.db, 'SELECT * FROM schema_migrations ORDER BY version;'), previousMigrations);
 
-  assert.deepEqual(store.ensureInitialized(f.db).applied, ['011_lark_history_container_index.sql']);
+  // Isolate the index-only upgrade; 011→012 preservation has its own regression.
+  copyFileSync(join(migrations, '011_lark_history_container_index.sql'),
+    join(f.migrationOptions.migrationsDir, '011_lark_history_container_index.sql'));
+  assert.deepEqual(store.ensureInitialized(f.db, f.migrationOptions).applied, ['011_lark_history_container_index.sql']);
   assert.deepEqual(businessSnapshot(f.db), before, 'index construction must retain every row, trigger, column and checkpoint');
   assert.deepEqual(store.sqliteQuery(f.db, "SELECT * FROM schema_migrations WHERE version<>'011' ORDER BY version;"), previousMigrations);
   assert.equal(selectHistoryTarget(f.db).record.first_seen_scope_id, 'lark.im.sent_by_me');
-  assert.deepEqual(store.ensureInitialized(f.db).applied, [], 'initializer remains idempotent');
+  assert.deepEqual(store.ensureInitialized(f.db, f.migrationOptions).applied, [], 'initializer remains idempotent');
   assert.deepEqual(businessSnapshot(f.db), before);
 });
 

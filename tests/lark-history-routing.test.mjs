@@ -146,7 +146,7 @@ for (const mutation of ['provenance', 'route']) {
   });
 }
 
-test('known limitation: an unrecorded same-version detail conflict retains visible debt and incomplete coverage', t => {
+test('record-only history leaves orphan confirmation to independent complete detail retries', t => {
   const f = fixture(t);
   const queued = raw({ msg_type: 'merge_forward', body: { content: '{"snapshot":1}' } });
   const current = raw({ msg_type: 'merge_forward', body: { content: '{"snapshot":2}' } });
@@ -169,7 +169,8 @@ test('known limitation: an unrecorded same-version detail conflict retains visib
   list(START, START + 60000, [queued]); retry();
   const initialTask = task();
   assert.equal(initialTask.status, 'pending');
-  assert.match(initialTask.last_error_message, /source_version_conflict/);
+  assert.equal(initialTask.last_error_type, "LarkDetailObservationConflict");
+  assert.ok(initialTask.candidate_json);
   assert.equal(records(f).length, 0);
   list(START + 60000, START + 120000, []);
   const fullBefore = store.readScope(f.db, SCOPE).cursor_json;
@@ -180,12 +181,13 @@ test('known limitation: an unrecorded same-version detail conflict retains visib
   }
   retry();
   const retained = task();
-  assert.equal(retained.status, 'pending');
-  assert.match(retained.last_error_message, /source_version_conflict/);
+  assert.equal(retained.status, 'complete');
+  assert.equal(retained.last_error_message, null);
   assert.equal(retained.attempt_count, 2);
-  assert.equal(retained.raw_root_json, initialTask.raw_root_json);
-  assert.equal(retained.fingerprint, initialTask.fingerprint);
-  assert.equal(records(f).length, 0, 'do not manufacture a full record or hide unresolved content');
-  assert.equal(store.readScope(f.db, SCOPE).cursor_json, fullBefore);
+  assert.equal(retained.candidate_json, null);
+  assert.equal(records(f).length, 1, 'only the second independent complete receipt creates the record');
+  assert.equal(JSON.parse(records(f)[0].raw_json).body.content, current.body.content);
+  assert.equal(fullBefore, null);
+  assert.equal(store.readScope(f.db, SCOPE).cursor.created_at_ms, START + 120000);
   assert.equal(store.readLarkListProgress(f.db, store.readScope(f.db, SCOPE)).cursor.created_at_ms, START + 120000);
 });

@@ -83,7 +83,8 @@ import {
  * @typedef {AdapterOptions & {
  *   detailBudgetMs?: number,
  *   detailMaxPages?: number,
- *   detailMaxItems?: number
+ *   detailMaxItems?: number,
+ *   captureSameVersionConflict?: boolean
  * }} DetailOptions
  *
  * @typedef {object} NameDetails
@@ -316,8 +317,9 @@ function detailFailureReason(error) {
 
 /** A queued root is evidence of identity/version, not the authoritative detail snapshot.
  * @param {JsonObject} queued @param {JsonObject} refreshed
+ * @param {boolean} [captureSameVersionConflict]
  */
-function assertRefreshedRoot(queued, refreshed) {
+function assertRefreshedRoot(queued, refreshed, captureSameVersionConflict = false) {
   if (refreshed.message_id !== queued.message_id ||
       typeof queued.chat_id !== "string" || !queued.chat_id.trim() || refreshed.chat_id !== queued.chat_id ||
       parseLarkTimeMs(refreshed.create_time) !== parseLarkTimeMs(queued.create_time)) {
@@ -332,7 +334,12 @@ function assertRefreshedRoot(queued, refreshed) {
   }
   if (previousVersion === nextVersion) {
     if (!["exact", "json_representation", "reference_rename"].includes(mergeRootRelation(queued, refreshed))) {
-      throw new MessageDetailError("source_version_conflict");
+      // Only the orphan-task confirmation path requests conflict evidence.
+      // This is acquisition, not write admission; the store independently
+      // requires a second complete observation and its account/task fences.
+      if (!captureSameVersionConflict || previousVersion === null) {
+        throw new MessageDetailError("source_version_conflict");
+      }
     }
   }
 }
@@ -340,11 +347,12 @@ function assertRefreshedRoot(queued, refreshed) {
 /** Assemble one complete authoritative root and its subtree for every route.
  * A refreshed newer root is used in full, never mixed with the queued sender.
  * @param {JsonObject} queued @param {JsonObject[]} items
+ * @param {boolean} [captureSameVersionConflict]
  */
-function normalizeDetailSnapshot(queued, items) {
+function normalizeDetailSnapshot(queued, items, captureSameVersionConflict = false) {
   assertMergeTree(queued.message_id, items);
   const refreshed = /** @type {JsonObject} */ (items.find(item => item.message_id === queued.message_id));
-  assertRefreshedRoot(queued, refreshed);
+  assertRefreshedRoot(queued, refreshed, captureSameVersionConflict);
   if (refreshed.msg_type !== "merge_forward") {
     if (items.length !== 1) throw new MessageDetailError("invalid_or_unavailable_details");
     return normalizeApiMessage(refreshed);
@@ -617,11 +625,16 @@ function createLarkImAdapter({ run = runLark, clock = Date.now } = {}) {
   /** Hydrate one root under an independent, capped budget. The returned root
    * is refreshed from the authoritative response, so a queued old version
    * cannot permanently block recovery after an edit.
+   * Explicit conflict capture collects a complete known-version snapshot for
+   * durable orphan-task confirmation; it never itself authorizes a write.
    * @type {LarkImAdapter["fetchMessageDetails"]}
    */
   function fetchMessageDetails(rawRoot, opts = {}) {
     try {
       assertRawMessagePage([rawRoot], "queued-message-details");
+      if (opts.captureSameVersionConflict !== undefined && typeof opts.captureSameVersionConflict !== "boolean") {
+        throw new MessageDetailError("invalid_detail_options");
+      }
       // History may have accepted an ordinary replacement for a former merge
       // root. Its pending task still needs a fresh, complete detail receipt.
       const boundedOption = (/** @type {number | undefined} */ value, /** @type {number} */ cap) => {
@@ -672,7 +685,7 @@ function createLarkImAdapter({ run = runLark, clock = Date.now } = {}) {
         if (!page.has_more) break;
         token = page.page_token;
       }
-      return normalizeDetailSnapshot(rawRoot, items);
+      return normalizeDetailSnapshot(rawRoot, items, opts.captureSameVersionConflict === true);
     } catch (error) {
       throw error instanceof MessageDetailError ? error : new MessageDetailError(detailFailureReason(error));
     }
