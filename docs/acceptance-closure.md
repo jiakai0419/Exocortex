@@ -59,6 +59,28 @@ The primary regression families are
 and [history producer/status integration](../tests/status-history-producer.integration.test.mjs).
 These overlap; do not add their counts to manufacture a suite total.
 
+## Original symptom oracles
+
+Check these inputs and interleavings before using a full-suite total as release
+evidence. Expected behavior is written independently of the implementation.
+Old-failure columns identify the recorded counterexample and revision, not a
+claim that this candidate reran historical code or inspected a current client.
+
+| Symptom and input | Expected observation | Recorded old failure | Current proof and closure limit |
+| --- | --- | --- | --- |
+| Group join text uses `{to_chatters}` and lacks `{group_name}`; matching scope has a local title. | Readable joined names and clearly labelled current local title; historical parameter remains partial. Explicit event-time name wins; mismatched identity cannot borrow a title. Raw/canonical/body and DB stay unchanged. | At `9d04b3d`, the generic `{name}` fixture and safe unknown-parameter assertion did not exercise this actual template or establish readable output. | [Actual messages CLI](../tests/messages-current-group-context.integration.test.mjs) at baseline `817090d` covers the input and controls. Display mechanism is covered; historical title reconstruction and current client equality remain separate. |
+| Previously adopted high-confidence sender name has no observation time; lookup returns same, failed or unknown. | Preserve a legitimate adopted value, including numeric names. Missing time stays unknown; failed verification cannot become success; same requires the correct identity/source/time. No evidence of a new name means no rename. | Earlier verification established adopted-value precedence, not fresh verification or client equality. The saved API evidence still returned the adopted name; it did not establish a replacement. | [Name verification](../tests/lark-im-name-verification.test.mjs) and [sender evidence](../tests/messages-sender-evidence.integration.test.mjs) cover the mechanism. Original client-name symptom remains **unclosed** until attributable same-message client evidence exists. |
+| History H(B), equivalent ordinary detail D(B), independent H(B), then fresh D(B). | Intervening D preserves candidate time/attempt/context and cannot confirm. Independent H may confirm; debt and full cursor remain pending until the accepted fresh D. Context/generation conflicts reject. | `810dfeb7` reset candidate context when D was inserted between H calls; adjacent H calls could pass. | [Runner/history/store interleaving](../tests/lark-convergence-interleaving.test.mjs) exercises the real storage and runner boundaries with injected transport. It is not a complete worker execution or proof that existing candidates cleared. |
+| Deleted debt, newer version, version-only proof without deleted field, then explicit deletion proof; unsafe integers and duplicate keys enter as raw JSON strings. | Each debt clears only on its own positive proof after publication/reload. Missing or ambiguous body evidence preserves body debt while independently proved version debt may clear. | `810dfeb7` lost earlier dimensions; `358a0ab` still accepted lossy body equality for unsafe integers/duplicate keys. | [Persistent debt regressions](../tests/remote-sample-debts.test.mjs) cover collector/scheduler/publication/reload. [Check CLI](../tests/check-acceptance.integration.test.mjs) independently proves collection success can remain incomplete. Production multidimensional coverage requires an observed target; synthetic coverage cannot stand in for one. |
+| New provenance label plus the minimum terminal width; test text and JSON separately. | At 20/19/1/21 requested columns, text exits 0, each line fits `max(20, columns)` and provenance survives; normal widths remain stable. | `9fe0cba` passed the full suite but failed text at 20/19/1 and overflowed at 21; JSON succeeded. | [Actual CLI boundary cases](../tests/messages-current-group-context.integration.test.mjs) at `817090d` close this synthetic counterexample. A later UX reacceptance can supersede an earlier pending handoff; neither proves deployment. |
+| Check returns process success while history or quality remains unresolved; a guardian fails independently of collection. | Preserve incomplete/error status, exact safe process/cleanup diagnostics and stored-record gap counts; distinguish current/history windows and reject contradictory partitions. | Before this candidate, text omitted guardian stages and quality counts, mixed historical messages into the current window, and could label a failed collection healthy. | [Check acceptance](../tests/check-acceptance.integration.test.mjs) has old-red/new-green evidence, independent debt expectations, real SQLite quality checks and 20/40/80/160-column cases. It changes diagnosis only; no business debt is repaired. |
+
+For integration, record implementation delivered and original symptom closed
+in separate columns. Retain the old failing result and its passing control;
+then run the focused oracle, freeze the candidate, and run complete verification.
+The unique publisher's deployment and same-symptom read-only acceptance follow
+that sequence. Do not add overlapping regression counts to manufacture a total.
+
 ## Actionable, bounded diagnostics
 
 Remote checks must preserve both collection and process-lifetime evidence.
