@@ -251,12 +251,28 @@ function readPendingLarkDetails(dbPath: string, scope: SyncScope,
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new Error("detail retry limit must be between 1 and 100");
   const date = now instanceof Date ? now : new Date(now);
   if (!Number.isFinite(date.getTime())) throw new Error("invalid detail retry clock");
-  return sqliteQuery(dbPath,
-    `SELECT d.*, EXISTS(SELECT 1 FROM records r WHERE r.source_id='lark.im' AND r.external_id=d.message_id) AS record_exists
-     FROM lark_im_detail_tasks d WHERE scope_id = ${quoteSql(scope.id)}
-       AND status = 'pending' AND descriptor_generation >= 0 AND retry_at <= ${quoteSql(date.toISOString())}
-     ORDER BY retry_at, occurred_at_ms, message_id LIMIT ${limit};`, "read pending Lark details")
-    .map((row) => ({ ...row, raw_root: JSON.parse(row.raw_root_json), raw: JSON.parse(row.raw_root_json) }) as PendingLarkDetail);
+  // A legal per-task candidate can approach 4 MiB. Never export a batch of
+  // those blobs through SQLite's shared stdout buffer: first select lightweight
+  // identities in due order, then load one generation-qualified task at a time.
+  const selected = sqliteQuery(dbPath,
+    `SELECT message_id, descriptor_generation, evidence_generation FROM lark_im_detail_tasks
+     WHERE scope_id = ${quoteSql(scope.id)} AND status = 'pending' AND descriptor_generation >= 0
+       AND retry_at <= ${quoteSql(date.toISOString())}
+     ORDER BY retry_at, occurred_at_ms, message_id LIMIT ${limit};`, "read pending Lark details");
+  const tasks: PendingLarkDetail[] = [];
+  for (const selectedTask of selected) {
+    // Read record ownership in the SAME statement as the complete task. Rows
+    // changed between selection and acquisition are deferred, never combined
+    // with an old candidate/owner snapshot or replaced by an out-of-order row.
+    const row = sqliteQuery(dbPath,
+      `SELECT d.*, EXISTS(SELECT 1 FROM records r WHERE r.source_id='lark.im' AND r.external_id=d.message_id) AS record_exists
+       FROM lark_im_detail_tasks d WHERE scope_id = ${quoteSql(scope.id)} AND message_id = ${quoteSql(selectedTask.message_id)}
+         AND status = 'pending' AND retry_at <= ${quoteSql(date.toISOString())}
+         AND descriptor_generation = ${Number(selectedTask.descriptor_generation)}
+         AND evidence_generation = ${Number(selectedTask.evidence_generation)};`, "read pending Lark detail evidence")[0];
+    if (row) tasks.push({ ...row, raw_root: JSON.parse(row.raw_root_json), raw: JSON.parse(row.raw_root_json) } as PendingLarkDetail);
+  }
+  return tasks;
 }
 
 function stableJson(value: any): string {

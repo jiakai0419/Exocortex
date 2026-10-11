@@ -389,7 +389,9 @@ function runFenceGuardSql(scope, runId, finishedAtIso, deps) {
 function retryScopeDetails(dbPath, opts, scope, selfProfile, deps, limit = 5,
   deadline = deps.nowMs() + Math.min(30_000, opts.detailBudgetMs ?? 30_000)) {
   if (deps.nowMs() >= deadline) return { ok: false, skipped: true, reason: "detail_budget_exhausted", detail_attempts: 0 };
-  const due = deps.readPendingLarkDetails(dbPath, scope, { limit, now: deps.nowIso() });
+  // This pre-lock read only answers whether work exists. The full configured
+  // batch is selected again under the scope lock; do not load its blobs twice.
+  const due = deps.readPendingLarkDetails(dbPath, scope, { limit: 1, now: deps.nowIso() });
   if (!due.length) return { ok: false, skipped: true, reason: "details_not_due", detail_attempts: 0 };
   return syncScope(dbPath, scope.id, opts, (lockedScope, runId) => {
     const tasks = deps.readPendingLarkDetails(dbPath, lockedScope, { limit, now: deps.nowIso() });

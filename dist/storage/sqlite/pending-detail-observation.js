@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { compareObservation, isNativeRecord, OBSERVATION_POLICY } from "../../core/lark-observation.js";
+import { scopeObservationContext } from "../../core/lark-scope-config.js";
 import { evaluateObservation } from "./observation-store.js";
 import { quoteSql } from "./sqlite-executor.js";
 /** Context is based on the existing verified request admission, never on
@@ -13,9 +14,11 @@ export function pendingDetailContextKey(databaseKey, scope) {
     if (!admittedScope || admittedScope.source_id !== scope.source_id || admittedScope.enabled !== scope.enabled
         || admittedScope.config_json !== scope.config_json)
         throw new Error("pending detail scope admission changed");
+    const scopeContext = scopeObservationContext(admittedScope.config_json);
     return createHash("sha256").update(JSON.stringify({ databaseKey, policy: OBSERVATION_POLICY,
         accountKey: admission.accountKey, sourceConfig: admission.sourceConfigJson,
-        scope: { id: scope.id, source_id: scope.source_id, enabled: scope.enabled, config_json: scope.config_json } })).digest("hex");
+        scope: { id: scope.id, source_id: scope.source_id, enabled: scope.enabled,
+            config_policy: scopeContext.policy, config_json: scopeContext.configJson } })).digest("hex");
 }
 /** All fields are local snapshots. Check before record insertion in the same
  * run-fenced transaction; a concurrent new record changes the observation owner. */

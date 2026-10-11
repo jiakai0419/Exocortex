@@ -8,8 +8,7 @@ import { readOnlySqliteJson } from '../storage/sqlite/readonly-query.mjs';
 import { captureRemoteAccountBinding, readRemoteAccountBinding, accountBindingAdmissionError } from '../diagnostics/remote-account-binding.mjs';
 import { captureLarkWriteAdmission } from '../diagnostics/lark-write-admission.mjs';
 import { commitBoundedReplayRecords, quoteSql, normalizeBoundedReplayRecords } from '../../dist/storage/sqlite/ingestion-store.js';
-import { parseEvidence, stable } from '../../dist/core/lark-observation.js';
-import { SCOPE_CONFIG_POLICY, projectScopeConfig } from './scope-config-policy.mjs';
+import { scopeObservationContext } from './scope-config-policy.mjs';
 
 const sha = text => createHash('sha256').update(text).digest('hex');
 const PROFILE = 'known_record_history/v1';
@@ -88,12 +87,7 @@ function executeLarkImHistory(options, deps = {}) {
   }
   const row = target.record, scope = target.scope, config = JSON.parse(scope.config_json);
   const writeAdmission = captureLarkWriteAdmission(db, { selfOpenId: self.open_id, requireVerified: true, scopeIds: [scope.id] });
-  // Never bind unknown config through a rounded JS Number. Only a verified
-  // parse permits the existing hot-field projection; otherwise exact source
-  // text (including hot fields) forms a distinct, conservative context.
-  let scopePolicy = SCOPE_CONFIG_POLICY, scopeConfig;
-  try { scopeConfig = stable(projectScopeConfig(parseEvidence(scope.config_json))); }
-  catch { scopePolicy = 'exact_scope_config/v1'; scopeConfig = scope.config_json; }
+  const { policy: scopePolicy, configJson: scopeConfig } = scopeObservationContext(scope.config_json);
   const startMs = Math.max(target.baseline, Math.floor(row.occurred_at_ms / 1000) * 1000);
   const endMs = Math.floor(row.occurred_at_ms / 1000) * 1000 + 1000;
   let records = [], pages = 1, fetchedCount = 0, error = null;
