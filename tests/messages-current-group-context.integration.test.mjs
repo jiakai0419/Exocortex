@@ -4,11 +4,15 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { Writable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+import { runCli } from '../bin/exocortex.mjs';
 import { ensureInitialized, quoteSql, sqliteExec } from '../dist/storage/sqlite/ingestion-store.js';
+import { plain } from '../dist/terminal/index.js';
 import { normalizeApiMessage } from '../src/adapters/lark-im/raw-message.mjs';
 import { recordFromMessage } from '../src/adapters/lark-im/message-record.mjs';
+import { textWidth } from '../src/terminal/text-layout.mjs';
 
 // Invented inputs only. The native system message intentionally has no title
 // or conversation type; these are separately bound local scope metadata.
@@ -125,6 +129,56 @@ test('offline messages labels current group/topic titles for the native to_chatt
   assert.match(text, /current local\s+title: Synthetic Cedar Workshop/);
   assert.doesNotMatch(text, /2058-06-13|2058-06-14/, 'scope bookkeeping timestamps are not title observation evidence');
   assert.deepEqual(f.run('json'), json, 'text projection does not change a later JSON read');
+});
+
+test('real messages CLI stacks current-title provenance at 20 columns and below the width clamp', async t => {
+  const f = fixture(t, [{ key: 'narrow_columns' }]);
+  const messages = f.run('json');
+  const before = JSON.stringify(messages);
+  assertCurrentContext(messages[0]);
+  function writer(columns) {
+    let output = '';
+    const stream = new Writable({ write(chunk, _encoding, done) { output += chunk.toString(); done(); } });
+    stream.columns = columns;
+    stream.isTTY = false;
+    return { stream, text: () => plain(output) };
+  }
+  async function run(columns, format) {
+    const stdout = writer(columns), stderr = writer(columns);
+    const code = await runCli(['messages', '--db', '/synthetic/narrow-never-opened.sqlite', '--format', format], {
+      stdout: stdout.stream, stderr: stderr.stream,
+      messagesDeps: {
+        resolvePath: () => '/synthetic/narrow-never-opened.sqlite', existsSync: () => true,
+        readLocalChatAppNames: () => null, loadMessages: () => messages,
+      },
+    });
+    assert.equal(JSON.stringify(messages), before, 'CLI rendering preserves body, raw and canonical inputs');
+    return { code, stdout: stdout.text(), stderr: stderr.text() };
+  }
+  for (const columns of [20, 19, 1, 21]) {
+    await t.test(`stream columns ${columns}`, async () => {
+      const json = await run(columns, 'json');
+      assert.equal(json.code, 0, json.stderr);
+      assert.equal(json.stderr, '');
+      assert.deepEqual(JSON.parse(json.stdout), messages, 'JSON is independent of terminal width');
+      const text = await run(columns, 'text');
+      assert.equal(text.code, 0, text.stderr);
+      assert.equal(text.stderr, '');
+      assert.match(text.stdout, /Messages \(1\)/);
+      const lines = text.stdout.split('\n');
+      for (const line of lines) {
+        assert.ok(textWidth(line) <= Math.max(20, columns), `${textWidth(line)} cells at ${columns} columns: ${line}`);
+      }
+      const source = lines.indexOf('  当前本地标题来源');
+      assert.ok(source >= 0, 'the long provenance label occupies its own line');
+      const nextField = lines.findIndex((line, index) => index > source && line.startsWith('  类型 '));
+      assert.ok(nextField > source + 1, 'the provenance value follows below its label');
+      const values = lines.slice(source + 1, nextField);
+      assert.ok(values.every(line => line.startsWith('    ')), 'stacked values retain their hanging indentation');
+      assert.equal(values.map(line => line.slice(4)).join(''), '会话配置；观察时间未知');
+    });
+  }
+  assert.deepEqual(f.run('json'), messages, 'all narrow text reads preserve database bytes and a later JSON read');
 });
 
 test('explicit historical group names and existing adopted sender names retain precedence', t => {

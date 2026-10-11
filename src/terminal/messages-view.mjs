@@ -25,9 +25,19 @@ function renderMessagesText(messages, options = {}) {
   const columns = terminalColumns(options.stream, options.columns);
   const lines = [];
   const faithful = { preserveWhitespace: true, preserveUrls: true };
-  /** Metadata keeps its existing label and first-line spacing. */
+  /** Keep existing spacing unless a long label leaves no room for a wide glyph. */
   function field(label, content, gap) {
     const prefix = `  ${label}${" ".repeat(gap)}`;
+    if (columns - textWidth(prefix) < 2) {
+      // terminalColumns clamps to at least 20; both stacked widths stay positive.
+      for (const line of wrapTextLine(label, columns - 2, faithful)) {
+        lines.push(`  ${key(line)}`);
+      }
+      for (const line of wrapTextLine(sanitizeTerminalText(content), columns - 4, faithful)) {
+        lines.push(`    ${line}`);
+      }
+      return;
+    }
     const continuation = " ".repeat(textWidth(prefix));
     const wrapped = wrapTextLine(sanitizeTerminalText(content), columns - textWidth(prefix), faithful);
     for (const [index, line] of wrapped.entries()) {
