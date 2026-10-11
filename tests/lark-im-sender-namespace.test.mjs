@@ -66,6 +66,17 @@ for (const type of ["open_id", "user_id", "app_id"]) {
   });
 }
 
+for (const [type, kind] of [['app_id', 'user'], ['open_id', 'app']]) {
+  test(`native ${kind} actor contradicts ${type} in both SQL inheritance directions`, () => {
+    for (const field of ['sender_type', 'type']) {
+      const conflicting = { raw_api: { ...raw(type), sender: { ...raw(type).sender, [field]: kind } } };
+      assert.equal(namespace(canonical(type), conflicting), null);
+      assertNotInherited(type, type, conflicting, raw(type));
+      assertNotInherited(type, type, raw(type), conflicting);
+    }
+  });
+}
+
 test("raw user_id evidence overrides an absent canonical type and cannot inherit into open_id despite an ou_ actor", () => {
   assert.equal(namespace(canonical(undefined), raw("user_id")), "typed:user_id");
   assertNotInherited(undefined, "open_id", raw("user_id"), raw("open_id"));

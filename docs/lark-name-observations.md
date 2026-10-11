@@ -87,6 +87,10 @@ contradictory entry. The legacy medium-confidence unique-bot fallback applies
 only to an unbound bot, never a bot explicitly belonging to a different app;
 it remains unavailable to exact verification.
 
+Native actor-kind conflicts also reject local-history recipients, historical
+donors and SQL name inheritance. Binding an official lookup to the current
+account uses the same namespace gate; later enrichment cannot undo its refusal.
+
 Names returned by accessible APIs remain valid even when they look like a
 default or numeric nickname. Source-name precedence is unchanged. Display names,
 English names, aliases and client group nicknames are not interchangeable:

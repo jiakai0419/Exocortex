@@ -43,6 +43,7 @@ function larkSenderNamespaceSql(canonical, raw, actor, allowLegacy = true) {
   ), evidence AS MATERIALIZED (${pairs}), types AS MATERIALIZED (
     SELECT *, NULLIF(json_extract(canonical, '$.sender_id_type'), '') AS canonical_type,
       NULLIF(json_extract(raw, '$.sender.id_type'), '') AS declared_type,
+      COALESCE(NULLIF(json_extract(raw, '$.sender.sender_type'), ''), json_extract(raw, '$.sender.type')) AS actor_kind,
       CASE WHEN json_type(raw, '$.sender.id') = 'text' THEN NULLIF(json_extract(raw, '$.sender.id'), '') END AS raw_id,
       ${selectedId} AS selected_id,
       (SELECT COUNT(DISTINCT type) FROM evidence WHERE value = native.actor) AS matching_types,
@@ -70,6 +71,8 @@ function larkSenderNamespaceSql(canonical, raw, actor, allowLegacy = true) {
         SELECT 1 FROM evidence WHERE type = source_type AND typeof(value) = 'text' AND value <> '' AND value <> actor)
       OR declared_type IS NOT NULL AND raw_id IS NULL AND NOT EXISTS (
         SELECT 1 FROM evidence WHERE type = declared_type AND value = actor)
+      OR actor_kind = 'app' AND source_type IS NOT NULL AND source_type <> 'app_id'
+      OR actor_kind = 'user' AND source_type = 'app_id'
       OR canonical_type IS NOT NULL AND source_type IS NOT NULL AND canonical_type <> source_type
       THEN NULL
     WHEN source_type IS NOT NULL THEN 'typed:' || source_type

@@ -5,7 +5,7 @@ import { quoteSql } from '../../../dist/storage/sqlite/ingestion-store.js';
 import { larkSenderNameIsUnknownSql, larkSenderNamespaceSql } from '../../../dist/storage/sqlite/lark-name-projection.js';
 import { readRemoteAccountBinding } from '../../diagnostics/remote-account-binding.mjs';
 import { readOnlySqliteJson } from '../../storage/sqlite/readonly-query.mjs';
-import { personName, senderIdentity } from './sender-identity.mjs';
+import { personName, senderIdentity, senderLookupNamespace } from './sender-identity.mjs';
 
 const GLOBAL_SOURCES = new Set(['contact', 'self', 'application_api']);
 const SOURCES = [...GLOBAL_SOURCES, 'chat_member', 'chat_bot_app_id'];
@@ -23,10 +23,11 @@ function bindCurrentSenderNames(records, selfProfile) {
   return records.map((record) => {
     try {
       const canonical = JSON.parse(record.canonical_json);
-      const identity = senderIdentity(JSON.parse(record.raw_json));
+      const native = JSON.parse(record.raw_json), identity = senderIdentity(native);
       const source = canonical.sender_name_source;
       if (record.source_id !== 'lark.im' || record.record_type !== 'lark.im.message'
-        || !identity.verified || identity.id !== record.actor_id || canonical.sender_id !== record.actor_id
+        || !identity.verified || senderLookupNamespace(native) !== identity.type
+        || identity.id !== record.actor_id || canonical.sender_id !== record.actor_id
         || canonical.sender_id_type !== identity.type || canonical.sender_name_confidence !== 'high'
         || canonical.sender_name_state === 'cleared' || canonical.msg_type === 'system'
         || !personName(canonical.sender_name, identity.identifiers)
@@ -50,9 +51,9 @@ function reuseKnownSenderNames(dbPath, records, selfProfile, budgetMs = 4500) {
   const pending = records.map((record) => {
     try {
       const canonical = JSON.parse(record.canonical_json);
-      const identity = senderIdentity(JSON.parse(record.raw_json));
+      const native = JSON.parse(record.raw_json), identity = senderIdentity(native);
       if (record.source_id !== 'lark.im' || record.record_type !== 'lark.im.message'
-        || !identity.verified || !['open_id', 'app_id'].includes(identity.type || '')
+        || !identity.verified || senderLookupNamespace(native) !== identity.type
         || identity.id !== record.actor_id || canonical.sender_id !== record.actor_id
         || canonical.sender_id_type !== identity.type || !record.container_id
         || canonical.chat_id !== record.container_id || canonical.msg_type === 'system'
