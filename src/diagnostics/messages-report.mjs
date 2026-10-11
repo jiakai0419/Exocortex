@@ -1,7 +1,7 @@
 // @ts-check
 
 import { readOnlySqliteJson } from "../storage/sqlite/readonly-query.mjs";
-import { renderSystemContent } from "../adapters/lark-im/system-content.mjs";
+import { renderSystemProjection } from "../adapters/lark-im/system-content.mjs";
 import { renderCardContent } from "../adapters/lark-im/card-content.mjs";
 import { personName, senderIdentity, senderNameFromSource } from "../adapters/lark-im/sender-identity.mjs";
 
@@ -30,7 +30,8 @@ import { personName, senderIdentity, senderNameFromSource } from "../adapters/la
  *     recipient: string | null,
  *     chat: string | null,
  *     body: unknown,
- *     card?: import("../adapters/lark-im/raw-message.mjs").RenderResult
+ *     card?: import("../adapters/lark-im/raw-message.mjs").RenderResult,
+ *     system?: NonNullable<ReturnType<typeof renderSystemProjection>>
  *   }
  * }} EnrichedMessage
  *
@@ -167,9 +168,40 @@ function displayBody(body, canonical, raw) {
     if (canonical.content_rendering?.status === "structured_fallback" || raw.content_rendering?.status === "structured_fallback") {
       return body;
     }
-    return renderSystemContent(canonical.content ?? raw.content ?? body) || body;
+    return displaySystem(body, canonical, raw)?.text || body;
   }
   return body;
+}
+
+/** Derive only message-local container metadata. The event timestamp binds the
+ * snapshot to this record; it does not claim the name was current at retrieval
+ * or reconstruct a historical rename. Scope/canonical caches are never sources.
+ * @param {Row} row @param {Row} canonical @param {Row} raw */
+function systemContext(row, canonical, raw) {
+  const native = raw.raw_api && typeof raw.raw_api === "object" && !Array.isArray(raw.raw_api) ? raw.raw_api : raw;
+  if (canonical.source_api !== "im.v1.messages" || native.message_id !== row.external_id
+    || typeof native.chat_id !== "string" || !native.chat_id || native.chat_id !== row.container_id
+    || canonical.chat_id !== native.chat_id) return undefined;
+  const time = native.create_time;
+  if (!(typeof time === "string" && /^\d{1,15}$/.test(time) || typeof time === "number" && Number.isSafeInteger(time) && time >= 0)) return undefined;
+  const n = BigInt(time), at = n < 10000000000n ? n * 1000n : n;
+  if (!Number.isSafeInteger(row.occurred_at_ms) || at !== BigInt(row.occurred_at_ms)) return undefined;
+  const type = native.chat_type ?? native.chat?.chat_type, name = native.chat_name ?? native.chat?.name;
+  if (!["group", "topic"].includes(type) || typeof name !== "string" || !name.trim()
+    || native.chat?.chat_id !== undefined && native.chat.chat_id !== native.chat_id
+    || native.chat?.id !== undefined && native.chat.id !== native.chat_id
+    || native.chat?.chat_type !== undefined && native.chat.chat_type !== type
+    || native.chat?.name !== undefined && native.chat.name !== name
+    || canonical.chat_type != null && canonical.chat_type !== type) return undefined;
+  return { chat_id: native.chat_id, group: { chat_id: native.chat_id, name, chat_type: type,
+    source: "message", time_basis: "message_snapshot" } };
+}
+
+/** @param {unknown} body @param {Row} canonical @param {Row} raw @param {unknown} [context] */
+function displaySystem(body, canonical, raw, context) {
+  if (canonical.content_rendering?.status === "structured_fallback" || raw.content_rendering?.status === "structured_fallback") return null;
+  const native = raw.raw_api && typeof raw.raw_api === "object" && !Array.isArray(raw.raw_api) ? raw.raw_api : raw;
+  return renderSystemProjection(native.body?.content ?? canonical.content ?? raw.content ?? body, context);
 }
 
 /**
@@ -237,6 +269,7 @@ function enrichRow(row) {
   const p2pPartnerId = partnerId || chatId;
   const isP2p = chatType === "p2p";
   const isGroupLike = !isP2p;
+  const system = messageType === "system" ? displaySystem(row.body, canonical, raw, systemContext(row, canonical, raw)) : null;
   return {
     ...row,
     canonical,
@@ -255,7 +288,8 @@ function enrichRow(row) {
             : "我"
           : null,
       chat: isGroupLike ? nameOrId(chatName, chatId) : null,
-      body: displayBody(row.body, canonical, raw),
+      body: system?.text || displayBody(row.body, canonical, raw),
+      ...(system ? { system } : {}),
       ...(messageType === "interactive" ? { card: displayCard(raw) } : {}),
     },
   };

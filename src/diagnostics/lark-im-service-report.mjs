@@ -1,4 +1,5 @@
 import { summarizeRemoteSample } from "./remote-sample-cache.mjs";
+import { parseWorkerEventTimestamp } from "./worker-event-time.mjs";
 // @ts-check
 
 import { readOnlySqliteJson } from "../storage/sqlite/readonly-query.mjs";
@@ -182,8 +183,7 @@ function readRecentWorkerEvents(logDir, limits = {}) {
  * @returns {number | null}
  */
 function eventTimeMs(event) {
-  const parsed = Date.parse(String(event?.at || event?.finished_at || event?.started_at || ""));
-  return Number.isFinite(parsed) ? parsed : null;
+  return parseWorkerEventTimestamp(event?.at || event?.finished_at || event?.started_at);
 }
 
 /**

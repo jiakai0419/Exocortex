@@ -12,12 +12,12 @@ import { publicActivity } from "./public-activity.mjs";
 import { summarizeRuntimeStats } from "./status-runtime-stats.mjs";
 import { parseWorkerEventTimestamp as timestamp } from "./worker-event-time.mjs";
 import { expectedCycleSteps } from "../../dist/runtime/worker/lark-im-worker-core.js";
+import { WORKER_STEPS } from "../runtime/worker/step-vocabulary.mjs";
 
 /** @typedef {Record<string, any>} JsonObject */
-const choice = (/** @type {unknown} */ value, /** @type {string[]} */ values) => values.includes(String(value)) ? String(value) : "unknown";
+const choice = (/** @type {unknown} */ value, /** @type {readonly string[]} */ values) => values.includes(String(value)) ? String(value) : "unknown";
 const count = (/** @type {unknown} */ value) => Number.isSafeInteger(value) && Number(value) >= 0 ? Number(value) : null;
 
-const WORKER_STEPS = ["sent", "discover-hot", "received-hot", "discover-catchup", "discover-reconcile", "received-fair", "history", "retention", "received-catchup"];
 const LEASE_REASONS = ["invalid_timestamp", "invalid_interval", "future_start", "hard_limit_exceeded", "expired"];
 const HEALTH_REASONS = ["service_state_unavailable", "service_stopped", "sync_status_unavailable", "detail_evidence_unavailable",
   "list_progress_unavailable", "initial_sync_unverified", "no_successful_runs", "unfinished_runs_unverified", "last_cycle_failed",
@@ -95,8 +95,8 @@ function publicLeases(value) {
 function publicWorker(value, observedAt) {
   const summary = value || {};
   const validTimestamp = (/** @type {unknown} */ value) => {
-    const at = typeof value === "string" ? Date.parse(value) : NaN;
-    return Number.isFinite(at) && at <= observedAt;
+    const at = timestamp(value);
+    return at !== null && at <= observedAt;
   };
   const event = (/** @type {JsonObject | null | undefined} */ item) => item ? {
     cycle: count(item.cycle), ok: item.ok === true, at: publicTimestamp(item.at), age_ms: count(item.age_ms),

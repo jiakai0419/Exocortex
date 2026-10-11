@@ -3,11 +3,11 @@ import { serviceTimeRange, serviceTimestamp, durationText, formatStabilityInterv
 import { statusLayout } from "./status-layout.mjs";
 import { formatLogLine } from "./status-log-view.mjs";
 import { safeCollectorDiagnostic } from "../diagnostics/remote-sample-diagnostic.mjs";
+import { WORKER_STEP_LABELS } from "../runtime/worker/step-vocabulary.mjs";
+import { parseWorkerEventTimestamp } from "../diagnostics/worker-event-time.mjs";
 
 /** @typedef {Record<string, any>} Report */
-const TASKS = Object.freeze({ sent: "Sent messages", "discover-hot": "Active conversation refresh", "received-hot": "Active conversation messages",
-  "discover-catchup": "Initial conversation discovery", "discover-reconcile": "Conversation list review", "received-fair": "Other conversation messages",
-  "received-catchup": "Conversation history", retention: "History cleanup", all: "Message synchronization", discover: "Conversation discovery",
+const TASKS = Object.freeze({ ...WORKER_STEP_LABELS, all: "Message synchronization", discover: "Conversation discovery",
   received: "Received messages", details: "Message details", cycle: "Background round" });
 const ACTIVITY = Object.freeze({ activity_evidence_unavailable: "current work evidence is unavailable", sync_status_unavailable: "database status is unavailable",
   database_identity_unavailable: "database identity changed or could not be verified", phase_evidence_incomplete: "current activity records are incomplete",
@@ -47,7 +47,7 @@ const FRESHNESS = Object.freeze({ no_cached_probe: "no cached remote sample", le
 const INVALID_SAMPLE_REASONS = new Set(["expired", "invalid_timestamp", "invalid_evidence", "context_mismatch", "legacy_evidence",
   "account_unverified", "account_mismatch", "identity_unavailable", "account_changed", "database_changed", "context_changed", "context_unavailable"]);
 const SAMPLE_DIFFERENCES = [
-  ["confirmed_missing", "confirmed missing"], ["stale_version", "older versions"], ["content_mismatch", "content differences"],
+  ["confirmed_missing", "confirmed missing"], ["stale_version", "local versions behind"], ["content_mismatch", "content differences"],
   ["identity_conflict", "message identity conflicts"], ["suspected_missing", "suspected missing"], ["pending_sync", "awaiting sync"],
 ];
 const SAMPLE_UNCERTAINTIES = [["unresolved_prior", "prior findings unresolved"], ["local_newer", "newer local versions"],
@@ -61,7 +61,7 @@ const task = (name) => Object.hasOwn(TASKS, String(name)) ? TASKS[String(name)] 
 /** @param {unknown} kind */
 const failure = (kind) => Object.hasOwn(FAILURE, String(kind)) ? FAILURE[String(kind)] : "Unclassified failure";
 /** @param {unknown} value */
-const validTime = (value) => typeof value === "string" && Number.isFinite(Date.parse(value));
+const validTime = (value) => parseWorkerEventTimestamp(value) !== null;
 /** @param {number} ms */
 const lookback = (ms) => Number.isFinite(ms) && ms > 0 && Number.isInteger(ms / 3600000) ? `${ms / 3600000}h` : durationText(ms);
 /** @param {unknown} state */
@@ -180,6 +180,7 @@ export function renderStatusText(report, options = {}) {
       }
       screen.row("Sample coverage", `${number(freshness.sample?.hot_chats)} hot + ${number(freshness.sample?.fair_chats)} rotating · ${number(freshness.sample?.eligible_chats)} eligible chats · ${number(freshness.sample?.truncated_chats)} truncated`);
       screen.row("Sample content", comparisonAvailable ? `${number(f.content_equal)} static bodies matched · ${number(f.content_unverified)} unverified` : `Not verified · ${reason}`);
+      if (f.unresolved_prior > 0) screen.row("Prior findings", "Unresolved targets excluding this sample's listed differences; revisited targets may remain unresolved");
       screen.row("Sample identity", usable ? `Matched at check · ${freshness.binding?.evidence === "single_sent_actor" ? "stored sent identity" : "initial empty database binding"}` : "Account association unverified");
       screen.row("Sample limits", "Discovered chat creation window; thread-only replies and client dynamic cards unverified");
       const resultLabel = usable && freshness.status === "behind"

@@ -43,7 +43,8 @@ test("dependency plan blocks remote access while still inspecting an explicit ba
   f.deps.collectQualityReport = () => { throw new Error("PRIVATE_SOURCE_MISSING"); };
   const result = await collectCheckReport(options({ live: true, through: "2030-01-01T00:00:00Z", backup: "/tmp/existing-copy.sqlite" }), f.context, f.deps);
   assert.equal(result.exit_code, 1); assert.equal(result.checks.backup.status, "passed");
-  assert.equal(result.checks.coverage.status, "unavailable"); assert.equal(result.checks.live.status, "skipped");
+  assert.equal(result.checks.coverage.status, "unavailable"); assert.equal(result.checks.live.status, "unavailable");
+  assert.deepEqual(result.checks.live.missing_dependencies, ["python3"]);
   assert.deepEqual(f.calls, ["backup"]); assert.doesNotMatch(JSON.stringify(result), /PRIVATE|existing-copy/);
 });
 for (const overrides of [{ probe: { remote_messages_checked: 0, probe_errors: 0 } }, { probe: { remote_messages_checked: 1, probe_errors: 1 } }, { missing_count: 1 }, { window: {} }, { status: "unavailable", ok: false }, { status: "inconclusive", ok: false }]) test(`live rejects insufficient evidence ${JSON.stringify(overrides)}`, async () => {

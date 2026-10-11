@@ -157,7 +157,7 @@ test("remote states remain distinct after runtime pairing and ordinary-detail re
     [{ result: "delayed", reason: "sync_pending", findings: { pending_sync: 3 } }, /3 awaiting sync/],
     [{ result: "delayed", reason: "suspected_missing", findings: { suspected_missing: 2 } }, /2 suspected missing/],
     [{ result: "needs_attention", reason: "confirmed_missing", findings: { confirmed_missing: 1 } }, /1 confirmed missing/],
-    [{ result: "needs_attention", reason: "source_difference", findings: { stale_version: 2, content_mismatch: 1 } }, /2 older versions · 1 content differences/],
+    [{ result: "needs_attention", reason: "source_difference", findings: { stale_version: 2, content_mismatch: 1 } }, /2 local versions behind · 1 content differences/],
     [{ result: "inconclusive", reason: "unresolved_observations", findings: { unresolved_prior: 4 } }, /4 prior findings unresolved/],
     [{ result: "unavailable", reason: "account_unverified", binding: { state: "unverified" } }, /Not verified/],
   ];
@@ -232,10 +232,11 @@ test("valid mixed findings remain complete in default and detail without changin
     for (const [key, value] of Object.entries(findings)) assert.equal(report.freshness.findings[key], value);
     for (const columns of [40, 96]) {
       const output = render(report, columns), progress = section(output, "Messages & progress");
-      for (const text of ["1 confirmed missing", "1 suspected missing", "1 awaiting sync", "2 older versions",
+      for (const text of ["1 confirmed missing", "1 suspected missing", "1 awaiting sync", "2 local versions behind",
         "1 content differences", "1 message identity conflicts", "2 prior findings unresolved"]) assert.ok(progress.includes(text), text);
       assert.equal(occurrences(output, "Remote sample"), 1);
       assert.doesNotMatch(progress, /Sample matched/);
+      if (detail) assert.match(progress, /Unresolved targets excluding this sample's listed differences; revisited targets may remain unresolved/);
     }
   }
 });
@@ -271,7 +272,7 @@ test("rejected sample evidence cannot promote retained differences or body match
     for (const columns of [40, 96]) {
       const progress = section(render(report, columns), "Messages & progress");
       assert.match(progress, expected);
-      assert.doesNotMatch(progress, /1 confirmed missing|1 older versions|1 message identity conflicts|static bodies matched|Sample matched|Matched at check/);
+      assert.doesNotMatch(progress, /1 confirmed missing|1 local versions behind|1 message identity conflicts|static bodies matched|Sample matched|Matched at check/);
     }
   }
 });

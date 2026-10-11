@@ -111,7 +111,7 @@ async function collectCheckReport(options, context, deps = {}) {
     finalSync = await collect("sync", () => (deps.buildStatus || buildStatus)(plan.db), isLocalReady, sanitizeStatusReportForPublicOutput);
     finalQuality = await collect("quality", () => (deps.collectQualityReport || collectQualityReport)(plan.db), (value) => !hasQualityIssues(value), sanitizeQualityReportForPublicOutput);
   }
-  if (plan.wait && checks.wait.status === "passed" && (!isLocalReady(finalSync) || !finalQuality || hasQualityIssues(finalQuality))) {
+  if (plan.wait && checks.wait.status === "passed" && (checks.database.status !== "passed" || !isLocalReady(finalSync) || !finalQuality || hasQualityIssues(finalQuality))) {
     checks.wait = { status: "incomplete", observed_at: observed(), evidence: { ok: false, reason: "final_local_not_ready" } };
     issues.push({ code: "wait_final_local_not_ready", check: "wait" });
   }
@@ -128,11 +128,16 @@ async function collectCheckReport(options, context, deps = {}) {
   let manualAttempt = /** @type {any} */ (null);
   if (plan.live) {
     const waitFailed = plan.wait && checks.wait.status !== "passed";
-    const failedDependency = !dependencies.live || !dependencies.sqlite || (plan.through || plan.live) && !dependencies.python || plan.wait && !dependencies.wait;
+    const missingDependencies = [["sqlite3", dependencies.sqlite], ["python3", dependencies.python],
+      ["lark-cli", dependencies.live], ["launchctl", !plan.wait || dependencies.wait]].filter(([, ready]) => !ready).map(([name]) => name);
     const localReadFailed = ["database", "sync", "quality"].some((key) => checks[key].status === "unavailable");
-    if (waitFailed || failedDependency || localReadFailed) {
+    if (missingDependencies.length) {
+      unavailable("live", "live_dependency_unavailable");
+      checks.live.reason = "dependency_unavailable";
+      checks.live.missing_dependencies = missingDependencies;
+    } else if (waitFailed || localReadFailed) {
       checks.live = { status: "skipped", observed_at: observed(), reason: waitFailed ? "wait_not_passed" : "dependency_or_local_read_failed" };
-      issues.push({ code: !dependencies.live ? "live_dependency_unavailable" : "live_skipped", check: "live" });
+      issues.push({ code: "live_skipped", check: "live" });
     } else {
       live = await collect("live", () => {
         if (plan.writeLiveCache) {

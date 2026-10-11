@@ -179,7 +179,15 @@ function block(lines: unknown[]) {
 function compact(value: unknown, limit = 240) {
   const text = sanitizeTerminalText(value).replace(/\s+/g, " ").trim();
   if (!text) return "(empty)";
-  return text.length > limit ? `${text.slice(0, limit - 3)}...` : text;
+  if (text.length <= limit) return text;
+  const budget = Math.max(0, limit - 3);
+  let end = 0;
+  // Keep the existing UTF-16 budget, but never split a displayed grapheme.
+  for (const part of new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text)) {
+    if (part.index + part.segment.length > budget) break;
+    end = part.index + part.segment.length;
+  }
+  return `${text.slice(0, end)}${".".repeat(Math.min(3, Math.max(0, limit)))}`;
 }
 
 function json(value: unknown) {

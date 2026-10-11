@@ -1,4 +1,6 @@
 import { WORKER_DEFAULTS } from "./options.mjs";
+import { REQUIRED_CYCLE_STEPS } from "./step-vocabulary.mjs";
+import { parseWorkerEventTimestamp } from "../../diagnostics/worker-event-time.mjs";
 
 type JsonObject = Record<string, any>;
 
@@ -83,10 +85,6 @@ const TRANSPORT_OPERATIONS = new Set([
   "message_history_bundle", "message_search_bundle", "chat_discovery_bundle",
   "self_profile", "contact_search", "chat_members", "chat_bots", "application_info", "other",
 ]);
-
-const REQUIRED_CYCLE_STEPS = [
-  "sent", "discover-hot", "received-hot", "discover-catchup", "discover-reconcile", "received-fair",
-];
 
 function stepHealthy(step: WorkerEvent) {
   return step.ok === true && step.summary?.received?.ok !== false &&
@@ -543,8 +541,7 @@ function runCycleWithRunner(
 
 function eventTimeMs(event: WorkerEvent | null | undefined) {
   const value = event?.at || event?.finished_at || event?.started_at || "";
-  const parsed = Date.parse(value);
-  return Number.isFinite(parsed) ? parsed : null;
+  return parseWorkerEventTimestamp(value);
 }
 
 function eventTimeIso(event: WorkerEvent | null | undefined) {

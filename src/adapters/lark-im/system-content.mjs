@@ -2,6 +2,11 @@
 
 const PIN_TOPIC_TEMPLATE = "{name} clipped a topic to top.";
 const PLACEHOLDER = /\{(\w+)\}/g;
+// A closed semantic profile: this group parameter names the message container,
+// not a renamed group, an invitation destination, or another historical group.
+const CONTAINER_GROUP_TEMPLATES = new Set([
+  "{name} joined {group_name}. New members can view all chat history.",
+]);
 
 /** @param {unknown} value @returns {string | null} */
 function nonEmptyString(value) {
@@ -37,9 +42,10 @@ function parameterText(parameters, key) {
  * text, never evidence of sender/actor identity. No input is mutated.
  *
  * @param {unknown} content
- * @returns {string | null} null means the caller should keep its existing body.
+ * @param {unknown} [context] Explicit source and temporal evidence; a message
+ * snapshot alone is not evidence of the group name at the event's time.
  */
-function renderSystemContent(content) {
+function renderSystemProjection(content, context) {
   let parameters = content;
   if (typeof content === "string") {
     try {
@@ -54,13 +60,43 @@ function renderSystemContent(content) {
     : typeof parameters === "string" ? parameters : null;
   if (template === null) return null;
 
+  const missing = new Set();
+  const contextual = new Set();
+  const group = ownField(context, "group");
+  const groupName = ownField(group, "source") === "message_event" && ownField(group, "time_basis") === "event"
+    && Number.isSafeInteger(ownField(context, "event_time_ms")) && Number(ownField(context, "event_time_ms")) >= 0
+    && ownField(group, "effective_at_ms") === ownField(context, "event_time_ms")
+    && ["group", "topic"].includes(String(ownField(group, "chat_type")))
+    && nonEmptyString(ownField(context, "chat_id")) !== null && ownField(group, "chat_id") === ownField(context, "chat_id")
+    ? nonEmptyString(ownField(group, "name")) : null;
+  const result = (text) => ({ text, status: missing.size ? "partial" : "rendered",
+    reason: missing.size ? "system_parameters_missing" : null, version: 1,
+    missing_parameters: [...missing], context_parameters: [...contextual],
+    context_source: contextual.size ? "message_event" : null, context_time_basis: contextual.size ? "event" : null,
+    context_status: contextual.size ? "applied" : ownField(group, "time_basis") === "message_snapshot" ? "snapshot_only" : "not_applied" });
+
   // For this evidenced event only, the absent name is an unknown operator.
   // Other templates can use {name} for a group or another non-person value.
   if (template.trim() === PIN_TOPIC_TEMPLATE && parameterText(parameters, "name") === null) {
-    return "未知操作者置顶了一个话题";
+    missing.add("name");
+    return result("未知操作者置顶了一个话题");
   }
-  return template.replace(PLACEHOLDER, (_placeholder, key) =>
-    parameterText(parameters, key) ?? `[未知参数：${key}]`);
+  const text = template.replace(PLACEHOLDER, (_placeholder, key) => {
+    const explicit = parameterText(parameters, key);
+    if (explicit !== null) return explicit;
+    // An explicit malformed/empty field is not permission to replace it with
+    // unrelated context. Only the absent container-group parameter may borrow.
+    if (key === "group_name" && CONTAINER_GROUP_TEMPLATES.has(template.trim())
+      && ownField(parameters, key) === undefined && groupName !== null) {
+      contextual.add(key); return groupName;
+    }
+    missing.add(key); return `[未知参数：${key}]`;
+  });
+  return result(text);
 }
 
-export { renderSystemContent };
+/** Keep the ingestion API unchanged; contextual reprojection is display-only.
+ * @param {unknown} content @param {unknown} [context] @returns {string | null} */
+function renderSystemContent(content, context) { return renderSystemProjection(content, context)?.text ?? null; }
+
+export { renderSystemContent, renderSystemProjection };

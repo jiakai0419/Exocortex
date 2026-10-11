@@ -1,3 +1,4 @@
+import { REQUIRED_CYCLE_STEPS } from "./step-vocabulary.mjs";
 type JsonObject = Record<string, any>;
 type WorkerCycleOptions = {
     db: string;
@@ -66,7 +67,6 @@ type AdaptiveCycleObservation = {
     durationMs: number;
     steps?: WorkerEvent[];
 };
-declare const REQUIRED_CYCLE_STEPS: string[];
 /** Optional maintenance has its own outcome. Its business debt cannot stand in
  * for evidence that a forward step failed. Without receipts, keep the caller's
  * conservative legacy cycle result. */
@@ -75,7 +75,7 @@ declare function cycleHealthyWithoutHistory(steps: WorkerEvent[] | undefined, fa
 declare function expectedCycleSteps(event: {
     step_count?: number;
     cycle_policy?: string;
-}): string[] | null;
+}): readonly string[] | null;
 declare function compactTransportCooldowns(input: unknown): Record<string, number>;
 declare function mergeTransportCooldowns(previous: unknown, incoming: unknown, nowMs?: number): {
     [k: string]: number;

@@ -38,6 +38,9 @@ export async function runCheckCommand(options, context, deps = {}) {
     row(`${report.privacy === "private" ? "PRIVATE · " : ""}Check`, report.ok ? "PASSED" : report.exit_code === 1 ? "ERROR" : "INCOMPLETE");
     for (const [name, item] of Object.entries(report.checks)) row(name, item.status.toUpperCase());
     for (const issue of report.issues) row(issue.check, issue.code);
+    const missingDependencies = report.checks.live.missing_dependencies;
+    if (Array.isArray(missingDependencies)) row("Live dependencies", missingDependencies.filter(name =>
+      ["sqlite3", "python3", "lark-cli", "launchctl"].includes(name)).map(name => `${name} unavailable`).join(" · "));
     const waitReason = waitReasonText(report.checks.wait);
     if (waitReason) row("Wait reason", waitReason);
     const live = report.checks.live.evidence;

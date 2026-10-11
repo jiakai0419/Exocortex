@@ -1,4 +1,6 @@
 import { WORKER_DEFAULTS } from "./options.mjs";
+import { REQUIRED_CYCLE_STEPS } from "./step-vocabulary.mjs";
+import { parseWorkerEventTimestamp } from "../../diagnostics/worker-event-time.mjs";
 const TRANSPORT_COUNTERS = [
     "calls", "attempts", "retries", "rate_limits", "timeouts", "wait_ms",
     "max_retry_after_ms", "cooldown_until_ms", "exhausted",
@@ -9,9 +11,6 @@ const TRANSPORT_OPERATIONS = new Set([
     "message_history_bundle", "message_search_bundle", "chat_discovery_bundle",
     "self_profile", "contact_search", "chat_members", "chat_bots", "application_info", "other",
 ]);
-const REQUIRED_CYCLE_STEPS = [
-    "sent", "discover-hot", "received-hot", "discover-catchup", "discover-reconcile", "received-fair",
-];
 function stepHealthy(step) {
     return step.ok === true && step.summary?.received?.ok !== false &&
         step.summary?.sent?.ok !== false && step.summary?.discovery?.ok !== false;
@@ -395,8 +394,7 @@ function runCycleWithRunner(opts, cycle, runStep, writeLog, now = () => new Date
 }
 function eventTimeMs(event) {
     const value = event?.at || event?.finished_at || event?.started_at || "";
-    const parsed = Date.parse(value);
-    return Number.isFinite(parsed) ? parsed : null;
+    return parseWorkerEventTimestamp(value);
 }
 function eventTimeIso(event) {
     const ms = eventTimeMs(event);
