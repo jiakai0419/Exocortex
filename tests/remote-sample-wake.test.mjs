@@ -77,9 +77,19 @@ test('missing, duplicate, oversized, malformed and ineligible ticket results can
     ['bad'], [false], [{ key: key(0) }], [key(100)]]) {
     assert.deepEqual(resolveRemoteSampleDue(opts, state, START + 60000, {}, deps(pending)), unchanged(state));
   }
-  const recent = { ...state, observations: { [key(0)]: { ...state.observations[key(0)], target: START - 3600000 } } };
-  assert.deepEqual(resolveRemoteSampleDue(opts, recent, START + 60000, {}, deps()), unchanged(recent));
+  const unstable = { ...state, observations: { [key(0)]: { ...state.observations[key(0)], target: START - 300000 } } };
+  assert.deepEqual(resolveRemoteSampleDue(opts, unstable, START + 60000, {}, deps()), unchanged(unstable));
   assert.deepEqual(resolveRemoteSampleDue(opts, state, START + 60000, {}, { ...deps(), pendingVerifications() { throw new Error('synthetic'); } }), unchanged(state));
+});
+
+test('a validated recent ticket wakes within the existing gap only after its complete route is stable', () => {
+  const state = fixture(); state.observations[key(0)].target = START - 3600000;
+  assert.equal(resolveRemoteSampleDue(opts, state, START + 60000, {}, deps()).next_due, START + 60000);
+  const end = START + 60000 - 600000;
+  state.observations[key(0)].target = end - 2000;
+  assert.ok(resolveRemoteSampleDue(opts, state, START + 60000, {}, deps()).wake);
+  state.observations[key(0)].target += 1000;
+  assert.deepEqual(resolveRemoteSampleDue(opts, state, START + 60000, {}, deps()), unchanged(state));
 });
 
 test('database identity is checked both before and after the ticket read', () => {

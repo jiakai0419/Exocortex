@@ -186,7 +186,7 @@ function publicationFixture(t) {
             now: () => now, context: () => ({ database_key: database }),
             readBinding: () => ({ ...binding, database_key: database, account_key: account }),
             loadInventory: () => [{ id: chatScopeId(original.chat_id), chat_id: original.chat_id, source_id: 'lark.im', enabled: 1 }],
-            inspectSnapshot: () => ({ coverage: {}, records: new Map(record ? [[original.message_id, record]] : []) }),
+            inspectSnapshot: () => ({ verification: { status: 'ready', blockedKeys: [] }, coverage: {}, records: new Map(record ? [[original.message_id, record]] : []) }),
             api: { deadline: now + 55000, count: () => calls, call(path) {
               calls++; injectedCalls++;
               if (path === '/open-apis/authen/v1/user_info') return { code: 0, data: { open_id: 'ou_invented_self', tenant_key: 'invented_tenant' } };

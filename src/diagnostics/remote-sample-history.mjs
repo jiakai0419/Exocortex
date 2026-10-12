@@ -1,7 +1,7 @@
 // @ts-check
 import { readOnlySqliteJson } from '../storage/sqlite/readonly-query.mjs';
 import { chatScopeId } from '../adapters/lark-im/core.mjs';
-import { digest, epoch, sampleScopeHash } from './remote-sample-core.mjs';
+import { digest, epoch, sampleScopeHash, SAMPLE_POLICY } from './remote-sample-core.mjs';
 import { scopeObservationContext } from '../maintenance/scope-config-policy.mjs';
 
 const HASH = /^[a-f0-9]{64}$/;
@@ -28,9 +28,15 @@ export function loadLegacyObservationCandidates(db, target, chats, deps = {}) {
  * A failed/unroutable target rotates too; it remains unresolved in the reducer.
  * Routing is re-derived from this account and the current enabled inventory.
  */
-function historicalEntries(previous, startMs, now) {
+export function stableVerificationTarget(observation, windowEnd) {
+  return epoch(observation?.target) !== null && epoch(windowEnd) !== null &&
+    Math.floor(observation.target / 1000) * 1000 + 2000 <= windowEnd;
+}
+
+function historicalEntries(previous, startMs, now, pending = new Set(), windowEnd = startMs) {
   const entries = Object.entries(previous).filter(([key, value]) => HASH.test(key) && value &&
-    ['missing', 'version', 'content'].includes(value.kind) && epoch(value.target) !== null && value.target + 2000 < startMs &&
+    ['missing', 'version', 'content'].includes(value.kind) && epoch(value.target) !== null &&
+    (value.target + 2000 < startMs || pending.has(key) && stableVerificationTarget(value, windowEnd)) &&
     ['first_seen', 'last_seen', 'run_finished'].every(field => Number.isSafeInteger(value[field]) && value[field] >= 0 && value[field] <= now));
   entries.sort((a,b) => (a[1].last_checked || 0) - (b[1].last_checked || 0) || a[1].first_seen - b[1].first_seen || a[0].localeCompare(b[0]));
   return entries;
@@ -80,6 +86,7 @@ export function loadPendingHistoryVerifications(db, previous, binding, now, deps
       JOIN sync_scopes s ON s.id=d.scope_id AND s.source_id='lark.im' AND s.enabled=1
       JOIN sources src ON src.id='lark.im' AND src.enabled=1
       WHERE d.status='awaiting_verification' AND r.source_id='lark.im' AND r.record_type='lark.im.message'
+        AND o.candidate_json IS NULL AND o.history_error IS NULL
       ORDER BY d.verification_requested_at_ms,d.record_id LIMIT 201;`, 'remote sample pending verification hints', { timeoutMs: 1000 });
     if (!Array.isArray(rows) || rows.length > 200) return [];
     const pending = [];
@@ -106,15 +113,18 @@ export function loadPendingHistoryVerifications(db, previous, binding, now, deps
   } catch { return []; }
 }
 
-export function selectHistoricalObservations(db, previous, binding, rows, startMs, now, deps = {}, limit = 3) {
-  const entries = historicalEntries(previous, startMs, now);
-  if (!entries.length || limit < 1) return [];
+export function selectHistoricalObservations(db, previous, binding, rows, startMs, now, deps = {}, limit = 3,
+  windowEnd = Math.floor((now - SAMPLE_POLICY.stableBufferMs) / 60000) * 60000) {
+  if (limit < 1) return [];
   const priority = new Set((deps.pendingVerifications || loadPendingHistoryVerifications)(db, previous, binding, now, deps));
+  const entries = historicalEntries(previous, startMs, now, priority, windowEnd);
+  if (!entries.length) return [];
   // First route is always the oldest: bad or unmodified debt cannot starve
   // behind a continuing supply of successful writer attempts.
   const ordered = [entries[0], ...entries.slice(1).filter(([key]) => priority.has(key)),
     ...entries.slice(1).filter(([key]) => !priority.has(key))].slice(0, Math.min(MAX_TARGETED_HISTORY, limit));
-  return ordered.map(([key, observation]) => routeObservation(db, key, observation, binding, rows, deps));
+  return ordered.map(([key, observation]) => ({ ...routeObservation(db, key, observation, binding, rows, deps),
+    verificationRequired: priority.has(key) }));
 }
 
 /** Recover only routing metadata for explicitly retained findings. This is not

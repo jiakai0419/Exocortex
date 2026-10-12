@@ -9,8 +9,8 @@ import { classifyLarkFailure } from '../adapters/lark-im/transport.mjs';
 import { tryAcquireLarkApiLease, readSharedLarkCooldown, writeSharedLarkCooldown } from '../runtime/lark-api-lease.mjs';
 import { readRemoteAccountBinding } from './remote-account-binding.mjs';
 import { inspectRemoteSampleSnapshot } from './remote-sample-coverage.mjs';
-import { SAMPLE_POLICY, digest, epoch, sampleScopeHash, selectSampleChats, evaluateSample } from './remote-sample-core.mjs';
-import { selectHistoricalObservations, loadPendingHistoryVerifications, routeTargetedHistory, MAX_TARGETED_HISTORY } from './remote-sample-history.mjs';
+import { SAMPLE_POLICY, digest, epoch, sampleScopeHash, selectSampleChats, evaluateSample, sameSampleMessageAcquisition } from './remote-sample-core.mjs';
+import { selectHistoricalObservations, loadPendingHistoryVerifications, routeTargetedHistory, MAX_TARGETED_HISTORY, stableVerificationTarget } from './remote-sample-history.mjs';
 import { runGuardedRemoteSampleProcess, safeGuardianDiagnostic } from '../runtime/worker/remote-sample-process.mjs';
 import { publicRemoteReport } from './remote-sample-cache.mjs';
 import { collectorDiagnostic } from './remote-sample-diagnostic.mjs';
@@ -26,6 +26,7 @@ export function createSampleApi(db, options = {}, deps = {}) {
   const now = deps.now || Date.now;
   const monotonic = deps.monotonicNow || deps.now || (() => performance.now());
   const start = now(); const monotonicStart = monotonic(); let calls = 0; let selfCalls = 0; let last = -Infinity;
+  let lastAcquiredAt = /** @type {number|null} */ (null);
   const maxCalls = options.maxApiCalls === undefined ? SAMPLE_POLICY.calls :
     Number.isSafeInteger(options.maxApiCalls) && options.maxApiCalls >= 0 && options.maxApiCalls <= SAMPLE_POLICY.calls ? options.maxApiCalls : 0;
   const maxSelfCalls = options.maxSelfCalls === undefined ? 6 :
@@ -54,7 +55,7 @@ export function createSampleApi(db, options = {}, deps = {}) {
       if (shared?.state === 'cooldown') throw new SampleFailure('rate_cooldown', shared.untilMs || 0, operation);
       const timeout = Math.floor(Math.min(SAMPLE_POLICY.requestMs, remainingMs() - reserveMs));
       if (timeout <= 0) throw new SampleFailure('time_budget');
-      calls++; if (operation === 'self_profile') selfCalls++; last = monotonic();
+      calls++; if (operation === 'self_profile') selfCalls++; last = monotonic(); lastAcquiredAt = now();
       const args = ['api', 'GET', path, '--as', 'user', '--params', JSON.stringify(params), '--format', 'json'];
       const result = (deps.spawnSync || spawnSync)(options.env?.LARK_CLI || process.env.LARK_CLI || 'lark-cli', args,
         { encoding: 'utf8', env: options.env || process.env, timeout, killSignal: 'SIGKILL', maxBuffer: 2 * 1024 * 1024,
@@ -79,7 +80,7 @@ export function createSampleApi(db, options = {}, deps = {}) {
       return json;
     } finally { last = monotonic(); lease.release(); }
   };
-  return { call, count: () => calls, selfCount: () => selfCalls, remainingMs, maxCalls, maxSelfCalls, deadline };
+  return { call, count: () => calls, selfCount: () => selfCalls, lastAcquiredAt: () => lastAcquiredAt, remainingMs, maxCalls, maxSelfCalls, deadline };
 }
 
 export function loadSampleInventory(db, deps = {}) {
@@ -170,7 +171,7 @@ export function collectRemoteSample(db, options = {}, deps = {}) {
     if (options.accountKey && options.accountKey !== binding.account_key) { observations = {}; observationOverflow = false; }
     let revisits = maxChats > 1 ? (deps.selectHistoricalObservations || (deps.selectHistoricalObservation
       ? (...args) => { const selected = deps.selectHistoricalObservation(...args); return selected ? [selected] : []; }
-      : selectHistoricalObservations))(db, observations, binding, rows, start, started, localDeps, MAX_TARGETED_HISTORY) : [];
+      : selectHistoricalObservations))(db, observations, binding, rows, start, started, localDeps, MAX_TARGETED_HISTORY, end) : [];
     revisits = (deps.routeTargetedHistory || routeTargetedHistory)(db, revisits, binding, localDeps)
       .filter((revisit, index) => index < Math.min(3, maxChats - 1) || revisit.messageId);
     const targeted = revisits.filter(revisit => revisit.messageId);
@@ -182,6 +183,7 @@ export function collectRemoteSample(db, options = {}, deps = {}) {
       const windows = revisits.map(revisit => revisit.chat ? { start: new Date(revisit.start).toISOString(), end: new Date(revisit.end).toISOString() } : null);
       report.history = { requested: revisits.length, chats_checked: 0, pages: 0, messages_checked: 0, unsupported_chats: 0, truncated_chats: 0,
         unroutable: revisits.filter(revisit => !revisit.chat).length, window: revisits.length === 1 ? windows[0] : null,
+        ...(revisits.some(revisit => revisit.observation.target + 2000 >= start) ? { scope: 'known_verification' } : {}),
         ...(revisits.length > 1 ? { windows, attempts: 0 } : {}) };
       if (targeted.length) {
         report.probe.mode = 'bounded_native_pages_and_targeted_ids';
@@ -198,7 +200,24 @@ export function collectRemoteSample(db, options = {}, deps = {}) {
       for (const revisit of revisits.filter(item => !item.chat)) observations = { ...observations,
         [revisit.key]: { ...revisit.observation, last_checked: started } };
     }
-    /** @type {Record<string, any>[]} */ const messages = []; const seenMessages = new Set();
+    /** @type {Record<string, any>[]} */ const messages = [];
+    const seenMessages = new Map(); const unsupportedMessages = new Map(); const acquisitions = new Map(); const historyMessages = new Set();
+    const revisitKeys = new Set(revisits.filter(revisit => revisit.chat).map(revisit => revisit.key));
+    const messageKey = item => digest([binding.database_key, binding.account_key, item.chat_id, item.message_id, epoch(item.create_time)]);
+    const rememberMessage = (item, scopeId, acquiredAt, explicit, comparable = true) => {
+      const key = messageKey(item), prior = seenMessages.get(item.message_id) || unsupportedMessages.get(item.message_id);
+      if (prior && (!revisitKeys.has(key) || messageKey(prior) !== key || !sameSampleMessageAcquisition(prior, item))) {
+        throw new SampleFailure('invalid_page');
+      }
+      // Even a representation we cannot compare can contradict an ordinary
+      // response. Keep it for overlap checks without granting it debt proof.
+      if (!comparable) { unsupportedMessages.set(item.message_id, item); return; }
+      if (!seenMessages.has(item.message_id)) { const stored = { ...item, scope_id: scopeId }; messages.push(stored); seenMessages.set(item.message_id, stored); }
+      // The explicit revisit is the intended ticket acquisition when ordinary
+      // coverage overlaps it, regardless of which request happened first.
+      if (!acquisitions.has(key) || explicit && !acquisitions.get(key).explicit) acquisitions.set(key, { at: acquiredAt, explicit });
+      if (explicit) historyMessages.add(key);
+    };
     const currentRequests = selection.selected.map(chat => ({ chat, start, end, historical: false, revisit: null }));
     let targetedInserted = false;
     /** @type {Record<string, any>[]} */
@@ -208,6 +227,11 @@ export function collectRemoteSample(db, options = {}, deps = {}) {
       targetedInserted = true;
       return [{ targeted, historical: true }];
     });
+    // A slow two-page oldest target cannot permanently put the static batch
+    // behind all current routes. Both existing route classes get first place
+    // in two of the four existing phases; no capacity or deadline is added.
+    const batchIndex = historyRequests.findIndex(request => request.targeted);
+    if ((rotationPlan?.phase || 0) >= 2 && batchIndex > 0) historyRequests.unshift(...historyRequests.splice(batchIndex, 1));
     // Interleave the fair historical slot with current coverage. Under slow
     // requests both domains make progress before optional priority slots.
     if (currentFirst === 1 && currentRequests.length > 1) currentRequests.reverse();
@@ -232,12 +256,13 @@ export function collectRemoteSample(db, options = {}, deps = {}) {
     for (const request of requests) {
       if (request.targeted) {
         if (!canStartRoute(1)) break;
-        const callsBefore = api.count(); const attemptStarted = now(); let json;
+        const callsBefore = api.count(); let attemptStarted = now(); let json;
         stage = 'message_request';
         try { json = api.call('/open-apis/im/v1/messages/mget', {
           message_ids: request.targeted.map(revisit => revisit.messageId), card_msg_content_type: 'raw_card_content',
         }, { reserveMs: closingReserveMs }); }
         finally { if (api.count() > callsBefore) {
+          attemptStarted = api.lastAcquiredAt?.() ?? attemptStarted;
           report.history.targeted.batches++;
           request.targeted.forEach(revisit => recordHistoryAttempt(revisit, attemptStarted));
         } }
@@ -254,13 +279,15 @@ export function collectRemoteSample(db, options = {}, deps = {}) {
         for (const item of data.items) {
           const revisit = expected.get(item.message_id);
           const created = epoch(item.create_time);
-          if (!revisit || returned.has(item.message_id) || seenMessages.has(item.message_id) ||
+          if (!revisit || returned.has(item.message_id) ||
             item.chat_id !== revisit.chat.chat_id || created !== revisit.observation.target ||
             digest([binding.database_key,binding.account_key,item.chat_id,item.message_id,created]) !== revisit.key) throw new SampleFailure('invalid_page');
           returned.add(item.message_id);
-          if (!['text','post'].includes(item.msg_type)) { report.history.targeted.unsupported++; continue; }
-          seenMessages.add(item.message_id);
-          messages.push({ ...item, scope_id: revisit.chat.id });
+          if (!['text','post'].includes(item.msg_type)) {
+            rememberMessage(item, revisit.chat.id, attemptStarted, true, false);
+            report.history.targeted.unsupported++; continue;
+          }
+          rememberMessage(item, revisit.chat.id, attemptStarted, true);
           report.history.targeted.targets_checked++;
         }
         report.history.targeted.omitted += expected.size - returned.size;
@@ -275,13 +302,14 @@ export function collectRemoteSample(db, options = {}, deps = {}) {
         if (pageNo > 0 && !canStartRoute(1)) { counters.truncated_chats++; budgetTruncated = true; break; }
         let json;
         stage = 'message_request';
-        const callsBefore = api.count(); const attemptStarted = now();
+        const callsBefore = api.count(); let attemptStarted = now();
         try { json = api.call('/open-apis/im/v1/messages', { container_id_type: 'chat', container_id: chat.chat_id,
           sort_type: 'ByCreateTimeDesc', page_size: pageSize, card_msg_content_type: 'user_card_content',
           start_time: String(Math.floor(request.start / 1000)), end_time: String(Math.ceil(request.end / 1000)), ...(token ? { page_token: token } : {}) },
           { reserveMs: closingReserveMs }); }
         catch (error) { if (error instanceof SampleFailure && error.reason === 'restricted_mode') { counters.unsupported_chats++; break; } throw error; }
         finally {
+          if (api.count() > callsBefore) attemptStarted = api.lastAcquiredAt?.() ?? attemptStarted;
           // A lease/cooldown refusal made no remote acquisition and cannot
           // consume a writer verification ticket.
           if (!historical && pageNo === 0 && api.count() > callsBefore && rotationPlan && Object.hasOwn(rotationPlan.fairRotations, chat.chat_id)) {
@@ -305,9 +333,7 @@ export function collectRemoteSample(db, options = {}, deps = {}) {
           const created = epoch(item.create_time);
           if (created === null || created < request.start || created > request.end) continue;
           if (historical && digest([binding.database_key, binding.account_key, item.chat_id, item.message_id, created]) !== revisit.key) continue;
-          if (seenMessages.has(item.message_id)) throw new SampleFailure('invalid_page');
-          seenMessages.add(item.message_id);
-          messages.push({ ...item, scope_id: chat.id });
+          rememberMessage(item, chat.id, attemptStarted, historical);
         }
         if (!page.has_more) break;
         token = page.page_token;
@@ -327,29 +353,41 @@ export function collectRemoteSample(db, options = {}, deps = {}) {
     if (remainingTime() <= 0) throw new SampleFailure('time_budget');
     // Coverage, debt and records must come from one SQLite snapshot, including concurrent revocation.
     stage = 'snapshot';
-    const { coverage, records } = (deps.inspectSnapshot || inspectRemoteSampleSnapshot)(db, targets, { timeoutMs: Math.min(5000, remaining()), now });
+    const knownAcquisitions = Object.fromEntries([...acquisitions].filter(([key]) => observations[key]).map(([key, acquisition]) => [key, acquisition.at]));
+    const verificationRequest = Object.keys(knownAcquisitions).length ? { binding, observations,
+      acquisitions: knownAcquisitions, requiredKeys: revisits.filter(revisit => revisit.verificationRequired && acquisitions.has(revisit.key)).map(revisit => revisit.key) } : null;
+    const { coverage, records, verification } = (deps.inspectSnapshot || inspectRemoteSampleSnapshot)(db, targets,
+      { timeoutMs: Math.min(5000, remaining()), now, ...(verificationRequest ? { verification: verificationRequest } : {}) });
+    if (verificationRequest && (!verification || verification.status !== 'ready' || !Array.isArray(verification.blockedKeys) ||
+      verification.blockedKeys.some(key => !Object.hasOwn(knownAcquisitions, key)))) throw new SampleFailure('context_unavailable');
     if (Object.values(coverage).some(proof => ['source_unavailable', 'scope_unavailable'].includes(proof.reason)) ||
         revisits.some(revisit => revisit.chat && coverage[revisit.key]?.reason === 'before_sync_baseline')) throw new SampleFailure('context_changed');
     stage = 'binding_after';
     const finalBinding = readBinding(after);
     if (finalBinding.state !== 'verified' || finalBinding.account_key !== binding.account_key || finalBinding.database_key !== binding.database_key) throw new SampleFailure('account_changed');
+    // The final record snapshot also fences current writer tickets against the
+    // actual request start. A response acquired before an accepted commit cannot
+    // clear the later generation simply because comparison finishes afterward.
+    const lateTickets = new Set(verification?.blockedKeys || []);
+    const comparableMessages = messages.filter(message => !lateTickets.has(messageKey(message)));
     stage = 'comparison';
-    const evaluated = evaluateSample({ messages, records, coverage, binding, previous: observations, previousOverflow: observationOverflow, now: now(), windowEnd: end });
+    const evaluated = evaluateSample({ messages: comparableMessages, records, coverage, binding, previous: observations, previousOverflow: observationOverflow, now: now(), windowEnd: end });
     observations = evaluated.observations;
+    // Persist acquisition time, not finish time, even when a ticket arrives
+    // after the fence. The later writer acceptance must remain unconsumed.
+    for (const [key, acquisition] of acquisitions) if (observations[key]) observations[key] = { ...observations[key], last_checked: acquisition.at };
     observationOverflow = evaluated.observationOverflow;
     report.findings = evaluated.counts;
     report.missing_count = evaluated.counts.missing;
-    report.probe.remote_messages_checked = messages.length;
+    report.probe.remote_messages_checked = comparableMessages.length;
     if (revisits.length) {
       const historyKeys = new Set(revisits.map(revisit => revisit.key));
-      report.history.messages_checked = messages.filter(message => historyKeys.has(
-        digest([binding.database_key, binding.account_key, message.chat_id, message.message_id, epoch(message.create_time)]))).length;
+      report.history.messages_checked = comparableMessages.filter(message => historyKeys.has(messageKey(message)) && historyMessages.has(messageKey(message))).length;
     }
-    // Exact historical verification intentionally retains its older-than-window
-    // contract. Recent findings use normal current-chat coverage; they cannot
-    // keep requesting minute follow-ups for an ineligible historical route.
+    // Only still-unattempted, generation-bound tickets can request a follow-up;
+    // recent known targets use the same complete-window stability boundary.
     pendingVerification = (deps.pendingVerifications || loadPendingHistoryVerifications)(db, observations, binding, now(), localDeps)
-      .some(key => observations[key] && observations[key].target + 2000 < start);
+      .some(key => stableVerificationTarget(observations[key], end));
     stage = 'final_context';
     if ((deps.context || liveProbeContext)(db)?.database_key !== context.database_key || remainingTime() < 0) throw new SampleFailure('context_changed');
     const c = evaluated.counts;

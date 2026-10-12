@@ -67,7 +67,7 @@ settle each retained version, deletion, type or static-body dimension with its
 existing positive proof and version floor.
 
 For uniquely located native text/post rows, the independent sampler can acquire
-up to five historical targets with its own mget. Dynamic cards, merge roots and
+up to five retained targets with its own mget. Dynamic cards, merge roots and
 unlocatable targets keep the original bounded-window route. The oldest target
 keeps its fair position; one hot and one fair recent route remain. A mixed report
 counts targeted IDs separately from list pages/chats. Batch omissions leave
@@ -85,9 +85,32 @@ follow-up no sooner than 60 seconds. A healthy later due time can also be advanc
 by a newly committed eligible ticket, with the same fixed 60-second floor and
 locked publication revalidation. Failures, busy backoff,
 cooldowns and account guards retain precedence. An actual API attempt consumes
-the ticket's rapid-revisit eligibility; a denied lease does not. Targets inside
-the ordinary recent window retain ordinary recent sampling rather than gaining
-an out-of-window historical claim.
+the ticket's rapid-revisit eligibility; a denied lease does not. A retained
+finding inside the ordinary 24-hour window may use the same bounded exact route
+only with a current accepted ticket, matching account/database, source/scope
+policy, debt fingerprint and record generation, and no pending candidate or
+history error. Its entire three-second route must end before or at the rounded
+ten-minute stability boundary. Unobserved recent records gain no new scan path.
+Reports explicitly mark these mixed retained-target visits as
+`history.scope: known_verification`; older reports still require every exact
+window to precede the ordinary window. No cache TTL or debt age is extended.
+
+The final read-only SQLite transaction reads ticket metadata with comparison
+records. A request that started before the ticket's accepted commit cannot
+settle that ticket, even if its response and the local record have equal source
+versions when comparison finishes. Unknown or changed ticket evidence retains
+the finding. Retained attempt timestamps use the actual request start rather
+than comparison completion. These times order local acquisitions, not remote
+server commits. The proof is limited to that SQLite snapshot; it does not
+certify a writer generation accepted afterward.
+
+Ordinary pages may overlap an exact revisit. The collector deduplicates the full
+salted identity only when version, type, explicit deletion and normalized body
+evidence agree, and uses the exact request's acquisition time. Conflicting
+responses fail the sample and retain debt; transport-only fields do not create
+duplicate comparisons. Two of the existing four phases put the static batch
+ahead of an old multi-page route so neither route class can always consume the
+other's budget. Ordinary hot/fair rotation and foreground sync priority remain.
 
 ## Foreground priority and limits
 

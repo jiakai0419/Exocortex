@@ -167,7 +167,7 @@ export function renderStatusText(report, options = {}) {
       : usable && freshness.status === "behind" && findings ? findings
       : `Not verified · ${reason}${uncertainties ? ` · ${uncertainties}` : ""}`;
     const sampleCounts = freshness.history
-      ? `${number(Math.max(0, freshness.sample_count - freshness.history.messages_checked))} current messages / ${number(freshness.chat_count)} chats + ${number(freshness.history.messages_checked)} historical target${freshness.history.messages_checked === 1 ? '' : 's'}`
+      ? `${number(Math.max(0, freshness.sample_count - freshness.history.messages_checked))} current messages / ${number(freshness.chat_count)} chats + ${number(freshness.history.messages_checked)} ${freshness.history.scope === 'known_verification' ? 'known' : 'historical'} target${freshness.history.messages_checked === 1 ? '' : 's'}`
       : `${number(freshness.sample_count)} messages / ${number(freshness.chat_count)} discovered chats`;
     screen.row("Remote sample", `${result} · ${sampleCounts} · checked ${stamp(freshness.checked_at)}`);
     if (detailed) {
@@ -175,8 +175,9 @@ export function renderStatusText(report, options = {}) {
       if (diagnostic) screen.row("Sample diagnostic", `${diagnostic.stage} · ${diagnostic.code}`);
       screen.row("Sample window", range(freshness.window?.start, freshness.window?.end));
       if (freshness.history) {
-        screen.row("Historical revisit", `${number(freshness.history.messages_checked)} target observed · ${number(freshness.history.unroutable)} unroutable · ${number(freshness.history.truncated_chats)} truncated`);
-        if (freshness.history.window) screen.row("History window", range(freshness.history.window.start, freshness.history.window.end));
+        const known = freshness.history.scope === 'known_verification';
+        screen.row(known ? "Known target revisit" : "Historical revisit", `${number(freshness.history.messages_checked)} target observed · ${number(freshness.history.unroutable)} unroutable · ${number(freshness.history.truncated_chats)} truncated`);
+        if (freshness.history.window) screen.row(known ? "Verification window" : "History window", range(freshness.history.window.start, freshness.history.window.end));
       }
       screen.row("Sample coverage", `${number(freshness.sample?.hot_chats)} hot + ${number(freshness.sample?.fair_chats)} rotating · ${number(freshness.sample?.eligible_chats)} eligible chats · ${number(freshness.sample?.truncated_chats)} truncated`);
       screen.row("Sample content", comparisonAvailable ? `${number(f.content_equal)} static bodies matched · ${number(f.content_unverified)} unverified` : `Not verified · ${reason}`);

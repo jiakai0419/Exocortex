@@ -25,6 +25,8 @@ function safeHistory(value) {
   const fields = ['requested', 'chats_checked', 'pages', 'messages_checked', 'unsupported_chats', 'truncated_chats', 'unroutable'];
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const multiple = value.requested > 1;
+  const known = Object.hasOwn(value, 'scope');
+  if (known && value.scope !== 'known_verification') return null;
   const targeted = Object.hasOwn(value, 'targeted') ? value.targeted : null;
   const targetKeys = ['requested','batches','targets_checked','omitted','unsupported'];
   if (Object.hasOwn(value, 'targeted') && (!targeted || typeof targeted !== 'object' || Array.isArray(targeted) ||
@@ -32,7 +34,7 @@ function safeHistory(value) {
     !targetKeys.every(key => Number.isSafeInteger(targeted[key]) && targeted[key] >= 0) ||
     targeted.requested < 1 || targeted.requested > MAX_TARGETED_HISTORY || targeted.requested > value.requested - value.unroutable ||
     targeted.batches > 1 || targeted.targets_checked + targeted.omitted + targeted.unsupported > targeted.requested * targeted.batches)) return null;
-  const keys = [...fields, 'window', ...(multiple ? ['windows', 'attempts'] : []), ...(targeted ? ['targeted'] : [])];
+  const keys = [...fields, 'window', ...(multiple ? ['windows', 'attempts'] : []), ...(targeted ? ['targeted'] : []), ...(known ? ['scope'] : [])];
   if (Object.keys(value).sort().join(',') !== keys.sort().join(',') ||
       !fields.every(key => Number.isSafeInteger(value[key]) && value[key] >= 0) ||
       value.requested < 1 || value.requested > (targeted ? MAX_TARGETED_HISTORY : SAMPLE_POLICY.historyTargets) || value.unroutable > value.requested) return null;
@@ -49,13 +51,17 @@ function safeHistory(value) {
       !Number.isSafeInteger(value.attempts) || value.attempts < Math.max(value.chats_checked,value.unsupported_chats) + (targeted ? targeted.requested * targeted.batches : 0) || value.attempts > routed
     : routed ? !validWindow(value.window) : value.window !== null || value.pages || value.messages_checked || value.unsupported_chats) return null;
   return { ...Object.fromEntries(fields.map(key => [key, value[key]])),
+    ...(known ? { scope: 'known_verification' } : {}),
     ...(targeted ? { targeted: { ...targeted } } : {}),
     window: value.window ? { start: value.window.start, end: value.window.end } : null,
     ...(multiple ? { windows: value.windows.map(window => window ? { start: window.start, end: window.end } : null), attempts: value.attempts } : {}) };
 }
 function historicalWindows(history) { return history?.windows || (history?.window ? [history.window] : []); }
-export function remoteSampleHistoryWithinWindow(history, windowStart) { return !historicalWindows(history).some(window => window &&
-  (!isoTime(windowStart) || Date.parse(window.end) > Date.parse(windowStart))); }
+export function remoteSampleHistoryWithinWindow(history, windowStart, windowEnd = windowStart) {
+  const boundary = history?.scope === 'known_verification' ? windowEnd : windowStart;
+  return !historicalWindows(history).some(window => window &&
+    (!isoTime(boundary) || Date.parse(window.end) > Date.parse(boundary)));
+}
 export { safeHistory as safeRemoteSampleHistory };
 
 /** @returns {Record<string, any>} */
@@ -70,7 +76,7 @@ export function publicRemoteReport(input) {
   const invalidSelfCalls = history?.targeted && !Object.hasOwn(input?.probe || {}, 'self_calls') || Object.hasOwn(input?.probe || {}, 'self_calls') &&
     (!Number.isSafeInteger(input.probe.self_calls) || input.probe.self_calls < 0 || input.probe.self_calls > 6 || input.probe.self_calls > input.probe.api_calls);
   const invalidPageBudget = Object.hasOwn(input?.probe || {}, 'max_pages_per_chat') && ![1,SAMPLE_POLICY.pages].includes(input.probe.max_pages_per_chat);
-  const invalidHistory = invalidMode || invalidSelfCalls || invalidPageBudget || Object.hasOwn(input || {}, 'history') && (!history || !remoteSampleHistoryWithinWindow(history, input.window?.start) ||
+  const invalidHistory = invalidMode || invalidSelfCalls || invalidPageBudget || Object.hasOwn(input || {}, 'history') && (!history || !remoteSampleHistoryWithinWindow(history, input.window?.start, input.window?.end) ||
     input.ok === true && !validPositiveReport(input, history));
   // Even a malformed diagnostic cannot be stripped into a positive report.
   const status = hasDiagnostic || hasCollectorDiagnostic || invalidHistory ? 'unavailable' : ['healthy','delayed','needs_attention','inconclusive','unavailable'].includes(input?.status) ? input.status : 'inconclusive';
@@ -169,7 +175,7 @@ export function parseRemoteSampleCache(input) {
   if (Object.hasOwn(input, 'collector_diagnostic') && (!safeCollectorDiagnostic(input.collector_diagnostic) ||
       input.ok !== false || input.status !== 'unavailable' || input.reason !== 'invalid_evidence')) return null;
   const history = Object.hasOwn(input, 'history') ? safeHistory(input.history) : null;
-  if (Object.hasOwn(input, 'history') && (!history || !remoteSampleHistoryWithinWindow(history, input.window?.start))) return null;
+  if (Object.hasOwn(input, 'history') && (!history || !remoteSampleHistoryWithinWindow(history, input.window?.start, input.window?.end))) return null;
   if (!validCounters(input.probe, input.findings, history) ||
       ![input.checked_at, input.expires_at, input.window?.start, input.window?.end].every(isoTime) ||
       input.reason !== null && !REMOTE_REASONS.includes(input.reason) ||
@@ -222,13 +228,13 @@ export function summarizeRemoteSample(cache, now, expectedContext) {
   const start = Date.parse(report.window.start || ''); const end = Date.parse(report.window.end || '');
   if (!Number.isFinite(checked) || checked > now || !(expiry > checked) || expiry - checked > 3600000 ||
       !(start < end) || end - start > SAMPLE_POLICY.windowMs || end > checked - SAMPLE_POLICY.stableBufferMs) return unknown('invalid_timestamp','sample time is invalid');
-  if (!remoteSampleHistoryWithinWindow(report.history, report.window.start)) return unknown('invalid_timestamp','historical sample time is invalid');
+  if (!remoteSampleHistoryWithinWindow(report.history, report.window.start, report.window.end)) return unknown('invalid_timestamp','retained target sample time is invalid');
   if (now >= expiry) return unknown('expired','last sample expired');
   if (!hash(cache.context.account_key) || !cache.context.auth_identity_verified || report.binding.state !== 'verified') {
     return { ...unknown(report.reason || 'account_unverified','account association not verified'), auth_identity: 'unknown' };
   }
   if (report.ok) return { ...base, status: 'sampled', detail: report.history
-    ? `${base.sample_count - report.history.messages_checked} current messages sampled in ${base.chat_count} discovered chats; ${report.history.messages_checked} retained historical target verified`
+    ? `${base.sample_count - report.history.messages_checked} current messages sampled in ${base.chat_count} discovered chats; ${report.history.messages_checked} retained ${report.history.scope === 'known_verification' ? 'known' : 'historical'} target verified`
     : `${base.sample_count} messages sampled in ${base.chat_count} discovered chats` };
   if (['delayed','needs_attention'].includes(report.status)) return { ...base, status: 'behind', detail: report.reason || 'sample differences observed' };
   return unknown(report.reason || 'inconclusive','sample not verified');

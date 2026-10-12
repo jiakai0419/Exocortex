@@ -6,6 +6,9 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { inspectRemoteSampleCoverage, inspectRemoteSampleSnapshot } from "../src/diagnostics/remote-sample-coverage.mjs";
+import { chatScopeId } from "../src/adapters/lark-im/core.mjs";
+import { digest, evaluateSample, sampleScopeHash } from "../src/diagnostics/remote-sample-core.mjs";
+import { scopeObservationContext } from "../src/maintenance/scope-config-policy.mjs";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const NOW = 1_609_459_200_000 + 3_600_000;
@@ -135,4 +138,161 @@ test("snapshot exposes only requested bounded private comparison records", () =>
     assert.throws(() => inspectRemoteSampleSnapshot("unused", [target], { now: () => NOW,
       spawnSync: () => response(evidence, { records }) }), /^Error: remote_sample_coverage_invalid_output$/);
   }
+});
+
+function ticketFixture() {
+  const binding = { database_key: 'a'.repeat(64), account_key: 'b'.repeat(64) };
+  const chat = 'synthetic_chat'; const created = NOW - 120_000;
+  const key = digest([binding.database_key, binding.account_key, chat, target.message_id, created]);
+  const scope = { id: chatScopeId(chat), source_id: 'lark.im', enabled: 1,
+    config_json: JSON.stringify({ chat_id: chat, hot_rank: 1 }) };
+  const source = { id: 'lark.im', enabled: 1, config_json: JSON.stringify({ initial_sync_start_ms: NOW - 86400000 }) };
+  const observation = { kind: 'version', target: created, first_seen: NOW - 90000, last_seen: NOW - 90000,
+    run_finished: NOW - 90000, scope_hash: sampleScopeHash(binding, chat), debts: { version: created, body: created, deleted: created } };
+  const item = { ...target, key, scope_id: scope.id, expected_chat_id: chat };
+  const record = { id: 1, external_id: item.message_id, source_id: 'lark.im', record_type: 'lark.im.message',
+    container_id: chat, occurred_at_ms: created, generation: 4, candidate_present: 0, history_error_present: 0 };
+  const ticket = { record_id: 1, finding_key: key, database_key: binding.database_key, account_key: binding.account_key,
+    scope_id: scope.id, context_fingerprint: digest({ source: source.config_json, scope: scope.id,
+      policy: scopeObservationContext(scope.config_json) }),
+    debt_fingerprint: digest(Object.fromEntries(Object.entries(observation.debts).sort(([a], [b]) => a.localeCompare(b)))),
+    verification_generation: 4, verification_requested_at_ms: NOW - 10000, status: 'awaiting_verification' };
+  const verification = { binding, observations: { [key]: observation }, acquisitions: { [key]: NOW - 5000 }, requiredKeys: [key] };
+  const metadata = { status: 'ready', source, rows: [{ key, record, scope, ticket }] };
+  return { key, item, verification, metadata };
+}
+
+function inspectTicket(f) {
+  return inspectRemoteSampleSnapshot('synthetic-unused', [f.item], { now: () => NOW, verification: f.verification,
+    spawnSync: (_exe, _args, options) => {
+      assert.deepEqual(JSON.parse(options.input), { targets: [f.item], verification_keys: [f.key] });
+      return response(evidence, { coverage: { [f.key]: evidence }, verification: f.metadata });
+    } }).verification;
+}
+
+test('same-snapshot acceptance fence admits exact bound generation acquired after ticket', () => {
+  const f = ticketFixture();
+  assert.deepEqual(inspectTicket(f), { status: 'ready', blockedKeys: [] });
+  // Hot-only inventory changes use the same actual runtime projection.
+  f.metadata.rows[0].scope.config_json = JSON.stringify({ chat_id: 'synthetic_chat', hot_rank: 2 });
+  assert.deepEqual(inspectTicket(f).blockedKeys, []);
+});
+
+test('pre-acceptance acquisitions cannot clear any floor, including ordinary known targets', () => {
+  for (const required of [true, false]) {
+    const f = ticketFixture();
+    f.verification.requiredKeys = required ? [f.key] : [];
+    f.verification.acquisitions[f.key] = f.metadata.rows[0].ticket.verification_requested_at_ms - 1;
+    const fence = inspectTicket(f);
+    assert.deepEqual(fence.blockedKeys, [f.key]);
+    // The collector removes the whole key before the reducer, not one
+    // dimension; an equal response is never allowed to consume later floors.
+    const previous = structuredClone(f.verification.observations);
+    const reduced = evaluateSample({ messages: [], records: new Map(), coverage: {}, binding: f.verification.binding,
+      previous, now: NOW, windowEnd: NOW });
+    assert.deepEqual(reduced.observations[f.key].debts, previous[f.key].debts);
+  }
+});
+
+test('ticket identity, context, complete debt, generation, candidate and error drift fail closed', () => {
+  const mutations = [
+    f => f.metadata.rows[0].record.candidate_present = 1,
+    f => f.metadata.rows[0].record.history_error_present = 1,
+    f => f.metadata.rows[0].record.generation++,
+    f => f.metadata.rows[0].record.generation = null,
+    f => f.metadata.rows[0].ticket.verification_generation = null,
+    f => f.metadata.rows[0].ticket.database_key = 'c'.repeat(64),
+    f => f.metadata.rows[0].ticket.account_key = 'c'.repeat(64),
+    f => f.metadata.rows[0].ticket.finding_key = 'c'.repeat(64),
+    f => f.metadata.rows[0].ticket.record_id++,
+    f => f.metadata.rows[0].ticket.context_fingerprint = 'c'.repeat(64),
+    f => f.metadata.rows[0].ticket.debt_fingerprint = 'c'.repeat(64),
+    f => f.metadata.rows[0].ticket.status = 'ready',
+    f => f.metadata.rows[0].ticket.verification_requested_at_ms = NOW + 1,
+    f => f.metadata.rows[0].scope.enabled = 0,
+    f => f.metadata.source.enabled = 0,
+    f => f.metadata.rows[0].scope.config_json = JSON.stringify({ chat_id: 'synthetic_other' }),
+    f => f.metadata.source.config_json = JSON.stringify({ initial_sync_start_ms: NOW }),
+    f => f.verification.observations[f.key].debts.deleted++,
+  ];
+  for (const mutate of mutations) {
+    const f = ticketFixture(); mutate(f);
+    assert.deepEqual(inspectTicket(f).blockedKeys, [f.key]);
+  }
+});
+
+test('missing queue schema or required ticket is never positive acceptance evidence', () => {
+  const f = ticketFixture();
+  f.metadata.rows[0].ticket = null;
+  assert.deepEqual(inspectTicket(f).blockedKeys, [f.key]);
+  f.verification.requiredKeys = [];
+  assert.deepEqual(inspectTicket(f).blockedKeys, []);
+  f.metadata = { status: 'unavailable', rows: [] };
+  assert.deepEqual(inspectTicket(f).blockedKeys, [f.key]);
+  for (const metadata of [undefined, { status: 'ready', rows: [] }, { status: 'unavailable', rows: [{}] }]) {
+    f.metadata = metadata;
+    assert.throws(() => inspectTicket(f), /remote_sample_coverage_invalid_output/);
+  }
+});
+
+test('verification keys and acquisition clocks are bounded before subprocess', () => {
+  const f = ticketFixture();
+  f.verification.acquisitions[f.key] = NOW + 1;
+  assert.throws(() => inspectRemoteSampleSnapshot('unused', [f.item], { now: () => NOW, verification: f.verification,
+    spawnSync: () => assert.fail('invalid request') }), /remote_sample_coverage_invalid_targets/);
+  f.verification.acquisitions[f.key] = NOW - 1;
+  assert.deepEqual(inspectRemoteSampleSnapshot('unused', [], { now: () => NOW, verification: f.verification,
+    spawnSync: () => assert.fail('no targets') }).verification, { status: 'ready', blockedKeys: [f.key] });
+});
+
+test('real SQLite ready queue without an accepted ticket preserves ordinary positive closure only when fully bound', () => {
+  const f = ticketFixture();
+  f.verification.requiredKeys = [];
+  Object.assign(f.metadata.rows[0].ticket, { status: 'ready', verification_generation: null, verification_requested_at_ms: 0 });
+  const remote = { message_id: f.item.message_id, chat_id: f.item.expected_chat_id,
+    create_time: String(f.item.created_ms), update_time: String(f.item.created_ms), msg_type: 'text',
+    deleted: false, body: { content: '{"text":"synthetic equal body"}' } };
+  const dir = mkdtempSync(join(tmpdir(), 'synthetic-snapshot-ready-'));
+  try {
+    const db = join(dir, 'synthetic.sqlite');
+    const seed = spawnSync('python3', ['-B', '-c', `
+import json,sqlite3,sys
+f=json.load(sys.stdin); m=f['metadata']; row=m['rows'][0]; r=row['record']; scope=row['scope']; ticket=row['ticket']
+c=sqlite3.connect(sys.argv[1])
+c.executescript('''
+CREATE TABLE sources(id TEXT PRIMARY KEY,enabled INTEGER,config_json TEXT);
+CREATE TABLE sync_scopes(id TEXT PRIMARY KEY,source_id TEXT,enabled INTEGER,config_json TEXT);
+CREATE TABLE sync_runs(id INTEGER,source_id TEXT,scope_id TEXT,status TEXT,metadata_json TEXT,cursor_before_json TEXT,cursor_after_json TEXT,started_at TEXT,finished_at TEXT);
+CREATE TABLE lark_im_list_progress(scope_id TEXT);
+CREATE TABLE lark_im_detail_tasks(scope_id TEXT,status TEXT);
+CREATE TABLE records(id INTEGER PRIMARY KEY,external_id TEXT,source_id TEXT,record_type TEXT,container_id TEXT,external_version TEXT,raw_json TEXT,canonical_json TEXT,occurred_at_ms INTEGER,UNIQUE(source_id,external_id));
+CREATE TABLE record_observation_state(record_id INTEGER PRIMARY KEY,generation INTEGER,candidate_json TEXT,history_error TEXT);
+CREATE TABLE lark_im_history_debt(record_id INTEGER PRIMARY KEY,finding_key TEXT UNIQUE,database_key TEXT,account_key TEXT,scope_id TEXT,context_fingerprint TEXT,debt_fingerprint TEXT,verification_generation INTEGER,verification_requested_at_ms INTEGER,status TEXT);
+''')
+c.execute('INSERT INTO sources VALUES(?,?,?)',tuple(m['source'][k] for k in ('id','enabled','config_json')))
+c.execute('INSERT INTO sync_scopes VALUES(?,?,?,?)',tuple(scope[k] for k in ('id','source_id','enabled','config_json')))
+c.execute('INSERT INTO records VALUES(?,?,?,?,?,?,?,?,?)',(r['id'],r['external_id'],r['source_id'],r['record_type'],r['container_id'],f['remote']['update_time'],json.dumps(f['remote']),json.dumps({'source_api':'im.v1.messages'}),r['occurred_at_ms']))
+c.execute('INSERT INTO record_observation_state VALUES(?,?,NULL,NULL)',(r['id'],r['generation']))
+c.execute('INSERT INTO lark_im_history_debt VALUES(?,?,?,?,?,?,?,?,?,?)',tuple(ticket[k] for k in ('record_id','finding_key','database_key','account_key','scope_id','context_fingerprint','debt_fingerprint','verification_generation','verification_requested_at_ms','status')))
+c.commit()
+`, db], { encoding: 'utf8', input: JSON.stringify({ metadata: f.metadata, remote }), timeout: 5000 });
+    assert.equal(seed.status, 0, seed.stderr);
+    const inspect = () => inspectRemoteSampleSnapshot(db, [f.item], { verification: f.verification });
+    const reduce = snapshot => evaluateSample({ messages: snapshot.verification.blockedKeys.includes(f.key) ? [] : [remote],
+      records: snapshot.records, coverage: snapshot.coverage, binding: f.verification.binding,
+      previous: f.verification.observations, now: NOW, windowEnd: NOW });
+    let snapshot = inspect();
+    assert.deepEqual(snapshot.verification.blockedKeys, []);
+    assert.equal(reduce(snapshot).observations[f.key], undefined);
+    f.verification.requiredKeys = [f.key];
+    assert.deepEqual(inspect().verification.blockedKeys, [f.key], 'ready never admits recent fast verification');
+    f.verification.requiredKeys = [];
+    const corrupt = spawnSync('python3', ['-B', '-c',
+      "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE lark_im_history_debt SET context_fingerprint='invalid'\"); c.commit()", db],
+      { encoding: 'utf8', timeout: 5000 });
+    assert.equal(corrupt.status, 0, corrupt.stderr);
+    snapshot = inspect();
+    assert.deepEqual(snapshot.verification.blockedKeys, [f.key]);
+    assert.deepEqual(reduce(snapshot).observations[f.key].debts, f.verification.observations[f.key].debts);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

@@ -35,7 +35,7 @@ function collect({ count = 3, latency = 1, sameWindow = false, pages = 2, previo
     now: () => time, sleep: ms => { time += ms; }, context: () => ({ database_key: binding.database_key }), readBinding: () => { time += overheadMs; return binding; },
     loadInventory: () => rows, pendingVerifications: (_db, remaining) => priority.filter(key => remaining[key] && remaining[key].last_checked < START - 1),
     tryAcquireLease: () => { time += overheadMs; return { state: ++acquisitions === busyAt ? 'busy' : 'acquired', release() {} }; },
-    inspectSnapshot: (_db, targets) => ({ records, coverage: Object.fromEntries(targets.map(target => [target.key,
+    inspectSnapshot: (_db, targets) => ({ verification: { status: 'ready', blockedKeys: [] }, records, coverage: Object.fromEntries(targets.map(target => [target.key,
       { covered: true, details_pending: false, latest_finished_ms: START - 1, reason: 'covered' }])) }),
     spawnSync: (_command, args) => {
       const path = args[2]; const params = JSON.parse(args[args.indexOf('--params') + 1]);
@@ -220,12 +220,16 @@ test('short budgets with real phase overhead alternate domains and do not advanc
 });
 
 
-test('recent-window findings cannot keep requesting exact historical follow-ups', () => {
+test('only validated recent-window tickets enter the bounded known-target route', () => {
   const item = {...message(0),create_time:String(START - 3600000)}; const key = keyFor(item);
   const previous = {[key]:{...observation(item,0),target:Number(item.create_time)}};
   const f = collect({previous,priority:[key]});
   assert.equal(f.result.outcome,'ok'); assert.ok(f.result.observations[key]);
-  assert.equal(f.result.report.history,undefined); assert.equal(f.result.pendingVerification,false);
+  assert.equal(f.result.report.history.scope,'known_verification'); assert.equal(f.result.pendingVerification,false);
+  assert.equal(f.result.historyAttempts.length,1);
+  const unapproved = collect({previous});
+  assert.equal(unapproved.result.report.history,undefined);
+  assert.equal(unapproved.result.pendingVerification,false);
 });
 
 test('the worker idle budget survives background launch and the actual scheduled collector boundary', async t => {

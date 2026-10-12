@@ -493,7 +493,7 @@ def inspect_database(db_path, target_ms):
 
 def validate_sample_targets(payload, now_ms):
     """Accept only bounded caller correlation hashes and received-scope targets."""
-    if not isinstance(payload, dict) or set(payload) != {'targets'}:
+    if not isinstance(payload, dict) or 'targets' not in payload or set(payload) - {'targets', 'verification_keys'}:
         raise ValueError('invalid sample targets')
     targets = payload['targets']
     if not isinstance(targets, list) or len(targets) > SAMPLE_MAX_TARGETS:
@@ -524,6 +524,12 @@ def validate_sample_targets(payload, now_ms):
             if value is None or not MIN_EPOCH_MS <= value <= min(now_ms, MAX_EPOCH_MS):
                 raise ValueError('invalid sample timestamp')
         keys.add(key)
+    if 'verification_keys' in payload:
+        selected = payload['verification_keys']
+        if (not isinstance(selected, list) or len(selected) > SAMPLE_MAX_TARGETS
+                or any(not isinstance(key, str) or key not in keys for key in selected)
+                or len(set(selected)) != len(selected)):
+            raise ValueError('invalid verification keys')
     return targets
 
 
@@ -647,6 +653,72 @@ def sample_records(con, targets, deadline):
     return rows
 
 
+def sample_verification(con, targets, keys, deadline):
+    """Private ticket/context metadata from the SAME record snapshot.
+
+    No option means no additional schema dependency for legacy callers. Missing
+    optional schema is explicit unavailability, never a successful empty queue.
+    The JS bridge applies the existing salted identity/context digest contract.
+    Candidate/error bodies are not needed: only their presence is returned.
+    """
+    needed = {
+        'records': {'id', 'external_id', 'source_id', 'record_type', 'container_id', 'occurred_at_ms'},
+        'record_observation_state': {'record_id', 'generation', 'candidate_json', 'history_error'},
+        'lark_im_history_debt': {'record_id', 'finding_key', 'database_key', 'account_key', 'scope_id',
+                               'context_fingerprint', 'debt_fingerprint', 'verification_generation',
+                               'verification_requested_at_ms', 'status'},
+        'sources': {'id', 'enabled', 'config_json'},
+        'sync_scopes': {'id', 'source_id', 'enabled', 'config_json'},
+    }
+    for table, columns in needed.items():
+        present = {row['name'] for row in con.execute(f'PRAGMA table_info({table})')}
+        if not columns <= present:
+            return {'status': 'unavailable', 'rows': []}
+
+    remaining = SAMPLE_MAX_RECORD_BYTES
+
+    def bounded_rows(query, args):
+        # Bound all text before materializing it, including private configs.
+        # LIMIT 2 also rejects ambiguous identities instead of choosing a row.
+        nonlocal remaining
+        if time.monotonic() >= deadline:
+            raise ValueError('sample deadline exceeded')
+        cursor = con.execute(f'SELECT * FROM ({query}) LIMIT 0', args)
+        names = [column[0] for column in cursor.description]
+        lengths = '+'.join(f'COALESCE(length(CAST("{name}" AS BLOB)),0)' for name in names)
+        size = con.execute(f'SELECT count(*) AS count,COALESCE(sum({lengths}),0) AS bytes FROM ({query})', args).fetchone()
+        if size['count'] > 1 or size['bytes'] > remaining:
+            raise ValueError('sample verification budget or identity conflict')
+        remaining -= size['bytes']
+        rows = [dict(row) for row in con.execute(query, args)]
+        if len(rows) != size['count'] or time.monotonic() >= deadline:
+            raise ValueError('sample verification incomplete')
+        return rows[0] if rows else None
+
+    source = bounded_rows("SELECT id,enabled,config_json FROM sources WHERE id='lark.im' LIMIT 2", ())
+    rows = []
+    selected = set(keys)
+    for target in targets:
+        if target['key'] not in selected:
+            continue
+        record = bounded_rows('''SELECT r.id,r.external_id,r.source_id,r.record_type,r.container_id,r.occurred_at_ms,
+            o.generation AS generation,
+            CASE WHEN o.record_id IS NULL THEN NULL WHEN o.candidate_json IS NULL THEN 0 ELSE 1 END AS candidate_present,
+            CASE WHEN o.record_id IS NULL THEN NULL WHEN o.history_error IS NULL THEN 0 ELSE 1 END AS history_error_present
+            FROM records r LEFT JOIN record_observation_state o ON o.record_id=r.id
+            WHERE r.source_id='lark.im' AND r.external_id=? LIMIT 2''', (target['message_id'],))
+        scope = bounded_rows('SELECT id,source_id,enabled,config_json FROM sync_scopes WHERE id=? LIMIT 2',
+                             (target['scope_id'],))
+        # Include a stale key on this record AND a stale record for this key.
+        # Neither may silently turn into "no ticket" due to a JOIN predicate.
+        ticket = bounded_rows('''SELECT record_id,finding_key,database_key,account_key,scope_id,
+            context_fingerprint,debt_fingerprint,verification_generation,verification_requested_at_ms,status
+            FROM lark_im_history_debt WHERE finding_key=? OR record_id=? LIMIT 2''',
+                              (target['key'], record['id'] if record else None))
+        rows.append({'key': target['key'], 'record': record, 'scope': scope, 'ticket': ticket})
+    return {'status': 'ready', 'source': source, 'rows': rows}
+
+
 def inspect_sample_database(db_path, payload, now_ms=None, after_coverage=None):
     """Read coverage and records in one transaction, with no snapshot handoff.
 
@@ -658,6 +730,7 @@ def inspect_sample_database(db_path, payload, now_ms=None, after_coverage=None):
     deadline = time.monotonic() + SAMPLE_BUDGET_SECONDS
     con = None
     error = None
+    verification = None
     try:
         con = sqlite3.connect(Path(db_path).resolve().as_uri() + '?mode=ro', uri=True, timeout=0.1)
         con.row_factory = sqlite3.Row
@@ -668,6 +741,8 @@ def inspect_sample_database(db_path, payload, now_ms=None, after_coverage=None):
         if after_coverage is not None:
             after_coverage()
         records = sample_records(con, targets, deadline)
+        if 'verification_keys' in payload:
+            verification = sample_verification(con, targets, payload['verification_keys'], deadline)
     except (sqlite3.Error, OSError, ValueError, TypeError, OverflowError):
         reason = 'inspection_budget_exhausted' if time.monotonic() >= deadline else 'readonly_inspection_failed'
         results = {target['key']: sample_result(reason) for target in targets}
@@ -679,6 +754,8 @@ def inspect_sample_database(db_path, payload, now_ms=None, after_coverage=None):
     result = {'kind': 'lark_im_sample_snapshot/v1', 'checked_at_ms': now_ms, 'coverage': results, 'records': records}
     if error is not None:
         result['error'] = error
+    elif verification is not None:
+        result['verification'] = verification
     return result
 
 

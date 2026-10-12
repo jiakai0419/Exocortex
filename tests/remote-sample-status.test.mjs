@@ -68,6 +68,22 @@ test('manual cache-writing check shares scheduler and respects not_due without d
   assert.equal(scheduler,1);assert.equal(result.exit_code,2);assert.equal(result.cache.status,'skipped');assert.equal(result.checks.live.evidence.reason,'not_due');
 });
 
+test('status labels recent known-target evidence without claiming an out-of-window historical visit', () => {
+  const end = Date.parse(freshness().window.end);
+  const history = { scope: 'known_verification', requested: 1, chats_checked: 1, pages: 1, messages_checked: 1,
+    unsupported_chats: 0, truncated_chats: 0, unroutable: 0,
+    window: { start: new Date(end - 3000).toISOString(), end: new Date(end).toISOString() } };
+  const value = report(freshness({ history, sample_count: 5, chat_count: 4 }));
+  assert.equal(value.freshness.status, 'sampled');
+  const text = plain(renderStatusText(value, { columns: 96, stream, detail: true })).replace(/\s+/g, ' ');
+  assert.match(text, /4 current messages \/ 4 chats \+ 1 known target/);
+  assert.match(text, /Known target revisit/); assert.match(text, /Verification window/);
+  assert.doesNotMatch(text, /historical target|Historical revisit/);
+  const invalid = structuredClone(history); invalid.window.end = new Date(end + 1000).toISOString();
+  invalid.window.start = new Date(end - 2000).toISOString();
+  assert.equal(report(freshness({ history: invalid })).freshness.status, 'unknown');
+});
+
 test('one-shot no-cache checks include every local and remote phase in the 60 second child bound',()=>{
   let call;
   const result=runReadOnlyRemoteSample('/synthetic/db',{}, {now:()=>STATUS_SCREEN_NOW,spawnSync:(bin,args,opts)=>{call={args,opts};return{status:null,signal:'SIGKILL'}}});

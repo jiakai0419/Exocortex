@@ -59,9 +59,9 @@ export async function runCheckCommand(options, context, deps = {}) {
       // valid history object from a failed report. Do not invent a partition.
       const scopeVerified = live.reason !== "invalid_evidence" && (!live.history ||
         live.history.messages_checked <= live.probe.remote_messages_checked &&
-        remoteSampleHistoryWithinWindow(live.history, live.window.start));
+        remoteSampleHistoryWithinWindow(live.history, live.window.start, live.window.end));
       const sampleCounts = !scopeVerified ? "sample scope unverified" : live.history
-        ? `${live.probe.remote_messages_checked - live.history.messages_checked} current messages / ${live.probe.hot_chats_found} chats + ${live.history.messages_checked} historical target${live.history.messages_checked === 1 ? "" : "s"}`
+        ? `${live.probe.remote_messages_checked - live.history.messages_checked} current messages / ${live.probe.hot_chats_found} chats + ${live.history.messages_checked} ${live.history.scope === 'known_verification' ? 'known' : 'historical'} target${live.history.messages_checked === 1 ? "" : "s"}`
         : `${live.probe.remote_messages_checked} messages / ${live.probe.hot_chats_found} discovered chats`;
       row("Remote sample", `${status} · ${sampleCounts} · checked ${live.checked_at}`);
       if (live.status !== "healthy" && REMOTE_REASONS.includes(live.reason)) {

@@ -364,6 +364,98 @@ class SampleCoverageTests(unittest.TestCase):
         self.assertFalse(result['coverage'][KEY]['covered'])
         self.assertEqual(result['records'], [])
 
+    def verification_fixture(self):
+        self.record(body='synthetic old body')
+        self.con.executescript('''
+            ALTER TABLE records ADD COLUMN id INTEGER;
+            ALTER TABLE records ADD COLUMN occurred_at_ms INTEGER;
+            CREATE TABLE record_observation_state(record_id INTEGER PRIMARY KEY,generation INTEGER,
+              candidate_json TEXT,history_error TEXT);
+            CREATE TABLE lark_im_history_debt(record_id INTEGER PRIMARY KEY,finding_key TEXT UNIQUE,
+              database_key TEXT,account_key TEXT,scope_id TEXT,context_fingerprint TEXT,debt_fingerprint TEXT,
+              verification_generation INTEGER,verification_requested_at_ms INTEGER,status TEXT);
+        ''')
+        self.con.execute('UPDATE records SET id=1,occurred_at_ms=?', (self.target()['created_ms'],))
+        self.con.execute('INSERT INTO record_observation_state VALUES(1,3,NULL,NULL)')
+        self.con.execute('INSERT INTO lark_im_history_debt VALUES(?,?,?,?,?,?,?,?,?,?)',
+                         (1, KEY, 'a' * 64, 'b' * 64, SCOPE, 'c' * 64, 'd' * 64, 3, END, 'awaiting_verification'))
+        self.con.commit()
+        return {'targets': [self.target()], 'verification_keys': [KEY]}
 
+    def test_verification_is_opt_in_and_missing_schema_is_explicit(self):
+        self.con.commit()
+        legacy = check.inspect_sample_database(self.path, {'targets': [self.target()]}, now_ms=NOW)
+        self.assertNotIn('verification', legacy)
+        missing = check.inspect_sample_database(self.path,
+                    {'targets': [self.target()], 'verification_keys': [KEY]}, now_ms=NOW)
+        self.assertNotIn('error', missing)
+        self.assertEqual(missing['verification'], {'status': 'unavailable', 'rows': []})
+        for keys in [[KEY, KEY], ['unknown'], [False], 'not a list']:
+            with self.assertRaises(ValueError):
+                check.inspect_sample_database(self.path, {'targets': [self.target()], 'verification_keys': keys}, now_ms=NOW)
+
+    def test_verification_record_and_late_ticket_share_the_coverage_wal_snapshot(self):
+        payload = self.verification_fixture()
+        self.con.execute('PRAGMA journal_mode=WAL')
+        self.run_window()
+        self.con.commit()
+
+        def accept_later_generation():
+            with sqlite3.connect(self.path, timeout=0.1) as writer:
+                writer.execute('UPDATE records SET raw_json=?,external_version=?',
+                               (json.dumps({'body': 'synthetic accepted body'}), str(END + 1000)))
+                writer.execute('UPDATE record_observation_state SET generation=4')
+                writer.execute('UPDATE lark_im_history_debt SET verification_generation=4,verification_requested_at_ms=?',
+                               (END + 1000,))
+
+        before = check.inspect_sample_database(self.path, payload, now_ms=NOW, after_coverage=accept_later_generation)
+        self.assertNotIn('error', before)
+        self.assertEqual(before['verification']['status'], 'ready')
+        self.assertIn('synthetic old body', before['records'][0]['raw_json'])
+        row = before['verification']['rows'][0]
+        self.assertEqual((row['record']['generation'], row['ticket']['verification_generation'],
+                          row['ticket']['verification_requested_at_ms']), (3, 3, END))
+        after = check.inspect_sample_database(self.path, payload, now_ms=NOW)
+        self.assertIn('synthetic accepted body', after['records'][0]['raw_json'])
+        row = after['verification']['rows'][0]
+        self.assertEqual((row['record']['generation'], row['ticket']['verification_generation'],
+                          row['ticket']['verification_requested_at_ms']), (4, 4, END + 1000))
+
+    def test_verification_preserves_invalid_ticket_candidate_and_error_metadata(self):
+        payload = self.verification_fixture()
+        self.con.execute("UPDATE record_observation_state SET candidate_json='private candidate',history_error='private error'")
+        self.con.execute("UPDATE lark_im_history_debt SET finding_key=?,status='ready',verification_generation=NULL", ('e' * 64,))
+        self.con.commit()
+        result = check.inspect_sample_database(self.path, payload, now_ms=NOW)
+        self.assertNotIn('error', result)
+        row = result['verification']['rows'][0]
+        self.assertEqual(row['ticket']['finding_key'], 'e' * 64, 'record match cannot hide stale-key ticket')
+        self.assertEqual(row['ticket']['status'], 'ready')
+        self.assertEqual(row['record']['candidate_present'], 1)
+        self.assertEqual(row['record']['history_error_present'], 1)
+        self.assertNotIn('private candidate', json.dumps(result))
+        self.assertNotIn('private error', json.dumps(result))
+        self.con.execute('UPDATE lark_im_history_debt SET finding_key=?,record_id=2', (KEY,))
+        self.con.commit()
+        result = check.inspect_sample_database(self.path, payload, now_ms=NOW)
+        self.assertEqual(result['verification']['rows'][0]['ticket']['record_id'], 2,
+                         'finding-key match cannot hide stale-record ticket')
+
+    def test_verification_ambiguity_and_metadata_size_fail_the_snapshot(self):
+        payload = self.verification_fixture()
+        self.con.execute('UPDATE lark_im_history_debt SET finding_key=?', ('e' * 64,))
+        self.con.execute('INSERT INTO lark_im_history_debt VALUES(?,?,?,?,?,?,?,?,?,?)',
+                         (2, KEY, 'a' * 64, 'b' * 64, SCOPE, 'c' * 64, 'd' * 64, 3, END, 'awaiting_verification'))
+        self.con.commit()
+        result = check.inspect_sample_database(self.path, payload, now_ms=NOW)
+        self.assertEqual(result['error'], 'readonly_inspection_failed')
+        self.assertEqual(result['records'], [])
+        self.con.execute('DELETE FROM lark_im_history_debt WHERE record_id=2')
+        self.con.execute('UPDATE sync_scopes SET config_json=?', (json.dumps({'chat_id': 'synthetic_private_chat',
+                          'large': 'x' * check.SAMPLE_MAX_RECORD_BYTES}),))
+        self.con.commit()
+        result = check.inspect_sample_database(self.path, payload, now_ms=NOW)
+        self.assertEqual(result['error'], 'readonly_inspection_failed')
+        self.assertEqual(result['records'], [])
 if __name__ == '__main__':
     unittest.main()

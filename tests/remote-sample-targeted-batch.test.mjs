@@ -48,7 +48,7 @@ function fixture({ editMessages = ms => ms, mutateBatch = ms => ms, rotation = 0
       }
       return { status: 0, stdout: JSON.stringify({ code: 0,data }) };
     },
-    inspectSnapshot: (_db,targets) => ({ records: editRecords(records), coverage: Object.fromEntries(targets.map(target => [target.key,
+    inspectSnapshot: (_db,targets) => ({ verification: { status: 'ready', blockedKeys: [] }, records: editRecords(records), coverage: Object.fromEntries(targets.map(target => [target.key,
       { covered: snapshotReason === 'covered', reason: snapshotReason, latest_finished_ms: at - 1, details_pending: false }])) }),
   });
   return { result,calls,previous,messages,cooldown,elapsed: at - START };

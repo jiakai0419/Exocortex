@@ -3,7 +3,7 @@
 import { createHash } from 'node:crypto';
 import { activityDatabaseKey } from '../../diagnostics/lark-im-activity-evidence.mjs';
 import { canonical, SAMPLE_POLICY } from '../../diagnostics/remote-sample-core.mjs';
-import { loadPendingHistoryVerifications } from '../../diagnostics/remote-sample-history.mjs';
+import { loadPendingHistoryVerifications, stableVerificationTarget } from '../../diagnostics/remote-sample-history.mjs';
 
 const HASH = /^[a-f0-9]{64}$/;
 export const VERIFICATION_WAKE_GAP_MS = 60_000;
@@ -55,14 +55,14 @@ export function resolveRemoteSampleDue(opts, state, now, cooldowns = {}, deps = 
     if (cooldown > now) return unchanged;
     const databaseKey = deps.databaseKey || activityDatabaseKey;
     if (databaseKey(opts.db) !== state.database_key) return unchanged;
-    const start = Math.floor((now - SAMPLE_POLICY.stableBufferMs) / 60_000) * 60_000 - SAMPLE_POLICY.windowMs;
+    const end = Math.floor((now - SAMPLE_POLICY.stableBufferMs) / 60_000) * 60_000;
     // The existing query rechecks account/source/scope/context/debt identity,
     // record generation and whether this writer ticket was already attempted.
     const pending = (deps.pendingVerifications || loadPendingHistoryVerifications)(opts.db, state.observations,
       { database_key: state.database_key, account_key: state.account_key }, now, deps.ticketDeps || {});
     if (!Array.isArray(pending) || pending.length > SAMPLE_POLICY.observations ||
         new Set(pending).size !== pending.length || pending.some(key => typeof key !== 'string' || !HASH.test(key)) ||
-        !pending.some(key => integer(state.observations[key]?.target) && state.observations[key].target + 2000 < start) ||
+        !pending.some(key => stableVerificationTarget(state.observations[key], end)) ||
         databaseKey(opts.db) !== state.database_key) return unchanged;
     const next = Math.max(state.written_at + VERIFICATION_WAKE_GAP_MS, cooldown);
     if (next >= original) return unchanged;

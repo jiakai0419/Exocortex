@@ -49,6 +49,19 @@ export function selectSampleChats(rows, rotation, now, limit = Number(SAMPLE_POL
 /** Only source-native static bodies have a comparable representation. */
 export function compareSampleMessage(remote, local) { return inspectSampleMessage(remote, local).comparison; }
 
+/** Overlapping list/mget acquisitions may have different transport metadata.
+ * Accept a duplicate only when their message identity, version and body evidence
+ * agree. This is deduplication, never an additional proof of a debt dimension. */
+export function sameSampleMessageAcquisition(a, b) {
+  const evidence = message => ({ id: message.message_id, chat: message.chat_id,
+    created: epoch(message.create_time), version: epoch(message.update_time), type: message.msg_type,
+    deleted: typeof message.deleted === 'boolean' ? message.deleted : null,
+    body: bodyEvidence(message.body?.content) ?? message.body?.content ?? null });
+  const left = evidence(a), right = evidence(b);
+  return left.created !== null && left.version !== null &&
+    JSON.stringify(canonical(left)) === JSON.stringify(canonical(right));
+}
+
 /** Keep the public primary category separate from each independent proof. */
 function inspectSampleMessage(remote, local) {
   const unverified = kind => ({ comparison: { kind, content: 'unverified' }, dimensions: null });

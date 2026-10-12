@@ -36,7 +36,7 @@ function sample({ repaired = false, previous = { [key]: observation() }, at = no
     loadInventory: () => rows, sqliteJson: () => candidates,
     inspectSnapshot: (_db, targets) => {
       for (const target of targets) assert.equal(typeof target.expected_chat_id, 'string');
-      return { records, coverage: Object.fromEntries(targets.map(target => [target.key, { covered: !snapshotReason,
+      return { verification: { status: 'ready', blockedKeys: [] }, records, coverage: Object.fromEntries(targets.map(target => [target.key, { covered: !snapshotReason,
         details_pending: false, latest_finished_ms: at - 1, reason: snapshotReason || 'covered' }])) };
     },
     api: { deadline: at + 55000, count: () => calls, call: (path, params) => {

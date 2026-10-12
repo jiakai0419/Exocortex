@@ -213,7 +213,7 @@ function publicStatusReport(collected, options) {
   const hasHistory = Object.hasOwn(overview.freshness, 'history');
   const history = hasHistory ? safeRemoteSampleHistory(overview.freshness.history) : null;
   const invalidHistory = hasHistory && (!history || count(overview.freshness.sample_count) === null ||
-    history.messages_checked > overview.freshness.sample_count || !remoteSampleHistoryWithinWindow(history, overview.freshness.window?.start) ||
+    history.messages_checked > overview.freshness.sample_count || !remoteSampleHistoryWithinWindow(history, overview.freshness.window?.start, overview.freshness.window?.end) ||
     overview.freshness.status === 'sampled' && (history.unroutable || history.unsupported_chats || history.messages_checked !== history.requested));
   return { schema_version: 1, privacy: options.logs ? "private" : "public-safe", observed_at: new Date(observedAt).toISOString(),
     service: { status: choice(service.status, ["running", "loaded", "absent", "unknown"]), target_match: service.target_match,

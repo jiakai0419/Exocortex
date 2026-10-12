@@ -22,13 +22,13 @@ function fixture(t) {
   sqliteExec(db, `CREATE TABLE sources(id TEXT PRIMARY KEY,enabled INTEGER,config_json TEXT);
     CREATE TABLE sync_scopes(id TEXT PRIMARY KEY,source_id TEXT,enabled INTEGER,config_json TEXT);
     CREATE TABLE records(id INTEGER PRIMARY KEY,external_id TEXT,container_id TEXT,occurred_at_ms INTEGER,source_id TEXT,record_type TEXT);
-    CREATE TABLE record_observation_state(record_id INTEGER PRIMARY KEY,generation INTEGER);
+    CREATE TABLE record_observation_state(record_id INTEGER PRIMARY KEY,generation INTEGER,candidate_json TEXT,history_error TEXT);
     CREATE TABLE lark_im_history_debt(record_id INTEGER PRIMARY KEY,finding_key TEXT,database_key TEXT,account_key TEXT,
       context_fingerprint TEXT,debt_fingerprint TEXT,scope_id TEXT,verification_generation INTEGER,verification_requested_at_ms INTEGER,status TEXT);
     INSERT INTO sources VALUES('lark.im',1,${q(sourceConfig)});
     INSERT INTO sync_scopes VALUES(${q(scope)},'lark.im',1,${q(scopeConfig)});
     INSERT INTO records VALUES(1,${q(id)},${q(chat)},${target},'lark.im','lark.im.message');
-    INSERT INTO record_observation_state VALUES(1,3);`);
+    INSERT INTO record_observation_state VALUES(1,3,NULL,NULL);`);
   const binding = { database_key: activityDatabaseKey(db), account_key: 'b'.repeat(64) };
   const key = digest([binding.database_key, binding.account_key, chat, id, target]);
   const observation = { kind: 'version', target, first_seen: start - 10000, last_seen: start - 10000,
@@ -58,6 +58,8 @@ test('lock-side re-resolution rejects tickets changed after a successful parent 
   const f = fixture(t), unchanged = { next_due: f.state.next_due, wake: null };
   for (const [change, restore] of [
     ['UPDATE record_observation_state SET generation=4', 'UPDATE record_observation_state SET generation=3'],
+    ["UPDATE record_observation_state SET candidate_json='{}'", 'UPDATE record_observation_state SET candidate_json=NULL'],
+    ["UPDATE record_observation_state SET history_error='synthetic'", 'UPDATE record_observation_state SET history_error=NULL'],
     ['UPDATE lark_im_history_debt SET verification_generation=NULL', 'UPDATE lark_im_history_debt SET verification_generation=3'],
     [`UPDATE lark_im_history_debt SET verification_requested_at_ms=${f.start - 10000}`, `UPDATE lark_im_history_debt SET verification_requested_at_ms=${f.start + 1000}`],
     ["UPDATE lark_im_history_debt SET status='ready'", "UPDATE lark_im_history_debt SET status='awaiting_verification'"],
