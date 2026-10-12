@@ -40,7 +40,9 @@ function sample(remote, stored, previous) {
     now: () => NOW, context: () => ({ database_key: binding.database_key }), readBinding: () => binding,
     loadInventory: () => chats.map((chat_id, hot_rank) => ({ id: chatScopeId(chat_id), source_id: 'lark.im', enabled: 1, chat_id, hot_rank })),
     sqliteJson: () => assert.fail('scoped synthetic observations need no legacy DB routing'),
-    inspectSnapshot: (_db, targets) => ({ records, coverage: Object.fromEntries(targets.map(target => [target.key,
+    // This synthetic snapshot has no writer ticket or concurrent generation;
+    // real ticket fences are exercised by the SQLite integration scenarios.
+    inspectSnapshot: (_db, targets) => ({ records, verification: { status: 'ready', blockedKeys: [] }, coverage: Object.fromEntries(targets.map(target => [target.key,
       { covered: true, details_pending: false, latest_finished_ms: NOW - 1, reason: 'covered' }])) }),
     api: { deadline: NOW + 55000, count: () => calls, call(path, params) {
       assert.ok(++calls <= SAMPLE_POLICY.calls);
