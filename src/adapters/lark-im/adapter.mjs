@@ -105,6 +105,7 @@ import {
  *
  * @typedef {object} LarkImAdapter
  * @property {(opts?: AdapterOptions) => SelfProfile} getSelfProfile
+ * @property {(ids: string[], opts?: AdapterOptions) => MessageFetchResult} fetchKnownMessageList
  * @property {import("./name-resolver.mjs").NameResolver["verifySenderName"]} verifySenderName
  * @property {(openIds: unknown[], opts: AdapterOptions, seed?: Map<string, string>) => Map<string, string>} resolveContactNames
  * @property {(chatIdValue: string, openIds: unknown[], opts: AdapterOptions) => Map<string, string>} resolveChatMemberNames
@@ -477,6 +478,30 @@ function createLarkImAdapter({ run = runLark, clock = Date.now } = {}) {
     return { request, normalize, complete };
   }
 
+  /** Exact known identities only. One native mget is not list-window coverage.
+   * Absence, duplicates, extra items and pagination never become source facts.
+   * @param {string[]} ids @param {AdapterOptions} [opts] */
+  function fetchKnownMessageList(ids, opts = {}) {
+    if (!Array.isArray(ids) || ids.length < 1 || ids.length > 6 || new Set(ids).size !== ids.length ||
+        ids.some(id => typeof id !== "string" || !id.trim() || id.length > 512)) throw new Error("invalid known message identities");
+    const data = nativeData(run(["api", "GET", "/open-apis/im/v1/messages/mget", "--as", "user", "--params",
+      JSON.stringify({message_ids:ids,card_msg_content_type:"raw_card_content"}), "--format", "json"],
+    {redactedFlags:["--params"],retries:0,retryDelayMs:0}), "known-messages-mget");
+    if (data.has_more !== undefined && data.has_more !== false || data.page_token != null && data.page_token !== "")
+      throw new Error("incomplete");
+    const items = nativeItems(data,"known-messages-mget"); assertRawMessagePage(items,"known-messages-mget");
+    const byId = new Map(items.map(item => [item.message_id,item]));
+    if (items.length !== ids.length || byId.size !== items.length || ids.some(id => !byId.has(id))) throw new Error("incomplete");
+    if (Buffer.byteLength(JSON.stringify(items)) > 1024*1024) throw new Error("size_limit");
+    /** @type {JsonObject[]} */ const messages=[];
+    /** @type {JsonObject[]} */ const detailRoots=[];
+    for (const id of ids) {
+      const item=/** @type {JsonObject} */(byId.get(id));
+      if(item.msg_type === "merge_forward") detailRoots.push(item); else messages.push(normalizeApiMessage(item));
+    }
+    return {messages,detailRoots,pages:1};
+  }
+
   /** @param {AdapterOptions} [opts] */
   function getSelfProfile(opts = {}) {
     const json = run(["contact", "+get-user", "--as", "user", "--format", "json"], {
@@ -757,6 +782,7 @@ function createLarkImAdapter({ run = runLark, clock = Date.now } = {}) {
     fetchChatDiscoveryPage,
     fetchChatMetadata,
     fetchChatMessages,
+    fetchKnownMessageList,
     fetchSentMessages,
     fetchChatMessageList,
     fetchSentMessageList,

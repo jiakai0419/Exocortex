@@ -43,7 +43,8 @@ function sample(overrides = {}) {
   return {
     outcome: "ok", rotation: 5, observations: {}, cooldownsByOperation: {},
     cacheContext: { account_key: ACCOUNT, auth_identity_verified: true },
-    report: { status: "healthy", reason: "sampled" }, ...overrides,
+    ...overrides,
+    report: { status: "healthy", reason: "sampled", probe: { api_calls: 3, self_calls: 2 }, ...overrides.report },
   };
 }
 function childResult(output = { outcome: "ok", reason: "sampled", next_due: NOW + 900_000 }) {
@@ -56,7 +57,11 @@ function schedulerHarness(settings = {}) {
   const guard = (...args) => {
     calls.guarded.push(args);
     if (settings.guard) return settings.guard({ args, setVisible(value) { visible = value; } });
-    return childResult();
+    const input = JSON.parse(args[2].input);
+    return childResult({ outcome: "ok", reason: "sampled", next_due: NOW + 900_000,
+      budget_receipt: { version: 1, complete: true, attempt_id: input.publication.attemptId,
+        max_cli_attempts: input.collectorOptions.maxApiCalls, max_self_attempts: input.collectorOptions.maxSelfCalls,
+        cli_attempts: 3, self_attempts: 2 } });
   };
   const spawn = (...args) => {
     calls.spawned.push(args);
@@ -79,6 +84,10 @@ function schedulerHarness(settings = {}) {
     publicRemoteReport: value => value, readStableJsonFile: readState,
     REMOTE_SAMPLE_GUARDIAN: "synthetic guardian source; never executed", REMOTE_SAMPLE_TIMEOUT_MS: 60_000,
     runGuardedRemoteSampleProcess: guard, safeGuardianDiagnostic: value => value || null,
+    // Wake/ticket policy has separate tests. These publication fixtures retain
+    // their supplied due value and cannot reach a real database or collector.
+    resolveRemoteSampleDue: (_opts, saved, now) => ({ next_due: saved?.next_due ?? now, wake: null }),
+    MAX_TARGETED_HISTORY: 5,
     createRemoteSamplePublication: (logDir, databaseKey) => createRemoteSamplePublication(logDir, databaseKey, ATTEMPT),
     remoteSamplePublicationStage,
   };
@@ -165,7 +174,10 @@ test("one cache target has a shared lock across database identities and attempts
 
 test("manual and background parents pass the shared lock and exact attempt contract to the guardian", () => {
   const manual = schedulerHarness();
-  assert.equal(manual.api.runScheduledRemoteSample(options(), manual.deps).outcome, "ok");
+  const manualResult = manual.api.runScheduledRemoteSample(options({ maxApiCalls: 5, maxSelfCalls: 2 }), manual.deps);
+  assert.equal(manualResult.outcome, "ok");
+  assert.deepEqual(copy(manualResult.budget_receipt), { version: 1, complete: true,
+    max_cli_attempts: 5, max_self_attempts: 2, cli_attempts: 3, self_attempts: 2 });
   const [, , guardedOptions] = manual.calls.guarded[0];
   assert.equal(guardedOptions.guardianPrefix[2], publication().lockPath);
   assert.deepEqual(JSON.parse(guardedOptions.env.EXOCORTEX_REMOTE_SAMPLE_PUBLICATION), publication());
@@ -226,6 +238,8 @@ test("attempt reports prepared only after a completed write to its own stage", a
   const result = await harness.api.executeRemoteSampleAttempt(options(), harness.deps);
   assert.equal(result.outcome, "ok");
   assert.equal(result.cachePrepared, true);
+  assert.deepEqual(copy(result.budget_receipt), { version: 1, complete: true, attempt_id: publication().attemptId,
+    max_cli_attempts: 12, max_self_attempts: 6, cli_attempts: 3, self_attempts: 2 });
   assert.equal(harness.calls.stages.length, 1);
   assert.equal(harness.calls.stages[0].path, publication().stagePath);
   assert.notEqual(harness.calls.stages[0].path, publication().cachePath);

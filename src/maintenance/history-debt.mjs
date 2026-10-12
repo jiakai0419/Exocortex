@@ -97,7 +97,7 @@ export function readHistoryDebtSchedule(db, loaded, now, deps = {}) {
   const queue = mergeHistoryDebtHints(loaded.hints, previous);
   const due = queue.filter(row => row.status === 'ready' && row.next_due_at_ms <= now)
     .sort((a,b) => (a.last_attempt_at_ms || a.enqueued_at_ms) - (b.last_attempt_at_ms || b.enqueued_at_ms) || a.enqueued_at_ms - b.enqueued_at_ms || a.record_id - b.record_id);
-  return { scheduler, queue, previous, selected: scheduler.priority_streak < 2 ? due[0] || null : null,
+  return { scheduler, queue, previous, due, selected: scheduler.priority_streak < 2 ? due[0] || null : null,
     hints: loaded.hints, reason: loaded.reason };
 }
 
@@ -167,4 +167,28 @@ export function readHistoryFairRound(db, scheduler, deps = {}) {
     Number(a.last_attempt_at_ms >= enrollment.get(a.scope_id)) - Number(b.last_attempt_at_ms >= enrollment.get(b.scope_id)) || a.scope_id.localeCompare(b.scope_id));
   return { reason: 'ready', eligibleScopeIds: eligible.map(row => row.scope_id),
     state: { beforeRound: scheduler.fair_round || 0, nextRound: round, previous, baselines } };
+}
+
+/** A bounded prefetch hint, never a scheduler. The real selector is re-run
+ * before every commit; a miss discards the remaining in-memory acquisition.
+ * No predicted result advances a queue or a fair checkpoint.
+ */
+export function readHistoryCandidatePool(db, selection, limit, readFairTargets) {
+  const {target,schedule}=selection;
+  const ordinary = item => {
+    if (!item || item.checkpoint.detailTask) return false;
+    try { return JSON.parse(item.record.raw_json)?.msg_type !== 'merge_forward'; }
+    catch { return false; } // A corrupt hint cannot pin a valid live selection.
+  };
+  const pool=[], seen=new Set();
+  const add=item=>{if(pool.length<limit && ordinary(item) && !seen.has(item.record.id)) {seen.add(item.record.id);pool.push(item);}};
+  add(target);
+  const priority=schedule.due.slice(0,Math.min(4,Math.ceil(limit*2/3)));
+  for(const hint of priority) add(selectHistoryDebtTarget(db,hint));
+  const scopes=schedule.fairRound.eligibleScopeIds?.slice(0,limit) || [null];
+  const frontiers=scopes.map(scope=>readFairTargets(scope,limit));
+  // One head per eligible scope first; additional rows let a single long scope
+  // benefit too. Every read remains inside its current fixed sweep horizon.
+  for(let depth=0;depth<limit && pool.length<limit;depth++) for(const rows of frontiers) add(rows[depth]);
+  return pool;
 }

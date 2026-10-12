@@ -9,6 +9,7 @@ import ast
 import base64
 import builtins
 import errno
+import hashlib
 import io
 import json
 import posixpath
@@ -592,9 +593,11 @@ fake_time = types.SimpleNamespace(monotonic=lambda: state["elapsed"],
     time=lambda: scenario.get("wall_now_ms", 1800000000000) / 1000.0 + state["elapsed"], sleep=sleep)
 replacement = {"os": fake_os, "signal": fake_signal, "subprocess": fake_subprocess,
                "sys": fake_sys, "time": fake_time}
-# Reject dependencies before execution. Even a new nested import must use a
-# fake module; imports cannot fall through to real process or filesystem APIs.
-allowed = {**replacement, "json": json, "re": re, "stat": stat, "base64": base64}
+# Reject dependencies before execution, including nested imports. Only the
+# pure SHA256 constructor is exposed from hashlib; process/filesystem imports
+# still resolve exclusively to the fake modules and cannot fall through.
+allowed = {**replacement, "json": json, "re": re, "stat": stat, "base64": base64,
+           "hashlib": types.SimpleNamespace(sha256=hashlib.sha256)}
 tree = ast.parse(request["code"], "<mock-" + mode + ">")
 for node in ast.walk(tree):
     if isinstance(node, ast.Import):

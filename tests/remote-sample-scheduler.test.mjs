@@ -106,8 +106,8 @@ test('successful sample persists private rotation/account/observations and exact
   assert.equal(f.options().accountKey, ACCOUNT);
   assert.deepEqual(f.options().previousObservations, { [OBS_KEY]: observation() });
   assert.equal(f.options().cacheTtlMs, 1_800_000);
-  assert.equal(f.options().maxApiCalls, 12); assert.equal(f.options().minApiGapMs, 1000);
-  assert.equal(f.options().totalTimeoutMs, 55_000);
+  assert.equal(f.options().maxApiCalls, 12); assert.equal(f.options().maxSelfCalls, 6);
+  assert.equal(f.options().remoteSampleBudgetMs, 55_000);
 });
 
 test('30-minute cadence passes a one-hour TTL without changing the request budget', async t => {
@@ -470,7 +470,7 @@ test('unavailable binding cannot erase debt while leaving the old account namesp
 test('manual cache-writing sample shares due gate and only returns a sanitized report', async t => {
   const f = fixture(t); let options;
   const sampled = runManualRemoteSample(f.opts, { nowMs: f.now, collectorOptions: {
-    startMs: START - 3_600_000, endMs: START - 900_000, hotChats: 1, messagesPerChat: 2, maxApiCalls: 999,
+    startMs: START - 3_600_000, endMs: START - 900_000, hotChats: 1, messagesPerChat: 2, maxApiCalls: 5, maxSelfCalls: 2,
   }, spawnSync: (_command, _args, processOptions) => {
     options = JSON.parse(processOptions.input);
     return { status: 0, stdout: JSON.stringify({ outcome: 'ok', reason: 'sampled', cacheWritten: true, report: {
@@ -478,7 +478,7 @@ test('manual cache-writing sample shares due gate and only returns a sanitized r
     } }) };
   } });
   assert.equal(options.returnReport, true); assert.equal(options.collectorOptions.hotChats, 1);
-  assert.equal(options.collectorOptions.maxApiCalls, undefined); assert.equal(sampled.cacheWritten, true);
+  assert.equal(options.collectorOptions.maxApiCalls, 5); assert.equal(options.collectorOptions.maxSelfCalls, 2); assert.equal(sampled.cacheWritten, true);
   assert.doesNotMatch(JSON.stringify(sampled), /SYNTHETIC|"observations":|"body":/);
   await executeRemoteSampleAttempt(f.opts, f.deps);
   assert.equal(runManualRemoteSample(f.opts, { nowMs: f.now, spawnSync: () => { throw Error('must not spawn'); } }).outcome, 'not_due');

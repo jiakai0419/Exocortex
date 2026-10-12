@@ -119,6 +119,8 @@ export type BoundedReplayOptions = {
         selectedId: number;
         nextSweepMaxId: number;
         startedAtMs: number;
+        /** Read after remote acquisition at commit entry; optional for old callers. */
+        commitReadyAtMs?: number;
         error: string | null;
         requestBudget: Record<string, number | string | null>;
         scheduling?: {

@@ -74,10 +74,57 @@ def remote_sample_cache_pass_fds():
     if sample_cache_identity(info)!=sample_cache_identity(os.stat(value['lockPath'],follow_symlinks=False)):
         raise ValueError('cache lock changed')
     return (fd,)
+def sample_cache_canonical_value(value):
+    # Match JSON.parse + JSON.stringify for the schedule's ASCII, safe-integer
+    # domain, including integer-valued decimal/exponent spellings and -0.
+    # Bool is deliberately handled before int: Python bool subclasses int.
+    if value is None or type(value) is bool: return value
+    if type(value) is str and value.isascii(): return value
+    if type(value) in (int,float):
+        if not -9007199254740991<=value<=9007199254740991 or type(value) is float and not value.is_integer():
+            raise ValueError('wake integer')
+        return int(value)
+    if type(value) is dict and all(type(key) is str and key.isascii() for key in value):
+        return {key:sample_cache_canonical_value(value[key]) for key in sorted(value)}
+    raise ValueError('wake canonical value')
+def sample_cache_wake_hint():
+    raw=os.environ.get('EXOCORTEX_REMOTE_SAMPLE_WAKE')
+    if not raw or len(raw)>512: return None
+    try:
+        hint=sample_cache_canonical_value(json.loads(raw))
+        if type(hint) is not dict or set(hint)!={'state_hash','not_before'} or type(hint['state_hash']) is not str or re.fullmatch(r'[a-f0-9]{64}',hint['state_hash']) is None:
+            return None
+        if type(hint['not_before']) is not int or not 0<=hint['not_before']<=9007199254740991: return None
+        return hint
+    except (ValueError,TypeError,OverflowError,RecursionError): return None
+def sample_cache_wake_allowed(state,hint,now):
+    # This hint admits only the existing JS child, which must revalidate its DB
+    # ticket under this same scheduler lock. It is not API or fact authority.
+    # Admission lets prepare replace the old cache with unavailable before JS
+    # runs. If its DB ticket has gone away, inner not_due need not restore that
+    # old cache and must never be reported as a successful independent sample.
+    if hint is None: return False
+    try:
+        state=sample_cache_canonical_value(state)
+        required={'kind','database_key','account_key','written_at','next_due','failures','rotation','observations','last_outcome','cooldowns','blocked_reason'}
+        if type(state) is not dict or set(state) not in (required,required|{'observation_overflow'}): return False
+        if 'observation_overflow' in state and type(state['observation_overflow']) is not bool: return False
+        if state['last_outcome']!='ok' or type(state['failures']) is not int or state['failures']!=0 or state['blocked_reason'] is not None: return False
+        if type(state['account_key']) is not str or re.fullmatch(r'[a-f0-9]{64}',state['account_key']) is None: return False
+        if type(state['rotation']) is not int or not 0<=state['rotation']<=1000000000 or type(state['observations']) is not dict: return False
+        written=state['written_at']
+        if hint['not_before']<written+60000 or now<max([written+60000,hint['not_before'],*state['cooldowns'].values()]): return False
+        # Imported only for a complete wake hint; ordinary due gates and their
+        # existing pure-OS substitutes do not gain an extra dependency.
+        import hashlib
+        canonical=json.dumps(state,sort_keys=True,separators=(',',':'),ensure_ascii=False,allow_nan=False).encode('utf-8')
+        return hashlib.sha256(canonical).hexdigest()==hint['state_hash']
+    except (ValueError,TypeError,OverflowError,RecursionError): return False
 def sample_cache_due(value):
     # The parent's precheck may be stale by the time this shared flock is
-    # acquired. This read-only header gate can only skip work; the worker's
-    # existing JavaScript validator remains authoritative for actual attempts.
+    # acquired. Default not_due remains a read-only skip. A wake bound to the
+    # same healthy state may admit JS, whose validator/ticket check remains
+    # authoritative for actual attempts.
     directory_fd=state_fd=None
     try:
         directory=os.path.dirname(value['statePath'])
@@ -110,6 +157,10 @@ def sample_cache_due(value):
         directory_fd=None
         os.close(finished_fd)
         state=json.loads(data)
+        hint=sample_cache_wake_hint()
+        if hint is not None:
+            try: state=sample_cache_canonical_value(state)
+            except (ValueError,TypeError,OverflowError,RecursionError): pass
         now=int(time.time()*1000)
         if type(state) is not dict or state.get('kind')!='lark_im_remote_sample_schedule/v1' or state.get('database_key')!=name[:-5]:
             raise ValueError('sample schedule header')
@@ -122,6 +173,7 @@ def sample_cache_due(value):
             raise ValueError('sample schedule cooldown')
         if due>max([written+21600000,*cooldowns.values()]): raise ValueError('sample schedule time')
         if due>now:
+            if sample_cache_wake_allowed(state,hint,now): return None
             return {'outcome':'not_due','reason':'not_due','next_due':due,'cooldownsByOperation':{},'cachePrepared':False}
         return None
     finally:

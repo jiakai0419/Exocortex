@@ -12,6 +12,10 @@ import { invalidateRemoteSampleCache, publicRemoteReport } from "../../diagnosti
 import { readStableJsonFile } from "../../diagnostics/private-json-file.mjs";
 import { REMOTE_SAMPLE_GUARDIAN, REMOTE_SAMPLE_TIMEOUT_MS, runGuardedRemoteSampleProcess, safeGuardianDiagnostic } from "./remote-sample-process.mjs";
 import { createRemoteSamplePublication, remoteSamplePublicationStage } from "./remote-sample-cache-gate.mjs";
+import { resolveRemoteSampleDue } from "./remote-sample-wake.mjs";
+import { MAX_TARGETED_HISTORY } from "../../diagnostics/remote-sample-history.mjs";
+
+export { resolveRemoteSampleDue };
 
 export { REMOTE_SAMPLE_GUARDIAN, REMOTE_SAMPLE_TIMEOUT_MS };
 export const REMOTE_SAMPLE_MAX_BACKOFF_MS = 6 * 60 * 60_000;
@@ -50,7 +54,7 @@ except Exception:
 /** @typedef {{first_seen:number,last_seen:number,run_finished:number,target:number,kind:'missing'|'version'|'content',scope_hash?:string,last_checked?:number,debts?:Record<string,number>}} Observation */
 /** @typedef {Record<string, Observation>} Observations */
 /** @typedef {{kind:string,database_key:string,account_key:string|null,written_at:number,next_due:number,failures:number,rotation:number,observations:Observations,observation_overflow?:boolean,last_outcome:string,cooldowns:Record<string,number>,blocked_reason:string|null}} ScheduleState */
-/** @typedef {{db:string,logDir:string,remoteSampleIntervalSeconds?:number,remoteSampleBudgetMs?:number,publication?:Record<string,any>}} ScheduleOptions */
+/** @typedef {{db:string,logDir:string,remoteSampleIntervalSeconds?:number,remoteSampleBudgetMs?:number,maxApiCalls?:number,maxSelfCalls?:number,publication?:Record<string,any>}} ScheduleOptions */
 
 function plainObject(value) { return Boolean(value && typeof value === "object" && !Array.isArray(value)); }
 function integer(value) { return typeof value === "number" && Number.isSafeInteger(value) && value >= 0; }
@@ -175,13 +179,64 @@ function invalidateAttempt(opts, deps, reason) {
 }
 
 function boundedCollectorOptions(value = {}) {
+  for (const [key, maximum] of [["maxApiCalls", 12], ["maxSelfCalls", 6]]) {
+    if (Object.hasOwn(value, key) && (!integer(value[key]) || value[key] < 1 || value[key] > maximum)) throw new Error("invalid sample budget");
+  }
+  if (Object.hasOwn(value, "remoteSampleBudgetMs") && (!integer(value.remoteSampleBudgetMs) ||
+      value.remoteSampleBudgetMs < 1000 || value.remoteSampleBudgetMs > 55000)) throw new Error("invalid sample duration");
   return { ...Object.fromEntries(["startMs", "endMs", "hotChats", "messagesPerChat"].filter(key => integer(value[key])).map(key => [key, value[key]])),
-    ...(integer(value.remoteSampleBudgetMs) && value.remoteSampleBudgetMs >= 1000 && value.remoteSampleBudgetMs <= 55000
-      ? { remoteSampleBudgetMs: value.remoteSampleBudgetMs } : {}) };
+    maxApiCalls: value.maxApiCalls ?? 12, maxSelfCalls: value.maxSelfCalls ?? 6,
+    remoteSampleBudgetMs: value.remoteSampleBudgetMs ?? 55000 };
 }
 function collectorOptionsFor(opts, deps) {
   return boundedCollectorOptions({ ...deps.collectorOptions,
+    ...(opts.maxApiCalls === undefined ? {} : { maxApiCalls: opts.maxApiCalls }),
+    ...(opts.maxSelfCalls === undefined ? {} : { maxSelfCalls: opts.maxSelfCalls }),
     ...(opts.remoteSampleBudgetMs === undefined ? {} : { remoteSampleBudgetMs: opts.remoteSampleBudgetMs }) });
+}
+
+/** Counts are admission evidence, never a public-report projection. Unknown
+ * counters cannot become zero and cannot refund a parent's reserved allowance. */
+function budgetReceipt(options, publication, cli, self) {
+  const maxCli = options.maxApiCalls ?? 12, maxSelf = options.maxSelfCalls ?? 6;
+  if (!integer(cli) || !integer(self) || self > cli || cli > maxCli || self > maxSelf ||
+      typeof publication?.attemptId !== "string") return null;
+  return { version: 1, complete: true, attempt_id: publication.attemptId,
+    max_cli_attempts: maxCli, max_self_attempts: maxSelf, cli_attempts: cli, self_attempts: self };
+}
+
+function verifiedBudgetReceipt(receipt, options, publication) {
+  if (!exactKeys(receipt, ["version", "complete", "attempt_id", "max_cli_attempts", "max_self_attempts", "cli_attempts", "self_attempts"]) ||
+      receipt.version !== 1 || receipt.complete !== true || receipt.attempt_id !== publication.attemptId ||
+      receipt.max_cli_attempts !== (options.maxApiCalls ?? 12) || receipt.max_self_attempts !== (options.maxSelfCalls ?? 6)) return null;
+  const checked = budgetReceipt(options, publication, receipt.cli_attempts, receipt.self_attempts);
+  if (!checked) return null;
+  const { attempt_id, ...safe } = checked;
+  return safe;
+}
+
+function zeroBudget(options) {
+  return { version: 1, complete: true, max_cli_attempts: options.maxApiCalls ?? 12,
+    max_self_attempts: options.maxSelfCalls ?? 6, cli_attempts: 0, self_attempts: 0 };
+}
+
+/** Scheduling hint only. Both the guardian and locked JS child recheck due
+ * state; this function never authorizes a source request or a positive fact. */
+export function readScheduledRemoteSampleAdmission(opts, deps = {}) {
+  try {
+    const interval = intervalMs(opts);
+    if (interval === 0) return result("disabled", "disabled");
+    if (interval === null) return result("failed", "invalid_interval");
+    const now = (deps.nowMs || Date.now)();
+    const databaseKey = (deps.databaseKey || activityDatabaseKey)(opts.db);
+    if (!databaseKey) return result("failed", "database_unavailable");
+    const loaded = readRemoteSampleState(remoteSamplePaths(opts.logDir, databaseKey).state, databaseKey, now);
+    const inherited = safeCooldowns(deps.cooldownsByOperation || {}, now);
+    if (loaded.status === "invalid" || loaded.state?.blocked_reason || !inherited) return result("failed", "state_invalid");
+    const cooldowns = mergeCooldowns(loaded.state?.cooldowns || {}, inherited, now);
+    const due = resolveRemoteSampleDue(opts, loaded.state, now, cooldowns, deps);
+    return result(due.next_due > now ? "not_due" : "due", due.next_due > now ? "not_due" : "sample_due", due.next_due, cooldowns);
+  } catch { return result("failed", "scheduler_unavailable"); }
 }
 
 /** Restore shared transport cooldowns before the worker's first sync cycle. */
@@ -213,7 +268,8 @@ export function startScheduledRemoteSample(opts, deps = {}) {
     const inherited = safeCooldowns(deps.cooldownsByOperation || {}, now);
     if (!inherited) return failed("state_invalid");
     const cooldowns = mergeCooldowns(loaded.state?.cooldowns || {}, inherited, now);
-    const nextDue = loaded.state?.next_due ?? deps.notBeforeIfMissing ?? now;
+    const due = resolveRemoteSampleDue(opts, loaded.state, now, cooldowns, deps);
+    const nextDue = loaded.state ? due.next_due : Math.max(due.next_due, deps.notBeforeIfMissing ?? now);
     if (nextDue > now) return result("not_due", "not_due", nextDue, cooldowns);
     secureDirectory(paths.directory);
     const publication = createRemoteSamplePublication(opts.logDir, databaseKey);
@@ -224,6 +280,7 @@ export function startScheduledRemoteSample(opts, deps = {}) {
     const child = (deps.spawn || spawn)(python, ["-c", REMOTE_SAMPLE_LOCK_WRAPPER, paths.lock, python,
       "-c", REMOTE_SAMPLE_GUARDIAN, String(process.pid), String(REMOTE_SAMPLE_TIMEOUT_MS), deps.execPath || process.execPath, deps.scriptPath || MAIN_PATH], {
       stdio: "ignore", detached: true, env: { ...process.env, EXOCORTEX_REMOTE_SAMPLE_INPUT: input, EXOCORTEX_REMOTE_SAMPLE_CAPTURE: "0",
+        EXOCORTEX_REMOTE_SAMPLE_WAKE: due.wake ? JSON.stringify(due.wake) : "",
         EXOCORTEX_REMOTE_SAMPLE_PUBLICATION: JSON.stringify(publication) },
     });
     // No pipe callbacks or timers are needed by the synchronous worker loop.
@@ -267,6 +324,7 @@ export function runScheduledRemoteSample(opts, deps = {}) {
     return { ...result("failed", reason), ...(safe ? { guardian_diagnostic: safe } : {}) };
   };
   try {
+    const collectorOptions = collectorOptionsFor(opts, deps);
     const interval = intervalMs(opts);
     if (interval === 0) return result("disabled", "disabled");
     if (interval === null) return failed("invalid_interval");
@@ -279,16 +337,31 @@ export function runScheduledRemoteSample(opts, deps = {}) {
     const inherited = safeCooldowns(deps.cooldownsByOperation || {}, now);
     if (!inherited || loaded.state?.blocked_reason) return failed("state_invalid");
     const cooldowns = mergeCooldowns(loaded.state?.cooldowns || {}, inherited, now);
-    if (loaded.state && loaded.state.next_due > now) return result("not_due", "not_due", loaded.state.next_due, cooldowns);
+    const due = resolveRemoteSampleDue(opts, loaded.state, now, cooldowns, deps);
+    if (due.next_due > now) return { ...result("not_due", "not_due", due.next_due, cooldowns), budget_receipt: zeroBudget(collectorOptions) };
     secureDirectory(paths.directory);
     const publication = createRemoteSamplePublication(opts.logDir, databaseKey);
     const python = deps.pythonPath || "python3";
+    let guardianDeps = deps;
+    if (typeof deps.remainingTimeMs === "function") {
+      // A process-local performance.now() value cannot cross a process boundary.
+      // Keep the admission deadline in the parent and grant only its remaining
+      // duration. Existing cleanup grace uses the worker's interval-5 headroom;
+      // it is measured as idle work and never becomes another request budget.
+      const remaining = Math.floor(deps.remainingTimeMs());
+      if (!Number.isSafeInteger(remaining) || remaining < 1000) return {
+        ...result("not_due", "not_due", due.next_due, cooldowns), budget_receipt: zeroBudget(collectorOptions) };
+      const timeoutMs = Math.min(REMOTE_SAMPLE_TIMEOUT_MS, remaining);
+      collectorOptions.remoteSampleBudgetMs = Math.min(collectorOptions.remoteSampleBudgetMs ?? 55000, timeoutMs);
+      guardianDeps = { ...deps, timeoutMs };
+    }
     const child = runGuardedRemoteSampleProcess(deps.execPath || process.execPath, [deps.scriptPath || MAIN_PATH], {
       guardianPrefix: ["-c", REMOTE_SAMPLE_LOCK_WRAPPER, paths.lock, python],
-      env: { ...process.env, EXOCORTEX_REMOTE_SAMPLE_PUBLICATION: JSON.stringify(publication) },
+      env: { ...process.env, EXOCORTEX_REMOTE_SAMPLE_PUBLICATION: JSON.stringify(publication),
+        EXOCORTEX_REMOTE_SAMPLE_WAKE: due.wake ? JSON.stringify(due.wake) : "" },
       input: JSON.stringify({ db: resolve(opts.db), logDir: resolve(opts.logDir), remoteSampleIntervalSeconds: interval / 1000, cooldownsByOperation: cooldowns,
-        collectorOptions: collectorOptionsFor(opts, deps), returnReport: deps.returnReport === true, publication }),
-    }, deps);
+        collectorOptions, returnReport: deps.returnReport === true, publication }),
+    }, guardianDeps);
     if (child.guardian_diagnostic || child.error || child.signal) return failed("sample_process_failed", child.guardian_diagnostic);
     let output;
     try { output = JSON.parse(String(child.stdout || "")); } catch { return failed("sample_process_failed"); }
@@ -298,7 +371,17 @@ export function runScheduledRemoteSample(opts, deps = {}) {
     if (!reasons.has(output.reason)) return failed("sample_process_failed");
     const observed = safeCooldowns(output.cooldownsByOperation || {}, (deps.nowMs || Date.now)());
     if (!observed) return failed("state_invalid");
+    // The guardian has completed cleanup/publication with a zero exit. Only a
+    // matching private attempt receipt can refund a reservation. These two
+    // exact pre-child skip frames are also known to have made no API request.
+    const receipt = verifiedBudgetReceipt(output.budget_receipt, collectorOptions, publication) ||
+      ((exactKeys(output, ["outcome", "reason", "next_due", "cooldownsByOperation", "cachePrepared"]) &&
+        output.outcome === "not_due" && output.reason === "not_due" && output.cachePrepared === false &&
+        integer(output.next_due) && exactKeys(output.cooldownsByOperation, []) ||
+        exactKeys(output, ["outcome", "reason"]) && output.outcome === "busy" && output.reason === "scheduler_busy")
+        ? zeroBudget(collectorOptions) : null);
     return { ...result(output.outcome, output.reason, integer(output.next_due) ? output.next_due : null, mergeCooldowns(cooldowns, observed, now)),
+      ...(receipt ? { budget_receipt: receipt } : {}),
       ...(deps.returnReport === true && output.report ? { report: publicRemoteReport(output.report), cacheWritten: output.cacheWritten === true } : {}) };
   } catch { return failed("scheduler_unavailable"); }
 }
@@ -319,7 +402,10 @@ export function nextRemoteSampleDue({ finished, ok, busy, interval, backoff, pen
  * synthetic collector; this function never writes the business database.
  * @param {ScheduleOptions} opts */
 export async function executeRemoteSampleAttempt(opts, deps = {}) {
-  const failed = (reason) => { invalidateAttempt(opts, deps, reason); return { ...result("failed", reason), cachePrepared: false }; };
+  const collectorOptions = collectorOptionsFor(opts, deps);
+  let receipt = budgetReceipt(collectorOptions, opts.publication, 0, 0);
+  const failed = (reason) => { invalidateAttempt(opts, deps, reason); return { ...result("failed", reason), cachePrepared: false,
+    ...(receipt ? { budget_receipt: receipt } : {}) }; };
   const nowMs = deps.nowMs || Date.now;
   const dbKey = deps.databaseKey || activityDatabaseKey;
   const interval = intervalMs(opts);
@@ -333,12 +419,14 @@ export async function executeRemoteSampleAttempt(opts, deps = {}) {
   const loaded = readRemoteSampleState(paths.state, databaseKey, started);
   if (loaded.status === "invalid") return failed("state_invalid");
   if (loaded.state?.blocked_reason) return failed("state_invalid");
-  if (loaded.state && loaded.state.next_due > started) return { ...result("not_due", "not_due", loaded.state.next_due), cachePrepared: false };
   const previous = loaded.state || { kind: STATE_KIND, database_key: databaseKey, written_at: started,
     next_due: started, failures: 0, rotation: 0, observations: {}, observation_overflow: false, last_outcome: "ok", cooldowns: {}, account_key: null, blocked_reason: null };
   const inherited = safeCooldowns(deps.cooldownsByOperation || {}, started);
   if (!inherited) return failed("state_invalid");
   const cooldowns = mergeCooldowns(previous.cooldowns, inherited, started);
+  const due = resolveRemoteSampleDue(opts, loaded.state, started, cooldowns, deps);
+  if (due.next_due > started) return { ...result("not_due", "not_due", due.next_due), cachePrepared: false,
+    ...(receipt ? { budget_receipt: receipt } : {}) };
   const failures = Math.min(64, previous.failures + 1);
   const backoff = Math.min(REMOTE_SAMPLE_MAX_BACKOFF_MS, MIN_INTERVAL_MS * 2 ** Math.min(5, failures - 1));
   const reserved = { ...previous, failures, cooldowns, last_outcome: "attempting", written_at: started, next_due: started + backoff };
@@ -350,10 +438,12 @@ export async function executeRemoteSampleAttempt(opts, deps = {}) {
   let sampled;
   try {
     const collect = deps.collect || (await import("../../diagnostics/remote-sample.mjs")).collectRemoteSample;
-    sampled = await collect(opts.db, { ...collectorOptionsFor(opts, deps), rotation: previous.rotation, previousObservations: previous.observations,
+    receipt = null;
+    sampled = await collect(opts.db, { ...collectorOptions, rotation: previous.rotation, previousObservations: previous.observations,
       previousOverflow: previous.observation_overflow === true,
       accountKey: previous.account_key, cooldownsByOperation: cooldowns,
-      maxApiCalls: 12, minApiGapMs: 1000, totalTimeoutMs: 55_000, cacheTtlMs: Math.max(30 * 60_000, interval * 2) });
+      cacheTtlMs: Math.max(30 * 60_000, interval * 2) });
+    receipt = budgetReceipt(collectorOptions, opts.publication, sampled?.report?.probe?.api_calls, sampled?.report?.probe?.self_calls);
   } catch { sampled = { outcome: "failed" }; }
   const finished = nowMs();
   if (!integer(finished) || finished < started) return failed("state_invalid");
@@ -368,7 +458,7 @@ export async function executeRemoteSampleAttempt(opts, deps = {}) {
   // attempts may advance only scheduling metadata for an existing same-account
   // observation; they can never add, resolve, reroute or refresh its evidence.
   const suppliedAttempts = sampled.historyAttempts ?? (sampled.historyAttempt ? [sampled.historyAttempt] : []);
-  const attempts = Array.isArray(suppliedAttempts) && suppliedAttempts.length <= 3 &&
+  const attempts = Array.isArray(suppliedAttempts) && suppliedAttempts.length <= MAX_TARGETED_HISTORY &&
     new Set(suppliedAttempts.map(attempt => attempt?.key)).size === suppliedAttempts.length ? suppliedAttempts : [];
   const attemptedObservations = { ...previous.observations };
   for (const attempted of attempts) {
@@ -419,5 +509,6 @@ export async function executeRemoteSampleAttempt(opts, deps = {}) {
     }
   }
   return { ...result(ok ? "ok" : busy ? "busy" : "failed", ok ? "sampled" : busy ? "sync_busy" : "sample_failed", finalState.next_due, finalCooldowns), cachePrepared: cacheWritten,
+    ...(receipt ? { budget_receipt: receipt } : {}),
     ...(deps.returnReport === true && sampled?.report ? { report: publicRemoteReport(sampled.report), cacheWritten } : {}) };
 }

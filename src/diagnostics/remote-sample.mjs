@@ -1,6 +1,7 @@
 import { fileURLToPath } from 'node:url';
 // @ts-check
 import { spawnSync } from 'node:child_process';
+import { performance } from 'node:perf_hooks';
 import { readOnlySqliteJson } from '../storage/sqlite/readonly-query.mjs';
 import { liveProbeContext } from './live-probe-cache.mjs';
 import { nativePage, nativeData, assertRawMessagePage } from '../adapters/lark-im/adapter.mjs';
@@ -9,7 +10,7 @@ import { tryAcquireLarkApiLease, readSharedLarkCooldown, writeSharedLarkCooldown
 import { readRemoteAccountBinding } from './remote-account-binding.mjs';
 import { inspectRemoteSampleSnapshot } from './remote-sample-coverage.mjs';
 import { SAMPLE_POLICY, digest, epoch, sampleScopeHash, selectSampleChats, evaluateSample } from './remote-sample-core.mjs';
-import { selectHistoricalObservations, loadPendingHistoryVerifications } from './remote-sample-history.mjs';
+import { selectHistoricalObservations, loadPendingHistoryVerifications, routeTargetedHistory, MAX_TARGETED_HISTORY } from './remote-sample-history.mjs';
 import { runGuardedRemoteSampleProcess, safeGuardianDiagnostic } from '../runtime/worker/remote-sample-process.mjs';
 import { publicRemoteReport } from './remote-sample-cache.mjs';
 import { collectorDiagnostic } from './remote-sample-diagnostic.mjs';
@@ -23,30 +24,37 @@ export class SampleFailure extends Error {
 /** One bounded request; no retries, shortcuts, credentials or raw error output. */
 export function createSampleApi(db, options = {}, deps = {}) {
   const now = deps.now || Date.now;
-  const start = now(); let calls = 0; let last = -Infinity;
+  const monotonic = deps.monotonicNow || deps.now || (() => performance.now());
+  const start = now(); const monotonicStart = monotonic(); let calls = 0; let selfCalls = 0; let last = -Infinity;
+  const maxCalls = options.maxApiCalls === undefined ? SAMPLE_POLICY.calls :
+    Number.isSafeInteger(options.maxApiCalls) && options.maxApiCalls >= 0 && options.maxApiCalls <= SAMPLE_POLICY.calls ? options.maxApiCalls : 0;
+  const maxSelfCalls = options.maxSelfCalls === undefined ? 6 :
+    Number.isSafeInteger(options.maxSelfCalls) && options.maxSelfCalls >= 0 && options.maxSelfCalls <= 6 ? options.maxSelfCalls : 0;
   const requestedBudget = options.remoteSampleBudgetMs;
   const budget = requestedBudget === undefined ? SAMPLE_POLICY.deadlineMs :
     Number.isSafeInteger(requestedBudget) && requestedBudget >= 1000 && requestedBudget <= SAMPLE_POLICY.deadlineMs ? requestedBudget : 0;
   const deadline = start + budget;
-  const call = (path, params = {}) => {
-    const operation = path.includes('/authen/') ? 'self_profile' : 'message_history_bundle';
+  const remainingMs = () => monotonicStart + budget - monotonic();
+  const call = (path, params = {}, callOptions = {}) => {
+    const operation = path.includes('/authen/') ? 'self_profile' : path.endsWith('/messages/mget') ? 'message_search_bundle' : 'message_history_bundle';
     const retryAt = Math.max(Number(options.cooldownsByOperation?.[operation]) || 0, Number(options.cooldownsByOperation?.other) || 0);
     if (retryAt > now()) throw new SampleFailure('rate_cooldown', retryAt, operation);
-    if (calls >= SAMPLE_POLICY.calls) throw new SampleFailure('request_budget');
-    const wait = Math.max(0, last + SAMPLE_POLICY.gapMs - now());
-    if (now() + wait + 1 >= deadline) throw new SampleFailure('time_budget');
+    if (calls >= maxCalls || operation === 'self_profile' && selfCalls >= maxSelfCalls) throw new SampleFailure('request_budget');
+    const reserveMs = Number.isSafeInteger(callOptions.reserveMs) && callOptions.reserveMs >= 0 ? callOptions.reserveMs : 0;
+    const wait = Math.max(0, last + SAMPLE_POLICY.gapMs - monotonic());
+    if (wait + reserveMs + 1 >= remainingMs()) throw new SampleFailure('time_budget');
     if (wait) (deps.sleep || sleep)(wait);
-    if (now() >= deadline) throw new SampleFailure('time_budget');
-    const lease = (deps.tryAcquireLease || tryAcquireLarkApiLease)({ db, role: 'probe', deadlineMs: deadline });
+    if (remainingMs() <= reserveMs) throw new SampleFailure('time_budget');
+    const lease = (deps.tryAcquireLease || tryAcquireLarkApiLease)({ db, role: 'probe', deadlineMs: now() + Math.floor(remainingMs()) });
     if (lease.state !== 'acquired') throw new SampleFailure(lease.state === 'busy' ? 'sync_busy' : 'lease_unavailable');
     try {
       const readCooldown = deps.readSharedCooldown || (!deps.spawnSync ? readSharedLarkCooldown : null);
       const shared = readCooldown?.({ operation, nowMs: now() });
       if (shared?.state === 'unavailable') throw new SampleFailure('shared_cooldown_unavailable');
       if (shared?.state === 'cooldown') throw new SampleFailure('rate_cooldown', shared.untilMs || 0, operation);
-      const timeout = Math.min(SAMPLE_POLICY.requestMs, deadline - now());
+      const timeout = Math.floor(Math.min(SAMPLE_POLICY.requestMs, remainingMs() - reserveMs));
       if (timeout <= 0) throw new SampleFailure('time_budget');
-      calls++; last = now();
+      calls++; if (operation === 'self_profile') selfCalls++; last = monotonic();
       const args = ['api', 'GET', path, '--as', 'user', '--params', JSON.stringify(params), '--format', 'json'];
       const result = (deps.spawnSync || spawnSync)(options.env?.LARK_CLI || process.env.LARK_CLI || 'lark-cli', args,
         { encoding: 'utf8', env: options.env || process.env, timeout, killSignal: 'SIGKILL', maxBuffer: 2 * 1024 * 1024,
@@ -67,11 +75,11 @@ export function createSampleApi(db, options = {}, deps = {}) {
         throw new SampleFailure(result.error?.code === 'ETIMEDOUT' || result.signal ? 'request_timeout' :
           'api_unavailable');
       }
-      if (now() > deadline) throw new SampleFailure('time_budget');
+      if (remainingMs() < 0) throw new SampleFailure('time_budget');
       return json;
-    } finally { last = now(); lease.release(); }
+    } finally { last = monotonic(); lease.release(); }
   };
-  return { call, count: () => calls, deadline };
+  return { call, count: () => calls, selfCount: () => selfCalls, remainingMs, maxCalls, maxSelfCalls, deadline };
 }
 
 export function loadSampleInventory(db, deps = {}) {
@@ -104,17 +112,25 @@ export function collectRemoteSample(db, options = {}, deps = {}) {
   const pageSize = Math.min(SAMPLE_POLICY.pageSize, Math.max(1, options.messagesPerChat ?? SAMPLE_POLICY.pageSize));
   const maxChats = Math.min(SAMPLE_POLICY.chats, Math.max(1, options.hotChats ?? SAMPLE_POLICY.chats));
   const api = deps.api || createSampleApi(db, options, deps);
+  const apiLimit = api.maxCalls ?? options.maxApiCalls ?? SAMPLE_POLICY.calls;
+  let observedSelfCalls = 0;
+  const selfProfile = () => {
+    const count = api.count();
+    try { return identity(api.call('/open-apis/authen/v1/user_info')); }
+    finally { if (api.count() > count) observedSelfCalls++; }
+  };
+  const remainingTime = () => api.remainingMs ? api.remainingMs() : api.deadline - now();
   /** @type {Record<string, any>} */ const report = { schema_version: 3, ok: false, status: 'inconclusive', reason: null,
     checked_at: new Date(started).toISOString(), scope: 'discovered_chats_rotating',
     window: { start: new Date(start).toISOString(), end: new Date(end).toISOString() },
     binding: { state: 'unverified', evidence: null },
     probe: { mode: 'bounded_native_pages', comparison: 'identity_version_static_body', hot_chats_requested: maxChats,
       hot_chats_found: 0, messages_per_chat: pageSize, remote_messages_checked: 0, unsupported_chats: 0, probe_errors: 0,
-      eligible_chats: 0, hot_chats: 0, fair_chats: 0, chats_checked: 0, pages: 0, truncated_chats: 0, api_calls: 0 },
+      eligible_chats: 0, hot_chats: 0, fair_chats: 0, chats_checked: 0, pages: 0, truncated_chats: 0, api_calls: 0, self_calls: 0 },
     findings: {}, missing_count: 0, lag_ms: null,
     unverified: ['undiscovered_or_disabled_chats','outside_creation_window','thread_only_replies','merged_children','client_dynamic_cards'] };
   const remaining = () => {
-    const ms = Math.floor(api.deadline - now());
+    const ms = Math.floor(remainingTime());
     if (ms <= 0) throw new SampleFailure('time_budget');
     return ms;
   };
@@ -129,7 +145,7 @@ export function collectRemoteSample(db, options = {}, deps = {}) {
   let retryAtMs = 0; let operation = '';
   let stage = 'inventory';
   const finish = (outcome) => ({ outcome, rotation: outcome === 'ok' ? rotationPlan ? rotationPlan.nextCursor * 4 + (rotationPlan.phase + 1) % 4 : selection?.rotation ?? rotation : rotation,
-    observations, observationOverflow, historyAttempt: historyAttempts[0] || null, historyAttempts, pendingVerification, report: { ...report, checked_at: new Date(now()).toISOString(), probe: { ...report.probe, api_calls: api.count() } },
+    observations, observationOverflow, historyAttempt: historyAttempts[0] || null, historyAttempts, pendingVerification, report: { ...report, checked_at: new Date(now()).toISOString(), probe: { ...report.probe, api_calls: api.count(), self_calls: api.selfCount ? api.selfCount() : observedSelfCalls } },
     cacheContext: binding ? { database_key: context?.database_key, source_id: 'lark.im', account_key: binding.account_key,
       auth_identity_verified: binding.state === 'verified' } : context, retryAtMs,
     cooldownsByOperation: retryAtMs && operation ? { [operation]: retryAtMs } : {}, cacheTtlMs: options.cacheTtlMs });
@@ -141,8 +157,9 @@ export function collectRemoteSample(db, options = {}, deps = {}) {
     Object.assign(report.probe, { hot_chats_found: selection.selected.length, eligible_chats: selection.eligible,
       hot_chats: selection.hot, fair_chats: selection.fair });
     if (!selection.selected.length) { report.reason = 'no_eligible_chats'; return finish('ok'); }
+    if (apiLimit < 2 || (api.maxSelfCalls ?? options.maxSelfCalls ?? 6) < 2) throw new SampleFailure('request_budget');
     stage = 'identity_before';
-    const before = identity(api.call('/open-apis/authen/v1/user_info'));
+    const before = selfProfile();
     stage = 'binding_before';
     binding = readBinding(before);
     report.binding = { state: binding.state, evidence: binding.evidence };
@@ -151,9 +168,12 @@ export function collectRemoteSample(db, options = {}, deps = {}) {
     }
     // Observations from another account must never participate in confirmation.
     if (options.accountKey && options.accountKey !== binding.account_key) { observations = {}; observationOverflow = false; }
-    const revisits = maxChats > 1 ? (deps.selectHistoricalObservations || (deps.selectHistoricalObservation
+    let revisits = maxChats > 1 ? (deps.selectHistoricalObservations || (deps.selectHistoricalObservation
       ? (...args) => { const selected = deps.selectHistoricalObservation(...args); return selected ? [selected] : []; }
-      : selectHistoricalObservations))(db, observations, binding, rows, start, started, localDeps, Math.min(3, maxChats - 1)) : [];
+      : selectHistoricalObservations))(db, observations, binding, rows, start, started, localDeps, MAX_TARGETED_HISTORY) : [];
+    revisits = (deps.routeTargetedHistory || routeTargetedHistory)(db, revisits, binding, localDeps)
+      .filter((revisit, index) => index < Math.min(3, maxChats - 1) || revisit.messageId);
+    const targeted = revisits.filter(revisit => revisit.messageId);
     const shortBudget = api.deadline - started < SAMPLE_POLICY.deadlineMs;
     const currentPageLimit = shortBudget && revisits.some(revisit => revisit.chat) ? 1 : SAMPLE_POLICY.pages;
     if (currentPageLimit !== SAMPLE_POLICY.pages) report.probe.max_pages_per_chat = currentPageLimit;
@@ -163,6 +183,10 @@ export function collectRemoteSample(db, options = {}, deps = {}) {
       report.history = { requested: revisits.length, chats_checked: 0, pages: 0, messages_checked: 0, unsupported_chats: 0, truncated_chats: 0,
         unroutable: revisits.filter(revisit => !revisit.chat).length, window: revisits.length === 1 ? windows[0] : null,
         ...(revisits.length > 1 ? { windows, attempts: 0 } : {}) };
+      if (targeted.length) {
+        report.probe.mode = 'bounded_native_pages_and_targeted_ids';
+        report.history.targeted = { requested: targeted.length, batches: 0, targets_checked: 0, omitted: 0, unsupported: 0 };
+      }
       if (revisits.some(revisit => revisit.chat)) {
         const phase = rotation % 4; const cursor = Math.floor(rotation / 4);
         selection = selectSampleChats(rows, cursor, started, Math.min(2, maxChats - 1), 1);
@@ -176,31 +200,86 @@ export function collectRemoteSample(db, options = {}, deps = {}) {
     }
     /** @type {Record<string, any>[]} */ const messages = []; const seenMessages = new Set();
     const currentRequests = selection.selected.map(chat => ({ chat, start, end, historical: false, revisit: null }));
-    const historyRequests = revisits.filter(revisit => revisit.chat).map(revisit =>
-      ({ chat: revisit.chat, start: revisit.start, end: revisit.end, historical: true, revisit }));
+    let targetedInserted = false;
+    /** @type {Record<string, any>[]} */
+    const historyRequests = revisits.filter(revisit => revisit.chat).flatMap(revisit => {
+      if (!revisit.messageId) return [{ chat: revisit.chat, start: revisit.start, end: revisit.end, historical: true, revisit }];
+      if (targetedInserted) return [];
+      targetedInserted = true;
+      return [{ targeted, historical: true }];
+    });
     // Interleave the fair historical slot with current coverage. Under slow
     // requests both domains make progress before optional priority slots.
     if (currentFirst === 1 && currentRequests.length > 1) currentRequests.reverse();
     // Alternate the first domain too. A real lease/SQLite overhead must not
     // let a slow current route monopolize every short idle budget.
+    /** @type {Record<string, any>[]} */
     const requests = !historyRequests.length ? currentRequests : (rotationPlan?.phase || 0) % 2 === 1
       ? [historyRequests[0], ...currentRequests, ...historyRequests.slice(1)]
       : [currentRequests[0], historyRequests[0], ...currentRequests.slice(1), ...historyRequests.slice(1)].filter(Boolean);
-    const canStartRoute = pages => api.count() + pages + 1 <= SAMPLE_POLICY.calls &&
-      now() + (pages + 1) * (SAMPLE_POLICY.requestMs + SAMPLE_POLICY.gapMs) + 1000 <= api.deadline;
+    // Retain the existing conservative route admission and bound each request
+    // again, reserving final identity plus local inspection time. Batching saves
+    // acquisitions; it must not rely on shorter safety reservations.
+    const closingReserveMs = SAMPLE_POLICY.requestMs + SAMPLE_POLICY.gapMs + 1000;
+    const canStartRoute = pages => api.count() + pages + 1 <= apiLimit &&
+      remainingTime() >= (pages + 1) * (SAMPLE_POLICY.requestMs + SAMPLE_POLICY.gapMs) + 1000;
+    const recordHistoryAttempt = (revisit, attemptStarted) => {
+      historyAttempts.push({ key: revisit.key, checked_at: attemptStarted, database_key: binding.database_key, source_id: 'lark.im' });
+      if (Object.hasOwn(report.history, 'attempts')) report.history.attempts++;
+      observations = { ...observations, [revisit.key]: { ...revisit.observation, last_checked: attemptStarted,
+        scope_hash: sampleScopeHash(binding, revisit.chat.chat_id) } };
+    };
     for (const request of requests) {
+      if (request.targeted) {
+        if (!canStartRoute(1)) break;
+        const callsBefore = api.count(); const attemptStarted = now(); let json;
+        stage = 'message_request';
+        try { json = api.call('/open-apis/im/v1/messages/mget', {
+          message_ids: request.targeted.map(revisit => revisit.messageId), card_msg_content_type: 'raw_card_content',
+        }, { reserveMs: closingReserveMs }); }
+        finally { if (api.count() > callsBefore) {
+          report.history.targeted.batches++;
+          request.targeted.forEach(revisit => recordHistoryAttempt(revisit, attemptStarted));
+        } }
+        stage = 'message_page';
+        const data = nativeData(json, 'remote sample targeted messages');
+        if (!Array.isArray(data.items) || data.has_more !== undefined && data.has_more !== false ||
+          data.page_token != null && data.page_token !== '') throw new SampleFailure('invalid_page');
+        stage = 'message_shape';
+        assertRawMessagePage(data.items, 'remote sample targeted messages');
+        const expected = new Map(request.targeted.map(revisit => [revisit.messageId, revisit]));
+        const returned = new Set();
+        if (expected.size !== request.targeted.length) throw new SampleFailure('invalid_page');
+        stage = 'message_identity';
+        for (const item of data.items) {
+          const revisit = expected.get(item.message_id);
+          const created = epoch(item.create_time);
+          if (!revisit || returned.has(item.message_id) || seenMessages.has(item.message_id) ||
+            item.chat_id !== revisit.chat.chat_id || created !== revisit.observation.target ||
+            digest([binding.database_key,binding.account_key,item.chat_id,item.message_id,created]) !== revisit.key) throw new SampleFailure('invalid_page');
+          returned.add(item.message_id);
+          if (!['text','post'].includes(item.msg_type)) { report.history.targeted.unsupported++; continue; }
+          seenMessages.add(item.message_id);
+          messages.push({ ...item, scope_id: revisit.chat.id });
+          report.history.targeted.targets_checked++;
+        }
+        report.history.targeted.omitted += expected.size - returned.size;
+        continue;
+      }
       const { chat, historical, revisit } = request;
       const pageLimit = historical ? SAMPLE_POLICY.pages : currentPageLimit;
       if (!canStartRoute(pageLimit)) break;
       const counters = historical ? report.history : report.probe;
       const tokens = new Set(); const routeMessages = new Set(); let token = '';
       for (let pageNo = 0; pageNo < pageLimit; pageNo++) {
+        if (pageNo > 0 && !canStartRoute(1)) { counters.truncated_chats++; budgetTruncated = true; break; }
         let json;
         stage = 'message_request';
         const callsBefore = api.count(); const attemptStarted = now();
         try { json = api.call('/open-apis/im/v1/messages', { container_id_type: 'chat', container_id: chat.chat_id,
           sort_type: 'ByCreateTimeDesc', page_size: pageSize, card_msg_content_type: 'user_card_content',
-          start_time: String(Math.floor(request.start / 1000)), end_time: String(Math.ceil(request.end / 1000)), ...(token ? { page_token: token } : {}) }); }
+          start_time: String(Math.floor(request.start / 1000)), end_time: String(Math.ceil(request.end / 1000)), ...(token ? { page_token: token } : {}) },
+          { reserveMs: closingReserveMs }); }
         catch (error) { if (error instanceof SampleFailure && error.reason === 'restricted_mode') { counters.unsupported_chats++; break; } throw error; }
         finally {
           // A lease/cooldown refusal made no remote acquisition and cannot
@@ -209,10 +288,7 @@ export function collectRemoteSample(db, options = {}, deps = {}) {
             rotationPlan.nextCursor = rotationPlan.fairRotations[chat.chat_id];
           }
           if (historical && pageNo === 0 && api.count() > callsBefore) {
-            historyAttempts.push({ key: revisit.key, checked_at: attemptStarted, database_key: binding.database_key, source_id: 'lark.im' });
-            if (Object.hasOwn(report.history, 'attempts')) report.history.attempts++;
-            observations = { ...observations, [revisit.key]: { ...revisit.observation, last_checked: attemptStarted,
-              scope_hash: sampleScopeHash(binding, chat.chat_id) } };
+            recordHistoryAttempt(revisit, attemptStarted);
           }
         }
         stage = 'message_page';
@@ -242,13 +318,13 @@ export function collectRemoteSample(db, options = {}, deps = {}) {
       }
     }
     stage = 'identity_after';
-    const after = identity(api.call('/open-apis/authen/v1/user_info'));
+    const after = selfProfile();
     if (after.openId !== before.openId || after.tenantKey !== before.tenantKey) throw new SampleFailure('account_changed');
     stage = 'database_context';
     if ((deps.context || liveProbeContext)(db)?.database_key !== context.database_key) throw new SampleFailure('database_changed');
     const targets = messages.map((m) => ({ key: digest([binding.database_key, binding.account_key, m.chat_id, m.message_id, epoch(m.create_time)]),
       scope_id: m.scope_id, message_id: m.message_id, created_ms: epoch(m.create_time), expected_chat_id: m.chat_id }));
-    if (now() >= api.deadline) throw new SampleFailure('time_budget');
+    if (remainingTime() <= 0) throw new SampleFailure('time_budget');
     // Coverage, debt and records must come from one SQLite snapshot, including concurrent revocation.
     stage = 'snapshot';
     const { coverage, records } = (deps.inspectSnapshot || inspectRemoteSampleSnapshot)(db, targets, { timeoutMs: Math.min(5000, remaining()), now });
@@ -275,7 +351,7 @@ export function collectRemoteSample(db, options = {}, deps = {}) {
     pendingVerification = (deps.pendingVerifications || loadPendingHistoryVerifications)(db, observations, binding, now(), localDeps)
       .some(key => observations[key] && observations[key].target + 2000 < start);
     stage = 'final_context';
-    if ((deps.context || liveProbeContext)(db)?.database_key !== context.database_key || now() > api.deadline) throw new SampleFailure('context_changed');
+    if ((deps.context || liveProbeContext)(db)?.database_key !== context.database_key || remainingTime() < 0) throw new SampleFailure('context_changed');
     const c = evaluated.counts;
     if (c.confirmed_missing || c.identity_conflict || c.stale_version || c.content_mismatch) {
       report.status = 'needs_attention'; report.reason = c.confirmed_missing ? 'confirmed_missing' : 'source_difference';

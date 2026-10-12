@@ -487,8 +487,8 @@ function compactSummary(summary: SyncSummary | null | undefined) {
 }
 
 const HISTORY_OUTCOMES = new Set(["no_eligible_known_record", "processed", "pending_observation",
-  "incomplete", "size_limit", "identity", "ambiguous", "missing", "fetch_unavailable", "batch_processed", "batch_deferred", "batch_interrupted", "sample_scheduled"]);
-const REQUEST_STOP_REASONS = new Set(["cli_budget", "time_budget", "clock_unavailable", "sync_busy", "lease_unavailable",
+  "incomplete", "size_limit", "identity", "ambiguous", "missing", "fetch_unavailable", "batch_processed", "batch_deferred", "batch_interrupted", "legacy_required", "sample_scheduled"]);
+const REQUEST_STOP_REASONS = new Set(["cli_budget", "self_budget", "time_budget", "clock_unavailable", "sync_busy", "lease_unavailable",
   "rate_cooldown", "rate_limited", "shared_cooldown_unavailable"]);
 const HISTORY_HINT_REASONS = new Set(["not_configured", "state_missing", "state_invalid", "account_mismatch", "source_disabled",
   "policy_unavailable", "metadata_budget", "mapping_unavailable", "ready", "not_attempted"]);
@@ -511,7 +511,7 @@ function compactHistorySummary(summary: SyncSummary | null | undefined) {
     if (typeof summary[field] === "number" && Number.isSafeInteger(summary[field]) && Number(summary[field]) >= 0) result[field] = summary[field];
   }
   if (budget && typeof budget === "object" && !Array.isArray(budget)) {
-    result.request_budget = Object.fromEntries(["max_cli_attempts", "cli_attempts", "max_seconds", "min_interval_ms", "elapsed_ms"]
+    result.request_budget = Object.fromEntries(["max_cli_attempts", "cli_attempts", "max_self_attempts", "self_attempts", "max_seconds", "min_interval_ms", "elapsed_ms"]
       .filter(field => typeof budget[field] === "number" && Number.isSafeInteger(budget[field]) && budget[field] >= 0)
       .map(field => [field, budget[field]]));
     if (budget.stop_reason === null || REQUEST_STOP_REASONS.has(budget.stop_reason)) result.request_budget.stop_reason = budget.stop_reason;
@@ -542,11 +542,12 @@ function runCycleWithRunner(
   writeLog: WorkerLogWriter,
   now: () => string = () => new Date().toISOString(),
   onComplete?: (steps: WorkerEvent[], payload: WorkerCyclePayload) => void,
-  beforeHistory?: (steps: WorkerEvent[]) => WorkerEvent | null,
+  beforeHistory?: (steps: WorkerEvent[], runHistory: (args?: string[]) => WorkerEvent) => WorkerEvent | null,
 ) {
   const steps: WorkerEvent[] = [];
   for (const spec of buildCycleStepSpecs(opts, cycle)) {
-    const step = (spec.name === "history" ? beforeHistory?.(steps) : null) || runStep(spec.name, spec.args, spec.command || "sync");
+    const step = (spec.name === "history" ? beforeHistory?.(steps,
+      (args = spec.args) => runStep(spec.name, args, spec.command || "sync")) : null) || runStep(spec.name, spec.args, spec.command || "sync");
     steps.push(step);
     writeLog(opts, { ...step, type: "lark_im_worker_step", cycle, step_index: steps.length - 1 });
   }

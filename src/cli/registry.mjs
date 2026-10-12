@@ -108,8 +108,9 @@ export const COMMANDS = Object.freeze([
   route("maintenance.history", "Recheck a bounded batch of known historical records with durable debt and scan checkpoints.", [
     { ...db, default: undefined, required: true }, format,
     { ...logDir, default: undefined, description: 'Private worker sample state for optional known-debt scheduling hints.' },
-    option('--max-records', 'maxRecords', 'integer', 'Maximum selected records; each retains its own identity check and at most four CLI attempts.', { min: 1, max: 12, default: 1 }),
+    option('--max-records', 'maxRecords', 'integer', 'Maximum selected records; bounded acquisitions retain identity and per-record fences.', { min: 1, max: 12, default: 1 }),
     option('--max-cli-attempts', 'maxCliAttempts', 'integer', 'Shared actual CLI budget for the entire batch, including identity, pages and detail.', { min: 2, max: 12, default: 4 }),
+    option('--max-self-attempts', 'maxSelfAttempts', 'integer', 'Shared actual self-profile attempt cap, including failed requests.', { min: 0, max: 6, default: 6 }),
     option('--max-seconds', 'maxSeconds', 'integer', 'Remote-work budget, 1 to 30 seconds; not the whole subprocess wall time.', { min: 1, max: 30, default: 30 }),
   ], ['local-read', 'remote-read', 'database-write']),
   route("maintenance.repair", "Preview structural recovery; apply uses existing fences.", [db, format, apply], ["local-read"], "public-safe", [{ when: "--apply", effects: ["database-write"] }]),

@@ -6,6 +6,7 @@ import { scopeObservationContext } from '../maintenance/scope-config-policy.mjs'
 
 const HASH = /^[a-f0-9]{64}$/;
 const MAX_LEGACY_CANDIDATES = 1000;
+export const MAX_TARGETED_HISTORY = 5;
 const quote = value => `'${String(value).replaceAll("'", "''")}'`;
 
 /** Only exact creation timestamps in enabled discovered chats are inspected.
@@ -112,8 +113,41 @@ export function selectHistoricalObservations(db, previous, binding, rows, startM
   // First route is always the oldest: bad or unmodified debt cannot starve
   // behind a continuing supply of successful writer attempts.
   const ordered = [entries[0], ...entries.slice(1).filter(([key]) => priority.has(key)),
-    ...entries.slice(1).filter(([key]) => !priority.has(key))].slice(0, Math.min(3, limit));
+    ...entries.slice(1).filter(([key]) => !priority.has(key))].slice(0, Math.min(MAX_TARGETED_HISTORY, limit));
   return ordered.map(([key, observation]) => routeObservation(db, key, observation, binding, rows, deps));
+}
+
+/** Recover only routing metadata for explicitly retained findings. This is not
+ * comparison evidence: the final coverage/record transaction remains the sole
+ * local comparison snapshot. Raw/user card forms are only interchangeable for
+ * the existing text/post static-body contract; other types keep their list route.
+ */
+export function routeTargetedHistory(db, revisits, binding, deps = {}) {
+  const routed = revisits.filter(revisit => revisit.chat);
+  if (!routed.length || routed.length > MAX_TARGETED_HISTORY) return revisits;
+  let candidates;
+  try {
+    candidates = (deps.sqliteJson || readOnlySqliteJson)(db, `SELECT external_id,container_id,occurred_at_ms,
+      json_extract(raw_json,'$.message_id') AS native_id,json_extract(raw_json,'$.chat_id') AS native_chat,
+      json_extract(raw_json,'$.create_time') AS native_created,json_extract(raw_json,'$.msg_type') AS msg_type,
+      json_extract(canonical_json,'$.source_api') AS source_api
+      FROM records INDEXED BY idx_records_container_time
+      WHERE source_id='lark.im' AND record_type='lark.im.message' AND json_valid(raw_json) AND json_valid(canonical_json)
+      AND (${routed.map(revisit => `(container_id=${quote(revisit.chat.chat_id)} AND occurred_at_ms=${revisit.observation.target})`).join(' OR ')})
+      LIMIT ${MAX_LEGACY_CANDIDATES + 1};`, 'remote sample targeted routing', { timeoutMs: 1000 });
+  } catch { return revisits; }
+  if (!Array.isArray(candidates) || candidates.length > MAX_LEGACY_CANDIDATES) return revisits;
+  return revisits.map(revisit => {
+    if (!revisit.chat) return revisit;
+    const matches = candidates.filter(row => typeof row.external_id === 'string' && row.external_id.trim() && row.external_id.length <= 512 &&
+      !/[\u0000-\u001f\u007f]/u.test(row.external_id) && row.container_id === revisit.chat.chat_id &&
+      row.occurred_at_ms === revisit.observation.target &&
+      digest([binding.database_key,binding.account_key,row.container_id,row.external_id,row.occurred_at_ms]) === revisit.key);
+    const row = matches.length === 1 ? matches[0] : null;
+    return row && row.source_api === 'im.v1.messages' && ['text','post'].includes(row.msg_type) &&
+      row.native_id === row.external_id && row.native_chat === row.container_id && epoch(row.native_created) === row.occurred_at_ms
+      ? { ...revisit, messageId: row.external_id } : revisit;
+  });
 }
 
 export function selectHistoricalObservation(db, previous, binding, rows, startMs, now, deps = {}) {

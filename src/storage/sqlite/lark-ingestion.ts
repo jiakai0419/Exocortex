@@ -69,6 +69,20 @@ function historySchedulingSql(history: NonNullable<BoundedReplayOptions["history
   const failures = failed ? Math.min(16, (selected?.failures || 0) + 1) : 0;
   const due = history.startedAtMs + (failed ? Math.min(6 * 60 * 60_000, 60_000 * 2 ** Math.min(9, failures - 1)) : candidate ? 1000 : 0);
   const round = scheduling.fairRound;
+  const previous = scheduling.queueBefore.find(row => row.record_id === history.selectedId);
+  const newDebt = Boolean(selected && previous && ['finding_key','database_key','account_key','context_fingerprint','debt_fingerprint']
+    .some(key => selected[key as keyof typeof selected] !== previous[key as keyof typeof previous]));
+  // A record generation also changes for local metadata. Only a committed,
+  // accepted source change renews an existing debt's fast-verification ticket.
+  const sourceAccepted = records.some(record => record.observation?.action === 'accept' && record.observation.before &&
+    (record.observation.before.raw_json !== record.raw_json || record.observation.before.external_version !== record.external_version));
+  const renewed = newDebt ? '1' : sourceAccepted ? 'EXISTS(SELECT 1 FROM __replay_effects WHERE changed=1 AND existed=1)' : '0';
+  // Source acquisition time is not commit order: a sampler may finish between
+  // them. Both real SQL time and the injected commit-entry clock form a lower
+  // bound; +1 orders even a same-millisecond preceding sample strictly before
+  // this ticket. Readers may defer this at most one millisecond into the future.
+  const ticketTime = `MAX(${history.commitReadyAtMs ?? history.startedAtMs},
+    CAST(strftime('%s','now') AS INTEGER)*1000 + CAST(substr(strftime('%f','now'),4,3) AS INTEGER))+1`;
   return `${queue}
     ${round ? `DELETE FROM lark_im_history_round ${round.baselines.length ? `WHERE scope_id NOT IN (${round.baselines.map(row => quoteSql(row.scope_id)).join(',')})` : ''};
       ${round.baselines.map(row => `INSERT INTO lark_im_history_round(scope_id,round,baseline_sweeps,enrolled_at_ms)
@@ -77,8 +91,8 @@ function historySchedulingSql(history: NonNullable<BoundedReplayOptions["history
     ${selected ? `UPDATE lark_im_history_debt SET generation=generation+1,last_attempt_at_ms=${history.startedAtMs},
       next_due_at_ms=${due},failures=${failures},status=${quoteSql(failed || candidate ? 'ready' : 'awaiting_verification')},
       last_attempt_id=${quoteSql(attemptId)},last_result_json=${resultSql}
-      ${failed || candidate ? '' : `,verification_requested_at_ms=CASE WHEN verification_generation IS NOT
-        (SELECT generation FROM record_observation_state WHERE record_id=${history.selectedId}) THEN ${history.startedAtMs} ELSE verification_requested_at_ms END,
+      ${failed || candidate ? '' : `,verification_requested_at_ms=CASE WHEN verification_generation IS NULL OR ${renewed}
+        THEN ${ticketTime} ELSE verification_requested_at_ms END,
         verification_generation=(SELECT generation FROM record_observation_state WHERE record_id=${history.selectedId})`}
       WHERE record_id=${history.selectedId};` : ''}
     INSERT INTO lark_im_history_scheduler(id,generation,priority_streak,last_attempt_id,last_result_json,fair_round)
@@ -151,6 +165,10 @@ function commitBoundedReplayRecords(dbPath: string, options: BoundedReplayOption
     reviewFence: options.reviewFence, acquisition: options.observationAcquisition ? { ...options.observationAcquisition, basis: [...options.observationAcquisition.basis] } : null })).digest("hex") : null;
   if (history) {
     validateHistoryScheduling(history);
+    if (history.commitReadyAtMs !== undefined && (!Number.isSafeInteger(history.commitReadyAtMs) ||
+      history.commitReadyAtMs < history.startedAtMs || history.commitReadyAtMs >= 253_402_300_799_999)) {
+      throw new Error('invalid history commit clock');
+    }
     const task = history.detailTask;
     if (task != null && (!/^[a-f0-9]{64}$/.test(task.fingerprint) || typeof task.raw_root_json !== "string"
       || !Number.isSafeInteger(task.occurred_at_ms) || task.occurred_at_ms < 0

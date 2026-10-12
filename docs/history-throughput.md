@@ -1,19 +1,36 @@
 # Historical review throughput
 
-The worker processes a bounded sequential batch after forward sync and due
-retention. Its maximum is 12 CLI attempts, 12 selected records and 25 seconds of
-remote work. Every selected record independently verifies identity and has its
-own four-attempt limit. One session owns the whole batch's deadline, request gaps,
-cooldowns and attempt count. A slow or paginated source therefore yields fewer
-records; the configured maximum is not a promised throughput.
+The worker uses idle time after forward sync and due retention. History and
+independent sampling share at most 12 CLI attempts, 6 self-profile attempts and
+25 seconds of remote-work admission, further bounded by the configured interval
+minus five seconds. These are application limits, not official HTTP quotas.
+Each job receives only the remaining budget; a validated completion receipt is
+required before unused capacity can pass to another job.
+
+History prefetches at most six known IDs with one native mget, bracketed by fresh
+identity reads. The pool freezes each row's source context and observation
+generation before acquisition. Each subsequent transaction re-runs the original
+live selector; an out-of-pool, consumed or changed selection ends that group.
+The pool does not grant turns or simulate scheduler progress. Every row retains
+its original snapshot and CAS, and a second confirmation requires another real
+acquisition. Single rows and merge details retain the original four-attempt
+route. Unusable message batches may be discarded in favor of a fresh bounded
+original-route acquisition; account changes, cooldowns and deadline failures
+cannot be bypassed. Missing items never prove deletion.
 
 The configured interval is an idle allowance. Monotonic elapsed history time
 uses that allowance instead of being added to another full sleep. Local commits
 can exceed the remote deadline; their overrun remains visible as forward delay.
-A due asynchronous sample replaces that cycle's history batch, receives the full
-idle allowance and limits remote work to the interval minus five seconds, capped
-at 55 seconds. The final cycle of a finite worker completes history without
-starting a sample that shutdown would immediately cancel. `idle_history/v2`
+Due jobs run serially, at most once each per idle period. Waiting age decides
+which gets the first opportunity; a writer that made no progress retains its
+age. Sampling runs with its full admitted budget, so old list routes are not
+silently reduced to fund history. Its measured remainder may then fund history,
+with a one-second handoff gap. After history, a sampler without its full budget
+waits for its next opportunity. Unknown consumption or a shared stop condition
+ends the idle slice. With no history work, ordinary sampling retains its original
+window, at most 55 seconds. Guardian cleanup and an already-started local commit
+can outlast remote admission; this is not a hard 25-second subprocess guarantee.
+The final cycle of a finite worker completes history. `idle_history/v2`
 receipts put retention before history; legacy and `bounded_history/v1` receipts
 remain readable.
 
@@ -42,14 +59,21 @@ failures; it does not certify successful repair or remote completeness.
 
 ## Independent verification
 
-Successful accepted/equivalent observations can create one verification ticket
-for their local generation. Repeated duplicates of that generation do not
-refresh it. The writer never deletes a finding. Only the independent sampler can
+Successful accepted/equivalent observations can create one verification ticket.
+An existing ticket is renewed by an accepted source change or a new debt, not
+local metadata churn. Commit-entry and SQL time order the ticket after a sample
+that completed during acquisition. The writer never deletes a finding. Only the independent sampler can
 settle each retained version, deletion, type or static-body dimension with its
 existing positive proof and version floor.
 
-With routable old targets, the sampler selects up to three exact historical
-windows plus one hot and one fair recent route. It reserves final identity and
+For uniquely located native text/post rows, the independent sampler can acquire
+up to five historical targets with its own mget. Dynamic cards, merge roots and
+unlocatable targets keep the original bounded-window route. The oldest target
+keeps its fair position; one hot and one fair recent route remain. A mixed report
+counts targeted IDs separately from list pages/chats. Batch omissions leave
+debt unresolved and do not establish list completeness or a verified writer
+generation. The original consistent SQLite snapshot proves only its compared
+dimensions. The sampler reserves final identity and
 local validation time before admitting a route. Short idle budgets restrict
 recent routes to one page, report truncation, and rotate which domain runs first
 so slow APIs cannot always exclude history or recent work. No history retains
@@ -57,7 +81,9 @@ the existing five-recent-route selection. The total remains at most 12 direct
 calls with an unleased one-second gap and no in-run retries.
 
 After successful sampling, still-unattempted generation tickets may schedule a
-follow-up no sooner than 60 seconds. Existing due times, failures, busy backoff,
+follow-up no sooner than 60 seconds. A healthy later due time can also be advanced
+by a newly committed eligible ticket, with the same fixed 60-second floor and
+locked publication revalidation. Failures, busy backoff,
 cooldowns and account guards retain precedence. An actual API attempt consumes
 the ticket's rapid-revisit eligibility; a denied lease does not. Targets inside
 the ordinary recent window retain ordinary recent sampling rather than gaining
@@ -75,8 +101,13 @@ Both lock files are private, validated and never unlinked for stale recovery.
 [Message list](https://open.feishu.cn/document/server-docs/im-v1/message/list)
 and [detail](https://open.feishu.cn/document/server-docs/im-v1/message/get)
 documentation lists 1000/minute and 50/second. The numerical special limit for
-self-profile is unknown. Application budgets and CLI attempts are not an
-independent HTTP quota. Shared 429 cooldowns remain authoritative.
+self-profile is unknown. The official CLI's
+[fixed mget implementation](https://github.com/larksuite/cli/blob/bba13cfe0f09a5abda796411ca4c54ee303cf007/shortcuts/im/im_messages_mget.go)
+supports user/bot identities and the native raw-card route, but no mget-specific
+numerical rate or user-card representation equivalence is assumed. Only strict
+native item evidence is admitted. Token refresh, redirects and connection retries
+can make underlying HTTP counts differ from CLI attempts. Shared 429 cooldowns
+remain authoritative, including mget's existing message-search operation bucket.
 
 ## Verification
 
@@ -85,8 +116,11 @@ synthetic content, API latency and request gap through their real worker,
 history writer, SQLite CAS and sampler. Virtual API/worker time is distinct from
 real SQLite review-fence time. It reports first debt touch, local acceptance,
 independent closure, unique initial-horizon coverage, attempt throughput and
-paired next-forward-start intervals. An asynchronous completion model represents
-the diagnostic child; it is not production latency evidence.
+paired next-forward-start intervals. The old revision uses its asynchronous
+completion model; `--serial-idle true` uses the new serial admission path. Neither
+models actual guardian/publication-token costs or competing processes. These are
+static auxiliary experiments, not production latency or continuous-arrival proof.
+Real-wall synthetic component and publication tests must accompany them.
 
 Include balanced scopes and a long scope among many one-row scopes. Never infer
 full-history scan time from repeated-record attempts/minute. Focused tests cover

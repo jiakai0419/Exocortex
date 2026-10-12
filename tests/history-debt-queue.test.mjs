@@ -24,7 +24,7 @@ function fixture(t, sizes = [12]) {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), 'synthetic-history-debt-'))); chmodSync(dir, 0o700);
   t.after(() => rmSync(dir, { force: true, recursive: true }));
   const f = { dir, db: join(dir, 'synthetic.sqlite'), logDir: dir, wall: Date.now(), tick: 0,
-    messages: [], scopes: [], calls: [], attempts: [], held: false, mode: 'ok', latency: 10 };
+    messages: [], scopes: [], calls: [], attempts: [], listAttempts: [], held: false, mode: 'ok', latency: 10 };
   f.start = Math.floor((f.wall - 86400000) / 1000) * 1000;
   store.ensureInitialized(f.db);
   f.binding = { database_key: activityDatabaseKey(f.db), account_key: hash(`lark.im\0${SELF.open_id}`) };
@@ -65,25 +65,38 @@ function fixture(t, sizes = [12]) {
         readSharedCooldown:()=>({state:'ready'}),writeSharedCooldown:()=>true,
         spawnSync:(_command,args)=>{
           assert.equal(f.held,true); f.calls.push(args); f.tick+=f.latency;
-          if(args[2]!=='/open-apis/im/v1/messages') return {status:0,stdout:JSON.stringify(SELF),stderr:''};
+          if(args[0]==='contact') {
+            const injected=f.onSelf?.(args);
+            return injected || {status:0,stdout:JSON.stringify(SELF),stderr:''};
+          }
           const params=JSON.parse(args[args.indexOf('--params')+1]);
+          if(args[2]==='/open-apis/im/v1/messages/mget') {
+            const messages=params.message_ids.map(id=>f.messages.find(message=>message.message_id===id));
+            const injected=f.onMget?.(messages,args);
+            return injected || {status:0,stdout:JSON.stringify({code:0,data:{items:messages}}),stderr:''};
+          }
+          assert.equal(args[2],'/open-apis/im/v1/messages');
           const messages=f.messages.filter(m=>m.chat_id===params.container_id && Number(m.create_time)>=Number(params.start_time)*1000 && Number(m.create_time)<Number(params.end_time)*1000);
-          f.attempts.push(messages[0]?.message_id);
+          f.listAttempts.push(messages[0]?.message_id);
           const injected=f.onList?.(messages,args);
           if(injected)return injected;
           return {status:0,stdout:JSON.stringify({code:0,data:{items:messages,has_more:false,page_token:''}}),stderr:''};
-        }},...deps});
+        }},...deps,commit:(db,options)=>{
+          f.attempts.push(options.reviewFence.records[0].external_id);
+          return (deps.commit || store.commitBoundedReplayRecords)(db,options);
+        }});
   };
   return f;
 }
 
-test('one shared twelve-call batch performs six ordinary acquisitions, with independent identity and one gap ledger',t=>{
+test('one shared twelve-call budget performs twelve ordinary rows in two bracketed acquisitions and one gap ledger',t=>{
   const f=fixture(t),result=f.run();
-  assert.equal(result.processed,6);assert.equal(result.fair_processed,6);assert.equal(result.request_budget.cli_attempts,12);
+  assert.equal(result.processed,12);assert.equal(result.fair_processed,12);assert.equal(result.request_budget.cli_attempts,6);
+  assert.equal(result.request_budget.self_attempts,4);
   assert.equal(result.fair_round_reason,'ready');
-  assert.equal(result.request_budget.stop_reason,'cli_budget');assert.equal(result.request_budget.elapsed_ms,11120);
-  assert.equal(new Set(f.attempts).size,6);assert.equal(f.query('SELECT generation FROM lark_im_history_scheduler')[0].generation,6);
-  assert.equal(f.query('SELECT generation FROM lark_im_history_progress')[0].generation,6);assert.equal(f.held,false);
+  assert.equal(result.request_budget.stop_reason,null);assert.equal(result.request_budget.elapsed_ms,5060);
+  assert.equal(new Set(f.attempts).size,12);assert.equal(f.query('SELECT generation FROM lark_im_history_scheduler')[0].generation,12);
+  assert.equal(f.query('SELECT generation FROM lark_im_history_progress')[0].generation,12);assert.equal(f.held,false);
 });
 
 test('priority scheduling persists two-to-one weighting without moving fair checkpoints',t=>{
@@ -110,7 +123,8 @@ test('a new sample reactivates verification-waiting debt but its existing cooldo
 test('permission failure backs off the bad target and permits other old debt plus fair work',t=>{
   const f=fixture(t);f.state([8,9,10]);
   f.onList=messages=>messages[0].message_id.endsWith('_8') ? {status:1,stdout:JSON.stringify({code:99991672,msg:'Synthetic permission unavailable'}),stderr:''}:null;
-  const result=f.run();assert.equal(result.failed,1);assert.equal(result.processed,6);
+  f.onMget=messages=>messages.some(message=>message.message_id.endsWith('_8')) ? {status:1,stdout:JSON.stringify({code:99991672,msg:'Synthetic permission unavailable'}),stderr:''}:null;
+  const result=f.run();assert.equal(result.failed,1);assert.equal(result.processed,5);
   assert.equal(f.attempts.filter(id=>id.endsWith('_8')).length,1);
   const debt=f.query('SELECT * FROM lark_im_history_debt WHERE record_id=9')[0];
   assert.equal(debt.failures,1);assert.equal(debt.status,'ready');assert.ok(debt.next_due_at_ms>f.wall);
@@ -118,16 +132,17 @@ test('permission failure backs off the bad target and permits other old debt plu
 });
 
 for(const failure of ['rate','deadline','lease'])test(`batch ${failure} preserves committed targets and does not invent a failed checkpoint`,t=>{
-  const f=fixture(t);f.state([8,9]);
-  f.onList=()=>{
-    if(f.attempts.length===1 && failure==='lease')f.mode='busy';
-    if(f.attempts.length!==2)return null;
+  const f=fixture(t);f.state([8,9]);let acquisitions=0;
+  f.onMget=()=>{
+    acquisitions++;
+    if(acquisitions===1 && failure==='lease')f.mode='busy';
+    if(acquisitions!==2)return null;
     if(failure==='rate')return {status:1,stdout:JSON.stringify({code:99991400,msg:'request rate limit',error:{rate_limit_reset:60}}),stderr:'HTTP 429'};
     if(failure==='deadline'){f.tick+=30000;}
     return null;
   };
   const result=f.run();
-  assert.equal(result.processed,failure==='lease'?0:1);
+  assert.equal(result.processed,failure==='lease'?0:6);
   assert.equal(f.query('SELECT COUNT(*) AS n FROM lark_im_history_debt')[0].n,failure==='lease'?0:2);
   assert.equal(f.query('SELECT COUNT(*) AS n FROM record_observation_state WHERE history_error IS NOT NULL')[0].n,0);
   assert.ok(result.request_budget.stop_reason);assert.equal(f.held,false);
@@ -136,7 +151,7 @@ for(const failure of ['rate','deadline','lease'])test(`batch ${failure} preserve
 test('fair round covers a skewed queue once before recycling small scopes despite different prior sweep totals',t=>{
   const f=fixture(t,[1,8,1]);
   store.sqliteExec(f.db,`INSERT INTO lark_im_history_progress(scope_id,completed_sweeps) VALUES(${q(f.scopes[0])},400),(${q(f.scopes[1])},2),(${q(f.scopes[2])},90);`);
-  f.run();f.run({maxRecords:4,maxCliAttempts:8});
+  f.run({maxRecords:6});f.run({maxRecords:4,maxCliAttempts:8});
   assert.equal(f.attempts.length,10);assert.equal(new Set(f.attempts).size,10,'no small scope recycles before the large scope finishes');
   const rounds=f.query('SELECT * FROM lark_im_history_round');assert.deepEqual(rounds.map(row=>row.baseline_sweeps).sort((a,b)=>a-b),[2,90,400]);
   f.run({maxRecords:1,maxCliAttempts:4});assert.equal(f.query('SELECT fair_round FROM lark_im_history_scheduler')[0].fair_round,1);

@@ -19,6 +19,8 @@ const rowCount = number('rows', 182), scopeCount = number('scopes', 91);
 const maxCycles = number('cycles', 10000), latencyMs = number('latency-ms', 250);
 const forwardMs = number('forward-ms', 62000), intervalSeconds = number('interval-seconds', 30);
 const arrivalsPerCycle = number('arrivals-per-cycle', 0);
+const debtCount = number('debts', 20), sameVersionCount = number('same-version-debts', Math.floor(debtCount / 2));
+const serialIdle = args['serial-idle'] === 'true';
 const layout = args.layout || 'balanced';
 assert.ok(Number.isInteger(rowCount) && rowCount >= 20 && rowCount <= 20000);
 assert.ok(Number.isInteger(scopeCount) && scopeCount >= 1 && scopeCount <= rowCount);
@@ -26,6 +28,8 @@ assert.ok(['balanced', 'skewed'].includes(layout));
 assert.ok(Number.isInteger(maxCycles) && maxCycles > 0 && maxCycles <= 100000);
 assert.ok(Number.isFinite(latencyMs) && latencyMs >= 0 && latencyMs <= 10000);
 assert.ok(Number.isInteger(arrivalsPerCycle) && arrivalsPerCycle >= 0 && arrivalsPerCycle <= 3);
+assert.ok(Number.isInteger(debtCount) && debtCount >= 1 && debtCount <= rowCount);
+assert.ok(Number.isInteger(sameVersionCount) && sameVersionCount >= 0 && sameVersionCount <= debtCount);
 const load = path => import(pathToFileURL(join(root, path)).href);
 const [store, history, worker, core, options, normalizer, syncRunner, larkCore, sampler, sampleCore,
   bindingModule, scheduler] = await Promise.all([
@@ -48,6 +52,7 @@ const wallStarted = performance.now(), q = store.quoteSql;
 const remote = [], debtIds = new Set(), twoConfirmation = new Set();
 const firstFetched = new Map(), firstProcessed = new Map(), accepted = new Map(), closed = new Map();
 const requestEvents = [], commits = [], cycleEvents = [], samples = [], sleeps = [], sentStarts = [];
+const invocationEvents = [];
 const sampleInsteadOfHistory = [];
 let heldLease = false, requestNo = 0, samplerRequests = 0, scanCompletedAt = null;
 let nextSampleAt = clock + 900000, rotation = 0, observations;
@@ -70,14 +75,17 @@ function remoteResponse(args, { diagnostic = false } = {}) {
   const at = clock;
   increment(latencyMs);
   if (diagnostic) samplerRequests++; else requestNo++;
+  invocationEvents.push({ cycle: currentCycle, diagnostic, self: args[0] === 'contact' || args[2]?.includes('/authen/'),
+    at_ms: at - startedClock, finished_ms: clock - startedClock });
   if (args[0] === 'contact') return { status: 0, stdout: JSON.stringify(SELF), stderr: '' };
   const path = args[2], params = JSON.parse(args[args.indexOf('--params') + 1]);
   if (path.includes('/authen/')) return { status: 0, stdout: JSON.stringify({ code: 0,
     data: { open_id: SELF.open_id, tenant_key: 'synthetic_throughput_tenant' } }), stderr: '' };
-  assert.equal(path, '/open-apis/im/v1/messages');
+  assert.ok(['/open-apis/im/v1/messages', '/open-apis/im/v1/messages/mget'].includes(path));
   const startMs = Number(params.start_time) * 1000, endMs = Number(params.end_time) * 1000;
-  const items = remote.filter(message => message.chat_id === params.container_id &&
-    Number(message.create_time) >= startMs && Number(message.create_time) < endMs);
+  const items = path.endsWith('/mget') ? remote.filter(message => params.message_ids.includes(message.message_id)) :
+    remote.filter(message => message.chat_id === params.container_id &&
+      Number(message.create_time) >= startMs && Number(message.create_time) < endMs);
   assert.ok(items.length <= (diagnostic ? 20 : 50));
   for (const message of items) {
     const id = Number(message.message_id.slice('om_synthetic_throughput_'.length));
@@ -109,9 +117,9 @@ try {
       sender: { id: 'ou_synthetic_throughput_author', id_type: 'open_id', sender_type: 'user' },
       body: { content: JSON.stringify({ text: `Synthetic original ${n}` }) } };
     const fresh = structuredClone(old);
-    if (n > rowCount - 20) {
+    if (n > rowCount - debtCount) {
       debtIds.add(n);
-      if (n > rowCount - 10) twoConfirmation.add(n);
+      if (n > rowCount - sameVersionCount) twoConfirmation.add(n);
       else fresh.update_time = String(created + 2000);
       fresh.body.content = JSON.stringify({ text: `Synthetic edited ${n}` });
     }
@@ -130,7 +138,7 @@ try {
     coverage: Object.fromEntries(debtMessages.map(message => [keyFor(message),
       { covered: true, details_pending: false, latest_finished_ms: clock - 3600001 }])),
     binding, now: clock - 3600000, windowEnd: clock - 3600000 }).observations;
-  assert.equal(Object.keys(observations).length, 20);
+  assert.equal(Object.keys(observations).length, debtCount);
   initialObservationKeys = new Map(debtMessages.map(message => [keyFor(message), Number(message.message_id.slice('om_synthetic_throughput_'.length))]));
   // Distinct scheduler-only timestamps remove database-salted hash ordering as
   // a source of variation between otherwise identical candidate/baseline runs.
@@ -204,9 +212,11 @@ try {
       closed.set(id, done.finishedAt - startedClock);
     }
     publishState(done.finishedAt);
-    if (scanCompletedAt !== null && closed.size === 20) opts.maxCycles = currentCycle;
+    if (scanCompletedAt !== null && closed.size === debtCount) opts.maxCycles = currentCycle;
   };
   worker.runWorker(opts, { nowMs: () => clock, monotonicNowMs: () => clock,
+    ...(serialIdle ? { hasHistoryWork: () => true,
+      remoteSampleAdmission: (sampleOptions, admissionDeps) => scheduler.readScheduledRemoteSampleAdmission(sampleOptions, admissionDeps) } : {}),
     sleepSeconds: seconds => { sleeps.push({ cycle: currentCycle, milliseconds: seconds * 1000 }); increment(seconds * 1000); },
     writeScheduler() {},
     runCycle: (cycleOpts, cycle, deps) => {
@@ -222,7 +232,9 @@ try {
             if (name === 'history') {
               const findNumber = (flag, fallback) => commandArgs.includes(flag) ? Number(commandArgs[commandArgs.indexOf(flag) + 1]) : fallback;
               const historyOptions = frame || { db, logDir,
-                maxRecords: findNumber('--max-records', 1), maxCliAttempts: findNumber('--max-cli-attempts', 4), maxSeconds: findNumber('--max-seconds', 30) };
+                maxRecords: findNumber('--max-records', 1), maxCliAttempts: findNumber('--max-cli-attempts', 4),
+                ...(commandArgs.includes('--max-self-attempts') ? { maxSelfAttempts: findNumber('--max-self-attempts', 6) } : {}),
+                maxSeconds: findNumber('--max-seconds', 30) };
               const localStarted = performance.now(), cpuStarted = process.cpuUsage();
               result = history.executeLarkImHistory({ db, ...historyOptions }, historyDeps);
               const cpu = process.cpuUsage(cpuStarted);
@@ -244,10 +256,14 @@ try {
     runRemoteSample: sampleOptions => {
       finishBackground();
       if (background) return { outcome: 'running' };
-      if (clock < nextSampleAt) return { outcome: 'not_due' };
+      if (serialIdle) {
+        const admission = scheduler.readScheduledRemoteSampleAdmission(sampleOptions, { nowMs: () => clock });
+        if (admission.outcome !== 'due') return admission;
+      } else if (clock < nextSampleAt) return { outcome: 'not_due' };
       const beforeKeys = new Set(Object.keys(observations)), sampledAt = clock;
       const result = sampler.collectRemoteSample(db, { previousObservations: observations,
         accountKey: binding.account_key, rotation, remoteSampleBudgetMs: sampleOptions.remoteSampleBudgetMs,
+        maxApiCalls: sampleOptions.maxApiCalls, maxSelfCalls: sampleOptions.maxSelfCalls,
         env: { LARK_CLI: 'synthetic_never_spawned' } }, {
         now: () => clock, sleep, tryAcquireLease: lease,
         readSharedCooldown: () => ({ state: 'ready' }), writeSharedCooldown: () => true,
@@ -257,7 +273,7 @@ try {
       const finishedAt = clock;
       samples.push({ cycle: currentCycle, start_ms: sampledAt - startedClock, finish_ms: clock - startedClock,
         remaining: Object.keys(result.observations).length, history: result.report.history || null,
-        calls: result.report.probe.api_calls, outcome: result.outcome });
+        calls: result.report.probe.api_calls, self_calls: result.report.probe.self_calls ?? 2, outcome: result.outcome });
       const nextDue = scheduler.nextRemoteSampleDue ? scheduler.nextRemoteSampleDue({ finished: clock,
         ok: result.outcome === 'ok', busy: result.outcome === 'busy', interval: 900000, backoff: 900000,
         verified: result.cacheContext?.auth_identity_verified === true && Boolean(result.cacheContext?.account_key),
@@ -266,6 +282,13 @@ try {
       // background timeline. The worker receives only its actual start result;
       // the child's duration is not synchronously added to foreground work.
       background = { result, beforeKeys, finishedAt, nextDue };
+      if (serialIdle) {
+        finishBackground();
+        return { outcome: result.outcome, reason: 'sampled', next_due: nextDue,
+          cooldownsByOperation: result.cooldownsByOperation, budget_receipt: { version: 1, complete: true,
+            max_cli_attempts: sampleOptions.maxApiCalls, max_self_attempts: sampleOptions.maxSelfCalls,
+            cli_attempts: result.report.probe.api_calls, self_attempts: result.report.probe.self_calls } };
+      }
       clock = sampledAt;
       return { outcome: 'started', next_due: nextDue };
     },
@@ -279,6 +302,15 @@ try {
   }
   assert.ok(summaries.every(summary => summary.request_budget.cli_attempts <= summary.request_budget.max_cli_attempts));
   assert.ok(samples.every(sample => sample.calls <= 12));
+  if (serialIdle) {
+    for (let cycle = 1; cycle <= currentCycle; cycle++) {
+      const calls = invocationEvents.filter(event => event.cycle === cycle);
+      assert.ok(calls.length <= 12, `cycle ${cycle} shares at most 12 CLI attempts`);
+      assert.ok(calls.filter(event => event.self).length <= 6, `cycle ${cycle} shares at most 6 identity attempts`);
+      for (let index = 1; index < calls.length; index++) assert.ok(calls[index].at_ms - calls[index - 1].finished_ms >= 1000,
+        `cycle ${cycle} preserves the gap across actor boundaries`);
+    }
+  }
   const summarize = values => {
     const sorted = values.filter(Number.isFinite).sort((a, b) => a - b);
     return { observed: sorted.length, p50_ms: sorted.length ? sorted[Math.max(0, Math.ceil(sorted.length * .5) - 1)] : null,
@@ -291,7 +323,7 @@ try {
   const report = {
     schema: 'history_throughput_synthetic/v1', root, synthetic_only: true,
     harness_sha256: harnessHash,
-    workload: { rows: rowCount, scopes: scopeCount, known_debts: 20, same_version_debts: 10, layout,
+    workload: { rows: rowCount, scopes: scopeCount, known_debts: debtCount, same_version_debts: sameVersionCount, layout,
       request_latency_ms: latencyMs, forward_work_ms: forwardMs, interval_seconds: intervalSeconds,
       arrivals_per_cycle: arrivalsPerCycle, max_cycles: maxCycles },
     model_boundary: ['Actual history selector, adapter, request budget, SQLite commit and observation reducer',
@@ -299,7 +331,9 @@ try {
       'Actual collector, request budget, SQLite snapshot and observation retirement; remote transport is synthetic',
       'Only SQLite review-TTL clock translated to real wall time; no account/row/CAS check disabled',
       'Sampler due is actual nextRemoteSampleDue when available, ordinary 900s interval on the old baseline',
-      'Collector starts through actual beforeHistory hook when available; completion is an asynchronous modeled event',
+      serialIdle ? 'Serial collector naturally advances the model clock; candidate admission helper reads actual state and tickets' :
+        'Collector starts through actual beforeHistory hook when available; completion is an asynchronous modeled event',
+      'Synthetic receipts omit guardian/publication-token execution; this model is static auxiliary evidence only',
       'Ordinary baseline collector starts after history. Both versions receive the same idle-overlap model',
       'Process guardian overhead and competing external processes are outside this experiment',
       'Actual runner/batch wall time is recorded separately, not added to deterministic modeled request/work/sleep time',
@@ -328,7 +362,7 @@ try {
       priority_processed: result.priority_processed ?? 0, fair_processed: result.fair_processed ?? 1,
       request_budget: result.request_budget })),
     fair_progress: store.sqliteQuery(db, 'SELECT scope_id,generation,after_id,sweep_max_id,completed_sweeps FROM lark_im_history_progress ORDER BY scope_id;'),
-    commits, sleeps,
+    commits, sleeps, invocation_events: invocationEvents,
     code_hashes: Object.fromEntries(['src/maintenance/history.mjs', 'src/runtime/worker/worker.mjs',
       'dist/runtime/worker/lark-im-worker-core.js', 'src/diagnostics/remote-sample.mjs']
       .map(path => [path, hash(readFileSync(join(root, path)))])),

@@ -5,7 +5,7 @@ import { classifyLarkFailure, createLarkCliRunner, createTransportState, transpo
 import { NAME_LOOKUP_RETRY_BUDGET_MS } from "../adapters/lark-im/name-resolver.mjs";
 import { tryAcquireLarkApiLease, readSharedLarkCooldown, writeSharedLarkCooldown } from "../runtime/lark-api-lease.mjs";
 
-const STOP_REASONS = new Set(["cli_budget", "time_budget", "clock_unavailable", "sync_busy", "lease_unavailable",
+const STOP_REASONS = new Set(["cli_budget", "self_budget", "time_budget", "clock_unavailable", "sync_busy", "lease_unavailable",
   "rate_cooldown", "rate_limited", "shared_cooldown_unavailable"]);
 const MAINTENANCE_REQUEST_GAP_MS = 1000;
 
@@ -27,12 +27,14 @@ class MaintenanceRequestError extends Error {
  * Maintenance never waits for an API lease or a cooldown. A running request
  * cannot be preempted. A sync holding shared intent excludes later probes;
  * there is no FIFO guarantee among sync waiters or before intent admission.
- * @param {{db?: string, maxCliAttempts?: number, maxSeconds?: number}} options
+ * @param {{db?: string, maxCliAttempts?: number, maxSelfAttempts?: number, maxSeconds?: number}} options
  * @param {Record<string, any>} [deps]
  */
 function createMaintenanceRequestSession(options = {}, deps = {}) {
   const maxCliAttempts = options.maxCliAttempts ?? 12;
   const maxSeconds = options.maxSeconds ?? 30;
+  const maxSelfAttempts = options.maxSelfAttempts ?? maxCliAttempts;
+  if (!Number.isSafeInteger(maxSelfAttempts) || maxSelfAttempts < 0 || maxSelfAttempts > maxCliAttempts) throw new RangeError("invalid self-attempt budget");
   if (!Number.isSafeInteger(maxCliAttempts) || maxCliAttempts < 1 || maxCliAttempts > 1000) {
     throw new RangeError("--max-cli-attempts must be an integer from 1 to 1000");
   }
@@ -49,7 +51,7 @@ function createMaintenanceRequestSession(options = {}, deps = {}) {
   const sleep = deps.sleep || ((/** @type {number} */ ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms));
   const started = monotonicClock();
   const deadline = started + maxSeconds * 1000;
-  let attempts = 0;
+  let attempts = 0, selfAttempts = 0;
   let lastFinished = -Infinity;
   /** @type {MaintenanceRequestError | null} */
   let stopped = null;
@@ -99,7 +101,10 @@ function createMaintenanceRequestSession(options = {}, deps = {}) {
       if (!heldLease) stop("lease_unavailable");
       const remaining = Math.floor(deadline - elapsedNow());
       if (remaining < 1) stop("time_budget");
+      const isSelf = transportOperation(args) === "self_profile";
+      if (isSelf && selfAttempts >= maxSelfAttempts) stop("self_budget");
       attempts += 1;
+      if (isSelf) selfAttempts += 1;
       const result = spawn(command, args, { ...settings, env, timeout: Math.min(settings.timeout, remaining),
         ...(heldLease.stdio ? { stdio: heldLease.stdio } : {}) });
       // Some CLI versions return exit 0 with an unsuccessful native envelope.
@@ -121,6 +126,7 @@ function createMaintenanceRequestSession(options = {}, deps = {}) {
   function runLark(args, settings = {}) {
     assertReady();
     if (attempts >= maxCliAttempts) stop("cli_budget");
+    if (transportOperation(args) === "self_profile" && selfAttempts >= maxSelfAttempts) stop("self_budget");
     // This cheap preflight avoids acquiring a lease for known cooled work.
     // The transport rechecks under the lease before the actual spawn.
     sharedReady({ operation: transportOperation(args), nowMs: wallClock() });
@@ -169,6 +175,7 @@ function createMaintenanceRequestSession(options = {}, deps = {}) {
   function summary() {
     const elapsed = monotonicClock() - started;
     return { max_cli_attempts: maxCliAttempts, cli_attempts: attempts, max_seconds: maxSeconds,
+      ...(options.maxSelfAttempts !== undefined ? { max_self_attempts: maxSelfAttempts, self_attempts: selfAttempts } : {}),
       min_interval_ms: MAINTENANCE_REQUEST_GAP_MS,
       elapsed_ms: Number.isFinite(elapsed) ? Math.max(0, Math.floor(elapsed)) : null,
       stop_reason: stopped?.reason || null };

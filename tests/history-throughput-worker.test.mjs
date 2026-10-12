@@ -69,19 +69,21 @@ test('batch receipts keep bounded counters and reasons without propagating targe
   assert.doesNotMatch(JSON.stringify(event.summary), /synthetic-private|record_id|targets/);
 });
 
-test('a due asynchronous sample replaces history and gets the whole idle interval before forward resumes', () => {
+test('a full synchronous sample consumes this idle allowance and its actual duration is credited before forward resumes', () => {
   let tick = 2208988800000, sampleFinish = null, sampleCalls = 0;
   const starts = [], historyCycles = [], receipts = [];
   const opts = { ...WORKER_DEFAULTS, intervalSeconds: 30, maxCycles: 3, logDir: '', db: '/tmp/synthetic-sample-idle.sqlite' };
   runWorker(opts, {
     nowMs: () => tick, monotonicNowMs: () => tick, sleepSeconds: seconds => { tick += seconds * 1000; },
     writeScheduler: () => {},
+    remoteSampleAdmission: () => ({ outcome: sampleCalls === 0 ? 'due' : 'not_due' }),
     runRemoteSample: sampleOpts => {
       assert.equal(sampleOpts.remoteSampleBudgetMs, 25_000);
       sampleCalls++;
-      if (sampleCalls !== 1) return { outcome: 'not_due' };
       sampleFinish = tick + 25_000;
-      return { outcome: 'started', reason: 'sample_started' };
+      tick = sampleFinish;
+      return { outcome: 'ok', reason: 'sampled', budget_receipt: { version: 1, complete: true,
+        max_cli_attempts: sampleOpts.maxApiCalls, max_self_attempts: sampleOpts.maxSelfCalls, cli_attempts: 12, self_attempts: 2 } };
     },
     runCycle: (cycleOpts, cycle, deps) => runCycleWithRunner(cycleOpts, cycle, (name, args, command) => {
       if (name === 'sent') {
@@ -95,7 +97,7 @@ test('a due asynchronous sample replaces history and gets the whole idle interva
   });
   assert.deepEqual(starts.map(value => value - starts[0]), [0, 36_000, 72_000]);
   assert.deepEqual(historyCycles, [2, 3]);
-  assert.equal(receipts.find(row => row.cycle === 1 && row.name === 'history').summary.outcome, 'sample_scheduled');
+  assert.equal(receipts.find(row => row.cycle === 1 && row.name === 'history').summary.outcome, 'batch_deferred');
 });
 
 for (const jump of [-60_000, 60_000]) {
@@ -126,7 +128,10 @@ test('retention on every cycle still admits samples and the final finite cycle c
     logDir: '', db: '/tmp/synthetic-retention-idle.sqlite' };
   runWorker(opts, {
     nowMs: () => tick, sleepSeconds: seconds => { tick += seconds * 1000; }, writeScheduler: () => {},
-    runRemoteSample: () => { samples++; order.push('sample'); return { outcome: 'started' }; },
+    remoteSampleAdmission: () => ({ outcome: samples === 0 ? 'due' : 'not_due' }),
+    runRemoteSample: sampleOpts => { samples++; order.push('sample'); tick += 1000; return { outcome: 'ok', reason: 'sampled',
+      budget_receipt: { version: 1, complete: true, max_cli_attempts: sampleOpts.maxApiCalls,
+        max_self_attempts: sampleOpts.maxSelfCalls, cli_attempts: 12, self_attempts: 2 } }; },
     runCycle: (cycleOpts, cycle, deps) => runCycleWithRunner(cycleOpts, cycle, (name, args, command) => {
       order.push(name);
       if (name === 'history') historyCycles.push(cycle);
@@ -135,7 +140,7 @@ test('retention on every cycle still admits samples and the final finite cycle c
       } });
     }, () => {}, () => new Date(tick).toISOString(), deps.onComplete, deps.beforeHistory),
   });
-  assert.equal(samples, 2);
-  assert.deepEqual(historyCycles, [3]);
+  assert.equal(samples, 1);
+  assert.deepEqual(historyCycles, [2, 3]);
   assert.equal(order[order.indexOf('sample') - 1], 'retention');
 });

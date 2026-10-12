@@ -8,7 +8,8 @@ import { writeLog, rotateLogIfNeeded } from "./log.mjs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { performance } from "node:perf_hooks";
-import { createRemoteSampleController, readScheduledRemoteCooldowns } from "./remote-sample-scheduler.mjs";
+import { readScheduledRemoteSampleAdmission, readScheduledRemoteCooldowns, runScheduledRemoteSample } from "./remote-sample-scheduler.mjs";
+import { selectHistoryTarget } from "../../maintenance/history.mjs";
 import {
   adaptiveFairDecision,
   compactHistorySummary,
@@ -90,7 +91,7 @@ const STEP_OPERATIONS = {
  * @property {() => number=} monotonicNowMs
  * @property {Record<string, number>=} cooldownsByOperation
  * @property {(steps: JsonObject[], payload: JsonObject) => void=} onComplete
- * @property {(steps: JsonObject[]) => JsonObject|null=} beforeHistory
+ * @property {(steps: JsonObject[], runHistory: (args?: string[]) => JsonObject) => JsonObject|null=} beforeHistory
  *
  * @typedef {object} RunWorkerDeps
  * @property {(opts: WorkerOptions, deps: JsonObject) => JsonObject=} runRemoteSample
@@ -102,6 +103,8 @@ const STEP_OPERATIONS = {
  * @property {() => number=} monotonicNowMs
  * @property {(opts: WorkerOptions, payload: JsonObject) => void=} writeScheduler
  * @property {Record<string, number>=} cooldownsByOperation
+ * @property {(opts: WorkerOptions) => boolean=} hasHistoryWork
+ * @property {(opts: WorkerOptions, deps: JsonObject) => JsonObject=} remoteSampleAdmission
  */
 
 function usage() {
@@ -280,6 +283,116 @@ function runCycle(opts, cycle, deps = {}) {
   );
 }
 
+/** Never infer zero from a missing/projected counter. Process failures and
+ * incomplete receipts consume their whole reservation and stop this idle slice. */
+function trustedIdleBudget(value, cli, self, sample = false) {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value) &&
+    (!sample || value.version === 1 && value.complete === true) &&
+    value.max_cli_attempts === cli && value.max_self_attempts === self &&
+    Number.isSafeInteger(value.cli_attempts) && value.cli_attempts >= 0 && value.cli_attempts <= cli &&
+    Number.isSafeInteger(value.self_attempts) && value.self_attempts >= 0 &&
+    value.self_attempts <= self && value.self_attempts <= value.cli_attempts);
+}
+
+/** Two complete jobs share one in-memory allowance. The sampler keeps its full
+ * list contract when it goes first. Only its measured surplus may fund history;
+ * history-first never squeezes a legacy sampler into an unproven smaller plan.
+ * Waiting ages survive unserved cycles, not restarts. No extra scheduling loop,
+ * persistent budget, API concurrency, or speculative refund is introduced.
+ * @param {WorkerOptions} opts
+ * @param {number} cycle
+ * @param {(args?: string[]) => JsonObject} runHistory
+ * @param {{history:number|null,sample:number|null}} waiting
+ * @param {JsonObject} deps
+ */
+function runSharedIdleWork(opts, cycle, runHistory, waiting, deps) {
+  const now = deps.nowMs, monotonic = deps.monotonicNowMs;
+  const began = monotonic(), startedAt = new Date(now()).toISOString();
+  let historyAvailable = true;
+  try { historyAvailable = deps.hasHistoryWork(opts) !== false; } catch { /* Child admission remains authoritative. */ }
+  const finalCycle = opts.maxCycles !== null && cycle >= opts.maxCycles;
+  let admission = { outcome: "disabled" };
+  if (!finalCycle && opts.remoteSampleIntervalSeconds !== 0 && deps.sample) {
+    try { admission = deps.remoteSampleAdmission(opts, { nowMs: now, cooldownsByOperation: deps.cooldowns }); }
+    catch { admission = { outcome: "failed", reason: "scheduler_unavailable", next_due: null }; }
+    if (admission.outcome === "failed") deps.onSample(admission);
+  }
+  const sampleDue = admission.outcome === "due";
+  if (!historyAvailable) waiting.history = null;
+  else if (waiting.history === null) waiting.history = began;
+  if (!sampleDue) waiting.sample = null;
+  else if (waiting.sample === null) waiting.sample = began;
+  const jobs = [
+    ...(sampleDue ? [{ name: "sample", since: waiting.sample }] : []),
+    ...(historyAvailable ? [{ name: "history", since: waiting.history }] : []),
+  ].sort((a, b) => Number(a.since) - Number(b.since)); // A first-cycle tie keeps the ordinary sample first.
+  const duration = Math.max(1000, Math.min(historyAvailable ? 25_000 : 55_000, (opts.intervalSeconds - 5) * 1000));
+  const deadline = began + duration;
+  let previous = began, cliRemaining = 12, selfRemaining = 6, called = false;
+  /** @type {JsonObject|null} */ let historyStep = null;
+  const remaining = () => {
+    const observed = monotonic();
+    if (!Number.isFinite(deadline) || !Number.isFinite(previous) || !Number.isFinite(observed) || observed < previous) return 0;
+    previous = observed;
+    return Math.max(0, deadline - observed);
+  };
+  for (const job of jobs) {
+    if (remaining() < 1000 || selfRemaining < 2 || cliRemaining < 3) break;
+    // No duplicate collector planner: preserve its whole CLI admission contract.
+    // A zero-request history race may leave all twelve calls available.
+    if (job.name === "sample" && (cliRemaining !== 12 || remaining() < 3000)) continue;
+    if (called) {
+      if (remaining() <= 1000) break;
+      deps.sleepSeconds(1);
+      if (remaining() < (job.name === "sample" ? 3000 : 1000)) break;
+    }
+    const maxCli = cliRemaining, maxSelf = job.name === "sample" ? 2 : selfRemaining;
+    // Reserve before spawning. Only a complete, strictly checked receipt refunds.
+    cliRemaining -= maxCli; selfRemaining -= maxSelf;
+    called = true;
+    let receipt;
+    if (job.name === "sample") {
+      const budgetMs = Math.floor(remaining());
+      let sampled;
+      try { sampled = deps.sample({ ...opts, maxApiCalls: maxCli, maxSelfCalls: maxSelf,
+        remoteSampleBudgetMs: budgetMs }, { nowMs: now, cooldownsByOperation: deps.cooldowns,
+        returnReport: true, remainingTimeMs: remaining }); }
+      catch { break; }
+      deps.onSample(sampled);
+      receipt = sampled?.budget_receipt;
+      if (!trustedIdleBudget(receipt, maxCli, maxSelf, true)) break;
+      cliRemaining += maxCli - receipt.cli_attempts;
+      selfRemaining += maxSelf - receipt.self_attempts;
+      if (sampled.outcome === "ok") waiting.sample = null;
+      if (!["ok", "not_due", "disabled"].includes(sampled.outcome)) break;
+    } else {
+      const seconds = Math.min(30, Math.floor(remaining() / 1000));
+      if (seconds < 1) break;
+      historyStep = runHistory(["history", "--db", opts.db, ...(opts.logDir ? ["--log-dir", opts.logDir] : []),
+        "--max-records", "12", "--max-cli-attempts", String(maxCli), "--max-self-attempts", String(maxSelf),
+        "--max-seconds", String(seconds), "--format", "json"]);
+      receipt = historyStep?.summary?.request_budget;
+      if (historyStep?.guardian_diagnostic || !trustedIdleBudget(receipt, maxCli, maxSelf)) break;
+      cliRemaining += maxCli - receipt.cli_attempts;
+      selfRemaining += maxSelf - receipt.self_attempts;
+      const summary = historyStep.summary;
+      if (summary?.outcome === "no_eligible_known_record" ||
+          Number(summary?.processed) > 0 && summary?.outcome !== "legacy_required") waiting.history = null;
+      // No progress, including ordinary->merge, stays at the head next cycle.
+      if (historyStep.ok !== true || ["sync_busy", "lease_unavailable", "rate_limited", "rate_cooldown",
+        "shared_cooldown_unavailable", "clock_unavailable"].includes(receipt.stop_reason)) break;
+    }
+  }
+  const finished = monotonic();
+  const elapsed = Number.isFinite(finished) && finished >= began ? finished - began : 0;
+  // This logical history/idle step includes the synchronous sample and gap.
+  // Its child request_budget.elapsed_ms remains the actual writer duration.
+  return { ...(historyStep || { name: "history", ok: true, exit_code: 0, stderr: "",
+    summary: { ok: true, profile: "known_record_history/v1", outcome: "batch_deferred", processed: 0,
+      cursor_policy: "unchanged", coverage: "known_rows_only" } }),
+    started_at: startedAt, finished_at: new Date(now()).toISOString(), elapsed_ms: elapsed };
+}
+
 /**
  * @param {WorkerOptions} opts
  * @param {RunWorkerDeps} [deps]
@@ -293,8 +406,12 @@ function runWorker(opts, deps = {}) {
   const cooldowns = deps.cooldownsByOperation || {};
   // Injected synthetic cycles never implicitly start real remote work.
   const sampleOpts = { ...opts, remoteSampleBudgetMs: Math.max(1000, Math.min(55_000, (opts.intervalSeconds - 5) * 1000)) };
-  const controller = deps.remoteSampleController || (!deps.runCycle && !deps.runRemoteSample ? createRemoteSampleController(sampleOpts) : null);
-  const sample = deps.runRemoteSample || (controller ? (_opts, sampleDeps) => controller.run(sampleDeps) : null);
+  const controller = deps.remoteSampleController || null;
+  const sample = deps.runRemoteSample || (controller ? (_opts, sampleDeps) => controller.run(sampleDeps) :
+    !deps.runCycle ? runScheduledRemoteSample : null);
+  const hasHistoryWork = deps.hasHistoryWork || (!deps.runCycle ? candidate => Boolean(selectHistoryTarget(candidate.db)) : () => true);
+  const remoteSampleAdmission = deps.remoteSampleAdmission || (!deps.runCycle ? readScheduledRemoteSampleAdmission : () => ({ outcome: "due" }));
+  const waiting = { history: /** @type {number|null} */ (null), sample: /** @type {number|null} */ (null) };
   if (!deps.runCycle) Object.assign(cooldowns, mergeTransportCooldowns(cooldowns, readScheduledRemoteCooldowns(opts, { nowMs }), nowMs()));
   const activity = deps.activity || (!deps.runCycle ? createActivityWriter({ db: opts.db, role: "worker", now: nowMs,
     emit: (event) => writeLog(opts, event, { stdout: { write() {} } }), }) : undefined);
@@ -313,11 +430,7 @@ function runWorker(opts, deps = {}) {
     /** @type {JsonObject[] | undefined} */
     let observedSteps;
     let sampleAttempted = false;
-    const attemptSample = () => {
-      sampleAttempted = true;
-      if (!sample || opts.remoteSampleIntervalSeconds === 0) return false;
-      try {
-        const sampled = sample(sampleOpts, { nowMs, cooldownsByOperation: cooldowns });
+    const onSample = sampled => {
         const merged = mergeTransportCooldowns(cooldowns, sampled.cooldownsByOperation, nowMs());
         for (const key of Object.keys(cooldowns)) delete cooldowns[key];
         Object.assign(cooldowns, merged);
@@ -327,6 +440,13 @@ function runWorker(opts, deps = {}) {
             at: new Date(nowMs()).toISOString(), outcome: sampled.outcome, reason: sampled.reason,
             next_due: sampled.next_due });
         }
+    };
+    const attemptSample = () => {
+      sampleAttempted = true;
+      if (!sample || opts.remoteSampleIntervalSeconds === 0) return false;
+      try {
+        const sampled = sample(sampleOpts, { nowMs, cooldownsByOperation: cooldowns });
+        onSample(sampled);
         return sampled.outcome === "started";
       } catch { return false; }
     };
@@ -337,17 +457,12 @@ function runWorker(opts, deps = {}) {
       nowMs,
       monotonicNowMs: monotonicNow,
       onComplete: (steps) => { observedSteps = steps; },
-      beforeHistory: (steps) => {
-        // A due independent sample owns this cycle's idle allowance. Running
-        // writer history first would consume that allowance and repeatedly
-        // interrupt the asynchronous sample at the next forward sync.
+      beforeHistory: (steps, runHistory) => {
         sampleAttempted = true;
-        if (opts.maxCycles !== null && cycle >= opts.maxCycles ||
-            !cycleHealthyWithoutHistory(steps, false) || !attemptSample()) return null;
-        const at = new Date(nowMs()).toISOString();
-        return { name: "history", ok: true, exit_code: 0, started_at: at, finished_at: at, elapsed_ms: 0,
-          summary: { ok: true, profile: "known_record_history/v1", outcome: "sample_scheduled",
-            processed: 0, cursor_policy: "unchanged", coverage: "known_rows_only" }, stderr: "" };
+        if (!runHistory || !cycleHealthyWithoutHistory(steps, false) ||
+            !sample || opts.remoteSampleIntervalSeconds === 0) return null;
+        return runSharedIdleWork(opts, cycle, runHistory, waiting, { nowMs, monotonicNowMs: monotonicNow,
+          hasHistoryWork, remoteSampleAdmission, sample, cooldowns, onSample, sleepSeconds: sleep });
       },
     }) === true;
     ok = cycleOk && ok;

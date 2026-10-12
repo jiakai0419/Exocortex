@@ -294,8 +294,9 @@ Recheck a bounded batch of known historical records with durable debt and scan c
 | `--db` | path | — | 必填 | Database; default relative to installation root, explicit relative paths to cwd. |
 | `--format` | text/json | `text` | — | Output format. |
 | `--log-dir` | path | — | — | Private worker sample state for optional known-debt scheduling hints. |
-| `--max-records` | integer | `1` | ≥ 1；≤ 12 | Maximum selected records; each retains its own identity check and at most four CLI attempts. |
+| `--max-records` | integer | `1` | ≥ 1；≤ 12 | Maximum selected records; bounded acquisitions retain identity and per-record fences. |
 | `--max-cli-attempts` | integer | `4` | ≥ 2；≤ 12 | Shared actual CLI budget for the entire batch, including identity, pages and detail. |
+| `--max-self-attempts` | integer | `6` | ≥ 0；≤ 6 | Shared actual self-profile attempt cap, including failed requests. |
 | `--max-seconds` | integer | `30` | ≥ 1；≤ 30 | Remote-work budget, 1 to 30 seconds; not the whole subprocess wall time. |
 
 ### maintenance repair
@@ -386,6 +387,6 @@ Preview database compaction; --apply permits the write.
 
 ### 有界历史核验
 
-`maintenance history --db <path>` 默认只处理一个已知原生历史记录。worker 在正常同步及到期保留清理之后，以 `--max-records 12 --max-cli-attempts 12 --max-seconds 25 --log-dir <private-log-dir>` 执行共享预算批次；每条记录仍独立核验身份、最多4次CLI，实际条数受耗时和分页限制。较短周期间隔会进一步收紧远端预算。历史耗时抵扣配置的周期间歇；到期独立采样替代该轮批次。远端预算不等于本地提交的墙钟期限。欠账优先队列与普通扫描检查点分离，失败退避，小会话完成一轮后等待其他会话。它不推进发现或同步游标，不证明未入库历史消息已全部发现，不启用停用来源或范围。详见[历史吞吐设计](history-throughput.md)。
+`maintenance history --db <path>` 默认只处理一个已知原生历史记录。worker 在正常同步及到期保留清理之后，让历史处理与独立采样串行共享最多12次CLI、6次身份查询和25秒远端工作额度；实际传入各子作业的是剩余额度。历史处理最多预取6个已知ID，以新身份查询围住一次mget，每行仍由真实调度器重新选择并通过原快照和CAS；同版本确认必须另做一次实际采集。单条及合并转发详情保留原有至多4次CLI路径。较短间隔进一步收紧预算，实际耗时抵扣周期间歇；已开始的本地事务和guardian清理可能越过远端截止。欠账优先队列与普通扫描检查点分离，失败退避，小会话完成一轮后等待其他会话。它不推进发现或同步游标，不证明未入库历史消息已全部发现，不启用停用来源或范围。详见[历史吞吐设计](history-throughput.md)。
 
 消息 replay 的新私有审阅使用 v4：仅在完整来源证明和本地投影依赖一致时接受表示变化。旧 v1–v3 文件仍按原有精确规则验证。review completion 拒绝完整 fresh proposal 时，每个审批摘要最多保存三份仅本人可读的候选证据；身份前检与最终 SQLite CAS 拒绝不在此留证范围；这些文件不是批准文件，不能延长原 TTL。具体边界见 [数据变化契约](data-change-contract.md)。

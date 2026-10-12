@@ -82,33 +82,48 @@ for (const stopReason of ['cli_budget', 'time_budget', 'sync_busy']) {
   });
 }
 
-test('history operation cooldown still reaches diagnostics and defers related forward work', () => {
+test('history operation cooldown stops remaining idle work and defers next-cycle related steps', () => {
   let tick = 2208988800000;
-  const cooldown = tick + 60_000, samples = [], calls = [], decisions = [], events = [];
+  const cooldown = tick + 60_000, samples = [], calls = [], decisions = [], events = [], cycleCooldowns = [];
   const opts = { ...WORKER_DEFAULTS, db: '/tmp/synthetic-not-opened-history-cooldown.sqlite', logDir: null,
     adaptiveFair: true, receivedScopesPerCycle: 50, maxCycles: 2 };
   const ok = runWorker(opts, {
     nowMs: () => tick, sleepSeconds: () => {}, writeScheduler: (_opts, event) => decisions.push(event),
-    runRemoteSample: (_opts, deps) => { samples.push({ ...deps.cooldownsByOperation }); return { outcome: 'not_due' }; },
-    runCycle: (cycleOpts, cycle, deps) => runCycle(cycleOpts, cycle, { ...deps,
-      writeLog: { stdout: { write: line => events.push(JSON.parse(line)) } },
-      runStep: { runProcess: (_command, args) => {
-        calls.push([cycle, ...args]); tick += 1000;
-        const history = args[1] === 'maintenance';
-        const summary = history
-          ? { ok: false, profile: 'known_record_history/v1', outcome: 'fetch_unavailable',
-            request_budget: { stop_reason: 'rate_limited' },
-            transport: { rate_limits: 1, cooldowns_by_operation: { message_history_bundle: cooldown } } }
-          : { ok: true, transport: { calls: 0, attempts: 0, rate_limits: 0, timeouts: 0, exhausted: 0 } };
-        return { status: summary.ok ? 0 : 2, stdout: JSON.stringify(summary), stderr: '' };
-      } },
-    }),
+    runRemoteSample: (sampleOpts, deps) => {
+      samples.push({ ...deps.cooldownsByOperation });
+      assert.equal(calls.some(([, , command]) => command === 'maintenance'), false);
+      // A confirmed zero-request due recheck refunds its reservation. Missing
+      // counters must instead stop the shared slice before history can run.
+      return { outcome: 'not_due', budget_receipt: { version: 1, complete: true,
+        max_cli_attempts: sampleOpts.maxApiCalls, max_self_attempts: sampleOpts.maxSelfCalls,
+        cli_attempts: 0, self_attempts: 0 } };
+    },
+    runCycle: (cycleOpts, cycle, deps) => {
+      cycleCooldowns.push({ ...deps.cooldownsByOperation });
+      return runCycle(cycleOpts, cycle, { ...deps,
+        writeLog: { stdout: { write: line => events.push(JSON.parse(line)) } },
+        runStep: { runProcess: (_command, args) => {
+          calls.push([cycle, ...args]); tick += 1000;
+          const history = args[1] === 'maintenance';
+          const summary = history
+            ? { ok: false, profile: 'known_record_history/v1', outcome: 'fetch_unavailable',
+              request_budget: { cli_attempts: 2, self_attempts: 1,
+                max_cli_attempts: Number(args[args.indexOf('--max-cli-attempts') + 1]),
+                max_self_attempts: Number(args[args.indexOf('--max-self-attempts') + 1]),
+                stop_reason: 'rate_limited' },
+              transport: { rate_limits: 1, cooldowns_by_operation: { message_history_bundle: cooldown } } }
+            : { ok: true, transport: { calls: 0, attempts: 0, rate_limits: 0, timeouts: 0, exhausted: 0 } };
+          return { status: summary.ok ? 0 : 2, stdout: JSON.stringify(summary), stderr: '' };
+        } },
+      });
+    },
   });
   assert.equal(ok, false);
-  // The independent scheduler is consulted before this cycle's history request.
-  // Its next invocation still inherits the published shared cooldown; a failed
-  // forward cycle does not admit another sample merely to observe that value.
+  // The only diagnostic invocation precedes the history rate stop. The shared
+  // slice does not start another diagnostic, and the next cycle retains the
+  // cooldown even though its deferred forward work prevents sample admission.
   assert.deepEqual(samples, [{}]);
+  assert.deepEqual(cycleCooldowns, [{}, { message_history_bundle: cooldown }]);
   assert.equal(decisions[0].pressure.rate_limits, 1); // Do not double-count the budget's same rate stop.
   assert.equal(decisions[0].pressure.failed_steps, 0);
   assert.deepEqual(events.filter(event => event.cycle === 2 && event.summary?.deferred).map(event => event.name),
