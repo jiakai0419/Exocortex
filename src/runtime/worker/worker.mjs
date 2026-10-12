@@ -7,6 +7,7 @@ import { parseOptions } from "../../cli/parse-options.mjs";
 import { writeLog, rotateLogIfNeeded } from "./log.mjs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { performance } from "node:perf_hooks";
 import { createRemoteSampleController, readScheduledRemoteCooldowns } from "./remote-sample-scheduler.mjs";
 import {
   adaptiveFairDecision,
@@ -52,6 +53,7 @@ const STEP_OPERATIONS = {
  * @property {number=} exit_code
  * @property {string} started_at
  * @property {string} finished_at
+ * @property {number=} elapsed_ms
  * @property {JsonObject | null} summary
  * @property {string} stderr
  * @property {JsonObject=} guardian_diagnostic
@@ -74,6 +76,7 @@ const STEP_OPERATIONS = {
  * @property {Record<string, number>=} cooldownsByOperation
  * @property {Record<string, string>=} activityEnv
  * @property {() => number=} nowMs
+ * @property {() => number=} monotonicNowMs
  *
  * @typedef {import("./log.mjs").WriteLogDeps} WriteLogDeps
  *
@@ -84,8 +87,10 @@ const STEP_OPERATIONS = {
  * @property {WriteLogDeps=} writeLog
  * @property {() => string=} now
  * @property {() => number=} nowMs
+ * @property {() => number=} monotonicNowMs
  * @property {Record<string, number>=} cooldownsByOperation
  * @property {(steps: JsonObject[], payload: JsonObject) => void=} onComplete
+ * @property {(steps: JsonObject[]) => JsonObject|null=} beforeHistory
  *
  * @typedef {object} RunWorkerDeps
  * @property {(opts: WorkerOptions, deps: JsonObject) => JsonObject=} runRemoteSample
@@ -94,6 +99,7 @@ const STEP_OPERATIONS = {
  * @property {(opts: WorkerOptions, cycle: number, deps?: RunCycleDeps) => unknown=} runCycle
  * @property {(seconds: number) => void=} sleepSeconds
  * @property {() => number=} nowMs
+ * @property {() => number=} monotonicNowMs
  * @property {(opts: WorkerOptions, payload: JsonObject) => void=} writeScheduler
  * @property {Record<string, number>=} cooldownsByOperation
  */
@@ -134,9 +140,11 @@ function sleepSeconds(seconds) {
  */
 function runStep(name, args, deps = {}) {
   const now = deps.now || (() => new Date((deps.nowMs || Date.now)()));
+  const monotonicNow = deps.monotonicNowMs || deps.nowMs || (() => performance.now());
   const run = deps.runProcess || runGuardedWorkerStep;
   const execPath = deps.execPath || process.execPath;
   const startedAt = now().toISOString();
+  const startedMonotonic = monotonicNow();
   const result = run(execPath, [deps.scriptPath || CLI_PATH, deps.command || "sync", ...args], {
     maxBuffer: 100 * 1024 * 1024,
     timeout: Number(deps.timeoutSeconds || WORKER_DEFAULTS.stepTimeoutSeconds) * 1000,
@@ -149,6 +157,7 @@ function runStep(name, args, deps = {}) {
     } } : {}),
   });
   const finishedAt = now().toISOString();
+  const elapsedMs = Math.max(0, monotonicNow() - startedMonotonic);
   const stdout = String(result.stdout || "");
   const rawStderr = String(result.stderr || "");
   let errorTransport = null;
@@ -203,6 +212,7 @@ function runStep(name, args, deps = {}) {
     exit_code: result.status ?? undefined,
     started_at: startedAt,
     finished_at: finishedAt,
+    ...(Number.isFinite(elapsedMs) ? { elapsed_ms: elapsedMs } : {}),
     summary: transport ? { ...(outputSummary || {}), transport } : outputSummary,
     stderr: failureDetail.slice(0, 4000),
     ...(result.guardian_diagnostic ? { guardian_diagnostic: result.guardian_diagnostic } : {}),
@@ -251,6 +261,7 @@ function runCycle(opts, cycle, deps = {}) {
         command: command || "sync",
         cooldownsByOperation: cooldowns,
         nowMs,
+        monotonicNowMs: deps.monotonicNowMs || deps.nowMs || (() => performance.now()),
       });
       deps.activity?.update("between_steps", { cycle, durationMs: ACTIVITY_GAP_MS });
       const merged = mergeTransportCooldowns(cooldowns, step.summary?.transport?.cooldowns_by_operation, nowMs());
@@ -265,6 +276,7 @@ function runCycle(opts, cycle, deps = {}) {
     },
     deps.now || (() => new Date(nowMs()).toISOString()),
     deps.onComplete,
+    deps.beforeHistory,
   );
 }
 
@@ -276,10 +288,12 @@ function runWorker(opts, deps = {}) {
   const runOneCycle = deps.runCycle || runCycle;
   const sleep = deps.sleepSeconds || sleepSeconds;
   const nowMs = deps.nowMs || Date.now;
+  const monotonicNow = deps.monotonicNowMs || deps.nowMs || (() => performance.now());
   const logScheduler = deps.writeScheduler || writeLog;
   const cooldowns = deps.cooldownsByOperation || {};
   // Injected synthetic cycles never implicitly start real remote work.
-  const controller = deps.remoteSampleController || (!deps.runCycle && !deps.runRemoteSample ? createRemoteSampleController(opts) : null);
+  const sampleOpts = { ...opts, remoteSampleBudgetMs: Math.max(1000, Math.min(55_000, (opts.intervalSeconds - 5) * 1000)) };
+  const controller = deps.remoteSampleController || (!deps.runCycle && !deps.runRemoteSample ? createRemoteSampleController(sampleOpts) : null);
   const sample = deps.runRemoteSample || (controller ? (_opts, sampleDeps) => controller.run(sampleDeps) : null);
   if (!deps.runCycle) Object.assign(cooldowns, mergeTransportCooldowns(cooldowns, readScheduledRemoteCooldowns(opts, { nowMs }), nowMs()));
   const activity = deps.activity || (!deps.runCycle ? createActivityWriter({ db: opts.db, role: "worker", now: nowMs,
@@ -293,16 +307,48 @@ function runWorker(opts, deps = {}) {
   while (opts.maxCycles === null || cycle < opts.maxCycles) {
     cycle += 1;
     const startedMs = nowMs();
+    const startedMonotonic = monotonicNow();
     if (!deps.runCycle) Object.assign(cooldowns, mergeTransportCooldowns(cooldowns, readScheduledRemoteCooldowns(opts, { nowMs }), startedMs));
     activity?.update("cycle", { cycle, durationMs: ACTIVITY_GAP_MS });
     /** @type {JsonObject[] | undefined} */
     let observedSteps;
+    let sampleAttempted = false;
+    const attemptSample = () => {
+      sampleAttempted = true;
+      if (!sample || opts.remoteSampleIntervalSeconds === 0) return false;
+      try {
+        const sampled = sample(sampleOpts, { nowMs, cooldownsByOperation: cooldowns });
+        const merged = mergeTransportCooldowns(cooldowns, sampled.cooldownsByOperation, nowMs());
+        for (const key of Object.keys(cooldowns)) delete cooldowns[key];
+        Object.assign(cooldowns, merged);
+        if (!["not_due", "disabled"].includes(sampled.outcome)) {
+          logScheduler(opts, { type: "lark_im_remote_sample_schedule", version: 1, cycle,
+            database_key: activityDatabaseKey(opts.db), instance_id: activity?.instanceId || null,
+            at: new Date(nowMs()).toISOString(), outcome: sampled.outcome, reason: sampled.reason,
+            next_due: sampled.next_due });
+        }
+        return sampled.outcome === "started";
+      } catch { return false; }
+    };
     const cycleOpts = opts.adaptiveFair ? { ...opts, receivedScopesPerCycle: adaptiveState.batch } : opts;
     const cycleOk = runOneCycle(cycleOpts, cycle, {
       cooldownsByOperation: cooldowns,
       activity, activityEnv,
       nowMs,
+      monotonicNowMs: monotonicNow,
       onComplete: (steps) => { observedSteps = steps; },
+      beforeHistory: (steps) => {
+        // A due independent sample owns this cycle's idle allowance. Running
+        // writer history first would consume that allowance and repeatedly
+        // interrupt the asynchronous sample at the next forward sync.
+        sampleAttempted = true;
+        if (opts.maxCycles !== null && cycle >= opts.maxCycles ||
+            !cycleHealthyWithoutHistory(steps, false) || !attemptSample()) return null;
+        const at = new Date(nowMs()).toISOString();
+        return { name: "history", ok: true, exit_code: 0, started_at: at, finished_at: at, elapsed_ms: 0,
+          summary: { ok: true, profile: "known_record_history/v1", outcome: "sample_scheduled",
+            processed: 0, cursor_policy: "unchanged", coverage: "known_rows_only" }, stderr: "" };
+      },
     }) === true;
     ok = cycleOk && ok;
     if (opts.adaptiveFair) {
@@ -317,23 +363,19 @@ function runWorker(opts, deps = {}) {
     }
     // History business debt remains in the cycle result but cannot indefinitely
     // suppress independent diagnostics. Their own lease/cooldown gates remain.
-    if (cycleHealthyWithoutHistory(observedSteps, cycleOk) && sample && opts.remoteSampleIntervalSeconds !== 0) {
-      try {
-        const sampled = sample(opts, { nowMs, cooldownsByOperation: cooldowns });
-        const merged = mergeTransportCooldowns(cooldowns, sampled.cooldownsByOperation, nowMs());
-        for (const key of Object.keys(cooldowns)) delete cooldowns[key];
-        Object.assign(cooldowns, merged);
-        if (!["not_due", "disabled"].includes(sampled.outcome)) {
-          logScheduler(opts, { type: "lark_im_remote_sample_schedule", version: 1, cycle,
-            database_key: activityDatabaseKey(opts.db), instance_id: activity?.instanceId || null,
-            at: new Date(nowMs()).toISOString(), outcome: sampled.outcome, reason: sampled.reason,
-            next_due: sampled.next_due });
-        }
-      } catch { /* Diagnostic collection/logging cannot change sync success. */ }
-    }
+    if (!sampleAttempted && cycleHealthyWithoutHistory(observedSteps, cycleOk)) attemptSample();
     if (opts.maxCycles !== null && cycle >= opts.maxCycles) break;
-    activity?.update("waiting", { cycle, durationMs: opts.intervalSeconds * 1000 + ACTIVITY_GRACE_MS });
-    sleep(opts.intervalSeconds);
+    // History uses idle capacity after forward sync. Credit actual subprocess
+    // wall time (including local commits), never the configured remote budget.
+    // Unknown/malformed elapsed values earn no credit, and an overrun cannot turn
+    // into negative sleep or borrow time from the next forward cycle.
+    const historyMs = Math.min(Math.max(0, monotonicNow() - startedMonotonic), (observedSteps || [])
+      .filter(step => step.name === "history").reduce((total, step) => {
+        return total + (Number.isFinite(step.elapsed_ms) && step.elapsed_ms >= 0 ? step.elapsed_ms : 0);
+      }, 0));
+    const waitSeconds = Math.max(0, opts.intervalSeconds - historyMs / 1000);
+    activity?.update("waiting", { cycle, durationMs: waitSeconds * 1000 + ACTIVITY_GRACE_MS });
+    sleep(waitSeconds);
   }
   return ok;
   } finally { controller?.stop(); activity?.update("stopped", { cycle }); }

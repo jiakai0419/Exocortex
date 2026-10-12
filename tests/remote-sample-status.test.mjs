@@ -74,3 +74,22 @@ test('one-shot no-cache checks include every local and remote phase in the 60 se
   assert.equal(call.args[3],'60000');assert.equal(call.opts.timeout,62000);assert.equal(call.opts.killSignal,'SIGTERM');assert.equal(JSON.parse(call.opts.input).mode,'read_only');
   assert.equal(result.outcome,'failed');assert.equal(result.report.reason,'sample_process_failed');
 });
+
+
+test('multiple historical windows preserve count partition and each window must predate the recent sample', () => {
+  const end = Date.parse(freshness().window.start) - 1000;
+  const windows = [0,1,2].map(index => ({ start: new Date(end - index * 10000 - 3000).toISOString(), end: new Date(end - index * 10000).toISOString() }));
+  const history = { requested: 3, attempts: 3, chats_checked: 3, pages: 3, messages_checked: 3,
+    unsupported_chats: 0, truncated_chats: 0, unroutable: 0, window: null, windows };
+  const projected = report(freshness({ history, sample_count: 5, chat_count: 2 }));
+  assert.equal(projected.freshness.status,'sampled'); assert.deepEqual(projected.freshness.history,history);
+  assert.match(plain(renderStatusText(projected,{columns:120,stream})).replace(/\s+/g,' '),/2 current messages \/ 2 chats \+ 3 historical targets/);
+  for (const mutate of [value => { value.messages_checked = 2; }, value => { value.attempts = 2; },
+    value => { value.windows[2] = { start: new Date(STATUS_SCREEN_NOW).toISOString(), end: new Date(STATUS_SCREEN_NOW + 3000).toISOString() }; },
+    value => { value.windows[1].private = 'SYNTHETIC_PRIVATE'; }, value => { value.windows[0].end = value.windows[0].start; }]) {
+    const invalid = structuredClone(history); mutate(invalid);
+    const value = report(freshness({history:invalid,sample_count:5,chat_count:2}));
+    assert.equal(value.freshness.status,'unknown'); assert.equal(value.freshness.history,undefined);
+    assert.doesNotMatch(JSON.stringify(value),/SYNTHETIC_PRIVATE/);
+  }
+});

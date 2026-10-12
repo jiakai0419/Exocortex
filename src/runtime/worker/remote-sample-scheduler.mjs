@@ -50,7 +50,7 @@ except Exception:
 /** @typedef {{first_seen:number,last_seen:number,run_finished:number,target:number,kind:'missing'|'version'|'content',scope_hash?:string,last_checked?:number,debts?:Record<string,number>}} Observation */
 /** @typedef {Record<string, Observation>} Observations */
 /** @typedef {{kind:string,database_key:string,account_key:string|null,written_at:number,next_due:number,failures:number,rotation:number,observations:Observations,observation_overflow?:boolean,last_outcome:string,cooldowns:Record<string,number>,blocked_reason:string|null}} ScheduleState */
-/** @typedef {{db:string,logDir:string,remoteSampleIntervalSeconds?:number,publication?:Record<string,any>}} ScheduleOptions */
+/** @typedef {{db:string,logDir:string,remoteSampleIntervalSeconds?:number,remoteSampleBudgetMs?:number,publication?:Record<string,any>}} ScheduleOptions */
 
 function plainObject(value) { return Boolean(value && typeof value === "object" && !Array.isArray(value)); }
 function integer(value) { return typeof value === "number" && Number.isSafeInteger(value) && value >= 0; }
@@ -175,7 +175,13 @@ function invalidateAttempt(opts, deps, reason) {
 }
 
 function boundedCollectorOptions(value = {}) {
-  return Object.fromEntries(["startMs", "endMs", "hotChats", "messagesPerChat"].filter(key => integer(value[key])).map(key => [key, value[key]]));
+  return { ...Object.fromEntries(["startMs", "endMs", "hotChats", "messagesPerChat"].filter(key => integer(value[key])).map(key => [key, value[key]])),
+    ...(integer(value.remoteSampleBudgetMs) && value.remoteSampleBudgetMs >= 1000 && value.remoteSampleBudgetMs <= 55000
+      ? { remoteSampleBudgetMs: value.remoteSampleBudgetMs } : {}) };
+}
+function collectorOptionsFor(opts, deps) {
+  return boundedCollectorOptions({ ...deps.collectorOptions,
+    ...(opts.remoteSampleBudgetMs === undefined ? {} : { remoteSampleBudgetMs: opts.remoteSampleBudgetMs }) });
 }
 
 /** Restore shared transport cooldowns before the worker's first sync cycle. */
@@ -212,7 +218,7 @@ export function startScheduledRemoteSample(opts, deps = {}) {
     secureDirectory(paths.directory);
     const publication = createRemoteSamplePublication(opts.logDir, databaseKey);
     const input = JSON.stringify({ db: resolve(opts.db), logDir: resolve(opts.logDir), remoteSampleIntervalSeconds: interval / 1000,
-      cooldownsByOperation: cooldowns, publication });
+      cooldownsByOperation: cooldowns, collectorOptions: collectorOptionsFor(opts, deps), publication });
     if (Buffer.byteLength(input) > 16 * 1024) return failed("scheduler_unavailable");
     const python = deps.pythonPath || "python3";
     const child = (deps.spawn || spawn)(python, ["-c", REMOTE_SAMPLE_LOCK_WRAPPER, paths.lock, python,
@@ -281,7 +287,7 @@ export function runScheduledRemoteSample(opts, deps = {}) {
       guardianPrefix: ["-c", REMOTE_SAMPLE_LOCK_WRAPPER, paths.lock, python],
       env: { ...process.env, EXOCORTEX_REMOTE_SAMPLE_PUBLICATION: JSON.stringify(publication) },
       input: JSON.stringify({ db: resolve(opts.db), logDir: resolve(opts.logDir), remoteSampleIntervalSeconds: interval / 1000, cooldownsByOperation: cooldowns,
-        collectorOptions: boundedCollectorOptions(deps.collectorOptions), returnReport: deps.returnReport === true, publication }),
+        collectorOptions: collectorOptionsFor(opts, deps), returnReport: deps.returnReport === true, publication }),
     }, deps);
     if (child.guardian_diagnostic || child.error || child.signal) return failed("sample_process_failed", child.guardian_diagnostic);
     let output;
@@ -301,6 +307,12 @@ export function runScheduledRemoteSample(opts, deps = {}) {
  * A not_due result explicitly means no fresh remote check took place. */
 export function runManualRemoteSample(opts, deps = {}) {
   return runScheduledRemoteSample(opts, { ...deps, returnReport: true });
+}
+
+/** Scheduling only: fast follow-up never changes the collector/guardian gates. */
+export function nextRemoteSampleDue({ finished, ok, busy, interval, backoff, pendingVerification, verified, cooldowns }) {
+  const delay = ok ? verified && pendingVerification === true ? BUSY_RETRY_MS : interval : busy ? BUSY_RETRY_MS : backoff;
+  return Math.max(finished + delay, ...Object.values(cooldowns));
 }
 
 /** Runs only inside the kernel lock acquired by the wrapper. Tests inject a
@@ -338,7 +350,7 @@ export async function executeRemoteSampleAttempt(opts, deps = {}) {
   let sampled;
   try {
     const collect = deps.collect || (await import("../../diagnostics/remote-sample.mjs")).collectRemoteSample;
-    sampled = await collect(opts.db, { ...boundedCollectorOptions(deps.collectorOptions), rotation: previous.rotation, previousObservations: previous.observations,
+    sampled = await collect(opts.db, { ...collectorOptionsFor(opts, deps), rotation: previous.rotation, previousObservations: previous.observations,
       previousOverflow: previous.observation_overflow === true,
       accountKey: previous.account_key, cooldownsByOperation: cooldowns,
       maxApiCalls: 12, minApiGapMs: 1000, totalTimeoutMs: 55_000, cacheTtlMs: Math.max(30 * 60_000, interval * 2) });
@@ -355,17 +367,26 @@ export async function executeRemoteSampleAttempt(opts, deps = {}) {
   // A bad historical response must not pin the oldest target forever. Failed
   // attempts may advance only scheduling metadata for an existing same-account
   // observation; they can never add, resolve, reroute or refresh its evidence.
-  const attempted = sampled.historyAttempt;
-  const attemptedObservations = exactKeys(attempted, ['key', 'checked_at', 'database_key', 'source_id']) && HASH.test(attempted.key) &&
-    attempted.database_key === databaseKey && attempted.source_id === 'lark.im' &&
-    previous.observations[attempted.key] && integer(attempted.checked_at) && attempted.checked_at >= started && attempted.checked_at <= finished &&
-    sampled.cacheContext?.auth_identity_verified === true && sampledAccount === previous.account_key &&
-    !['account_changed', 'database_changed', 'context_changed'].includes(sampled.report?.reason)
-    ? { ...previous.observations, [attempted.key]: { ...previous.observations[attempted.key], last_checked: attempted.checked_at } }
-    : previous.observations;
+  const suppliedAttempts = sampled.historyAttempts ?? (sampled.historyAttempt ? [sampled.historyAttempt] : []);
+  const attempts = Array.isArray(suppliedAttempts) && suppliedAttempts.length <= 3 &&
+    new Set(suppliedAttempts.map(attempt => attempt?.key)).size === suppliedAttempts.length ? suppliedAttempts : [];
+  const attemptedObservations = { ...previous.observations };
+  for (const attempted of attempts) {
+    if (exactKeys(attempted, ['key', 'checked_at', 'database_key', 'source_id']) && HASH.test(attempted.key) &&
+      attempted.database_key === databaseKey && attempted.source_id === 'lark.im' &&
+      previous.observations[attempted.key] && integer(attempted.checked_at) && attempted.checked_at >= started && attempted.checked_at <= finished &&
+      sampled.cacheContext?.auth_identity_verified === true && sampledAccount === previous.account_key &&
+      !['account_changed', 'database_changed', 'context_changed'].includes(sampled.report?.reason)) {
+      attemptedObservations[attempted.key] = { ...previous.observations[attempted.key], last_checked: attempted.checked_at };
+    }
+  }
   const ok = successful && Boolean(sampled.report) && observedCooldowns !== null && !changedUnverifiedAccount;
   const finalCooldowns = mergeCooldowns(cooldowns, observedCooldowns || {}, finished);
-  const nextDue = Math.max(finished + (ok ? interval : busy ? BUSY_RETRY_MS : backoff), ...Object.values(finalCooldowns));
+  // Only a successful collector with a freshly bound outstanding writer
+  // attempt asks for a quicker follow-up. Failed attempts retain normal backoff.
+  const nextDue = nextRemoteSampleDue({ finished, ok, busy, interval, backoff,
+    verified: sampled.cacheContext?.auth_identity_verified === true && Boolean(sampledAccount),
+    pendingVerification: sampled.pendingVerification, cooldowns: finalCooldowns });
   const finalState = { ...reserved, written_at: finished, next_due: nextDue, cooldowns: finalCooldowns,
     blocked_reason: observedCooldowns ? null : "cooldown_invalid",
     account_key: ok && sampled.cacheContext?.auth_identity_verified === true && sampledAccount ? sampledAccount : previous.account_key,

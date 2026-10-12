@@ -38,6 +38,90 @@ function historyDetailCoordinationSql(scope: SyncScope, history: NonNullable<Bou
       WHERE scope_id=${quoteSql(scope.id)} AND changes()>0;`;
 }
 
+/** Queue hints and fairness advance with the source acquisition, never before
+ * it. Only the independent sampler removes findings; awaiting is not resolved. */
+function historySchedulingSql(history: NonNullable<BoundedReplayOptions["history"]>,
+  records: StoredRecord[], attemptId: string, resultSql: string) {
+  const scheduling = history.scheduling;
+  if (!scheduling) return "";
+  const selected = scheduling.queue.find(row => row.record_id === history.selectedId);
+  const queue = scheduling.hints === null ? "" : `
+    DELETE FROM bounded_replay_runs WHERE id IN (SELECT json_extract(last_result_json,'$.effects.audit_id') FROM lark_im_history_debt
+      ${scheduling.queue.length ? `WHERE record_id NOT IN (${scheduling.queue.map(row => row.record_id).join(',')})` : ''})
+      AND id NOT IN (SELECT json_extract(last_result_json,'$.effects.audit_id') FROM lark_im_history_progress WHERE last_result_json IS NOT NULL);
+    DELETE FROM lark_im_history_debt ${scheduling.queue.length ? `WHERE record_id NOT IN (${scheduling.queue.map(row => row.record_id).join(',')})` : ''};
+    ${scheduling.queue.map(row => `INSERT INTO lark_im_history_debt
+      (record_id,scope_id,finding_key,database_key,account_key,context_fingerprint,debt_fingerprint,debts_json,
+       enqueued_at_ms,sample_checked_at_ms,generation,last_attempt_at_ms,next_due_at_ms,failures,status,last_attempt_id,last_result_json,verification_generation,verification_requested_at_ms)
+      VALUES(${row.record_id},${quoteSql(row.scope_id)},${quoteSql(row.finding_key)},${quoteSql(row.database_key)},${quoteSql(row.account_key)},
+        ${quoteSql(row.context_fingerprint)},${quoteSql(row.debt_fingerprint)},${quoteSql(row.debts_json)},${row.enqueued_at_ms},
+        ${row.sample_checked_at_ms},${row.generation},${row.last_attempt_at_ms},${row.next_due_at_ms},${row.failures},
+        ${quoteSql(row.status)},${quoteSql(row.last_attempt_id)},${quoteSql(row.last_result_json)},${row.verification_generation ?? "NULL"},${row.verification_requested_at_ms})
+      ON CONFLICT(record_id) DO UPDATE SET scope_id=excluded.scope_id,finding_key=excluded.finding_key,
+        database_key=excluded.database_key,account_key=excluded.account_key,context_fingerprint=excluded.context_fingerprint,
+        debt_fingerprint=excluded.debt_fingerprint,debts_json=excluded.debts_json,enqueued_at_ms=excluded.enqueued_at_ms,
+        sample_checked_at_ms=excluded.sample_checked_at_ms,generation=excluded.generation,last_attempt_at_ms=excluded.last_attempt_at_ms,
+        next_due_at_ms=excluded.next_due_at_ms,failures=excluded.failures,status=excluded.status,
+        last_attempt_id=excluded.last_attempt_id,last_result_json=excluded.last_result_json,
+        verification_generation=excluded.verification_generation,verification_requested_at_ms=excluded.verification_requested_at_ms;`).join('\n')}`;
+  const failed = history.error !== null;
+  const candidate = records.some(record => record.observation?.action === 'conflict');
+  const failures = failed ? Math.min(16, (selected?.failures || 0) + 1) : 0;
+  const due = history.startedAtMs + (failed ? Math.min(6 * 60 * 60_000, 60_000 * 2 ** Math.min(9, failures - 1)) : candidate ? 1000 : 0);
+  const round = scheduling.fairRound;
+  return `${queue}
+    ${round ? `DELETE FROM lark_im_history_round ${round.baselines.length ? `WHERE scope_id NOT IN (${round.baselines.map(row => quoteSql(row.scope_id)).join(',')})` : ''};
+      ${round.baselines.map(row => `INSERT INTO lark_im_history_round(scope_id,round,baseline_sweeps,enrolled_at_ms)
+        VALUES(${quoteSql(row.scope_id)},${row.round},${row.baseline_sweeps},${row.enrolled_at_ms}) ON CONFLICT(scope_id)
+        DO UPDATE SET round=excluded.round,baseline_sweeps=excluded.baseline_sweeps,enrolled_at_ms=excluded.enrolled_at_ms;`).join('\n')}` : ''}
+    ${selected ? `UPDATE lark_im_history_debt SET generation=generation+1,last_attempt_at_ms=${history.startedAtMs},
+      next_due_at_ms=${due},failures=${failures},status=${quoteSql(failed || candidate ? 'ready' : 'awaiting_verification')},
+      last_attempt_id=${quoteSql(attemptId)},last_result_json=${resultSql}
+      ${failed || candidate ? '' : `,verification_requested_at_ms=CASE WHEN verification_generation IS NOT
+        (SELECT generation FROM record_observation_state WHERE record_id=${history.selectedId}) THEN ${history.startedAtMs} ELSE verification_requested_at_ms END,
+        verification_generation=(SELECT generation FROM record_observation_state WHERE record_id=${history.selectedId})`}
+      WHERE record_id=${history.selectedId};` : ''}
+    INSERT INTO lark_im_history_scheduler(id,generation,priority_streak,last_attempt_id,last_result_json,fair_round)
+      VALUES(1,${scheduling.generation + 1},${scheduling.lane === 'priority' ? scheduling.priorityStreak + 1 : 0},${quoteSql(attemptId)},${resultSql},
+        ${round ? round.nextRound : 'COALESCE((SELECT fair_round FROM lark_im_history_scheduler WHERE id=1),0)'})
+      ON CONFLICT(id) DO UPDATE SET generation=excluded.generation,priority_streak=excluded.priority_streak,fair_round=excluded.fair_round,
+        last_attempt_id=excluded.last_attempt_id,last_result_json=excluded.last_result_json;`;
+}
+
+function validateHistoryScheduling(history: NonNullable<BoundedReplayOptions["history"]>) {
+  const value = history.scheduling;
+  if (!value) return;
+  const integer = (n: unknown) => Number.isSafeInteger(n) && Number(n) >= 0;
+  if (!integer(value.generation) || !integer(value.priorityStreak) || value.priorityStreak > 2 ||
+    !['priority','fair'].includes(value.lane) || value.lane === 'priority' && value.priorityStreak === 2 ||
+    !(value.hints === null || Array.isArray(value.hints) && value.hints.length <= 200) ||
+    !Array.isArray(value.queueBefore) || value.queueBefore.length > 200 ||
+    new Set(value.queueBefore.map(row => row.record_id)).size !== value.queueBefore.length ||
+    !Array.isArray(value.queue) || value.queue.length > 200 || new Set(value.queue.map(row => row.record_id)).size !== value.queue.length ||
+    new Set(value.queue.map(row => row.finding_key)).size !== value.queue.length ||
+    value.hints === null && value.queue.length || value.lane === 'priority' && !value.queue.some(row => row.record_id === history.selectedId))
+    throw new Error('invalid history schedule');
+  const round = value.fairRound;
+  if (round && (value.lane !== 'fair' || !integer(round.beforeRound) || !integer(round.nextRound) ||
+    round.nextRound < round.beforeRound || round.nextRound > round.beforeRound + 1 ||
+    ![round.previous,round.baselines].every(rows => Array.isArray(rows) && rows.length <= 10000 &&
+      new Set(rows.map(row => row.scope_id)).size === rows.length && rows.every(row =>
+        row.scope_id.startsWith('lark.im.received.chat.') && integer(row.round) && integer(row.baseline_sweeps) && integer(row.enrolled_at_ms)))))
+    throw new Error('invalid history fair round');
+  for (const row of [...value.queue,...value.queueBefore]) {
+    if (![row.record_id,row.enqueued_at_ms,row.sample_checked_at_ms,row.generation,row.last_attempt_at_ms,row.next_due_at_ms,row.failures,row.verification_requested_at_ms].every(integer) ||
+      row.record_id < 1 || row.failures > 16 || !(row.verification_generation === null || integer(row.verification_generation)) || !['ready','awaiting_verification'].includes(row.status) ||
+      ![row.finding_key,row.database_key,row.account_key,row.context_fingerprint,row.debt_fingerprint].every(value => /^[a-f0-9]{64}$/.test(value)) ||
+      !row.scope_id.startsWith('lark.im.received.chat.') || typeof row.debts_json !== 'string' || row.debts_json.length > 1024 ||
+      !(row.last_attempt_id === null || typeof row.last_attempt_id === 'string') ||
+      !(row.last_result_json === null || typeof row.last_result_json === 'string')) throw new Error('invalid history debt hint');
+    if (Object.keys(row).some(key => !['record_id','scope_id','finding_key','database_key','account_key','context_fingerprint','debt_fingerprint',
+      'debts_json','enqueued_at_ms','sample_checked_at_ms','generation','last_attempt_at_ms','next_due_at_ms','failures','status',
+      'last_attempt_id','last_result_json','verification_generation','verification_requested_at_ms'].includes(key))) throw new Error('invalid history debt fields');
+    JSON.parse(row.debts_json);
+  }
+}
+
 /** Commit one completely fetched, explicitly bounded repair without touching
  * normal runs, scope cursors, or freshness markers. Remote work belongs outside
  * this method; only this short transaction holds a maintenance lease. */
@@ -66,6 +150,7 @@ function commitBoundedReplayRecords(dbPath: string, options: BoundedReplayOption
   const historyKey = history ? createHash("sha256").update(JSON.stringify({ scope, history, attemptId, records: options.records, initialSyncStartMs, startMs, endMs, planId, selfIdHash, pages, fetchedCount,
     reviewFence: options.reviewFence, acquisition: options.observationAcquisition ? { ...options.observationAcquisition, basis: [...options.observationAcquisition.basis] } : null })).digest("hex") : null;
   if (history) {
+    validateHistoryScheduling(history);
     const task = history.detailTask;
     if (task != null && (!/^[a-f0-9]{64}$/.test(task.fingerprint) || typeof task.raw_root_json !== "string"
       || !Number.isSafeInteger(task.occurred_at_ms) || task.occurred_at_ms < 0
@@ -82,7 +167,11 @@ function commitBoundedReplayRecords(dbPath: string, options: BoundedReplayOption
       || ![null, "incomplete", "size_limit", "identity", "ambiguous", "missing", "fetch_unavailable"].includes(history.error)) {
       throw new Error("invalid historical recheck fence");
     }
-    const receipt = sqliteQuery(dbPath, `SELECT last_attempt_id,last_result_json FROM lark_im_history_progress WHERE scope_id=${quoteSql(scope.id)};`, "read history receipt")[0];
+    const receipt = sqliteQuery(dbPath, history.scheduling ? `SELECT last_attempt_id,last_result_json FROM lark_im_history_scheduler
+      WHERE id=1 AND last_attempt_id=${quoteSql(attemptId)} UNION ALL
+      SELECT last_attempt_id,last_result_json FROM lark_im_history_debt WHERE record_id=${history.selectedId} AND last_attempt_id=${quoteSql(attemptId)}
+      UNION ALL SELECT last_attempt_id,last_result_json FROM lark_im_history_progress WHERE scope_id=${quoteSql(scope.id)} AND last_attempt_id=${quoteSql(attemptId)};`
+      : `SELECT last_attempt_id,last_result_json FROM lark_im_history_progress WHERE scope_id=${quoteSql(scope.id)};`, "read history receipt")[0];
     if (receipt?.last_attempt_id === attemptId) {
       const saved = JSON.parse(receipt.last_result_json);
       if (saved.history_key !== historyKey) throw new Error("history acquisition identity reused");
@@ -162,14 +251,33 @@ function commitBoundedReplayRecords(dbPath: string, options: BoundedReplayOption
         COALESCE((SELECT generation FROM lark_im_history_progress WHERE scope_id=${quoteSql(scope.id)}),0)=${history.generation}
         AND COALESCE((SELECT after_id FROM lark_im_history_progress WHERE scope_id=${quoteSql(scope.id)}),0)=${history.afterId}
         AND COALESCE((SELECT sweep_max_id FROM lark_im_history_progress WHERE scope_id=${quoteSql(scope.id)}),0)=${history.sweepMaxId}
+        AND COALESCE((SELECT completed_sweeps FROM lark_im_history_progress WHERE scope_id=${quoteSql(scope.id)}),0)=${history.completedSweeps}
         THEN 1 ELSE 0 END;` : ""}
+      ${history?.scheduling ? `INSERT INTO __replay_guard SELECT CASE WHEN
+        COALESCE((SELECT generation FROM lark_im_history_scheduler WHERE id=1),0)=${history.scheduling.generation}
+        AND COALESCE((SELECT priority_streak FROM lark_im_history_scheduler WHERE id=1),0)=${history.scheduling.priorityStreak}
+        AND (SELECT COUNT(*) FROM lark_im_history_debt)=${history.scheduling.queueBefore.length}
+        ${history.scheduling.queueBefore.map(row => `AND EXISTS(SELECT 1 FROM lark_im_history_debt
+          WHERE ${Object.entries(row).map(([key,value]) => `${key} IS ${quoteSql(value)}`).join(' AND ')})`).join(' ')}
+        THEN 1 ELSE 0 END;
+        ${history.scheduling.fairRound ? `INSERT INTO __replay_guard SELECT CASE WHEN
+          COALESCE((SELECT fair_round FROM lark_im_history_scheduler WHERE id=1),0)=${history.scheduling.fairRound.beforeRound}
+          AND (SELECT COUNT(*) FROM lark_im_history_round)=${history.scheduling.fairRound.previous.length}
+          ${history.scheduling.fairRound.previous.length ? `AND NOT EXISTS(SELECT scope_id,round,baseline_sweeps,enrolled_at_ms FROM lark_im_history_round
+            EXCEPT SELECT column1,column2,column3,column4 FROM (VALUES ${history.scheduling.fairRound.previous.map(row =>
+              `(${quoteSql(row.scope_id)},${row.round},${row.baseline_sweeps},${row.enrolled_at_ms})`).join(',')}))` : ''}
+          THEN 1 ELSE 0 END;` : ''}` : ''}
       CREATE TEMP TABLE __replay_before (existed INTEGER NOT NULL, same_fact INTEGER NOT NULL);
       CREATE TEMP TABLE __replay_effects (changed INTEGER NOT NULL, existed INTEGER NOT NULL, same_fact INTEGER NOT NULL);
       ${statements}
       ${history ? historyDetailCoordinationSql(scope, history, records) : ""}
       ${history ? `DELETE FROM bounded_replay_runs WHERE scope_id=${quoteSql(scope.id)} AND id=(
-        SELECT json_extract(last_result_json,'$.effects.audit_id') FROM lark_im_history_progress WHERE scope_id=${quoteSql(scope.id)}
-      );` : ""}
+        SELECT json_extract(last_result_json,'$.effects.audit_id') FROM ${history.scheduling?.lane === 'priority' ?
+          `lark_im_history_debt WHERE record_id=${history.selectedId}` : `lark_im_history_progress WHERE scope_id=${quoteSql(scope.id)}`}
+      ) ${history.scheduling?.lane === 'priority' ? "AND id NOT IN (SELECT json_extract(last_result_json,'$.effects.audit_id') FROM lark_im_history_progress WHERE last_result_json IS NOT NULL)" : ''};` : ""}
+      ${history?.scheduling ? `DELETE FROM bounded_replay_runs WHERE id=(SELECT json_extract(last_result_json,'$.effects.audit_id')
+        FROM lark_im_history_debt WHERE record_id=${history.selectedId})
+        AND id NOT IN (SELECT json_extract(last_result_json,'$.effects.audit_id') FROM lark_im_history_progress WHERE last_result_json IS NOT NULL);` : ''}
       INSERT INTO bounded_replay_runs (
         id,plan_id,attempt_id,source_id,scope_id,initial_sync_start_ms,window_start_ms,window_end_ms,self_id_hash,
         page_count,fetched_count,candidate_count,inserted_count,updated_count,duplicate_count,conflict_count,finished_at
@@ -179,7 +287,7 @@ function commitBoundedReplayRecords(dbPath: string, options: BoundedReplayOption
         COALESCE(SUM(changed=0 AND same_fact=1),0), COALESCE(SUM(changed=0 AND same_fact=0),0),
         strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM __replay_effects;
       ${history ? `UPDATE record_observation_state SET history_error=${quoteSql(history.error)} WHERE record_id=${history.selectedId};
-        INSERT INTO lark_im_history_progress(scope_id,generation,sweep_max_id,after_id,last_attempt_at_ms,last_attempt_id,last_result_json,completed_sweeps)
+        ${history.scheduling?.lane === 'priority' ? '' : `INSERT INTO lark_im_history_progress(scope_id,generation,sweep_max_id,after_id,last_attempt_at_ms,last_attempt_id,last_result_json,completed_sweeps)
         SELECT ${quoteSql(scope.id)},${history.generation + 1},${history.nextSweepMaxId},${history.selectedId},${history.startedAtMs},${quoteSql(attemptId)},
           json_object('history_key',${quoteSql(historyKey)},'error',${quoteSql(history.error)},'request_budget',json(${quoteSql(JSON.stringify(history.requestBudget))}),
             'effects',json_object('audit_id',id,'inserted',inserted_count,'updated',updated_count,'duplicate',duplicate_count,'conflicts',conflict_count)),
@@ -187,7 +295,11 @@ function commitBoundedReplayRecords(dbPath: string, options: BoundedReplayOption
         FROM bounded_replay_runs WHERE id=${quoteSql(auditId)}
         ON CONFLICT(scope_id) DO UPDATE SET generation=excluded.generation,sweep_max_id=excluded.sweep_max_id,after_id=excluded.after_id,
           last_attempt_at_ms=excluded.last_attempt_at_ms,last_attempt_id=excluded.last_attempt_id,last_result_json=excluded.last_result_json,
-          completed_sweeps=excluded.completed_sweeps;` : ""}
+          completed_sweeps=excluded.completed_sweeps;`}
+        ${historySchedulingSql(history, records, attemptId, `(SELECT json_object('history_key',${quoteSql(historyKey)},'error',${quoteSql(history.error)},
+          'request_budget',json(${quoteSql(JSON.stringify(history.requestBudget))}),
+          'effects',json_object('audit_id',id,'inserted',inserted_count,'updated',updated_count,'duplicate',duplicate_count,'conflicts',conflict_count))
+          FROM bounded_replay_runs WHERE id=${quoteSql(auditId)})`)} ` : ""}
       SELECT id AS audit_id,inserted_count AS inserted,updated_count AS updated,
         duplicate_count AS duplicate,conflict_count AS conflicts FROM bounded_replay_runs WHERE id=${quoteSql(auditId)};
       COMMIT;

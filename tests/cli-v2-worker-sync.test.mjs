@@ -120,8 +120,8 @@ test("worker routes all child steps through bin with retained timeout and JSON r
     assert.equal(call.opts.timeout, 600_000);
   }
   assert.ok(calls.slice(0, 6).every((call) => call.args[1] === "sync"));
-  assert.deepEqual(calls[6].args.slice(1), ["maintenance", "history", "--db", "data/exocortex.sqlite", "--max-cli-attempts", "4", "--max-seconds", "30", "--format", "json"]);
-  assert.deepEqual(calls[7].args.slice(1), ["maintenance", "prune-runs", "--db", "data/exocortex.sqlite", "--apply", "--format", "json"]);
+  assert.deepEqual(calls[6].args.slice(1), ["maintenance", "prune-runs", "--db", "data/exocortex.sqlite", "--apply", "--format", "json"]);
+  assert.deepEqual(calls[7].args.slice(1), ["maintenance", "history", "--db", "data/exocortex.sqlite", "--max-records", "12", "--max-cli-attempts", "12", "--max-seconds", "25", "--format", "json"]);
 });
 
 test("actual child timeout and signal termination never become successful worker steps", (t) => {

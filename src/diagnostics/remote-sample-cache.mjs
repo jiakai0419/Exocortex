@@ -22,18 +22,29 @@ const hash = (value) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value
 /** @returns {Record<string, any>|null} */
 function safeHistory(value) {
   const fields = ['requested', 'chats_checked', 'pages', 'messages_checked', 'unsupported_chats', 'truncated_chats', 'unroutable'];
-  if (!value || typeof value !== 'object' || Array.isArray(value) ||
-      Object.keys(value).length !== fields.length + 1 || !Object.hasOwn(value, 'window') ||
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const multiple = value.requested > 1;
+  const keys = [...fields, 'window', ...(multiple ? ['windows', 'attempts'] : [])];
+  if (Object.keys(value).sort().join(',') !== keys.sort().join(',') ||
       !fields.every(key => Number.isSafeInteger(value[key]) && value[key] >= 0) ||
-      value.requested !== 1 || value.chats_checked > 1 || value.pages < value.chats_checked || value.pages > value.chats_checked * SAMPLE_POLICY.pages ||
-      value.messages_checked > 1 || value.messages_checked > value.pages * SAMPLE_POLICY.pageSize || value.unsupported_chats > 1 || value.unroutable > 1 ||
-      value.truncated_chats > 1 || value.truncated_chats > value.pages - value.chats_checked ||
-      value.unroutable && (value.chats_checked || value.pages || value.messages_checked || value.unsupported_chats || value.window !== null) ||
-      !value.unroutable && (!value.window || Object.keys(value.window).length !== 2 ||
-        !isoTime(value.window.start) || !isoTime(value.window.end) || Date.parse(value.window.end) - Date.parse(value.window.start) !== 3000)) return null;
+      value.requested < 1 || value.requested > SAMPLE_POLICY.historyTargets || value.unroutable > value.requested) return null;
+  const routed = value.requested - value.unroutable;
+  if (value.chats_checked > routed || value.pages < value.chats_checked || value.pages > value.chats_checked * SAMPLE_POLICY.pages ||
+      value.messages_checked > value.chats_checked || value.messages_checked > value.pages * SAMPLE_POLICY.pageSize || value.unsupported_chats > routed ||
+      value.truncated_chats > value.chats_checked || value.truncated_chats > value.pages - value.chats_checked) return null;
+  const validWindow = window => window && typeof window === 'object' && !Array.isArray(window) && Object.keys(window).sort().join(',') === 'end,start' &&
+    isoTime(window.start) && isoTime(window.end) && Date.parse(window.end) - Date.parse(window.start) === 3000;
+  if (multiple ? value.window !== null || !Array.isArray(value.windows) || value.windows.length !== value.requested ||
+      value.windows.filter(Boolean).length !== routed || !value.windows.every(window => window === null || validWindow(window)) ||
+      !Number.isSafeInteger(value.attempts) || value.attempts < Math.max(value.chats_checked,value.unsupported_chats) || value.attempts > routed
+    : routed ? !validWindow(value.window) : value.window !== null || value.pages || value.messages_checked || value.unsupported_chats) return null;
   return { ...Object.fromEntries(fields.map(key => [key, value[key]])),
-    window: value.window ? { start: value.window.start, end: value.window.end } : null };
+    window: value.window ? { start: value.window.start, end: value.window.end } : null,
+    ...(multiple ? { windows: value.windows.map(window => window ? { start: window.start, end: window.end } : null), attempts: value.attempts } : {}) };
 }
+function historicalWindows(history) { return history?.windows || (history?.window ? [history.window] : []); }
+export function remoteSampleHistoryWithinWindow(history, windowStart) { return !historicalWindows(history).some(window => window &&
+  (!isoTime(windowStart) || Date.parse(window.end) > Date.parse(windowStart))); }
 export { safeHistory as safeRemoteSampleHistory };
 
 /** @returns {Record<string, any>} */
@@ -43,12 +54,13 @@ export function publicRemoteReport(input) {
   const hasCollectorDiagnostic = input != null && Object.hasOwn(input, 'collector_diagnostic');
   const collectorDiagnostic = safeCollectorDiagnostic(input?.collector_diagnostic);
   const history = Object.hasOwn(input || {}, 'history') ? safeHistory(input.history) : null;
-  const invalidHistory = Object.hasOwn(input || {}, 'history') && (!history || history.window &&
-    (!isoTime(input.window?.start) || Date.parse(history.window.end) > Date.parse(input.window.start)) ||
+  const invalidPageBudget = Object.hasOwn(input?.probe || {}, 'max_pages_per_chat') && ![1,SAMPLE_POLICY.pages].includes(input.probe.max_pages_per_chat);
+  const invalidHistory = invalidPageBudget || Object.hasOwn(input || {}, 'history') && (!history || !remoteSampleHistoryWithinWindow(history, input.window?.start) ||
     input.ok === true && !validPositiveReport(input, history));
   // Even a malformed diagnostic cannot be stripped into a positive report.
   const status = hasDiagnostic || hasCollectorDiagnostic || invalidHistory ? 'unavailable' : ['healthy','delayed','needs_attention','inconclusive','unavailable'].includes(input?.status) ? input.status : 'inconclusive';
-  const probe = Object.fromEntries(PROBE_KEYS.map((k) => [k, safeCount(input?.probe?.[k])]));
+  /** @type {Record<string, any>} */ const probe = { ...Object.fromEntries(PROBE_KEYS.map((k) => [k, safeCount(input?.probe?.[k])])),
+    ...(Object.hasOwn(input?.probe || {}, 'max_pages_per_chat') ? { max_pages_per_chat: safeCount(input.probe.max_pages_per_chat) } : {}) };
   const findings = Object.fromEntries(COUNT_KEYS.map((k) => [k, safeCount(input?.findings?.[k])]));
   const binding = { state: ['verified','unverified','conflict','unavailable'].includes(input?.binding?.state) ? input.binding.state : 'unverified',
     evidence: ['single_sent_actor','initialized_empty_database'].includes(input?.binding?.evidence) ? input.binding.evidence : null,
@@ -57,7 +69,7 @@ export function publicRemoteReport(input) {
     probe.probe_errors === 0 && probe.unsupported_chats === 0 && findings.missing === 0 && findings.confirmed_missing === 0 &&
     findings.stale_version === 0 && findings.content_mismatch === 0 && findings.identity_conflict === 0 && findings.unresolved_prior === 0 &&
     findings.pending_sync === 0 && findings.local_newer === 0 && findings.expired_observations === 0 && findings.observation_overflow === 0 &&
-    (!history || history.messages_checked === 1 && history.unroutable === 0 && history.unsupported_chats === 0),
+    (!history || history.messages_checked === history.requested && history.unroutable === 0 && history.unsupported_chats === 0),
     status, reason: hasDiagnostic ? 'sample_process_failed' : hasCollectorDiagnostic || invalidHistory ? 'invalid_evidence' : REMOTE_REASONS.includes(input?.reason) ? input.reason : null, checked_at: publicTimestamp(input?.checked_at),
     ...(diagnostic ? { guardian_diagnostic: diagnostic } : {}),
     ...(!hasDiagnostic && collectorDiagnostic ? { collector_diagnostic: collectorDiagnostic } : {}),
@@ -87,6 +99,8 @@ export function remoteSampleCache(result) {
 function validCounters(p, f, history = null) {
   if (!p || !f || !PROBE_KEYS.every((k) => Number.isSafeInteger(p[k]) && p[k] >= 0) ||
       !COUNT_KEYS.every((k) => Number.isSafeInteger(f[k]) && f[k] >= 0)) return false;
+  const pageLimit = Object.hasOwn(p, 'max_pages_per_chat') ? p.max_pages_per_chat : SAMPLE_POLICY.pages;
+  if (![1, SAMPLE_POLICY.pages].includes(pageLimit)) return false;
   const n = p.remote_messages_checked;
   const historyPages = history?.pages || 0;
   const historyMessages = history?.messages_checked || 0;
@@ -96,9 +110,9 @@ function validCounters(p, f, history = null) {
       p.hot_chats > SAMPLE_POLICY.hot || p.hot_chats + p.fair_chats !== p.hot_chats_found ||
       p.chats_checked > p.hot_chats_found || p.unsupported_chats > p.hot_chats_found ||
       p.probe_errors > 1 || p.messages_per_chat > SAMPLE_POLICY.pageSize ||
-      p.pages < p.chats_checked || p.pages > p.chats_checked * SAMPLE_POLICY.pages ||
-      p.hot_chats_found + (history?.window ? 1 : 0) > p.hot_chats_requested ||
-      p.truncated_chats > p.chats_checked || p.truncated_chats > p.pages - p.chats_checked ||
+      p.pages < p.chats_checked || p.pages > p.chats_checked * pageLimit ||
+      p.hot_chats_found + (history ? history.requested - history.unroutable : 0) > p.hot_chats_requested ||
+      p.truncated_chats > p.chats_checked || p.truncated_chats > p.pages - p.chats_checked * (pageLimit - 1) ||
       p.api_calls > SAMPLE_POLICY.calls || p.api_calls < p.pages + historyPages + p.unsupported_chats + historyUnsupported + (p.pages + historyPages + p.unsupported_chats + historyUnsupported > 0 ? 1 : 0) ||
       p.pages > 0 && p.messages_per_chat === 0 ||
       n > SAMPLE_POLICY.chats * SAMPLE_POLICY.pages * SAMPLE_POLICY.pageSize || n > p.pages * p.messages_per_chat + historyMessages || historyMessages > n ||
@@ -121,8 +135,8 @@ function validPositiveReport(input, history = null) {
     ['single_sent_actor', 'initialized_empty_database'].includes(input.binding.evidence) && validCounters(p, f, history) &&
     p.remote_messages_checked > 0 && p.chats_checked > 0 && p.chats_checked === p.hot_chats_found &&
     p.messages_per_chat >= 1 && p.messages_per_chat <= SAMPLE_POLICY.pageSize &&
-    p.api_calls >= p.pages + (history?.pages || 0) + 2 && p.probe_errors === 0 && p.unsupported_chats === 0 &&
-    (!history || history.unroutable === 0 && history.unsupported_chats === 0 && history.messages_checked === 1) &&
+    !(p.max_pages_per_chat === 1 && p.truncated_chats) && p.api_calls >= p.pages + (history?.pages || 0) + 2 && p.probe_errors === 0 && p.unsupported_chats === 0 &&
+    (!history || history.unroutable === 0 && history.unsupported_chats === 0 && history.messages_checked === history.requested) &&
     ['missing', 'pending_sync', 'suspected_missing', 'confirmed_missing', 'stale_version', 'content_mismatch', 'identity_conflict',
       'local_newer', 'unresolved_prior', 'expired_observations', 'observation_overflow'].every(key => f[key] === 0);
 }
@@ -134,8 +148,7 @@ export function parseRemoteSampleCache(input) {
   if (Object.hasOwn(input, 'collector_diagnostic') && (!safeCollectorDiagnostic(input.collector_diagnostic) ||
       input.ok !== false || input.status !== 'unavailable' || input.reason !== 'invalid_evidence')) return null;
   const history = Object.hasOwn(input, 'history') ? safeHistory(input.history) : null;
-  if (Object.hasOwn(input, 'history') && (!history || history.window &&
-      (!isoTime(input.window?.start) || Date.parse(history.window.end) > Date.parse(input.window.start)))) return null;
+  if (Object.hasOwn(input, 'history') && (!history || !remoteSampleHistoryWithinWindow(history, input.window?.start))) return null;
   if (!validCounters(input.probe, input.findings, history) ||
       ![input.checked_at, input.expires_at, input.window?.start, input.window?.end].every(isoTime) ||
       input.reason !== null && !REMOTE_REASONS.includes(input.reason) ||
@@ -188,7 +201,7 @@ export function summarizeRemoteSample(cache, now, expectedContext) {
   const start = Date.parse(report.window.start || ''); const end = Date.parse(report.window.end || '');
   if (!Number.isFinite(checked) || checked > now || !(expiry > checked) || expiry - checked > 3600000 ||
       !(start < end) || end - start > SAMPLE_POLICY.windowMs || end > checked - SAMPLE_POLICY.stableBufferMs) return unknown('invalid_timestamp','sample time is invalid');
-  if (report.history?.window && Date.parse(report.history.window.end) > start) return unknown('invalid_timestamp','historical sample time is invalid');
+  if (!remoteSampleHistoryWithinWindow(report.history, report.window.start)) return unknown('invalid_timestamp','historical sample time is invalid');
   if (now >= expiry) return unknown('expired','last sample expired');
   if (!hash(cache.context.account_key) || !cache.context.auth_identity_verified || report.binding.state !== 'verified') {
     return { ...unknown(report.reason || 'account_unverified','account association not verified'), auth_identity: 'unknown' };

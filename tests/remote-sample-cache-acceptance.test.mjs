@@ -121,7 +121,8 @@ const {tryAcquireLarkApiLease}=await import(cfg.leaseURL);
 const helpers=[];
 function run(_command,args,options){
   const child=spawnSync(cfg.pythonPath,args,{...options,timeout:Math.min(options.timeout||1000,1000)});
-  helpers.push({pid:child.pid,status:child.status,signal:child.signal,error_code:child.error?.code||null});return child;
+  helpers.push({pid:child.pid,status:child.status,signal:child.signal,error_code:child.error?.code||null,
+    lock_inode:fstatSync(options.stdio[3]).ino});return child;
 }
 const lease=tryAcquireLarkApiLease({role:'probe'},{directory:cfg.apiDirectory,spawnSync:run});
 assert.equal(lease.state,'acquired','private API flock must be available exactly once');
@@ -245,7 +246,9 @@ async function verifyReleased(f) {
   const handle = startOwnedProcess(process.execPath, [f.lockCheckPath, path], { deadline: f.deadline, env: f.env });
   f.owned.push(handle);
   const result = await completed(handle);
-  assert.equal(result.api_reacquired, true); assert.equal(result.schedule_reacquired, true); assert.equal(result.helpers.length, 2);
+  assert.equal(result.api_reacquired, true); assert.equal(result.schedule_reacquired, true);
+  assert.deepEqual(result.helpers.map(helper => helper.lock_inode),
+    [join(f.apiDirectory, 'sync-intent.lock'), join(f.apiDirectory, 'api.lock'), scheduleLock].map(path => statSync(path).ino));
   const pids = [handle.child.pid];
   for (const helper of result.helpers) { assert.equal(helper.status, 0); assert.equal(helper.signal, null); assert.equal(helper.error_code, null); pids.push(helper.pid); }
   await waitForPidsToExit(pids, f.deadline);

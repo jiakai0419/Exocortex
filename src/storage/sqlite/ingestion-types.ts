@@ -69,6 +69,15 @@ export type MaintenanceReviewFence = {
   scopes?: Array<{ id: string; source_id: string; enabled: number; config_json: string }>;
 };
 
+export type HistoryDebtRow = {
+  record_id: number; scope_id: string; finding_key: string; database_key: string; account_key: string;
+  context_fingerprint: string; debt_fingerprint: string; debts_json: string;
+  enqueued_at_ms: number; sample_checked_at_ms: number; generation: number;
+  last_attempt_at_ms: number; next_due_at_ms: number; failures: number;
+  verification_generation: number | null; verification_requested_at_ms: number;
+  status: 'ready' | 'awaiting_verification'; last_attempt_id: string | null; last_result_json: string | null;
+};
+
 export type BoundedReplayOptions = {
   scope: SyncScope;
   initialSyncStartMs: number;
@@ -88,6 +97,11 @@ export type BoundedReplayOptions = {
     generation: number; afterId: number; sweepMaxId: number; completedSweeps: number;
     selectedId: number; nextSweepMaxId: number; startedAtMs: number;
     error: string | null; requestBudget: Record<string, number | string | null>;
+    scheduling?: { generation: number; priorityStreak: number; lane: 'priority' | 'fair';
+      hints: unknown[] | null; queue: HistoryDebtRow[]; queueBefore: HistoryDebtRow[];
+      fairRound?: { beforeRound: number; nextRound: number;
+        previous: Array<{scope_id: string; round: number; baseline_sweeps: number; enrolled_at_ms: number}>;
+        baselines: Array<{scope_id: string; round: number; baseline_sweeps: number; enrolled_at_ms: number}> } | null };
     /** Selected before remote acquisition; descriptor CAS also fences list ABA. */
     detailTask?: { fingerprint: string; raw_root_json: string; external_version: string | null;
       occurred_at_ms: number; list_generation: number } | null;

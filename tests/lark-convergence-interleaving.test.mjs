@@ -68,16 +68,21 @@ function retry(f) {
     lockTtlSeconds: 600, retries: 0, retryDelayMs: 0 }, SELF);
 }
 function history(f, afterSelection) {
+  // The session starts unused. Its running ledger must reflect the injected
+  // self/list/detail boundaries rather than advertise the final three calls
+  // before acquisition; batch admission uses this same live budget contract.
+  let cliAttempts = 0;
   return executeLarkImHistory({ db: f.db, maxCliAttempts: 4, maxSeconds: 30 }, {
     createRequestSession: () => ({ runLark: () => { throw Error('unexpected boundary'); }, assertReady() {},
-      summary: () => ({ cli_attempts: 3, max_cli_attempts: 4, max_seconds: 30, elapsed_ms: 1 }) }),
-    getSelfProfile: () => SELF,
+      summary: () => ({ cli_attempts: cliAttempts, max_cli_attempts: 4, max_seconds: 30, elapsed_ms: 1 }) }),
+    getSelfProfile: () => { cliAttempts++; return SELF; },
     fetchChatMessageList: () => {
+      cliAttempts++;
       afterSelection?.();
       return f.remote.msg_type === 'merge_forward'
         ? { messages: [], detailRoots: [f.remote], pages: 1 }
         : { messages: [normalizeApiMessage(f.remote)], pages: 1 };
-    }, fetchMessageDetails: f.adapter.fetchMessageDetails,
+    }, fetchMessageDetails: (...args) => { cliAttempts++; return f.adapter.fetchMessageDetails(...args); },
   });
 }
 function seedComplete(f) {

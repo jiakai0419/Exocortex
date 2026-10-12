@@ -31,7 +31,7 @@ export const WORKER_DEFAULTS = Object.freeze(defaults);
 /** @type {ReadonlyArray<OptionSpec>} */
 export const WORKER_OPTION_SPECS = Object.freeze([
     { flag: "--db", key: "db", type: "path", default: defaults.db, description: "SQLite database path." },
-    { flag: "--interval-seconds", key: "intervalSeconds", type: "integer", default: defaults.intervalSeconds, description: "Sleep between cycles." },
+    { flag: "--interval-seconds", key: "intervalSeconds", type: "integer", default: defaults.intervalSeconds, description: "Idle allowance between forward cycles; elapsed history work uses this allowance." },
     { flag: "--received-scopes-per-cycle", key: "receivedScopesPerCycle", type: "integer", default: defaults.receivedScopesPerCycle, description: "Catch-up received scopes per cycle." },
     { flag: "--hot-received-scopes-per-cycle", key: "hotReceivedScopesPerCycle", type: "integer", default: defaults.hotReceivedScopesPerCycle, description: "Recently active received scopes per cycle." },
     { flag: "--discovery-pages-per-cycle", key: "discoveryPagesPerCycle", type: "integer", default: defaults.discoveryPagesPerCycle, description: "Full discovery pages per cycle." },

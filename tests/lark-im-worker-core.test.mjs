@@ -189,7 +189,9 @@ test("worker cycle runs sent, hot lane, then fair steady-state lane in a stable 
   assert.equal(argValue(fairReceived.args, "--received-mode"), "all");
   assert.equal(argValue(fairReceived.args, "--received-scopes-per-run"), "50");
 
-  const retention = buildCycleStepSpecs(opts({ retentionEveryCycles: 10 }), 10).at(-1);
+  const due = buildCycleStepSpecs(opts({ retentionEveryCycles: 10 }), 10);
+  assert.deepEqual(due.slice(-2).map(step => step.name), ['retention', 'history']);
+  const retention = due.at(-2);
   assert.equal(retention.name, "retention");
   assert.equal(retention.command, "maintenance");
   assert.deepEqual(retention.args.slice(0, 2), ["prune-runs", "--db"]);

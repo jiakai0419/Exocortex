@@ -24,7 +24,7 @@
 | `maintenance backup` | Create and verify a private backup before publishing it. | backup-write, same-source-backup-cleanup | `public-safe` |
 | `maintenance enrich` | Preview enrichment of one target; apply commits through its own CAS. | local-read, remote-read | `public-safe` |
 | `maintenance preview` | Preview independent exact-target units with durable private reviews and locally validated resume. | local-read, remote-read, private-review-file-write, private-progress-file-write | `public-safe` |
-| `maintenance history` | Recheck one known historical record with a durable fixed-horizon checkpoint. | local-read, remote-read, database-write | `public-safe` |
+| `maintenance history` | Recheck a bounded batch of known historical records with durable debt and scan checkpoints. | local-read, remote-read, database-write | `public-safe` |
 | `maintenance repair` | Preview structural recovery; apply uses existing fences. | local-read | `public-safe` |
 | `maintenance replay` | Preview replay of explicit scopes and a fixed interval. | local-read, remote-read | `public-safe` |
 | `maintenance prune-runs` | Preview run-history retention; applying can remove coverage evidence. | local-read | `public-safe` |
@@ -151,7 +151,7 @@ Validate local runtime dependencies and install configuration without starting t
 | 参数 | 类型/取值 | 默认 | 约束 | 说明 |
 | --- | --- | --- | --- | --- |
 | `--db` | path | `data/exocortex.sqlite` | — | SQLite database path. |
-| `--interval-seconds` | integer | `60` | — | Sleep between cycles. |
+| `--interval-seconds` | integer | `60` | — | Idle allowance between forward cycles; elapsed history work uses this allowance. |
 | `--received-scopes-per-cycle` | integer | `50` | — | Catch-up received scopes per cycle. |
 | `--hot-received-scopes-per-cycle` | integer | `20` | — | Recently active received scopes per cycle. |
 | `--discovery-pages-per-cycle` | integer | `1` | — | Full discovery pages per cycle. |
@@ -285,7 +285,7 @@ Preview independent exact-target units with durable private reviews and locally 
 
 ### maintenance history
 
-Recheck one known historical record with a durable fixed-horizon checkpoint.
+Recheck a bounded batch of known historical records with durable debt and scan checkpoints.
 
 默认效果：`local-read, remote-read, database-write`；输出：`public-safe`。
 
@@ -293,7 +293,9 @@ Recheck one known historical record with a durable fixed-horizon checkpoint.
 | --- | --- | --- | --- | --- |
 | `--db` | path | — | 必填 | Database; default relative to installation root, explicit relative paths to cwd. |
 | `--format` | text/json | `text` | — | Output format. |
-| `--max-cli-attempts` | integer | `4` | ≥ 2；≤ 4 | Actual CLI budget, 2 to 4. |
+| `--log-dir` | path | — | — | Private worker sample state for optional known-debt scheduling hints. |
+| `--max-records` | integer | `1` | ≥ 1；≤ 12 | Maximum selected records; each retains its own identity check and at most four CLI attempts. |
+| `--max-cli-attempts` | integer | `4` | ≥ 2；≤ 12 | Shared actual CLI budget for the entire batch, including identity, pages and detail. |
 | `--max-seconds` | integer | `30` | ≥ 1；≤ 30 | Remote-work budget, 1 to 30 seconds; not the whole subprocess wall time. |
 
 ### maintenance repair
@@ -384,6 +386,6 @@ Preview database compaction; --apply permits the write.
 
 ### 有界历史核验
 
-`maintenance history --db <path> --max-cli-attempts 4 --max-seconds 30` 处理一个已知原生历史记录，写入核验检查点和观察证据。worker 每轮在正常同步之后执行一次。先完成列表分页，再只展开选中合并消息；无关消息不耗用详情预算。30 秒限制远程工作，不是整个子进程墙钟期限。它不推进发现或同步游标，不证明未入库历史消息已全部发现。停用来源或范围不会被重新启用。
+`maintenance history --db <path>` 默认只处理一个已知原生历史记录。worker 在正常同步及到期保留清理之后，以 `--max-records 12 --max-cli-attempts 12 --max-seconds 25 --log-dir <private-log-dir>` 执行共享预算批次；每条记录仍独立核验身份、最多4次CLI，实际条数受耗时和分页限制。较短周期间隔会进一步收紧远端预算。历史耗时抵扣配置的周期间歇；到期独立采样替代该轮批次。远端预算不等于本地提交的墙钟期限。欠账优先队列与普通扫描检查点分离，失败退避，小会话完成一轮后等待其他会话。它不推进发现或同步游标，不证明未入库历史消息已全部发现，不启用停用来源或范围。详见[历史吞吐设计](history-throughput.md)。
 
 消息 replay 的新私有审阅使用 v4：仅在完整来源证明和本地投影依赖一致时接受表示变化。旧 v1–v3 文件仍按原有精确规则验证。review completion 拒绝完整 fresh proposal 时，每个审批摘要最多保存三份仅本人可读的候选证据；身份前检与最终 SQLite CAS 拒绝不在此留证范围；这些文件不是批准文件，不能延长原 TTL。具体边界见 [数据变化契约](data-change-contract.md)。

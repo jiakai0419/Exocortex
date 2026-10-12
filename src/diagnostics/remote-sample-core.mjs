@@ -5,7 +5,7 @@ import { parseEvidence } from '../../dist/core/lark-observation.js';
 
 export const SAMPLE_POLICY = Object.freeze({ version: 1, intervalMs: 900000, ttlMs: 1800000,
   stableBufferMs: 600000, windowMs: 86400000, chats: 5, hot: 2, pages: 2, pageSize: 20,
-  calls: 12, gapMs: 1000, deadlineMs: 55000, requestMs: 4000, observationTtlMs: 604800000, observations: 200 });
+  calls: 12, gapMs: 1000, deadlineMs: 55000, requestMs: 4000, observationTtlMs: 604800000, observations: 200, historyTargets: 3 });
 
 export function jsonValue(value) { try { return typeof value === 'string' ? JSON.parse(value) : value; } catch { return null; } }
 // A body match is positive evidence that can retire persistent debt. Do not
@@ -25,23 +25,25 @@ export function epoch(value) {
 }
 
 /** Stable ordering gives fair capacity even when the same chats remain hot. */
-export function selectSampleChats(rows, rotation, now, limit = Number(SAMPLE_POLICY.chats)) {
+export function selectSampleChats(rows, rotation, now, limit = Number(SAMPLE_POLICY.chats), hotLimit = Number(SAMPLE_POLICY.hot)) {
   const eligible = rows.filter((r) => r.enabled === 1 && r.source_id === 'lark.im' && r.chat_id &&
     r.id === chatScopeId(r.chat_id) && !r.unsupported_reason);
   const byId = [...new Map(eligible.map((r) => [r.chat_id, r])).values()].sort((a,b) => a.chat_id.localeCompare(b.chat_id));
   const hot = byId.filter((r) => Number.isSafeInteger(r.hot_rank) && r.hot_rank >= 0 &&
     Number.isFinite(Date.parse(r.hot_seen_at)) && Date.parse(r.hot_seen_at) <= now && now - Date.parse(r.hot_seen_at) <= 86400000)
-    .sort((a,b) => a.hot_rank - b.hot_rank || a.chat_id.localeCompare(b.chat_id)).slice(0, Math.min(2, limit));
-  const selected = [...hot];
+    .sort((a,b) => a.hot_rank - b.hot_rank || a.chat_id.localeCompare(b.chat_id)).slice(0, Math.min(SAMPLE_POLICY.hot, hotLimit, limit));
+  const selected = [...hot]; const fairRotations = {};
   let traversed = 0;
   const start = byId.length ? rotation % byId.length : 0;
   while (selected.length < limit && traversed < byId.length) {
     const row = byId[(start + traversed) % byId.length];
     traversed++;
-    if (!selected.some((r) => r.chat_id === row.chat_id)) selected.push(row);
+    if (!selected.some((r) => r.chat_id === row.chat_id)) {
+      selected.push(row); fairRotations[row.chat_id] = (start + traversed) % byId.length;
+    }
   }
   return { selected, rotation: byId.length ? (start + traversed) % byId.length : 0,
-    eligible: byId.length, hot: hot.length, fair: selected.length - hot.length, traversed };
+    eligible: byId.length, hot: hot.length, fair: selected.length - hot.length, traversed, fairRotations };
 }
 
 /** Only source-native static bodies have a comparable representation. */

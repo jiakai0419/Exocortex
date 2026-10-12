@@ -25,7 +25,8 @@ class MaintenanceRequestError extends Error {
 /** One command-wide budget. Counts actual CLI spawn attempts, including
  * pagination and fallbacks, not the CLI's opaque internal HTTP requests.
  * Maintenance never waits for an API lease or a cooldown. A running request
- * cannot be preempted; the shared flock has no waiter-priority guarantee.
+ * cannot be preempted. A sync holding shared intent excludes later probes;
+ * there is no FIFO guarantee among sync waiters or before intent admission.
  * @param {{db?: string, maxCliAttempts?: number, maxSeconds?: number}} options
  * @param {Record<string, any>} [deps]
  */
@@ -124,7 +125,8 @@ function createMaintenanceRequestSession(options = {}, deps = {}) {
     // The transport rechecks under the lease before the actual spawn.
     sharedReady({ operation: transportOperation(args), nowMs: wallClock() });
     // Leave the lease free between requests so a waiting sync can acquire it.
-    // This is a bounded opportunity to yield, not a priority-queue guarantee.
+    // An announced sync waiter also blocks new probes with its intent gate;
+    // active requests/local commits are not preempted and sync is not FIFO.
     while (true) {
       const before = elapsedNow();
       const wait = Math.max(0, lastFinished + MAINTENANCE_REQUEST_GAP_MS - before);

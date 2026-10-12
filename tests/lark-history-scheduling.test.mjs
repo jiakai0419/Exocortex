@@ -105,7 +105,10 @@ test('history operation cooldown still reaches diagnostics and defers related fo
     }),
   });
   assert.equal(ok, false);
-  assert.deepEqual(samples, [{ message_history_bundle: cooldown }]);
+  // The independent scheduler is consulted before this cycle's history request.
+  // Its next invocation still inherits the published shared cooldown; a failed
+  // forward cycle does not admit another sample merely to observe that value.
+  assert.deepEqual(samples, [{}]);
   assert.equal(decisions[0].pressure.rate_limits, 1); // Do not double-count the budget's same rate stop.
   assert.equal(decisions[0].pressure.failed_steps, 0);
   assert.deepEqual(events.filter(event => event.cycle === 2 && event.summary?.deferred).map(event => event.name),

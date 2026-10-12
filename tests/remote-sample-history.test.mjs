@@ -64,9 +64,9 @@ test('an old edit is outside normal cursor discovery but retained observations r
   assert.ok(messageWindow({ cursor: { created_at_ms: now - 60000 } }, { startMs: created, endMs: now, endExplicit: true }).startMs > created);
   const before = sample({ fullPages: true });
   assert.equal(before.result.report.findings.stale_version, 1);
-  assert.equal(before.calls, 12);
-  assert.equal(before.result.report.probe.hot_chats, 2);
-  assert.equal(before.result.report.probe.fair_chats, 2);
+  assert.equal(before.calls, 8);
+  assert.equal(before.result.report.probe.hot_chats, 1);
+  assert.equal(before.result.report.probe.fair_chats, 1);
   assert.equal(before.result.report.history.pages, 2);
   const historical = before.requests.filter(params => Number(params.start_time) * 1000 < created);
   assert.equal(historical.length, 2);

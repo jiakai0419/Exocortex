@@ -71,11 +71,13 @@ function fixture(t) {
   };
   return { root, db, state, directory, deps };
 }
-function assertNoCommit(f, before) {
+function assertNoCommit(f, before, lockStage = 'api') {
   assert.equal(read(f.db, '.dump'), before, 'all synthetic tables, including records/scopes/audit, remain byte-for-byte equal in the SQL dump');
   assert.equal(read(f.db, 'SELECT count(*) FROM maintenance_locks;').trim(), '0');
-  assert.ok(existsSync(join(f.directory, 'api.lock')), 'the real kernel lease was used in the private fixture directory');
-  const acquired = tryAcquireLarkApiLease({ role: 'sync' }, { directory: f.directory });
+  assert.ok(existsSync(join(f.directory, 'sync-intent.lock')), 'the real intent gate was used in the private fixture directory');
+  assert.equal(existsSync(join(f.directory, 'api.lock')), lockStage === 'api',
+    'a gate-only failure must stop before API lock creation');
+  const acquired = tryAcquireLarkApiLease({ role: lockStage === 'intent' ? 'probe' : 'sync' }, { directory: f.directory });
   assert.equal(acquired.state, 'acquired', 'the stopped command released its real API lease'); acquired.release();
 }
 
@@ -219,5 +221,5 @@ test('a successful real helper returning after its two-second boundary fails clo
     error => error instanceof MaintenanceRequestError && error.reason === 'lease_unavailable');
   assert.deepEqual(observed, { state: 'unavailable', reason: 'lease_helper_unavailable' });
   assert.equal(helpers, 1, 'no helper retry is allowed'); assert.equal(calls, 0);
-  assertNoCommit(f, before);
+  assertNoCommit(f, before, 'intent');
 });

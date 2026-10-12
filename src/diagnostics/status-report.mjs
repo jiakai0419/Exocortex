@@ -1,4 +1,4 @@
-import { REMOTE_REASONS, safeRemoteSampleHistory } from "./remote-sample-cache.mjs";
+import { REMOTE_REASONS, safeRemoteSampleHistory, remoteSampleHistoryWithinWindow } from "./remote-sample-cache.mjs";
 import { safeCollectorDiagnostic } from "./remote-sample-diagnostic.mjs";
 // @ts-check
 import { existsSync } from "node:fs";
@@ -213,9 +213,8 @@ function publicStatusReport(collected, options) {
   const hasHistory = Object.hasOwn(overview.freshness, 'history');
   const history = hasHistory ? safeRemoteSampleHistory(overview.freshness.history) : null;
   const invalidHistory = hasHistory && (!history || count(overview.freshness.sample_count) === null ||
-    history.messages_checked > overview.freshness.sample_count || history.window &&
-    !(Date.parse(history.window.end) <= Date.parse(overview.freshness.window?.start)) ||
-    overview.freshness.status === 'sampled' && (history.unroutable || history.unsupported_chats || history.messages_checked !== 1));
+    history.messages_checked > overview.freshness.sample_count || !remoteSampleHistoryWithinWindow(history, overview.freshness.window?.start) ||
+    overview.freshness.status === 'sampled' && (history.unroutable || history.unsupported_chats || history.messages_checked !== history.requested));
   return { schema_version: 1, privacy: options.logs ? "private" : "public-safe", observed_at: new Date(observedAt).toISOString(),
     service: { status: choice(service.status, ["running", "loaded", "absent", "unknown"]), target_match: service.target_match,
       configuration: choice(installed.status, ["installed", "missing", "unknown"]), pid: count(service.pid), last_exit_code: Number.isSafeInteger(service.last_exit_code) ? service.last_exit_code : null },

@@ -2,6 +2,7 @@ import { REQUIRED_CYCLE_STEPS } from "./step-vocabulary.mjs";
 type JsonObject = Record<string, any>;
 type WorkerCycleOptions = {
     db: string;
+    intervalSeconds?: number;
     hotDiscoveryPagesPerCycle: number;
     hotReceivedScopesPerCycle: number;
     discoveryPagesPerCycle: number;
@@ -194,7 +195,7 @@ declare function compactSummary(summary: SyncSummary | null | undefined): {
  * reasons or unknown nested fields into the worker's history receipt. */
 declare function compactHistorySummary(summary: SyncSummary | null | undefined): JsonObject | null;
 declare function cyclePayload(cycle: number, steps: WorkerEvent[], now?: () => string): WorkerCyclePayload;
-declare function runCycleWithRunner(opts: WorkerCycleOptions, cycle: number, runStep: WorkerStepRunner, writeLog: WorkerLogWriter, now?: () => string, onComplete?: (steps: WorkerEvent[], payload: WorkerCyclePayload) => void): boolean;
+declare function runCycleWithRunner(opts: WorkerCycleOptions, cycle: number, runStep: WorkerStepRunner, writeLog: WorkerLogWriter, now?: () => string, onComplete?: (steps: WorkerEvent[], payload: WorkerCyclePayload) => void, beforeHistory?: (steps: WorkerEvent[]) => WorkerEvent | null): boolean;
 declare function summarizeWorkerEvents(events: unknown[], nowMs?: number): {
     has_events: boolean;
     last_event_type: string | null;

@@ -12,7 +12,10 @@ try:
     info = os.fstat(3)
     if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_nlink != 1:
         sys.exit(74)
-    fcntl.flock(3, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    mode = sys.argv[1] if len(sys.argv) == 2 else "exclusive" if len(sys.argv) == 1 else None
+    if mode not in ("shared", "exclusive"):
+        sys.exit(74)
+    fcntl.flock(3, (fcntl.LOCK_SH if mode == "shared" else fcntl.LOCK_EX) | fcntl.LOCK_NB)
 except BlockingIOError:
     sys.exit(75)
 except OSError:

@@ -231,7 +231,7 @@ test('an 011 detail database is rejected by the first pending read before any AP
   assert.deepEqual(store.sqliteQuery(f.db, "SELECT * FROM sync_runs WHERE status='running';"), []);
 });
 
-test('migration 012 preserves every existing table value from 011 and initializes only bounded detail slots', t => {
+test('migrations after 011 preserve every existing table value and initialize bounded detail slots', t => {
   const f = fixture(t, { through011: true, queue: false });
   const ordinary = recordFromMessage(normalizeApiMessage(raw(1, { message_id: 'om_synthetic_prior_record',
     msg_type: 'text', body: { content: '{"text":"Synthetic pre-migration record"}' } })), SCOPE, 'received');
@@ -254,10 +254,10 @@ test('migration 012 preserves every existing table value from 011 and initialize
     return [name, { columns, rows: store.sqliteQuery(f.db, `SELECT * FROM ${identifiers(name)};`) }];
   }));
   assert.equal(before.get('schema_migrations').rows.at(-1).version, '011');
-  assert.deepEqual(store.ensureInitialized(f.db).applied, ['012_pending_detail_observation.sql']);
+  assert.deepEqual(store.ensureInitialized(f.db).applied, ['012_pending_detail_observation.sql', '013_lark_history_debt.sql']);
   for (const [name, saved] of before) {
     const current = store.sqliteQuery(f.db, `SELECT ${saved.columns.map(identifiers).join(',')} FROM ${identifiers(name)};`);
-    assert.deepEqual(name === 'schema_migrations' ? current.filter(row => row.version !== '012') : current,
+    assert.deepEqual(name === 'schema_migrations' ? current.filter(row => row.version <= '011') : current,
       saved.rows, `migration preserves all previous values in ${name}`);
   }
   const slots = store.sqliteQuery(f.db, `SELECT descriptor_generation,evidence_generation,candidate_json,candidate_generation,

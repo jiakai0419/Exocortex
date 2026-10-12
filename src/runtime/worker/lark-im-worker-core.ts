@@ -6,6 +6,7 @@ type JsonObject = Record<string, any>;
 
 type WorkerCycleOptions = {
   db: string;
+  intervalSeconds?: number;
   hotDiscoveryPagesPerCycle: number;
   hotReceivedScopesPerCycle: number;
   discoveryPagesPerCycle: number;
@@ -102,6 +103,11 @@ function cycleHealthyWithoutHistory(steps: WorkerEvent[] | undefined, fallback: 
 
 /** Version the added history slice so old six-step receipts are still readable. */
 function expectedCycleSteps(event: { step_count?: number; cycle_policy?: string }) {
+  if (event.cycle_policy === "idle_history/v2") {
+    if (event.step_count === REQUIRED_CYCLE_STEPS.length + 1) return [...REQUIRED_CYCLE_STEPS, "history"];
+    if (event.step_count === REQUIRED_CYCLE_STEPS.length + 2) return [...REQUIRED_CYCLE_STEPS, "retention", "history"];
+    return null;
+  }
   if (event.cycle_policy !== undefined && event.cycle_policy !== "bounded_history/v1") return null;
   const base = event.cycle_policy === "bounded_history/v1" ? [...REQUIRED_CYCLE_STEPS, "history"] : REQUIRED_CYCLE_STEPS;
   if (event.step_count === base.length) return base;
@@ -386,8 +392,10 @@ function buildCycleStepSpecs(opts: WorkerCycleOptions, cycle = 1): WorkerStepSpe
       ],
     },
   ];
-  steps.push({ name: "history", command: "maintenance",
-    args: ["history", "--db", opts.db, "--max-cli-attempts", "4", "--max-seconds", "30", "--format", "json"] });
+  // Spend a bounded part of the configured idle interval after forward work.
+  // The worker credits actual elapsed history time against that interval; five
+  // seconds of headroom is a reserve, not a bound on local commit wall time.
+  const historySeconds = Math.max(1, Math.min(25, (opts.intervalSeconds ?? WORKER_DEFAULTS.intervalSeconds) - 5));
   const retentionEveryCycles = Number(opts.retentionEveryCycles || WORKER_DEFAULTS.retentionEveryCycles);
   if (retentionEveryCycles > 0 && cycle % retentionEveryCycles === 0) {
     steps.push({
@@ -396,6 +404,10 @@ function buildCycleStepSpecs(opts: WorkerCycleOptions, cycle = 1): WorkerStepSpe
       args: ["prune-runs", "--db", opts.db, "--apply", "--format", "json"],
     });
   }
+  steps.push({ name: "history", command: "maintenance",
+    args: ["history", "--db", opts.db,
+      ...(opts.logDir ? ["--log-dir", opts.logDir] : []),
+      "--max-records", "12", "--max-cli-attempts", "12", "--max-seconds", String(historySeconds), "--format", "json"] });
   return steps;
 }
 
@@ -475,9 +487,11 @@ function compactSummary(summary: SyncSummary | null | undefined) {
 }
 
 const HISTORY_OUTCOMES = new Set(["no_eligible_known_record", "processed", "pending_observation",
-  "incomplete", "size_limit", "identity", "ambiguous", "missing", "fetch_unavailable"]);
+  "incomplete", "size_limit", "identity", "ambiguous", "missing", "fetch_unavailable", "batch_processed", "batch_deferred", "batch_interrupted", "sample_scheduled"]);
 const REQUEST_STOP_REASONS = new Set(["cli_budget", "time_budget", "clock_unavailable", "sync_busy", "lease_unavailable",
   "rate_cooldown", "rate_limited", "shared_cooldown_unavailable"]);
+const HISTORY_HINT_REASONS = new Set(["not_configured", "state_missing", "state_invalid", "account_mismatch", "source_disabled",
+  "policy_unavailable", "metadata_budget", "mapping_unavailable", "ready", "not_attempted"]);
 
 /** Strict public projection: never copy record IDs, raw/error payloads, arbitrary
  * reasons or unknown nested fields into the worker's history receipt. */
@@ -489,9 +503,11 @@ function compactHistorySummary(summary: SyncSummary | null | undefined) {
   if (HISTORY_OUTCOMES.has(summary.outcome || "")) result.outcome = summary.outcome;
   if (summary.cursor_policy === "unchanged") result.cursor_policy = "unchanged";
   if (summary.coverage === "known_rows_only") result.coverage = "known_rows_only";
+  if (HISTORY_HINT_REASONS.has(String(summary.priority_hint_reason))) result.priority_hint_reason = summary.priority_hint_reason;
+  if (["ready", "scope_budget"].includes(String(summary.fair_round_reason))) result.fair_round_reason = summary.fair_round_reason;
   const error = summary.error as JsonObject | undefined;
   if (summary.schema_version === 1 && error && ["invalid_arguments", "execution_failed"].includes(error.code)) result.reason = error.code;
-  for (const field of ["inserted", "updated", "duplicate", "conflicts"]) {
+  for (const field of ["inserted", "updated", "duplicate", "conflicts", "processed", "priority_processed", "fair_processed", "failed"]) {
     if (typeof summary[field] === "number" && Number.isSafeInteger(summary[field]) && Number(summary[field]) >= 0) result[field] = summary[field];
   }
   if (budget && typeof budget === "object" && !Array.isArray(budget)) {
@@ -514,7 +530,7 @@ function cyclePayload(
     ok: steps.length > 0 && steps.every((step) => step.ok === true),
     at: now(),
     step_count: steps.length,
-    ...(steps.some(step => step.name === "history") ? { cycle_policy: "bounded_history/v1" } : {}),
+    ...(steps.some(step => step.name === "history") ? { cycle_policy: "idle_history/v2" } : {}),
     failed_steps: steps.filter((step) => step.ok !== true).map((step) => step.name || "unknown"),
   };
 }
@@ -526,10 +542,11 @@ function runCycleWithRunner(
   writeLog: WorkerLogWriter,
   now: () => string = () => new Date().toISOString(),
   onComplete?: (steps: WorkerEvent[], payload: WorkerCyclePayload) => void,
+  beforeHistory?: (steps: WorkerEvent[]) => WorkerEvent | null,
 ) {
   const steps: WorkerEvent[] = [];
   for (const spec of buildCycleStepSpecs(opts, cycle)) {
-    const step = runStep(spec.name, spec.args, spec.command || "sync");
+    const step = (spec.name === "history" ? beforeHistory?.(steps) : null) || runStep(spec.name, spec.args, spec.command || "sync");
     steps.push(step);
     writeLog(opts, { ...step, type: "lark_im_worker_step", cycle, step_index: steps.length - 1 });
   }

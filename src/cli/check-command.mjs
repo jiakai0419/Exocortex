@@ -1,6 +1,6 @@
 // @ts-check
 import { collectCheckReport } from "../diagnostics/check-report.mjs";
-import { REMOTE_REASONS } from "../diagnostics/remote-sample-cache.mjs";
+import { REMOTE_REASONS, remoteSampleHistoryWithinWindow } from "../diagnostics/remote-sample-cache.mjs";
 import { safeCollectorDiagnostic } from "../diagnostics/remote-sample-diagnostic.mjs";
 import { safeGuardianDiagnostic } from "../runtime/worker/remote-sample-process.mjs";
 import { terminalColumns, wrapLabelValue } from "../terminal/text-layout.mjs";
@@ -59,7 +59,7 @@ export async function runCheckCommand(options, context, deps = {}) {
       // valid history object from a failed report. Do not invent a partition.
       const scopeVerified = live.reason !== "invalid_evidence" && (!live.history ||
         live.history.messages_checked <= live.probe.remote_messages_checked &&
-        (!live.history.window || Date.parse(live.history.window.end) <= Date.parse(live.window.start)));
+        remoteSampleHistoryWithinWindow(live.history, live.window.start));
       const sampleCounts = !scopeVerified ? "sample scope unverified" : live.history
         ? `${live.probe.remote_messages_checked - live.history.messages_checked} current messages / ${live.probe.hot_chats_found} chats + ${live.history.messages_checked} historical target${live.history.messages_checked === 1 ? "" : "s"}`
         : `${live.probe.remote_messages_checked} messages / ${live.probe.hot_chats_found} discovered chats`;

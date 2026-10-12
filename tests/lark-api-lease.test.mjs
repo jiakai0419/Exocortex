@@ -18,12 +18,12 @@ test("the real kernel lock survives helper exit and final close releases it with
   const deps = fixture(t), commands = [];
   const owner = tryAcquireLarkApiLease({ role: "sync", db: "synthetic-one" }, { ...deps,
     spawnSync: (command, args, options) => { commands.push(command); return spawnSync(command, args, options); } });
-  assert.equal(owner.state, "acquired"); assert.deepEqual(commands, ["python3"]);
+  assert.equal(owner.state, "acquired"); assert.deepEqual(commands, ["python3", "python3"]);
   assert.equal(tryAcquireLarkApiLease({ role: "probe", db: "synthetic-two" }, deps).state, "busy");
   owner.release(); owner.release();
   const probe = tryAcquireLarkApiLease({ role: "probe" }, deps);
   assert.equal(probe.state, "acquired"); probe.release();
-  assert.deepEqual(readdirSync(deps.directory), ["api.lock"]);
+  assert.deepEqual(readdirSync(deps.directory).sort(), ["api.lock", "sync-intent.lock"]);
 });
 
 test("shared or symlinked directories and unsafe lock files fail closed", (t) => {
@@ -123,7 +123,7 @@ test("real concurrent kernel contenders never enter the synthetic critical secti
   })));
   assert.ok(outputs.reduce((sum, value) => sum + value.acquired, 0) > 0);
   assert.ok(outputs.reduce((sum, value) => sum + value.busy, 0) > 0);
-  assert.deepEqual(readdirSync(deps.directory), ["api.lock"]);
+  assert.deepEqual(readdirSync(deps.directory).sort(), ["api.lock", "sync-intent.lock"]);
 });
 
 let ownedProcessFailure = null;

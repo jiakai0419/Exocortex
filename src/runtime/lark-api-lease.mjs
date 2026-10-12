@@ -10,6 +10,11 @@ import { readStableJsonFile } from "../diagnostics/private-json-file.mjs";
 const errorCode = (/** @type {unknown} */ error) => /** @type {NodeJS.ErrnoException|null} */ (error)?.code;
 const FLOCK_HELPER = fileURLToPath(new URL("./lark-api-flock.py", import.meta.url));
 /** @type {Set<number>} */ const activeLeaseDescriptors = new Set();
+// Internal wait context follows the exact options object through the injected
+// acquisition seam. Pure acquisition mocks never open a default shared path;
+// real acquisitions use their explicitly injected directory for both files.
+/** @type {WeakMap<object, {intent?: ReturnType<typeof acquireKernelLock>}>} */
+const syncWaitContexts = new WeakMap();
 const COOLDOWN_OPERATIONS = new Set(["message_history_bundle", "message_search_bundle", "chat_discovery_bundle",
   "self_profile", "contact_search", "chat_members", "chat_bots", "application_info", "other"]);
 const MAX_COOLDOWNS = 128;
@@ -108,8 +113,10 @@ function writeSharedLarkCooldown(options, deps = {}) {
   }
 }
 
-/** Wait briefly for a single bounded probe request; unavailable evidence never
- * causes a retry, and no caller can seize the currently executing request.
+/** Announce a sync waiter with a shared intent lock for the entire API wait.
+ * Later probes need an exclusive intent lock, so cannot chain ahead of an
+ * announced waiter. An already active request or local commit is not preempted;
+ * a long commit can still exhaust this wait. Sync waiters are not FIFO.
  * Convert an optional wall deadline once, then account for helper execution,
  * filesystem work and sleeps against one monotonic deadline across attempts.
  * @param {{db?: string, deadlineMs?: number}} options
@@ -122,13 +129,21 @@ function acquireSyncLarkApiLease(options, deps = {}) {
   const start = monotonicClock();
   const wallRemaining = options.deadlineMs === undefined ? limit : Math.max(0, options.deadlineMs - clock());
   const monotonicDeadlineMs = start + Math.min(limit, wallRemaining);
-  while (true) {
-    const result = (deps.acquire || tryAcquireLarkApiLease)({ ...options, role: "sync", monotonicDeadlineMs }, { clock, monotonicClock });
-    if (result.state !== "busy") return result;
-    const remaining = monotonicDeadlineMs - monotonicClock();
-    if (remaining <= 0) return result;
-    const pause = Math.min(100, remaining);
-    sleep(pause);
+  const request = { ...options, role: /** @type {const} */ ("sync"), monotonicDeadlineMs };
+  /** @type {{intent?: ReturnType<typeof acquireKernelLock>}} */ const context = {};
+  syncWaitContexts.set(request, context);
+  try {
+    while (true) {
+      const result = (deps.acquire || tryAcquireLarkApiLease)(request, { clock, monotonicClock });
+      if (result.state !== "busy") return result;
+      const remaining = monotonicDeadlineMs - monotonicClock();
+      if (remaining <= 0) return result;
+      const pause = Math.min(100, remaining);
+      sleep(pause);
+    }
+  } finally {
+    syncWaitContexts.delete(request);
+    context.intent?.release();
   }
 }
 
@@ -144,7 +159,8 @@ function getLarkApiLeaseStdio() {
  * open-file description is shared across dup/fork, so Node continues holding
  * the lock after the helper exits. Final close/process death releases it.
  * No PID, ps, stale-file removal, TTL or persistent helper is involved.
- * All databases for this Unix user share the one never-unlinked lock file.
+ * All databases for this Unix user share the never-unlinked API and intent
+ * files. Only the API descriptor may enter an actual request child.
  *
  * deadlineMs is a public wall-clock boundary, translated only on entry;
  * monotonicDeadlineMs carries the enclosing sync budget across helper calls.
@@ -164,6 +180,40 @@ function tryAcquireLarkApiLease(options, deps = {}) {
     ? 2000 : Math.max(0, options.deadlineMs - clock());
   const deadline = Math.min(options.monotonicDeadlineMs ?? started + wallRemaining, started + 2000);
   if (!Number.isFinite(started) || !Number.isFinite(deadline) || deadline <= started) return failed("unavailable", "lease_deadline");
+  const context = options.role === "sync" ? syncWaitContexts.get(options) : undefined;
+  const intent = context?.intent || acquireKernelLock("sync-intent.lock", options.role === "sync" ? "shared" : "exclusive", deadline,
+    { ...deps, directory, clock, monotonicClock });
+  if (intent.state !== "acquired") return intent;
+  if (context) context.intent = intent;
+  try {
+    if (!intent.isCurrent?.()) return failed("unavailable", "lease_evidence_unavailable");
+    const api = acquireKernelLock("api.lock", "exclusive", deadline, { ...deps, directory, clock, monotonicClock });
+    if (api.state === "acquired") {
+      if (!intent.isCurrent?.() || monotonicClock() >= deadline) {
+        api.release();
+        return failed("unavailable", "lease_evidence_unavailable");
+      }
+      if (api.stdio) activeLeaseDescriptors.add(/** @type {number} */ (api.stdio[3]));
+    }
+    return api;
+  } finally {
+    // A sync wrapper owns its shared intent across retries, then closes it on
+    // every return/throw. One-shot sync and all probes close the gate here.
+    if (!context) intent.release();
+  }
+}
+
+/** Both immutable files use identical ownership, path and descriptor checks.
+ * The supplied deadline covers gate and API helper work together.
+ * @param {string} filename
+ * @param {"shared"|"exclusive"} mode
+ * @param {number} deadline
+ * @param {{directory: string, clock: () => number, monotonicClock: () => number, spawnSync?: typeof spawnSync}} deps
+ */
+function acquireKernelLock(filename, mode, deadline, deps) {
+  const failed = (/** @type {"busy"|"unavailable"} */ state, /** @type {string} */ reason) => ({ state, reason, release() {} });
+  const { directory, monotonicClock } = deps;
+  const uid = process.getuid?.();
   /** @type {number|undefined} */ let fd;
   const release = () => {
     if (fd === undefined) return;
@@ -172,22 +222,30 @@ function tryAcquireLarkApiLease(options, deps = {}) {
   };
   try {
     privateDirectory(directory, true);
-    const file = join(directory, "api.lock");
+    const file = join(directory, filename);
     fd = openSync(file, constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o600);
     const info = fstatSync(fd);
     if (!info.isFile() || info.uid !== uid || (info.mode & 0o077) !== 0 || info.nlink !== 1) throw new Error("unsafe_lock");
     const timeout = Math.floor(deadline - monotonicClock());
     if (timeout <= 0) { release(); return failed("unavailable", "lease_deadline"); }
-    const result = (deps.spawnSync || spawnSync)("python3", ["-B", FLOCK_HELPER], {
+    const result = (deps.spawnSync || spawnSync)("python3", ["-B", FLOCK_HELPER, mode], {
       stdio: ["ignore", "ignore", "ignore", fd], timeout, killSignal: "SIGKILL",
     });
     if (result.error || result.signal || monotonicClock() > deadline) { release(); return failed("unavailable", "lease_helper_unavailable"); }
     if (result.status !== 0) { release(); return failed(result.status === 75 ? "busy" : "unavailable", result.status === 75 ? "lark_api_busy" : "lease_helper_unavailable"); }
-    const current = lstatSync(file);
-    if (!current.isFile() || current.dev !== info.dev || current.ino !== info.ino) throw new Error("lock_replaced");
+    const isCurrent = () => {
+      try {
+        privateDirectory(directory, false);
+        if (fd === undefined) return false;
+        const held = fstatSync(fd), current = lstatSync(file);
+        return current.isFile() && !current.isSymbolicLink() && current.uid === uid && (current.mode & 0o077) === 0
+          && current.nlink === 1 && held.nlink === 1 && current.dev === info.dev && current.ino === info.ino;
+      } catch { return false; }
+    };
+    if (!isCurrent()) throw new Error("lock_replaced");
     if (monotonicClock() >= deadline) { release(); return failed("unavailable", "lease_deadline"); }
-    activeLeaseDescriptors.add(fd);
-    return { state: "acquired", reason: null, release, stdio: ["pipe", "pipe", "pipe", fd] };
+    return { state: /** @type {const} */ ("acquired"), reason: null, release, isCurrent,
+      stdio: /** @type {import("node:child_process").StdioOptions} */ (["pipe", "pipe", "pipe", fd]) };
   } catch {
     release();
     return failed("unavailable", "lease_evidence_unavailable");

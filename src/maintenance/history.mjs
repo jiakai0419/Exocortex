@@ -9,6 +9,7 @@ import { captureRemoteAccountBinding, readRemoteAccountBinding, accountBindingAd
 import { captureLarkWriteAdmission } from '../diagnostics/lark-write-admission.mjs';
 import { commitBoundedReplayRecords, quoteSql, normalizeBoundedReplayRecords } from '../../dist/storage/sqlite/ingestion-store.js';
 import { scopeObservationContext } from './scope-config-policy.mjs';
+import { loadHistoryDebtHints, readHistoryDebtSchedule, selectHistoryDebtTarget, readHistoryFairRound } from './history-debt.mjs';
 
 const sha = text => createHash('sha256').update(text).digest('hex');
 const PROFILE = 'known_record_history/v1';
@@ -34,6 +35,7 @@ function selectHistoryTarget(db, deps = {}) {
     (SELECT MAX(r.id) FROM records r INDEXED BY records_history_container_id WHERE ${eligible}) AS current_max
     FROM sync_scopes s LEFT JOIN lark_im_history_progress p ON p.scope_id=s.id
     WHERE s.source_id='lark.im' AND s.enabled=1 AND s.id LIKE 'lark.im.received.chat.%'
+    ${deps.eligibleScopeIds ? `AND s.id IN (${deps.eligibleScopeIds.map(quoteSql).join(',') || 'NULL'})` : ''}
     AND CASE WHEN json_valid(s.config_json) THEN json_type(s.config_json,'$.chat_id')='text' ELSE 0 END
     AND EXISTS(SELECT 1 FROM records r WHERE ${eligible})
     ORDER BY COALESCE(p.last_attempt_at_ms,0),s.id LIMIT 1;`, 'select history scope')[0];
@@ -64,19 +66,17 @@ function selectHistoryTarget(db, deps = {}) {
 
 /** One explicitly bounded autonomous slice; no name fanout or discovery cursor.
  * Tests inject a transport session, never real source or shared production state. */
-function executeLarkImHistory(options, deps = {}) {
-  const db = options.db;
-  const maxCliAttempts = options.maxCliAttempts ?? 4, maxSeconds = options.maxSeconds ?? 30;
-  if (!db || !Number.isSafeInteger(maxCliAttempts) || maxCliAttempts < 2 || maxCliAttempts > 4
-    || !Number.isSafeInteger(maxSeconds) || maxSeconds < 1 || maxSeconds > 30) throw new Error('history requires at most 4 requests and 30 seconds');
-  const target = selectHistoryTarget(db);
-  if (!target) return { ok: true, profile: PROFILE, outcome: 'no_eligible_known_record', cursor_policy: 'unchanged' };
-  const now = deps.now || Date.now, startedAtMs = now(), attemptId = randomUUID();
+function executeHistoryTarget(options, deps, session, initialTarget) {
+  const db = options.db, now = deps.now || Date.now, startedAtMs = now(), attemptId = randomUUID();
+  let target = initialTarget, schedule = null, priority = false;
   const binding = captureRemoteAccountBinding({ db });
   if (!binding || binding.conflict) throw new Error('history account binding unavailable');
-  const session = (deps.createRequestSession || createMaintenanceRequestSession)({ db, maxCliAttempts, maxSeconds },
-    { env: deps.env, ...deps.requestSessionDeps });
-  const adapter = createLarkImAdapter({ run: session.runLark });
+  const attemptsBefore = session.summary().cli_attempts;
+  const targetSession = { ...session, runLark(...args) {
+    if (session.summary().cli_attempts - attemptsBefore >= 4) throw new Error('target_cli_budget');
+    return session.runLark(...args);
+  } };
+  const adapter = createLarkImAdapter({ run: targetSession.runLark });
   const fetchOptions = { pageSize: 50, chatPageSize: 100, maxPages: 2, retries: 0, retryDelayMs: 0 };
   // Account failures do not advance a selected scope or publish a candidate.
   const self = (deps.getSelfProfile || adapter.getSelfProfile)(fetchOptions);
@@ -84,6 +84,17 @@ function executeLarkImHistory(options, deps = {}) {
   const accountKey = 'account_key' in admission ? admission.account_key : null;
   if (typeof self?.open_id !== 'string' || !self.open_id.startsWith('ou_') || admission.state !== 'verified' || !/^[a-f0-9]{64}$/.test(accountKey || '') || accountBindingAdmissionError(admission)) {
     throw new Error('history account identity unavailable');
+  }
+  {
+    const loaded = loadHistoryDebtHints(db, options.logDir, { database_key: binding.database_key, account_key: accountKey }, now(), deps.debtDeps);
+    schedule = readHistoryDebtSchedule(db, loaded, now());
+    const fair = readHistoryFairRound(db, schedule.scheduler, { now: () => startedAtMs });
+    schedule.fairRound = fair;
+    target = selectHistoryTarget(db, { eligibleScopeIds: fair.eligibleScopeIds?.slice(0, 1) }) || initialTarget;
+    if (schedule.selected) {
+      const selected = selectHistoryDebtTarget(db, schedule.selected);
+      if (selected) { target = selected; priority = true; }
+    }
   }
   const row = target.record, scope = target.scope, config = JSON.parse(scope.config_json);
   const writeAdmission = captureLarkWriteAdmission(db, { selfOpenId: self.open_id, requireVerified: true, scopeIds: [scope.id] });
@@ -122,6 +133,9 @@ function executeLarkImHistory(options, deps = {}) {
     error = ['incomplete', 'size_limit', 'identity', 'ambiguous', 'missing'].includes(cause instanceof Error ? cause.message : '')
       ? /** @type {Error} */ (cause).message : 'fetch_unavailable';
     records = [];
+    // Batch exhaustion/cooldown/lease loss is not evidence against this row.
+    // Keep already committed targets, but leave this target's checkpoint intact.
+    if (options.maxRecords > 1 && session.summary().stop_reason) throw cause;
   }
   const checkBinding = () => {
     writeAdmission.assertCurrent();
@@ -139,7 +153,10 @@ function executeLarkImHistory(options, deps = {}) {
       contextKey: sha(JSON.stringify({ profile: PROFILE, self: self.open_id, account: accountKey,
         database: binding.database_key, source: sha(target.sourceConfigJson), scope: scope.id, chat: config.chat_id,
         scopePolicy, scopeConfig: sha(scopeConfig) })) },
-    history: { ...target.checkpoint, startedAtMs, error, requestBudget },
+    history: { ...target.checkpoint, startedAtMs, error, requestBudget,
+      ...(schedule ? { scheduling: { generation: schedule.scheduler.generation,
+        priorityStreak: schedule.scheduler.priority_streak, lane: priority ? 'priority' : 'fair',
+        hints: schedule.hints, queue: schedule.queue, queueBefore: schedule.previous, fairRound: priority ? null : schedule.fairRound.state } } : {}) },
     reviewBeforeCommit: checkBinding,
     reviewFence: { mode: 'replay', createdAtMs: startedAtMs, expiresAtMs: startedAtMs + 30 * 60 * 1000,
       sourceConfigJson: target.sourceConfigJson, sentActor: binding.sent_actor || null, records: [row],
@@ -147,7 +164,58 @@ function executeLarkImHistory(options, deps = {}) {
   });
   const effects = session.withCommit ? session.withCommit(commit, { allowStoppedForFailure: error !== null && records.length === 0 }) : commit();
   return { ok: error === null, profile: PROFILE, outcome: error || (effects.conflicts ? 'pending_observation' : 'processed'),
-    ...effects, request_budget: requestBudget, cursor_policy: 'unchanged', coverage: 'known_rows_only' };
+    ...effects, request_budget: requestBudget, cursor_policy: 'unchanged', coverage: 'known_rows_only',
+    ...(schedule ? { lane: priority ? 'priority' : 'fair', priority_hint_reason: schedule.reason, fair_round_reason: schedule.fairRound.reason } : {}) };
+}
+
+/** Defaults preserve the single-record public contract. A batch owns one
+ * session; neither target changes nor local commits reset its deadline/ledger. */
+function executeLarkImHistory(options, deps = {}) {
+  const maxRecords = options.maxRecords ?? 1;
+  const maxCliAttempts = options.maxCliAttempts ?? (maxRecords === 1 ? 4 : 12);
+  const maxSeconds = options.maxSeconds ?? (maxRecords === 1 ? 30 : 25);
+  if (!options.db || !Number.isSafeInteger(maxRecords) || maxRecords < 1 || maxRecords > 12 ||
+      !Number.isSafeInteger(maxCliAttempts) || maxCliAttempts < 2 || maxCliAttempts > (maxRecords === 1 ? 4 : 12) ||
+      !Number.isSafeInteger(maxSeconds) || maxSeconds < 1 || maxSeconds > 30)
+    throw new Error('history requires at most 12 records, 12 batch requests (4 per record), and 30 seconds');
+  let target = selectHistoryTarget(options.db);
+  if (!target) return { ok: true, profile: PROFILE, outcome: 'no_eligible_known_record', cursor_policy: 'unchanged' };
+  const session = (deps.createRequestSession || createMaintenanceRequestSession)({ db: options.db, maxCliAttempts, maxSeconds },
+    { env: deps.env, ...deps.requestSessionDeps });
+  const results = [];
+  let stopReason = null, interrupted = false;
+  for (let index = 0; index < maxRecords; index++) {
+    if (index) target = selectHistoryTarget(options.db);
+    if (!target) break;
+    if (maxCliAttempts - session.summary().cli_attempts < 2) { stopReason = 'cli_budget'; break; }
+    try {
+      session.assertReady();
+      const result = executeHistoryTarget({ ...options, maxRecords }, deps, session, target);
+      results.push(result);
+    } catch (error) {
+      stopReason = session.summary().stop_reason;
+      if (!stopReason) {
+        if (maxRecords === 1 || !results.length) throw error;
+        interrupted = true;
+      }
+      if (maxRecords === 1) throw error;
+      break;
+    }
+  }
+  if (maxRecords === 1 && results.length) return results[0];
+  const budget = { ...session.summary(), stop_reason: stopReason || session.summary().stop_reason };
+  return { ok: !interrupted && results.every(result => result.ok) && !['rate_limited','rate_cooldown','lease_unavailable','shared_cooldown_unavailable','clock_unavailable'].includes(budget.stop_reason),
+    profile: PROFILE, outcome: interrupted ? 'batch_interrupted' : results.length ? 'batch_processed' : 'batch_deferred',
+    processed: results.length, priority_processed: results.filter(result => result.lane === 'priority').length,
+    fair_processed: results.filter(result => result.lane !== 'priority').length,
+    inserted: results.reduce((sum,result) => sum + result.inserted, 0),
+    updated: results.reduce((sum,result) => sum + result.updated, 0),
+    duplicate: results.reduce((sum,result) => sum + result.duplicate, 0),
+    conflicts: results.reduce((sum,result) => sum + result.conflicts, 0),
+    failed: results.filter(result => !result.ok).length,
+    priority_hint_reason: results.at(-1)?.priority_hint_reason || 'not_attempted',
+    ...(results.length ? { fair_round_reason: results.at(-1).fair_round_reason } : {}),
+    request_budget: budget, cursor_policy: 'unchanged', coverage: 'known_rows_only' };
 }
 
 export { executeLarkImHistory, selectHistoryTarget };
