@@ -334,7 +334,7 @@ try {
       serialIdle ? 'Serial collector naturally advances the model clock; candidate admission helper reads actual state and tickets' :
         'Collector starts through actual beforeHistory hook when available; completion is an asynchronous modeled event',
       'Synthetic receipts omit guardian/publication-token execution; this model is static auxiliary evidence only',
-      'Ordinary baseline collector starts after history. Both versions receive the same idle-overlap model',
+      'Baseline collector starts after history with modeled asynchronous completion; candidate uses serial shared idle admission',
       'Process guardian overhead and competing external processes are outside this experiment',
       'Actual runner/batch wall time is recorded separately, not added to deterministic modeled request/work/sleep time',
       'Batch node_cpu_ms covers only the Node process; SQLite subprocess CPU is not included in that field'],
