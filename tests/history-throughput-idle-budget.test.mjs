@@ -8,17 +8,20 @@ import { WORKER_DEFAULTS } from '../src/runtime/worker/options.mjs';
 // synthetic. The guardian/token chain has its own real-process tests.
 const EPOCH = Date.parse('2035-01-01T00:00:00Z');
 function fixture(options = {}) {
-  let clock = 0, wallOffset = 0, currentCycle = 0;
-  const jobs = [], starts = [], sleeps = [], events = [], scheduleEvents = [];
+  let clock = 0, wallOffset = 0, currentCycle = 0, nextDue = 0;
+  const jobs = [], starts = [], sleeps = [], events = [], scheduleEvents = [], admissions = [];
   const opts = { ...WORKER_DEFAULTS, intervalSeconds: 30, maxCycles: 4,
     db: '/tmp/synthetic-idle-budget.sqlite', logDir: '', ...options.opts };
   const advance = ms => { clock += ms; };
-  const sample = sampleOpts => {
+  const sample = (sampleOpts, sampleDeps) => {
     jobs.push({ name: 'sample', cycle: currentCycle, at: clock, opts: sampleOpts });
-    const value = options.sample?.({ cycle: currentCycle, opts: sampleOpts, advance }) || { duration: 7000, cli: 5, self: 2 };
+    const value = options.sample?.({ cycle: currentCycle, opts: sampleOpts, deps: sampleDeps, advance }) || { duration: 7000, cli: 5, self: 2 };
     advance(value.duration || 0);
+    if (value.throw) throw new Error('synthetic collector failure');
     if (options.wallJump) wallOffset += options.wallJump;
-    return { outcome: value.outcome || 'ok', reason: 'sampled', next_due: EPOCH + clock + 60_000,
+    if (!value.outcome || value.outcome === 'ok') nextDue = clock + (options.dueIntervalMs ?? 60_000);
+    return { outcome: value.outcome || 'ok', reason: 'sampled', next_due: EPOCH + nextDue,
+      ...(value.cooldowns ? { cooldownsByOperation: value.cooldowns } : {}),
       ...(value.noReceipt ? {} : { budget_receipt: value.receipt || { version: 1, complete: true,
         max_cli_attempts: sampleOpts.maxApiCalls, max_self_attempts: sampleOpts.maxSelfCalls,
         cli_attempts: value.cli ?? 5, self_attempts: value.self ?? 2 } }) };
@@ -26,7 +29,13 @@ function fixture(options = {}) {
   const ok = runWorker(opts, {
     nowMs: () => EPOCH + clock + wallOffset, monotonicNowMs: () => clock,
     hasHistoryWork: () => options.historyAvailable !== false,
-    remoteSampleAdmission: () => options.admission || ({ outcome: options.notDue ? 'not_due' : 'due' }),
+    remoteSampleAdmission: (_opts, deps) => {
+      const admission = typeof options.admission === 'function'
+        ? options.admission({ cycle: currentCycle, clock, deps })
+        : options.admission || { outcome: options.notDue || options.dueIntervalMs !== undefined && clock < nextDue ? 'not_due' : 'due' };
+      admissions.push({ cycle: currentCycle, ...admission });
+      return admission;
+    },
     runRemoteSample: sample,
     writeScheduler: (_opts, event) => scheduleEvents.push(event),
     sleepSeconds: seconds => { sleeps.push({ cycle: currentCycle, seconds }); advance(seconds * 1000); },
@@ -44,7 +53,7 @@ function fixture(options = {}) {
           advance(value.duration || 0);
           summary = { ok: value.ok !== false, profile: 'known_record_history/v1', outcome: value.outcome || 'batch_processed',
             processed: value.processed ?? 12, cursor_policy: 'unchanged', coverage: 'known_rows_only',
-            ...(value.noReceipt ? {} : { request_budget: { max_cli_attempts: grant.cli, max_self_attempts: grant.self,
+            ...(value.noReceipt ? {} : { request_budget: value.receipt || { max_cli_attempts: grant.cli, max_self_attempts: grant.self,
               cli_attempts: value.cli ?? 6, self_attempts: value.self ?? 4, stop_reason: value.stopReason || null,
               elapsed_ms: value.duration || 0 } }) };
         } else advance(1000);
@@ -54,7 +63,7 @@ function fixture(options = {}) {
       }, (_opts, event) => events.push(event), () => new Date(EPOCH + clock).toISOString(), deps.onComplete, deps.beforeHistory);
     },
   });
-  return { ok, jobs, starts, sleeps, events, scheduleEvents };
+  return { ok, jobs, starts, sleeps, events, scheduleEvents, admissions };
 }
 
 test('sample actual surplus funds history with one CLI/self ledger, one deadline and a one-second gap', () => {
@@ -90,6 +99,82 @@ test('a full slow sample cannot repeatedly starve history; the deferred sample t
   assert.deepEqual(result.jobs.filter(job => job.cycle === 2).map(job => job.name), ['history']);
   assert.deepEqual(result.jobs.filter(job => job.cycle === 3).map(job => job.name), ['sample']);
   assert.deepEqual(result.starts, [0, 36_000, 72_000, 108_000]);
+});
+
+for (const dueIntervalMs of [900_000, 60_000]) {
+  for (const interrupted of [false, true]) {
+    test(`${dueIntervalMs / 1000}s due sampling survives persistent ${interrupted ? 'interrupted' : 'time-exhausted'} zero-progress history`, () => {
+      const run = processed => fixture({ dueIntervalMs, opts: { maxCycles: 80, remoteSampleIntervalSeconds: 900 },
+        history: ({ grant }) => ({ duration: interrupted ? 2030 : grant.seconds * 1000,
+          cli: interrupted ? 3 : 2, self: interrupted ? 2 : 1, processed,
+          ok: !interrupted, outcome: interrupted ? 'batch_interrupted' : processed ? 'batch_processed' : 'batch_deferred',
+          stopReason: interrupted ? null : 'time_budget' }),
+      });
+      const result = run(0), control = run(1);
+      const sampleCycles = result.jobs.filter(job => job.name === 'sample').map(job => job.cycle);
+      assert.deepEqual(sampleCycles, dueIntervalMs === 900_000 ? [1, 27, 53, 79]
+        : Array.from({ length: 40 }, (_, index) => index * 2 + 1));
+      assert.deepEqual(sampleCycles, control.jobs.filter(job => job.name === 'sample').map(job => job.cycle));
+      assert.deepEqual(result.admissions.filter(item => item.outcome === 'due').map(item => item.cycle), sampleCycles);
+      assert.deepEqual(result.starts, Array.from({ length: 80 }, (_, index) => index * 36_000));
+      assert.deepEqual(result.starts, control.starts, 'no request budget is borrowed from new forward sync');
+      assert.equal(result.ok, !interrupted, 'independent service must not turn business failure into success');
+      for (let cycle = 1; cycle <= 80; cycle++) {
+        const jobs = result.jobs.filter(job => job.cycle === cycle);
+        const history = result.events.find(event => event.cycle === cycle && event.name === 'history');
+        const budget = history.summary.request_budget;
+        assert.equal(history.summary.processed, 0);
+        assert.equal(history.summary.cursor_policy, 'unchanged');
+        assert.ok(budget.cli_attempts + jobs.filter(job => job.name === 'sample').length * 5 <= 12);
+        assert.ok(budget.self_attempts + jobs.filter(job => job.name === 'sample').length * 2 <= 6);
+        assert.ok(history.elapsed_ms <= 25_000);
+        assert.equal(new Set(jobs.map(job => job.name)).size, jobs.length, 'at most one admission per job per slice');
+      }
+    });
+  }
+}
+
+for (const [name, sample] of [
+  ['failed result', { outcome: 'failed', cli: 3, self: 2 }],
+  ['busy with zero attempts', { outcome: 'busy', cli: 0, self: 0 }],
+  ['missing receipt', { noReceipt: true }],
+  ['collector exception', { throw: true }],
+]) test(`a persistently ${name} sampler spends its first opportunity without starving history`, () => {
+  const result = fixture({ opts: { maxCycles: 8 }, sample: () => ({ duration: 1000, ...sample }) });
+  assert.deepEqual(result.jobs.filter(job => job.name === 'sample').map(job => job.cycle), [1, 3, 5, 7]);
+  assert.deepEqual(result.jobs.filter(job => job.name === 'history').map(job => job.cycle), [2, 4, 6, 8]);
+  assert.ok(result.jobs.filter(job => job.name === 'history').every(job => job.grant.cli === 12 && job.grant.self === 6));
+});
+
+for (const stopReason of ['sync_busy', 'lease_unavailable', 'rate_limited', 'rate_cooldown',
+  'shared_cooldown_unavailable', 'clock_unavailable']) {
+  test(`zero-request history ${stopReason} spends its first turn but still stops the current idle slice`, () => {
+    const result = fixture({ history: () => ({ duration: 1000, cli: 0, self: 0, processed: 0,
+      outcome: 'batch_deferred', stopReason }) });
+    assert.deepEqual(result.jobs.filter(job => job.cycle === 2).map(job => job.name), ['history']);
+    assert.equal(result.jobs.find(job => job.cycle === 3).name, 'sample');
+  });
+}
+
+test('unknown history consumption stops its slice without retaining every future first opportunity', () => {
+  const result = fixture({ history: () => ({ duration: 1000, processed: 0, ok: false,
+    outcome: 'batch_interrupted', noReceipt: true }) });
+  assert.deepEqual(result.jobs.filter(job => job.cycle === 2).map(job => job.name), ['history']);
+  assert.equal(result.jobs.find(job => job.cycle === 3).name, 'sample');
+  assert.equal(result.ok, false);
+});
+
+test('a sampler 429 keeps its shared cooldown across rotated opportunities', () => {
+  const until = EPOCH + 100_000;
+  const result = fixture({ opts: { maxCycles: 6 },
+    admission: ({ clock, deps }) => ({ outcome: deps.cooldownsByOperation.self_profile > EPOCH + clock ? 'not_due' : 'due' }),
+    sample: ({ cycle }) => cycle === 1 ? { duration: 1000, outcome: 'failed', cli: 1, self: 1,
+      cooldowns: { self_profile: until } } : { duration: 7000, cli: 5, self: 2 },
+  });
+  assert.deepEqual(result.jobs.filter(job => job.cycle === 1).map(job => job.name), ['sample']);
+  assert.ok(result.jobs.filter(job => job.name === 'sample' && job.cycle > 1).every(job => EPOCH + job.at >= until));
+  assert.equal(result.jobs.find(job => job.name === 'sample' && job.cycle > 1).cycle, 4);
+  assert.deepEqual(result.starts, Array.from({ length: 6 }, (_, index) => index * 36_000));
 });
 
 for (const [name, value] of [

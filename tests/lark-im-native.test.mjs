@@ -19,7 +19,7 @@ const options = (overrides = {}) => ({ pageSize: 50, maxPages: 5,
 function raw(id, overrides = {}) {
   return { message_id: id, msg_type: "text", chat_id: "oc_synthetic",
     create_time: String(BASE_MS), update_time: String(BASE_MS + 1_234),
-    updated: true, deleted: false, sender: { id: "ou_other", id_type: "open_id", sender_type: "user" },
+    updated: true, deleted: false, sender: { id: "ou_self", id_type: "open_id", sender_type: "user" },
     body: { content: JSON.stringify({ text: `body ${id}` }) }, ...overrides };
 }
 

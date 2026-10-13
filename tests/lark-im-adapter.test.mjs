@@ -78,6 +78,7 @@ test("fetchSentMessages builds native user search commands and closes each page 
       if (args[2].endsWith("/mget")) {
         return { ok: true, data: { items: params.message_ids.map((id) => ({
           message_id: id, create_time: id === "om_1" ? "1" : "2", update_time: "3",
+          sender: { id: "ou_self", id_type: "open_id", sender_type: "user" },
           msg_type: "text", body: { content: '{"text":"hello"}' },
         })) } };
       }

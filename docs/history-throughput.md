@@ -22,8 +22,16 @@ The configured interval is an idle allowance. Monotonic elapsed history time
 uses that allowance instead of being added to another full sleep. Local commits
 can exceed the remote deadline; their overrun remains visible as forward delay.
 Due jobs run serially, at most once each per idle period. Waiting age decides
-which gets the first opportunity; a writer that made no progress retains its
-age. Sampling runs with its full admitted budget, so old list routes are not
+which gets the first opportunity. Admission to that first opportunity consumes
+its waiting age even on failure, zero requests or zero progress; this is not an
+API-attempt or business-completion receipt. A writer given only the sampler's
+surplus retains its age on zero progress or an ordinary-to-merge transition, so
+it can receive the next full opportunity. When both jobs remain due and history
+cannot progress from surplus, each gets a first turn within two healthy idle
+slices with sufficient admission time. History making useful progress from
+surplus may continue in that position without taking the first turn. Durable
+debt, cooldowns and foreground guards still determine actual work.
+Sampling runs with its full admitted budget, so old list routes are not
 silently reduced to fund history. Its measured remainder may then fund history,
 with a one-second handoff gap. After history, a sampler without its full budget
 waits for its next opportunity. Unknown consumption or a shared stop condition

@@ -299,6 +299,11 @@ export function stop(deps = {}) {
 }
 /** @param {ServiceDeps} [deps] */
 export function restart(deps = {}) {
+  confirmedProbe(deps);
+  // Reject known configuration failures before stopping; start reads it again.
+  const installed = readInstalledServiceConfig(deps);
+  if (installed.status === "missing") throw new ServiceOperationError("service configuration is not installed");
+  if (installed.status !== "installed") throw new ServiceOperationError("installed service configuration is unavailable");
   stop(deps);
   start(deps);
   return { ok: true, action: "restart", status: "restart_requested" };

@@ -12,6 +12,7 @@ import {
 } from "./core.mjs";
 import { PaginationLimitError } from "../../../dist/core/sync.js";
 import { normalizeApiMessage } from "./raw-message.mjs";
+import { senderIdentity } from "./sender-identity.mjs";
 import {
   createNameResolver,
   NAME_LOOKUP_RETRY_BUDGET_MS,
@@ -84,7 +85,8 @@ import {
  *   detailBudgetMs?: number,
  *   detailMaxPages?: number,
  *   detailMaxItems?: number,
- *   captureSameVersionConflict?: boolean
+ *   captureSameVersionConflict?: boolean,
+ *   expectedScope?: {kind: "chat" | "sent", identity: string}
  * }} DetailOptions
  *
  * @typedef {object} NameDetails
@@ -225,6 +227,38 @@ function assertRawMessagePage(messages, endpoint) {
   }
 }
 
+/** Scope failures cannot become partial detail results or cursor coverage. */
+export class MessageScopeError extends Error {
+  constructor() {
+    super("message response does not match the requested scope");
+    this.name = "MessageScopeError";
+  }
+}
+
+/** Validate native top-level messages before clipping time or queuing roots.
+ * Forwarded children belong to the root's payload, not its retrieval scope.
+ * @param {JsonObject[]} messages
+ * @param {{kind: "chat" | "sent", identity: string}} scope
+ */
+function assertMessageScope(messages, scope) {
+  if (!["chat", "sent"].includes(scope.kind) || typeof scope.identity !== "string" || !scope.identity.trim()) {
+    throw new MessageScopeError();
+  }
+  for (const message of messages) {
+    if (scope.kind === "chat") {
+      if (message.chat_id !== scope.identity) throw new MessageScopeError();
+    } else {
+      // Read the native sender itself; extra wrapper-like fields are not
+      // authoritative identity evidence in a native API response.
+      const identity = senderIdentity({ sender: message.sender });
+      if (!identity.verified || identity.type !== "open_id" || identity.id !== scope.identity ||
+          [message.sender?.sender_type, message.sender?.type].some(kind => kind !== undefined && kind !== "user")) {
+        throw new MessageScopeError();
+      }
+    }
+  }
+}
+
 /** @param {number} startMs @param {number} endMs @param {FetchOptions} opts */
 function assertFetchBounds(startMs, endMs, opts) {
   if (!Number.isSafeInteger(startMs) || !Number.isSafeInteger(endMs) || startMs < 0 || endMs < startMs ||
@@ -312,6 +346,7 @@ class MessageDetailError extends Error {
 /** @param {unknown} error */
 function detailFailureReason(error) {
   if (error instanceof MessageDetailError) return error.detailReason;
+  if (error instanceof MessageScopeError) return "source_scope_mismatch";
   const failure = classifyLarkFailure(error);
   return failure.kind === "unknown" ? "invalid_or_unavailable_details" : failure.kind;
 }
@@ -371,9 +406,11 @@ function createLarkImAdapter({ run = runLark, clock = Date.now } = {}) {
 
   /** One fetch window shares its retry time and detail bounds; no per-child deadline reset.
    * @param {FetchOptions} opts @param {string} operation @param {number} startMs @param {number} endMs
+   * @param {{kind: "chat" | "sent", identity: string}} scope
    * @param {JsonObject[]=} detailRoots Defined only for the list-only path.
    */
-  function nativeWindow(opts, operation, startMs, endMs, detailRoots) {
+  function nativeWindow(opts, operation, startMs, endMs, scope, detailRoots) {
+    assertMessageScope([], scope);
     let lastNow = clock();
     if (!Number.isFinite(lastNow)) throw new Error("message fetch clock is invalid");
     const now = () => {
@@ -455,12 +492,13 @@ function createLarkImAdapter({ run = runLark, clock = Date.now } = {}) {
           items = collected;
           mergeCache.set(message.message_id, items);
         }
+        assertMessageScope(items.filter(item => item.message_id === message.message_id), scope);
         return normalizeDetailSnapshot(message, items);
       } catch (error) {
         // A detail denial says nothing about list access to this chat. Keep
         // reading ordinary messages; do not turn a partial merge into a record
         // that could erase an already stored complete expansion.
-        if (error instanceof MessageWindowBudgetError || isPaginationLimitError(error)) throw error;
+        if (error instanceof MessageScopeError || error instanceof MessageWindowBudgetError || isPaginationLimitError(error)) throw error;
         const text = error instanceof Error ? error.message : "";
         const reason = text === "merge-forward source changed during detail retrieval" ? "source_changed"
           : detailFailureReason(error);
@@ -468,6 +506,11 @@ function createLarkImAdapter({ run = runLark, clock = Date.now } = {}) {
         return null;
       }
     }).filter((message) => message !== null);
+    /** @param {JsonObject[]} messages */
+    const normalizeScoped = (messages) => {
+      assertMessageScope(messages, scope);
+      return normalize(messages);
+    };
     /** @param {MessageFetchResult} result */
     const complete = (result) => {
       if (missingDetails.size) {
@@ -475,7 +518,7 @@ function createLarkImAdapter({ run = runLark, clock = Date.now } = {}) {
       }
       return result;
     };
-    return { request, normalize, complete };
+    return { request, normalize: normalizeScoped, complete };
   }
 
   /** Exact known identities only. One native mget is not list-window coverage.
@@ -542,7 +585,8 @@ function createLarkImAdapter({ run = runLark, clock = Date.now } = {}) {
    */
   function fetchSentWindow(selfOpenId, startMs, endMs, opts, detailRoots) {
     assertFetchBounds(startMs, endMs, opts);
-    const { request, normalize, complete } = nativeWindow(opts, "message_search_bundle", startMs, endMs, detailRoots);
+    const { request, normalize, complete } = nativeWindow(opts, "message_search_bundle", startMs, endMs,
+      { kind: "sent", identity: selfOpenId }, detailRoots);
     const tokens = new Set();
     return complete(readBoundedPages({
       maxPages: opts.maxPages,
@@ -598,7 +642,8 @@ function createLarkImAdapter({ run = runLark, clock = Date.now } = {}) {
    */
   function fetchChatWindow(chatIdValue, startMs, endMs, opts, detailRoots) {
     assertFetchBounds(startMs, endMs, opts);
-    const { request, normalize, complete } = nativeWindow(opts, "message_history_bundle", startMs, endMs, detailRoots);
+    const { request, normalize, complete } = nativeWindow(opts, "message_history_bundle", startMs, endMs,
+      { kind: "chat", identity: chatIdValue }, detailRoots);
     const tokens = new Set();
     return complete(readBoundedPages({
       maxPages: opts.maxPages,
@@ -657,6 +702,7 @@ function createLarkImAdapter({ run = runLark, clock = Date.now } = {}) {
   function fetchMessageDetails(rawRoot, opts = {}) {
     try {
       assertRawMessagePage([rawRoot], "queued-message-details");
+      if (opts.expectedScope) assertMessageScope([rawRoot], opts.expectedScope);
       if (opts.captureSameVersionConflict !== undefined && typeof opts.captureSameVersionConflict !== "boolean") {
         throw new MessageDetailError("invalid_detail_options");
       }
@@ -709,6 +755,9 @@ function createLarkImAdapter({ run = runLark, clock = Date.now } = {}) {
         const page = nativePage(json, "message-details", tokens);
         if (!page.has_more) break;
         token = page.page_token;
+      }
+      if (opts.expectedScope) {
+        assertMessageScope(items.filter(item => item.message_id === rawRoot.message_id), opts.expectedScope);
       }
       return normalizeDetailSnapshot(rawRoot, items, opts.captureSameVersionConflict === true);
     } catch (error) {

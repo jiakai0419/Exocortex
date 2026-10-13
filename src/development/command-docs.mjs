@@ -2,6 +2,23 @@
 const cell = (value) => String(value).replaceAll("|", "\\|").replace(/[\r\n]+/g, " ");
 const code = (value) => `\`${cell(value)}\``;
 
+export function maintenanceEffectDocumentation(catalog) {
+  const commands = catalog.commands.filter(({ group }) => group === "maintenance");
+  const writers = commands.filter(({ effects }) => effects.includes("database-write"));
+  const rows = commands.map((entry) => {
+    const apply = entry.options.some(({ flag }) => flag === "--apply")
+      ? entry.modes.find(({ when }) => when === "--apply").effects.join(", ") : "不支持";
+    const other = entry.modes.filter(({ when, effects }) => when !== "--apply" && effects?.length)
+      .map(({ when, effects }) => `${code(when)}：${cell(effects.join(", "))}`).join("；") || "—";
+    return `| ${code(entry.path.join(" "))} | ${cell(entry.effects.join(", "))} | ${cell(apply)} | ${other} |`;
+  });
+  return [
+    `默认可能写数据库：${writers.map(({ path }) => code(path.join(" "))).join("、")}。\`--apply\` 不是维护命令的统一写入开关。`,
+    "", "下表由 registry 生成；默认效果表示可能产生的副作用，不保证每次调用都实际写入。预览也可能读取远端或写私有文件，不能当作离线或无副作用操作。",
+    "", "| 命令 | 默认效果 | `--apply` 附加效果 | 其他显式效果 |", "| --- | --- | --- | --- |", ...rows,
+  ].join("\n");
+}
+
 export function commandDocumentation(catalog) {
   const routes = ["| 命令 | 能力 | 默认效果 | 默认输出级别 |", "| --- | --- | --- | --- |"];
   const options = [];

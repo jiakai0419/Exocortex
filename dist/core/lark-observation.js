@@ -300,10 +300,27 @@ const DERIVED_CANONICAL_FIELDS = ["content", "content_rendering", "sender_name",
     "sender_name_verification", "sender_name_account_key", "sender_name_authority_source", "chat_name", "chat_name_source", "chat_type"];
 /** Keep one representative of an equivalent source; name merge remains SQL's
  * responsibility. Do not let alias allocation churn canonical source fields. */
-function retainSourceRepresentation(before, incoming) {
-    const canonical = mergeJsonObjectText(before.canonical_json, incoming.canonical_json, {
-        retain: ["mentions", "create_time", "update_time"], deleteMissing: DERIVED_CANONICAL_FIELDS,
-    });
+function retainSourceRepresentation(before, incoming, onProjectionLimit) {
+    let canonical = before.canonical_json;
+    // Accepted, byte-identical JSON needs no edit or additional parsing budget.
+    // Keep the general-purpose JSON editor strict, including for empty patches.
+    if (canonical !== incoming.canonical_json) {
+        try {
+            canonical = mergeJsonObjectText(before.canonical_json, incoming.canonical_json, {
+                retain: ["mentions", "create_time", "update_time"], deleteMissing: DERIVED_CANONICAL_FIELDS,
+            });
+        }
+        catch (error) {
+            if (!(error instanceof Error) || error.message !== "json_patch_limit" || !onProjectionLimit)
+                throw error;
+            // Source completeness and projection refresh are separate receipts. Keep
+            // the old projection together; the observation caller retains the full
+            // incoming projection as deferred evidence, or rejects it if it cannot.
+            onProjectionLimit();
+            return { ...incoming, raw_json: before.raw_json, content_hash: before.content_hash,
+                body: before.body, title: before.title, canonical_json: before.canonical_json };
+        }
+    }
     return { ...incoming, raw_json: before.raw_json, content_hash: before.content_hash, canonical_json: canonical };
 }
 /** Approval proof binds every effective field and canonical dependency. Native

@@ -297,7 +297,8 @@ function trustedIdleBudget(value, cli, self, sample = false) {
 /** Two complete jobs share one in-memory allowance. The sampler keeps its full
  * list contract when it goes first. Only its measured surplus may fund history;
  * history-first never squeezes a legacy sampler into an unproven smaller plan.
- * Waiting ages survive unserved cycles, not restarts. No extra scheduling loop,
+ * Waiting ages track first opportunities, not successful work, and survive
+ * unserved cycles, not restarts. No extra scheduling loop,
  * persistent budget, API concurrency, or speculative refund is introduced.
  * @param {WorkerOptions} opts
  * @param {number} cycle
@@ -347,6 +348,10 @@ function runSharedIdleWork(opts, cycle, runHistory, waiting, deps) {
       if (remaining() < (job.name === "sample" ? 3000 : 1000)) break;
     }
     const maxCli = cliRemaining, maxSelf = job.name === "sample" ? 2 : selfRemaining;
+    // Spending the first opportunity is independent of progress or a valid
+    // receipt. A failed job must not keep either peer behind it indefinitely.
+    // Surplus-only history keeps its age until it progresses or gets to go first.
+    const firstOpportunity = !called;
     // Reserve before spawning. Only a complete, strictly checked receipt refunds.
     cliRemaining -= maxCli; selfRemaining -= maxSelf;
     called = true;
@@ -354,6 +359,7 @@ function runSharedIdleWork(opts, cycle, runHistory, waiting, deps) {
     if (job.name === "sample") {
       const budgetMs = Math.floor(remaining());
       let sampled;
+      if (firstOpportunity) waiting.sample = null;
       try { sampled = deps.sample({ ...opts, maxApiCalls: maxCli, maxSelfCalls: maxSelf,
         remoteSampleBudgetMs: budgetMs }, { nowMs: now, cooldownsByOperation: deps.cooldowns,
         returnReport: true, remainingTimeMs: remaining }); }
@@ -368,6 +374,7 @@ function runSharedIdleWork(opts, cycle, runHistory, waiting, deps) {
     } else {
       const seconds = Math.min(30, Math.floor(remaining() / 1000));
       if (seconds < 1) break;
+      if (firstOpportunity) waiting.history = null;
       historyStep = runHistory(["history", "--db", opts.db, ...(opts.logDir ? ["--log-dir", opts.logDir] : []),
         "--max-records", "12", "--max-cli-attempts", String(maxCli), "--max-self-attempts", String(maxSelf),
         "--max-seconds", String(seconds), "--format", "json"]);
@@ -378,7 +385,7 @@ function runSharedIdleWork(opts, cycle, runHistory, waiting, deps) {
       const summary = historyStep.summary;
       if (summary?.outcome === "no_eligible_known_record" ||
           Number(summary?.processed) > 0 && summary?.outcome !== "legacy_required") waiting.history = null;
-      // No progress, including ordinary->merge, stays at the head next cycle.
+      // Surplus-only no progress, including ordinary->merge, keeps its next turn.
       if (historyStep.ok !== true || ["sync_busy", "lease_unavailable", "rate_limited", "rate_cooldown",
         "shared_cooldown_unavailable", "clock_unavailable"].includes(receipt.stop_reason)) break;
     }

@@ -109,7 +109,9 @@ for (const [label, refreshed, expected] of [
   const adapter = adapterFor(root(), [refreshed, child()]);
   assert.throws(() => adapter.fetchMessageDetails(root()), error => error.detailReason === expected);
   assert.throws(() => adapter.fetchChatMessages(CHAT, START, START + 60000, fetchOpts),
-    error => error.missingDetails?.[0].reason === expected);
+    error => expected === 'source_identity_changed'
+      ? error.name === 'MessageScopeError' && error.messages === undefined && error.missingDetails === undefined
+      : error.missingDetails?.[0].reason === expected);
   assert.throws(() => normalizeApiMessage(root(), { mergeItems: [refreshed, child()] }), /source changed/);
   const f = fixture(t); seedComplete(f); const before = record(f), debt = task(f);
   const result = cliReplay(f, adapter);

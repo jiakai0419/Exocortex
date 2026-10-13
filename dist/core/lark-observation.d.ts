@@ -42,7 +42,7 @@ declare function compareObservation(before: ObservationRecord, incoming: Observa
  * responsibility. Do not let alias allocation churn canonical source fields. */
 declare function retainSourceRepresentation<T extends ObservationRecord & {
     content_hash: string;
-}>(before: T, incoming: T): T;
+}>(before: T, incoming: T, onProjectionLimit?: () => void): T;
 /** Approval proof binds every effective field and canonical dependency. Native
  * redundant mentions may be represented by the graph proof only when they equal
  * the actual raw definitions. Unknown canonical fields are always included. */

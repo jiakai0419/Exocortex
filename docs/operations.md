@@ -92,7 +92,7 @@ STOPPED  LaunchAgent 未加载。
 
 安装时还会解析本机 Node、SQLite、Python 与 LARK CLI 路径，以所选后台 PATH、隔离初始化环境进行无网络依赖检查；失败时保留原配置，不启动 worker。检查不验证 launchd 继承环境或运行时初始化配置，不代替启动后验收。不会复制 shell 的完整环境或凭据，也不通过运行 LARK CLI 验证账号。自定义安装目录、检查能力与限制见[服务运行依赖](service-dependencies.md)。
 
-`service start` 是 ensure-running：已确认运行时不更换实例；已加载但未运行时请求非强制 kickstart，未加载时 bootstrap 后启动。无法检查时失败。`service restart` 才明确执行 stop → start。启动返回 0 只表示请求已接受，持续运行与新周期用 `check --wait` 验收。
+`service start` 是 ensure-running：已确认运行时不更换实例；已加载但未运行时请求非强制 kickstart，未加载时 bootstrap 后启动。无法检查时失败。`service restart` 才明确执行 stop → start；它先确认服务状态并只读预检已安装配置，配置缺失、不可读或无效时在停服前失败。预检不锁定配置，也不保证后续日志目录准备或启动成功；启动阶段仍重新读取配置。启动返回 0 只表示请求已接受，持续运行与新周期用 `check --wait` 验收。
 
 `stop` 与 `uninstall` 必须确认 job absent；unknown 不能冒充停止，uninstall 在停止或确认失败时保留 plist。安装校验、文件替换与回滚失败都显式报告，不把磁盘配置恢复等同于进程恢复。现有安装配置的迁移门槛见 [W](cli-migration.md#worker-切换门槛-w)。
 
@@ -331,7 +331,25 @@ node bin/exocortex.mjs check --live
 
 ### 业务数据维护
 
-`maintenance init` 和 `maintenance backup` 是明确写操作。其他维护动词默认预览，审阅后加 `--apply` 才写；enrich/replay 的预览仍会读取有界远端数据，不能当作离线模拟。记录和 scope 补全必须明确目标，没有隐式 all：
+<!-- BEGIN GENERATED maintenance-effects -->
+默认可能写数据库：`maintenance init`、`maintenance history`。`--apply` 不是维护命令的统一写入开关。
+
+下表由 registry 生成；默认效果表示可能产生的副作用，不保证每次调用都实际写入。预览也可能读取远端或写私有文件，不能当作离线或无副作用操作。
+
+| 命令 | 默认效果 | `--apply` 附加效果 | 其他显式效果 |
+| --- | --- | --- | --- |
+| `maintenance init` | database-write, permissions-write | 不支持 | — |
+| `maintenance backup` | backup-write, same-source-backup-cleanup | 不支持 | — |
+| `maintenance enrich` | local-read, remote-read | database-write | `--review-out`：private-review-file-write |
+| `maintenance preview` | local-read, remote-read, private-review-file-write, private-progress-file-write | 不支持 | — |
+| `maintenance history` | local-read, remote-read, database-write | 不支持 | — |
+| `maintenance repair` | local-read | database-write | — |
+| `maintenance replay` | local-read, remote-read | database-write | `--review-out`：private-review-file-write |
+| `maintenance prune-runs` | local-read | database-write | — |
+| `maintenance compact` | local-read | database-write | — |
+<!-- END GENERATED maintenance-effects -->
+
+记录和 scope 补全必须明确目标，没有隐式 all；enrich/replay 默认预览，审阅后加 `--apply` 才提交数据库变更：
 
 ```bash
 node bin/exocortex.mjs maintenance enrich --target scopes --limit 50
@@ -351,7 +369,7 @@ node bin/exocortex.mjs maintenance prune-runs
 node bin/exocortex.mjs maintenance compact
 ```
 
-确认计划后再对相应动作加 `--apply`。连续锁冲突或较长修复可先显式 stop，检查无独立同步后维护，完成再 start 和 `check --wait`。维护锁有 TTL，正常退出释放；过期只是恢复条件之一，不证明 owner 已死。
+上述命令中，只有 `prune-runs` 和 `compact` 支持加 `--apply`，确认计划后再提交。连续锁冲突或较长修复可先显式 stop，检查无独立同步后维护，完成再 start 和 `check --wait`。维护锁有 TTL，正常退出释放；过期只是恢复条件之一，不证明 owner 已死。
 
 ## Public-Safe Command Output
 
@@ -379,14 +397,14 @@ node bin/exocortex.mjs maintenance enrich --target scopes
 
 `status --logs --lines 20` 是显式私有日志读取，帮助和输出都标为 private。默认 status JSON 不暴露 launchctl 原文、内部 cache_path 或原始报告。
 
-少数命令支持显式打开本地明细：
+`--unsafe-details` 按命令区分，以下两种用法均将输出标为 private：
 
 ```bash
 node bin/exocortex.mjs check --live --unsafe-details
 node bin/exocortex.mjs maintenance enrich --target records --unsafe-details
 ```
 
-`--unsafe-details` 的含义是：输出可能包含真实本地 ID、群名、人名、应用名、消息片段或远端错误细节，只能用于本机临时排障，不要复制进公开仓库、CI artifact 或聊天记录。
+`check --live --unsafe-details` 仅兼容保留 private 标签；v3 仍经 `publicRemoteReport` 脱敏，不新增私有详情，也不绕过安全投影。`maintenance enrich --target records --unsafe-details` 则可输出私有查询明细，可能包含真实本地 ID、群名、人名、应用名、消息片段或远端错误细节。私有输出只用于本机临时排障，不要复制进公开仓库、CI artifact 或聊天记录。
 
 ## SQLite Private Durability
 

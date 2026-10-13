@@ -48,7 +48,7 @@ function evaluateObservation(before: StoredRecord | null, incoming: StoredRecord
   else if (comparison.version === "older") { action = "older"; reason = "source_timestamp_regressed"; }
   else if (comparison.equivalent) {
     action = "equivalent"; reason = comparison.representation;
-    record = retainSourceRepresentation(before, source);
+    record = retainSourceRepresentation(before, source, () => { reason = "equivalent_projection_capacity_deferred"; });
   } else if (comparison.version === "newer") { reason = "newer_observed_timestamp"; }
   else {
     action = "conflict"; reason = comparison.version === "unordered" ? "source_version_unordered"
@@ -122,9 +122,17 @@ function observationEvidenceSql(records: StoredRecord[], admission = "1") {
   return records.filter(record => record.observation?.before).map(record => {
     const o = record.observation!, accepted = o.action === "accept" || o.action === "equivalent";
     const candidate = JSON.stringify(o.incoming);
-    if (Buffer.byteLength(candidate) > 4 * 1024 * 1024) throw new Error("observation evidence capacity exceeded");
+    const oversized = Buffer.byteLength(candidate) > 4 * 1024 * 1024;
+    // An equivalent source already has its complete representative in records.
+    // Do not copy an oversized replay envelope, but invalidate old candidates
+    // and advance evidence generation exactly as for any accepted observation.
+    // A deferred projection needs its complete incoming evidence for recovery;
+    // it cannot use this no-copy receipt or silently discard unknown fields.
+    if (oversized && (o.action !== "equivalent" || o.reason === "equivalent_projection_capacity_deferred")) {
+      throw new Error("observation evidence capacity exceeded");
+    }
     return `UPDATE record_observation_state SET evidence_generation=evidence_generation+1,
-      last_observed_json=${quoteSql(candidate)},
+      last_observed_json=${oversized ? "NULL" : quoteSql(candidate)},
       previous_json=${o.action === "accept" ? quoteSql(JSON.stringify(o.before)) : "previous_json"},
       candidate_json=${o.preserveCandidate ? "candidate_json" : accepted ? "NULL" : quoteSql(candidate)},
       candidate_generation=${o.preserveCandidate ? "candidate_generation" : accepted || o.action === "stale" ? "NULL" : String(o.generation)},
@@ -132,7 +140,7 @@ function observationEvidenceSql(records: StoredRecord[], admission = "1") {
       candidate_policy=${o.preserveCandidate ? "candidate_policy" : accepted ? "NULL" : quoteSql(OBSERVATION_POLICY)},
       candidate_context=${o.preserveCandidate ? "candidate_context" : accepted ? "NULL" : quoteSql(o.contextKey)},
       candidate_observed_at_ms=${o.preserveCandidate ? "candidate_observed_at_ms" : accepted ? "NULL" : o.observedAtMs},
-      reason=${quoteSql(o.reason)}, observed_at_ms=${o.observedAtMs}
+      reason=${quoteSql(oversized ? "equivalent_evidence_capacity_deferred" : o.reason)}, observed_at_ms=${o.observedAtMs}
       WHERE record_id=${Number(o.before!.id)} AND (${admission});`;
   }).join("\n");
 }

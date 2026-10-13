@@ -428,6 +428,9 @@ function retryScopeDetails(dbPath, opts, scope, selfProfile, deps, limit = 5,
       try {
         lockedScope.assertWriteAdmission?.();
         const message = deps.fetchMessageDetails(task.raw_root, {
+          expectedScope: lockedScope.id === SENT_SCOPE_ID
+            ? { kind: "sent", identity: selfProfile.open_id }
+            : { kind: "chat", identity: lockedScope.config?.chat_id },
           captureSameVersionConflict: Boolean(acquisition),
           retries: opts.retries, retryDelayMs: opts.retryDelayMs,
           detailBudgetMs: Math.min(30_000, remaining),

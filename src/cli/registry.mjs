@@ -52,7 +52,7 @@ export const COMMANDS = Object.freeze([
     { ...logDir, description: "Worker log directory; requires --wait or --live --write-live-cache." }, backupDir,
     bool("--live", "live", "Read a bounded remote sample."),
     bool("--write-live-cache", "writeLiveCache", "Write the safe sample cache; requires --live."),
-    bool("--unsafe-details", "unsafeDetails", "Include private sample details; requires --live."),
+    bool("--unsafe-details", "unsafeDetails", "Compatibility privacy label only; v3 keeps the public-safe projection and adds no private sample fields; requires --live."),
     positive("--chat-pages", "chatPages", 5, "Legacy compatibility bound; live sampling uses local discovered chats."),
     positive("--hot-chats", "hotChats", 5, "Maximum sampled chats, capped at five; requires --live."),
     { ...positive("--messages-per-chat", "messagesPerChat", 20, "Messages per page, capped at twenty and two pages per chat; requires --live."), max: 50 },

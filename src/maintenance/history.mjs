@@ -1,6 +1,6 @@
 // @ts-check
 import { randomUUID, createHash } from 'node:crypto';
-import { createLarkImAdapter } from '../adapters/lark-im/adapter.mjs';
+import { createLarkImAdapter, MessageScopeError } from '../adapters/lark-im/adapter.mjs';
 import { messageId, chatId, chatScopeId } from '../adapters/lark-im/core.mjs';
 import { prepareChatWindowRecords } from '../adapters/lark-im/sync-runner.mjs';
 import { createMaintenanceRequestSession } from './request-session.mjs';
@@ -139,7 +139,8 @@ function executeHistoryTarget(options, deps, session, initialTarget, prepared = 
   } catch (cause) {
     // Never infer deletion from absence or transport failure. Finite, private-
     // content-free error rotates this row; the next sweep can retry it.
-    error = ['incomplete', 'size_limit', 'identity', 'ambiguous', 'missing'].includes(cause instanceof Error ? cause.message : '')
+    error = cause instanceof MessageScopeError ? 'identity'
+      : ['incomplete', 'size_limit', 'identity', 'ambiguous', 'missing'].includes(cause instanceof Error ? cause.message : '')
       ? /** @type {Error} */ (cause).message : 'fetch_unavailable';
     records = [];
     // Batch exhaustion/cooldown/lease loss is not evidence against this row.

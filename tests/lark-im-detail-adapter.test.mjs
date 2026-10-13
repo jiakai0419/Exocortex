@@ -11,7 +11,7 @@ const opts = (overrides = {}) => ({ pageSize: 50, maxPages: 5, chatPageSize: 100
 const raw = (id, overrides = {}) => ({ message_id: `om_synthetic_${id}`, chat_id: "oc_synthetic_details",
   create_time: String(START + 1000), update_time: String(START + 2000),
   msg_type: "text", body: { content: JSON.stringify({ text: `invented ${id}` }) },
-  sender: { id: "ou_synthetic_sender", id_type: "open_id", sender_type: "user" }, ...overrides });
+  sender: { id: "ou_synthetic_self", id_type: "open_id", sender_type: "user" }, ...overrides });
 const merged = (overrides = {}) => raw("root", { msg_type: "merge_forward",
   body: { content: JSON.stringify({ create_message_ids: ["om_synthetic_child"] }) }, ...overrides });
 const page = (items, has_more = false, page_token = "") => ({ ok: true, data: { items, has_more, page_token } });

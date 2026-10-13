@@ -99,7 +99,7 @@ Collect database, sync and quality evidence and requested extensions.
 | `--backup-dir` | path | `backups/private` | — | Private backup directory. |
 | `--live` | boolean | `false` | — | Read a bounded remote sample. |
 | `--write-live-cache` | boolean | `false` | — | Write the safe sample cache; requires --live. |
-| `--unsafe-details` | boolean | `false` | — | Include private sample details; requires --live. |
+| `--unsafe-details` | boolean | `false` | — | Compatibility privacy label only; v3 keeps the public-safe projection and adds no private sample fields; requires --live. |
 | `--chat-pages` | integer | `5` | ≥ 1 | Legacy compatibility bound; live sampling uses local discovered chats. |
 | `--hot-chats` | integer | `5` | ≥ 1 | Maximum sampled chats, capped at five; requires --live. |
 | `--messages-per-chat` | integer | `20` | ≥ 1；≤ 50 | Messages per page, capped at twenty and two pages per chat; requires --live. |

@@ -95,6 +95,9 @@ for (const direction of ["received", "sent"]) {
     const scopeId = direction === "sent" ? "lark.im.sent_by_me" : SCOPE;
     const root = rawMerge(40, START + 30_000);
     const ordinary = [raw(41, START + 1_000), raw(42, START + 45_000)];
+    if (direction === "sent") {
+      for (const item of [root, ...ordinary]) item.sender.id = PROFILE.open_id;
+    }
     let denied = true;
     const paths = [];
     const adapter = createLarkImAdapter({ run(args) {

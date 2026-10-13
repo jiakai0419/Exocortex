@@ -100,7 +100,38 @@ test("restart stops the old job and explicitly starts a new instance", () => {
     ["launchctl", "kickstart", "gui/701/com.exocortex.lark-im-worker"],
   ]);
   assert.notEqual(f.state.pid, 7011);
+  const preflight = f.state.calls.findIndex((call) => call[0] === "plutil" && call[1] === "-convert");
+  const bootout = f.state.calls.findIndex((call) => call[0] === "launchctl" && call[1] === "bootout");
+  assert.ok(preflight >= 0 && preflight < bootout);
+  assert.equal(f.state.calls.filter((call) => call[0] === "plutil" && call[1] === "-convert").length, 2);
 });
+for (const invalid of [
+  { name: "missing plist", installed: false, error: /service configuration is not installed/ },
+  { name: "unreadable plist", configure: (f) => { f.deps.readFileSync = () => { throw new Error("PRIVATE_SERVICE_SENTINEL"); }; } },
+  { name: "malformed plist", fail: (cmd) => cmd === "plutil" ? { status: 1, stderr: "PRIVATE_SERVICE_SENTINEL" } : null },
+  { name: "invalid converted JSON", fail: (cmd) => cmd === "plutil" ? ok("{") : null },
+  { name: "wrong service identity", alter: { Label: "synthetic.other-service" } },
+  { name: "invalid worker options", alter: { ProgramArguments: ["/synthetic/node", "/synthetic/worker", "--once"] } },
+]) {
+  test(`restart rejects ${invalid.name} before stopping a running service`, () => {
+    const f = fixture({ loaded: true, running: true, ...invalid });
+    invalid.configure?.(f);
+    const files = new Map(f.state.files);
+    const modes = new Map(f.state.modes);
+    assert.throws(() => restart(f.deps), (error) => {
+      assert.match(error.message, invalid.error || /installed service configuration is unavailable/);
+      assert.doesNotMatch(error.message, /PRIVATE_SERVICE_SENTINEL/);
+      return true;
+    });
+    assert.equal(f.state.loaded, true);
+    assert.equal(f.state.running, true);
+    assert.equal(f.state.pid, 7011);
+    assert.deepEqual(lifecycleCalls(f), []);
+    assert.equal(f.state.calls.some((call) => ["write", "rename", "remove", "chmod", "mkdir"].includes(call[0])), false);
+    assert.deepEqual(f.state.files, files);
+    assert.deepEqual(f.state.modes, modes);
+  });
+}
 for (const action of [stop, uninstall]) {
   test(`${action.name} only reports completion after verified absence`, () => {
     const f = fixture({ loaded: true });

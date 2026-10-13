@@ -96,7 +96,7 @@ worker 在子命令非零退出且没有 stderr 原因时，从已识别的错�
 - `status` / `status --detail` / `status --logs`
 - `check` 及显式的 live、coverage、backup、wait 扩展
 - `service` 的五种生命周期动作
-- `maintenance` 的七种维护动作
+- `maintenance` 的 9 种维护动作
 
 内部命令可以继续优先输出 JSON/JSONL：
 

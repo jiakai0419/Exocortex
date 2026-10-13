@@ -266,18 +266,27 @@ test('sent-by-me orphan details bind each queued chat and confirm only the match
   assert.equal(f.calls, 4, 'two selected roots each acquire two independent complete responses');
 });
 
-test('a same-version sender change in sent-by-me debt needs two complete observations and retains first-seen scope', t => {
+test('foreign sent-by-me detail responses never vote; a later valid conflict needs two fresh observations', t => {
   const f = fixture(t, SENT), sender = { ...root().sender, id: SELF.open_id };
   const queued = root(1, { sender }); queue(f, [queued]);
   const foreign = root(1, { sender: { ...sender, id: 'ou_synthetic_foreign_sender' } });
   setRemote(f, foreign);
-  retry(f); assertPending(f, 1);
-  assert.ok(task(f).candidate_json, 'sender source differences do not become immediate source acceptance');
-  assert.equal(JSON.parse(task(f).raw_root_json).sender.id, SELF.open_id);
-  restart(f); retry(f); assertComplete(f, foreign, 2);
-  assert.equal(records(f)[0].direction, 'received'); assert.equal(records(f)[0].actor_id, foreign.sender.id);
-  assert.equal(records(f)[0].first_seen_scope_id, SENT, 'first-seen scope is provenance, not current sender identity');
-  assert.equal(f.calls, 2);
+  const descriptor = task(f).raw_root_json, listCursor = progress(f).cursor_json;
+  for (let attempts = 1; attempts <= 2; attempts++) {
+    restart(f); retry(f); assertPending(f, attempts);
+    assert.equal(task(f).candidate_json, null, 'out-of-scope evidence cannot become a confirmation vote');
+    assert.match(task(f).last_error_message, /source_scope_mismatch/);
+    assert.equal(task(f).raw_root_json, descriptor);
+    assert.equal(progress(f).cursor_json, listCursor);
+  }
+  const valid = root(2, { sender }); setRemote(f, valid);
+  restart(f); retry(f); assertPending(f, 3);
+  assert.ok(task(f).candidate_json, 'the first valid conflict is still only one independent observation');
+  restart(f); retry(f); assertComplete(f, valid, 4);
+  assert.equal(records(f)[0].direction, 'sent'); assert.equal(records(f)[0].actor_id, SELF.open_id);
+  assert.equal(records(f)[0].first_seen_scope_id, SENT);
+  assert.equal(progress(f).cursor_json, listCursor);
+  assert.equal(f.calls, 4);
 });
 
 for (const [label, queued, refreshed] of [

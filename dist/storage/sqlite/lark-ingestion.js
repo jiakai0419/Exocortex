@@ -9,7 +9,7 @@ import { RUN_FENCE_METADATA_KEY, scopeCursorJson, validateRecordCursor, cursorCa
 import { normalizeStoredRecords, normalizeBoundedReplayRecords, normalizeExternalVersion, numericVersionSql, versionCanReplaceSql, upsertRecordsSql, recordWritesSql } from "./record-storage.js";
 import { reviewFenceSql } from "./maintenance-review.js";
 import { sourceProof } from "../../core/lark-observation.js";
-import { prepareObservationRecords } from "./observation-store.js";
+import { prepareObservationRecords, observationEvidenceSql, observationGuardSql } from "./observation-store.js";
 import { pendingDetailGuardSql, preparePendingDetailObservation } from "./pending-detail-observation.js";
 /** A historical acceptance may supersede a queued root, but never supplies
  * forward-window coverage. Rebase only the descriptor selected before fetching;
@@ -438,7 +438,10 @@ function commitLarkProgress(dbPath, scope, runId, records, scannedCount, metadat
     requireLarkScope(scope);
     if (!Number.isSafeInteger(scannedCount) || scannedCount < 0)
         throw new Error("invalid Lark scanned count");
-    const normalized = prepareObservationRecords(dbPath, normalizeStoredRecords(records, scope.source_id));
+    // Detail records were individually prepared and capacity-checked below. Their
+    // original observation/CAS basis must reach this transaction unchanged.
+    const normalized = phase === "details" ? normalizeStoredRecords(records, scope.source_id)
+        : prepareObservationRecords(dbPath, normalizeStoredRecords(records, scope.source_id));
     if (normalized.some((record) => record.first_seen_scope_id !== scope.id || record.record_type !== "lark.im.message")) {
         throw new Error("detail progress record does not belong to this Lark scope");
     }
@@ -615,8 +618,32 @@ function finishLarkDetailRun(dbPath, scope, runId, outcomes, metadata = {}) {
             resolvedRoot = larkDetailRoot(raw, false);
             if (outcome.acquisition)
                 ({ accepted, evidenceSql, failureReason } = preparePendingDetailObservation(scope, outcome.record, outcome.acquisition, resolvedRoot));
-            if (accepted)
-                records.push(outcome.record);
+            if (accepted) {
+                let prepared;
+                try {
+                    [prepared] = prepareObservationRecords(dbPath, normalizeStoredRecords([outcome.record], scope.source_id));
+                    // The actual evidence writer enforces its bound before any SQL is
+                    // committed. One over-budget source becomes ordinary retry debt;
+                    // healthy siblings keep their own fenced acceptance receipts.
+                    observationEvidenceSql([prepared]);
+                    records.push(prepared);
+                }
+                catch (error) {
+                    if (!(error instanceof Error) || !["json_patch_limit", "observation evidence capacity exceeded"].includes(error.message))
+                        throw error;
+                    accepted = false;
+                    failureReason = error.message === "json_patch_limit" ? "detail_projection_capacity_exceeded" : "detail_evidence_capacity_exceeded";
+                    if (prepared?.observation?.before) {
+                        // An unrecordable observation is not a confirmation vote. Fence its
+                        // local basis and invalidate prior qualification, without deleting
+                        // the retained candidate bytes or inventing last-observed evidence.
+                        guards.push(observationGuardSql([prepared]));
+                        evidenceSql += `UPDATE record_observation_state SET evidence_generation=evidence_generation+1,
+              candidate_generation=NULL,reason=${quoteSql(failureReason)},observed_at_ms=${Date.parse(now)}
+              WHERE record_id=${Number(prepared.observation.before.id)};`;
+                    }
+                }
+            }
         }
         const recordVersion = normalizeExternalVersion(outcome.record?.external_version);
         const taskCondition = `scope_id = ${quoteSql(scope.id)} AND message_id = ${quoteSql(outcome.message_id)}

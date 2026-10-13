@@ -32,6 +32,28 @@ Creating a run and acquiring its lock also require an enabled source/scope. A pe
 
 Lark list/detail transactions additionally check chat identity, progress generation, the list anchor and root fingerprint/version. They compose the common fence and record writer inside one transaction. Incomplete list pagination writes no progress. A complete list can save ordinary records and durable detail debt together, but missing detail content still blocks the full-content cursor. See [the list/detail contract](node-reliability-fixes.md#incomplete-details-and-bounded-progress).
 
+Native response admission also enforces the caller's requested scope before time
+clipping, record storage or detail queuing. Every top-level chat message must have
+exactly the requested `chat_id`. Every top-level sent message must identify the
+current self through an unambiguous typed `open_id` in its native sender. The
+existing identity parser accepts explicit, direct and nested typed forms; absent
+actor-kind fields remain compatible, but either `sender_type` or `type`, when
+present, must be `user`. Wrapper-like `raw_api` fields cannot supply missing native
+sender evidence. A mismatch rejects the entire list window instead of filtering
+it into apparent coverage, including mismatches outside the requested time range
+or on later pages. Error messages expose neither identity values nor content.
+
+A queued detail retry checks both the stored root and refreshed response root
+against the original locked scope: its configured chat, or current self for the
+sent scope. Scope mismatches remain pending detail debt and block full-content
+cursor promotion until a correct retry succeeds. Forwarded child messages belong
+to the root payload and are exempt from the root's chat/sender constraint.
+`tests/scope-guard-adapter.test.mjs` and `tests/scope-guard-sync.test.mjs` exercise
+these boundaries with invented responses and SQLite fixtures; they do not show
+that any real upstream response violated its contract. The separate capacity
+receipts and their projection limitations are described in
+[Shared acceptance](data-change-contract.md#shared-acceptance).
+
 The soft lock expiry, hard lease and process liveness are different evidence. None proves current activity; [Activity evidence](activity-evidence.md) requires a current phase and process identity. Maintenance enrichment uses a separate short lease, acquired only after remote lookups. Its shared helper checks owner, expiry and absence of sync locks inside the local write transaction, then performs CAS updates, counts effects and releases the owned lock. Dry runs and zero-change runs do not acquire that lock.
 
 ## Module ownership

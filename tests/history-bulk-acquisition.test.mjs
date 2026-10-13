@@ -149,6 +149,20 @@ test('committed prefix remains exact when a later per-record CAS fails',t=>{
   assert.equal(f.query('SELECT after_id FROM lark_im_history_progress')[0].after_id,1);
 });
 
+test('a first-row SQLite CAS race returns a zero-progress interruption with its actual request receipt',t=>{
+  const f=fixture(t),before=f.query('SELECT raw_json FROM records WHERE id=1')[0].raw_json;
+  const r=f.run({}, {commit:(db,o)=>{
+    store.sqliteExec(db,"UPDATE records SET received_at='2099-01-01' WHERE id=1;");
+    return store.commitBoundedReplayRecords(db,o);
+  }});
+  assert.equal(r.ok,false);assert.equal(r.outcome,'batch_interrupted');assert.equal(r.processed,0);assert.equal(r.failed,0);
+  assert.equal(r.request_budget.cli_attempts,3);assert.equal(r.request_budget.self_attempts,2);
+  assert.equal(r.request_budget.stop_reason,null);
+  assert.equal(f.query('SELECT raw_json FROM records WHERE id=1')[0].raw_json,before);
+  assert.equal(f.query('SELECT * FROM lark_im_history_progress').length,0);
+  assert.equal(f.query('SELECT * FROM lark_im_history_debt').length,0);
+});
+
 test('a deadline reached during one local commit cannot start another row from the same response',t=>{
   const f=fixture(t);let commits=0;
   const r=f.run({}, {commit:(db,o)=>{
@@ -286,4 +300,14 @@ for(const kind of ['chat','create'])test(`repeated wrong ${kind} identity is dis
   assert.ok(seen.includes(12));
   assert.equal(f.query('SELECT raw_json FROM records WHERE id=2')[0].raw_json,before);
   assert.equal(f.query('SELECT candidate_json FROM record_observation_state WHERE record_id=2')[0].candidate_json,null);
+  assert.equal(f.query('SELECT history_error FROM record_observation_state WHERE record_id=2')[0].history_error,'identity');
+});
+
+test('an unrelated acquisition error keeps the finite fetch-unavailable history reason',t=>{
+  const f=fixture(t),before=f.query('SELECT raw_json FROM records WHERE id=1')[0].raw_json;
+  const result=f.run({maxRecords:1,maxCliAttempts:4},{fetchChatMessageList:()=>{throw new Error('Synthetic transport unavailable');}});
+  assert.equal(result.ok,false);
+  assert.equal(f.query('SELECT history_error FROM record_observation_state WHERE record_id=1')[0].history_error,'fetch_unavailable');
+  assert.equal(f.query('SELECT raw_json FROM records WHERE id=1')[0].raw_json,before);
+  assert.equal(f.query('SELECT candidate_json FROM record_observation_state WHERE record_id=1')[0].candidate_json,null);
 });

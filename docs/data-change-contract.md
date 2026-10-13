@@ -54,7 +54,7 @@ fallback applies. A string matching an ID in another namespace is not a proof.
 | Observation relative to current | Selection |
 | --- | --- |
 | New identity in an authorized complete scope | Insert with original raw evidence. |
-| Exact / proven equivalent source | Preserve current raw/hash and redundant source representations; refresh derived projection using the existing name merge. Preserve unknown canonical keys from both observations. |
+| Exact / proven equivalent source | Preserve current raw/hash and redundant source representations; refresh derived projection using the existing name merge within its capacity limit. Preserve unknown canonical keys from both observations, or defer the whole projection as described below. |
 | Larger numeric timestamp | Accept under the existing local no-regression policy; retain predecessor evidence. No claim that visible content changed. |
 | Smaller timestamp | Retain current; record unresolved regression. |
 | Equal timestamp, different or unverified source | Retain current and pending evidence. No last-wins selection, including within a batch. |
@@ -66,6 +66,31 @@ ABA. A separate evidence generation fences pending-candidate replacement. A deci
 Network I/O occurs outside SQLite transactions. Existing account binding,
 source/scope enabled checks, run ownership, cursor, maintenance lock, API lease,
 cooldown, review TTL and exact predecessor fences remain mandatory.
+
+For an already accepted equivalent source, byte-identical canonical text needs no
+edit. If a projection merge exceeds the bounded JSON editor's capacity, the old
+`raw_json`/hash, `canonical_json`, `body` and `title` remain together. The receipt
+reason is `equivalent_projection_capacity_deferred`; the incoming projection has
+**not** been applied. Its complete incoming record envelope, when its serialized
+UTF-8 size is at most 4 MiB, is retained in `last_observed_json`. This is a readable
+latest-observation slot, overwritten by later evidence, with no automatic replay
+consumer in `src`. It is not a recovery queue or a promise of automatic projection
+convergence. A complete equivalent detail response may retire source detail debt
+with that receipt; source completeness does not prove a refreshed projection or
+latest remote state, and remote findings still require independent sampling.
+
+Only an equivalent observation with no deferred projection may omit an envelope
+larger than 4 MiB: it preserves the accepted raw representative, clears candidate
+qualification, advances evidence generation and records
+`equivalent_evidence_capacity_deferred` with `last_observed_json = NULL`. Deferred
+or changed incoming evidence exceeding that limit cannot use this receipt. On the
+detail path it remains retryable debt for that root, with bounded backoff; healthy
+siblings can commit, but any pending debt blocks the scope's full-content cursor.
+An over-budget new projection on the ordinary list path still fails closed. These
+rules do not expand first-insert capacity, `previous_json` capacity, the JSON
+editor's limits or the historical known-message fetch budget. Synthetic cases in
+`tests/lark-large-replay.test.mjs` cover preserved unknown fields and numeric bytes,
+the exact envelope boundary, sibling progress, restart and source-only receipts.
 
 An explicit authoritative deletion flag is source evidence and follows these same
 rules. Absence, 403/404, timeout or partial pages do not create a tombstone, clear
