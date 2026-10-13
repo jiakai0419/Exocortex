@@ -26,7 +26,7 @@ npm run verify
 
 ### macOS CI
 
-唯一完整 CI job `Check and test` 使用标准 `macos-26` ARM64 runner，保留 Node.js 22、`npm ci` 和完整 `npm run verify`，不另设 Linux 全量矩阵。测试仍最多四个文件并行，job 上限仍为 10 分钟，不因平台跳过测试。
+唯一完整 CI job `Check and test` 使用标准 `macos-26` ARM64 runner，保留 Node.js 22、`npm ci` 和完整 `npm run verify`，不另设 Linux 全量矩阵。测试仍最多四个文件并行，job 上限为 20 分钟，为 macOS runner 上的完整合成集成测试留出余量，不因平台跳过测试。
 
 CI 通过临时命令目录明确选择 `/usr/bin/python3` 与 `/usr/bin/sqlite3`，不遮蔽 `setup-node` 提供的 Node。预检输出系统、架构及依赖路径和版本，确认 Python 3.9+、`fcntl.flock`/非阻塞 FD、Python SQLite 的 JSON/schema 查询，以及 SQLite CLI 3.35+ 的 JSON 输出、JSON 函数、MATERIALIZED、RETURNING 和只读参数。完整性能力使用从零生成的临时 CHECK 违规库，验证产品所用的只读源 URI、一致性恢复和临时库检查能识别违规，并确认源文件不变；其他数据库探测使用 `:memory:`。系统依赖缺失或能力不符会失败，不自动升级系统工具。
 
