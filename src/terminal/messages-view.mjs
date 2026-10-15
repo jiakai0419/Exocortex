@@ -87,7 +87,10 @@ function renderMessagesText(messages, options = {}) {
     header(message, time);
     field("发送人", message.display.sender, 2);
     if (message.display.recipient) field("接收人", message.display.recipient, 2);
-    if (message.display.chat) field("群", message.display.chat, 6);
+    if (message.display.chat) {
+      if (message.display.scene === "群聊" || message.display.scene === "话题群") field("群", message.display.chat, 6);
+      else field("会话", message.display.chat, 4);
+    }
     if (message.display.system?.current_group_context) {
       field("当前本地标题来源", "会话配置；观察时间未知", 2);
     }

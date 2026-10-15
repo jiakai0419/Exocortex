@@ -4,6 +4,7 @@ import { readOnlySqliteJson } from "../storage/sqlite/readonly-query.mjs";
 import { renderSystemProjection } from "../adapters/lark-im/system-content.mjs";
 import { renderCardContent } from "../adapters/lark-im/card-content.mjs";
 import { personName, senderIdentity, senderNameFromSource } from "../adapters/lark-im/sender-identity.mjs";
+import { chatScopeId } from "../adapters/lark-im/core.mjs";
 
 /**
  * @typedef {"all" | "sent" | "received"} MessageDirection
@@ -70,7 +71,7 @@ function buildWhere(opts) {
  */
 function loadMessages(dbPath, opts, deps = {}) {
   const queryJson = deps.sqliteJson || sqliteJson;
-  return queryJson(
+  const rows = queryJson(
     dbPath,
     `SELECT
        r.id,
@@ -84,14 +85,35 @@ function loadMessages(dbPath, opts, deps = {}) {
        r.body,
        r.canonical_json,
        r.raw_json,
-       s.config_json AS scope_config_json
+       s.config_json AS scope_config_json,
+       s.id AS type_scope_id,
+       s.source_id AS type_scope_source_id
      FROM records r
      LEFT JOIN sync_scopes s ON s.id = r.first_seen_scope_id
      ${buildWhere(opts)}
      ORDER BY r.occurred_at_ms DESC, r.external_id DESC
      LIMIT ${Number(opts.limit)};`,
     "read messages",
-  ).map((row) => enrichRow(row));
+  );
+  // First-seen scope is ingestion provenance. Look up only this page's exact
+  // chat scopes by primary key; their current metadata supplies type only.
+  const scopeIds = new Map(rows.filter((row) => typeof row.container_id === "string" && row.container_id)
+    .map((row) => [chatScopeId(row.container_id), row.container_id]));
+  /** @type {Map<string, Row | null>} */
+  const chats = new Map();
+  if (scopeIds.size) {
+    const scopes = queryJson(dbPath, `SELECT id, source_id, config_json FROM sync_scopes
+      WHERE source_id = 'lark.im' AND id IN (${[...scopeIds.keys()].map(quoteSql).join(",")});`, "read message conversation types");
+    for (const scope of scopes) {
+      const chatId = scopeIds.get(scope.id);
+      const config = parseMaybeJson(scope.config_json);
+      if (!chatId || scope.source_id !== "lark.im" || config?.chat_id !== chatId) continue;
+      chats.set(chatId, chats.has(chatId) ? null : config);
+    }
+  }
+  return rows.map(({ type_scope_id, type_scope_source_id, ...row }) =>
+    enrichRow(row, chats.get(row.container_id), type_scope_source_id === "lark.im"
+      && typeof row.container_id === "string" && type_scope_id === chatScopeId(row.container_id)));
 }
 
 /** @param {unknown} value */
@@ -266,22 +288,45 @@ function displaySender(row, canonical, raw) {
   return { id, name: senderNameFromSource(raw) };
 }
 
+/** Resolve only explicit, identity-bound conversation modes. Visibility is
+ * not a mode, and a private/group contradiction is not resolved by priority.
+ * Preserve the old group/topic preference; this is not a topic reclassification.
+ * @param {Row} row @param {Row} canonical @param {Row} raw @param {Row} config
+ * @param {Row | null | undefined} currentChat
+ */
+function conversationType(row, canonical, raw, config, currentChat) {
+  if (currentChat === null) return "unknown";
+  const native = raw.raw_api && typeof raw.raw_api === "object" && !Array.isArray(raw.raw_api) ? raw.raw_api : {};
+  const messages = [canonical, raw, native];
+  for (const message of messages) {
+    if (message.message_id != null && message.message_id !== row.external_id) return "unknown";
+    for (const id of [message.chat_id, message.chat?.chat_id, message.chat?.id]) {
+      if (id != null && (typeof id !== "string" || !id || id !== row.container_id)) return "unknown";
+    }
+  }
+  if ([raw, native].some((message) => message.id != null && message.id !== row.external_id)) return "unknown";
+  const existing = [canonical, raw, raw.chat, config.chat_id === row.container_id ? config : null];
+  const declarations = [...existing, native, native.chat, currentChat];
+  const modes = [...existing.map((entry) => entry?.chat_type),
+    ...declarations.flatMap((entry) => [entry?.chat_type, entry?.chat_mode])]
+    .filter((mode) => mode === "p2p" || mode === "group" || mode === "topic");
+  if (modes.includes("p2p") && modes.some((mode) => mode !== "p2p")) return "unknown";
+  return modes[0] || "unknown";
+}
+
 /**
  * @param {Row} row
+ * @param {Row | null} [currentChat]
+ * @param {boolean} [scopeSourceMatches]
  * @returns {EnrichedMessage}
  */
-function enrichRow(row) {
+function enrichRow(row, currentChat, scopeSourceMatches = true) {
   const canonical = parseMaybeJson(row.canonical_json) || {};
   const raw = parseMaybeJson(row.raw_json) || {};
   const config = parseMaybeJson(row.scope_config_json) || {};
   const chatPartner =
     canonical.chat_partner || (raw.chat_partner && typeof raw.chat_partner === "object" ? raw.chat_partner : null);
-  const chatType =
-    canonical.chat_type ||
-    raw.chat_type ||
-    raw.chat?.chat_type ||
-    config.chat_type ||
-    (config.chat_id ? "group" : "unknown");
+  const chatType = conversationType(row, canonical, raw, scopeSourceMatches ? config : {}, currentChat);
   const chatName = canonical.chat_name || raw.chat_name || raw.chat?.name || config.chat_name || null;
   const chatId = canonical.chat_id || row.container_id || config.chat_id || raw.chat_id || null;
   const { id: senderId, name: senderName } = displaySender(row, canonical, raw);
@@ -304,7 +349,7 @@ function enrichRow(row) {
     scope_config: config,
     display: {
       external_id: shortId(row.external_id, 8),
-      scene: isP2p ? "私聊" : chatType === "topic" ? "话题群" : "群聊",
+      scene: isP2p ? "私聊" : chatType === "topic" ? "话题群" : chatType === "group" ? "群聊" : "会话类型未知",
       sender: senderLabel(senderName, senderId, senderType),
       sender_type: senderType || "unknown",
       message_type: messageTypeLabel(messageType),
