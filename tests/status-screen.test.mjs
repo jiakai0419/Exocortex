@@ -136,6 +136,76 @@ test("healthy local progress and waiting never claim complete remote freshness",
   assert.doesNotMatch(output, /all remote messages|fully up.to.date|real.time coverage|current work.*received-fair/i);
 });
 
+test("last completion keeps its result, time and duration together and declares retained-log scope", () => {
+  const report = statusScreenFixture("healthy");
+  report.runtime_stats.last_completed_at = new Date(STATUS_SCREEN_NOW - 1000).toISOString();
+  report.runtime_stats.last_duration_ms = 999000;
+  report.worker.last_cycle = { ok: false, at: new Date(STATUS_SCREEN_NOW - 1000).toISOString() };
+  for (const columns of [40, 80, 96]) {
+    const output = plain(renderStatusText(report, { columns, stream }));
+    const current = section(output, "Health & current work");
+    assert.match(current, /Runs 4 total · 4 successful Run scope Current worker · retained log/);
+    assert.match(current, /Last completed Succeeded · .*\(35s ago\) · 12s duration/);
+    assert.doesNotMatch(current, /Failed|\(1s ago\)|16m39s|Last tasks/);
+    assertWidth(output, columns);
+  }
+  report.runtime_stats.last_completion = null;
+  assert.match(section(plain(renderStatusText(report, { columns: 80, stream })), "Health & current work"), /Last completed Unavailable$/);
+});
+
+test("history task failures stay failed while message sync and retention results remain separate", () => {
+  for (const columns of [40, 80, 96]) {
+    const output = text("history_failed", { columns });
+    const current = section(output, "Health & current work");
+    assert.match(current, /Local health OK/);
+    assert.match(current, /Runs 4 total · 3 successful/);
+    assert.match(current, /Last completed Failed · .*\(35s ago\) · 16s duration/);
+    assert.match(current, /Last tasks Message sync succeeded · History task failed \(time budget\) · Retention succeeded/);
+    assert.equal(hasSection(output, "Problems"), false, "a history task failure does not invent a failed database sync");
+    assertWidth(output, columns);
+  }
+  const current = section(text("history_failed", { detail: true }), "Health & current work");
+  assert.match(current, /Message sync runs 4 total · 4 successful · 0 failed/);
+  assert.match(current, /History task runs 1 total · 0 successful · 1 failed/);
+  assert.match(current, /Retention runs 1 total · 1 successful · 0 failed/);
+});
+
+test("missing failure reasons remain unavailable and arbitrary reason text cannot enter the screen", () => {
+  const report = statusScreenFixture("history_reason_missing");
+  for (const reason of [undefined, "reason_unavailable", "INVENTED_PRIVATE_REASON", "toString", "constructor"]) {
+    report.runtime_stats.last_completion.failures = [{ step: "history", reason }];
+    const output = plain(renderStatusText(report, { columns: 40, stream }));
+    assert.match(section(output, "Health & current work"), /History task failed \(reason unavailable\)/);
+    assert.doesNotMatch(output, /INVENTED_PRIVATE_REASON|time budget/);
+  }
+});
+
+test("absent optional tasks and no completed rounds are distinct from unavailable runtime evidence", () => {
+  const failed = section(text("failed"), "Health & current work");
+  assert.match(failed, /Last tasks Message sync failed \(active conversation messages: reason unavailable\)$/);
+  assert.doesNotMatch(failed, /History task|Retention/);
+  const healthy = section(text("healthy", { detail: true }), "Health & current work");
+  assert.match(healthy, /Last tasks Message sync succeeded · History task not run · Retention not run/);
+  assert.match(healthy, /History task runs 0 total · 0 successful · 0 failed/);
+  const empty = section(text("no_completed", { detail: true }), "Health & current work");
+  assert.match(empty, /Runs 0 total · 0 successful Run scope Current worker · retained log Last completed None recorded/);
+  assert.doesNotMatch(empty, /Last tasks|Succeeded|\(0s ago\)/);
+  const unbound = section(text("legacy", { detail: true }), "Health & current work");
+  assert.match(unbound, /Runs Unavailable/);
+  assert.match(unbound, /Last completed Unavailable Message sync runs Unavailable History task runs Unavailable Retention runs Unavailable/);
+  assert.doesNotMatch(unbound, /0 total|0 successful|Last tasks|Last completed Failed/);
+});
+
+test("partial cached whole screen shows planned routes and confirmed bodies without claiming a difference", () => {
+  for (const columns of [40, 80, 96]) {
+    const output = text("partial_sample", { columns });
+    const progress = section(output, "Messages & progress");
+    assert.match(progress, /Remote sample Partial cached sample · 3\/5 chats checked · 8 messages · 2 static bodies confirmed · checked/);
+    assert.doesNotMatch(progress, /sample matched|confirmed missing|content differences|awaiting sync/i);
+    assertWidth(output, columns);
+  }
+});
+
 test("zero detail debt is hidden by default, stays in detail, and creates no Problems section", () => {
   const output = text("healthy");
   assert.doesNotMatch(output, /Message details|0 pending|0 due for retry/i);
@@ -559,7 +629,7 @@ test("documented synthetic whole screens match the fixed UTC examples without tr
   const document = readFileSync(new URL("../docs/status-screen-examples.md", import.meta.url), "utf8");
   assert.ok(document.endsWith("\n") && !document.endsWith("\n\n"));
   const examples = [...document.matchAll(/## ([a-z_]+)(-detail)?-(\d+)\.txt\n\n```text\n([\s\S]*?)```/g)];
-  assert.equal(examples.length, 8);
+  assert.equal(examples.length, 12);
   for (const [, scenario, detail, columns, expected] of examples) {
     assert.equal(renderInEnvironment({ scenario, detail: Boolean(detail), columns: Number(columns), zone: "UTC" }), expected, `${scenario}-${columns}`);
   }

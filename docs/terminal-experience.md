@@ -121,9 +121,11 @@ JSON 消费者原有字段不变，`display.card` 是可选增量；原始内容
 
 ## 服务状态
 
-公共 `status` 的整屏契约见 [Status screen design](status-screen-design.md)。默认按 Health & current work、Messages & progress 分组，附加异常才显示 Problems；正常 80 列无色合成屏为 13 行。`--detail` 增加 Background history 与 Diagnostics。窄屏折行并堆叠标签，颜色不承载唯一含义。
+公共 `status` 的整屏契约见 [Status screen design](status-screen-design.md)。默认按 Health & current work、Messages & progress 分组，附加异常才显示 Problems；完整合成输出见 [Synthetic status screens](status-screen-examples.md)。`--detail` 增加 Background history 与 Diagnostics。窄屏折行并堆叠标签，颜色不承载唯一含义。
 
 Current work 只取已验证的阶段、实例、数据库和时间证据；缺失或冲突显示 Unconfirmed 加具体原因。JSON 中 syncing/waiting/stopped/unknown 与既有兼容字段不变。未绑定日志中的成功或失败、未收尾轮次、正常锁均不能决定当前工作或本库健康。[Activity 证据](activity-evidence.md) 保留判定边界。
+
+Runs 的 total/successful 共用一个逻辑行，默认注明 current worker / retained log 范围；Last completed 的结果、时间和耗时来自同一个绑定完成事件并共用一个逻辑行。最后一轮未成功或请求 detail 时，分别说明消息同步、历史复查及到期清理的结果；未执行的可选步骤不显示成功，缺失原因不猜测。历史复查失败仍使整轮失败，不能因为消息同步成功而改写成功计数。详细契约见 [Runtime statistics](status-runtime-stats.md)。
 
 默认保留已知会话/内容待办与详情欠账，列表证据不可用或无效时仍显示。原始最旧水位仅在详情，不新增滚动列表计数或固定区间覆盖功能。收到的会话数量与包含全局发送源的详情来源数分开；存在检查点不代表连续内容覆盖。受限数量与排除范围合成一行，原因代码在详情；零数据库失败、正常关联证据与操作建议也在详情。
 

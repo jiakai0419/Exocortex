@@ -66,7 +66,12 @@ test("actual schedule log writes preserve verified Waiting and sync runtime stat
   assert.equal(baseline.public.activity.state, "waiting");
   assert.deepEqual(baseline.public.runtime_stats, { scope: "current_worker_retained_log", state: "available",
     total_runs: 1, successful_runs: 1, last_completed_at: iso(-2000),
-    last_duration_ms: REQUIRED_CYCLE_STEPS.length * 1000, reason: null });
+    last_duration_ms: REQUIRED_CYCLE_STEPS.length * 1000, reason: null,
+    groups: { sync: { total_runs: 1, successful_runs: 1, failed_runs: 0 },
+      history: { total_runs: 0, successful_runs: 0, failed_runs: 0 },
+      retention: { total_runs: 0, successful_runs: 0, failed_runs: 0 } },
+    last_completion: { cycle: 1, at: iso(-2000), ok: true, duration_ms: REQUIRED_CYCLE_STEPS.length * 1000,
+      failed_steps: [], failures: [], groups: { sync: "succeeded", history: "not_run", retention: "not_run" } } });
   for (const [outcome, reason] of LEGAL_RESULTS) {
     f.emit(f.schedule(outcome, reason));
     const read = readRecentWorkerEvents(f.dir);

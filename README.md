@@ -14,6 +14,8 @@ npm run exo -- status
 
 `messages` 阅读本机私有消息；`status` 查看当前服务和同步概况。规范入口为 `node bin/exocortex.mjs`，`npm run exo --` 是本地快捷方式，无需全局安装。机器读取 JSON 时直接使用 Node 入口，避免 npm 前缀。
 
+`status` 的运行次数只统计当前已验证 worker 在当前保留日志中的完成周期，日志轮转后可能减少。`Last completed` 同时显示该周期的结果、时间和耗时；消息同步与历史复查分别说明，历史维护失败仍计为整轮失败。Remote sample 展示缓存中的实际/计划会话数、比较消息数和静态正文确认数；部分抽样与发现差异分开，不代表全量同步完整。详见[统一状态契约](docs/status-unified-contract.md)。
+
 完整界面为 6 个顶层命令、18 个执行路由。帮助不计为业务路由，开发工具和内部 worker 不进入产品目录：
 
 ```sh

@@ -24,8 +24,11 @@ if (args.length !== 1 || !args[0]) {
       entries.push(file);
     }
   }
-  writeFileSync(join(destination, "failed-detail-80.txt"), plain(renderStatusText(statusScreenFixture("failed", { detail: true }), { columns: 80, stream })));
-  entries.push("failed-detail-80.txt");
+  for (const name of ["failed", "history_failed", "partial_sample"]) {
+    const file = `${name}-detail-80.txt`;
+    writeFileSync(join(destination, file), plain(renderStatusText(statusScreenFixture(name, { detail: true }), { columns: 80, stream })));
+    entries.push(file);
+  }
   writeFileSync(join(destination, "README.txt"), `Invented Exocortex status screens. Fixed observation time: 2032-02-04T12:00:00Z.\nTime zone: ${Intl.DateTimeFormat().resolvedOptions().timeZone}.\nAll inputs originate in tests/helpers/status-screen-fixture.mjs.\nNo production data, screenshots or operational logs are included.\n\n${entries.join("\n")}\n`);
   process.stdout.write(`Wrote ${entries.length} synthetic status examples to ${destination}\n`);
 }

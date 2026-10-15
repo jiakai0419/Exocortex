@@ -43,7 +43,7 @@ function remote(overrides = {}) {
     checked_at: iso(checkedOffset), window: { start: iso(endOffset - 24 * 3_600_000), end: iso(endOffset) }, binding,
     findings, probe: { hot_chats_requested: 5, hot_chats_found: 3, messages_per_chat: 20, remote_messages_checked: 12,
       eligible_chats: 17, hot_chats: 2, fair_chats: 1, chats_checked: 3, pages: 4,
-      truncated_chats: 1, api_calls: 6, unsupported_chats: 0, probe_errors: 0 }, raw: PRIVATE,
+      truncated_chats: 1, api_calls: 6, unsupported_chats: 0, probe_errors: 0, ...overrides.probe }, raw: PRIVATE,
   } });
   if (overrides.corrupt) cache.probe.pages = 0;
   const summary = summarizeServiceFreshness(cache, STATUS_SCREEN_NOW, undefined, { database_key: DATABASE_KEY });
@@ -90,12 +90,12 @@ function section(output, heading) {
 
 function pairedStats(output, detailed = false) {
   const labels = output.split("\n").map((line) => /^ {2}(Runs|Last completed|Run scope)(?:\s|$)/.exec(line)?.[1]).filter(Boolean);
-  assert.deepEqual(labels, detailed ? ["Runs", "Last completed", "Run scope"] : ["Runs", "Last completed"]);
+  assert.deepEqual(labels, ["Runs", "Run scope", "Last completed"]);
   assert.doesNotMatch(output, /^ {2}(?:Total runs|Successful runs|Last duration)(?:\s|$)/m);
   const current = section(output, "Health & current work");
   assert.match(current, /Runs 4 total · 4 successful/);
-  assert.match(current, /Last completed .*\(35s ago\) · 12s duration/);
-  if (!detailed) assert.doesNotMatch(output, /current worker \/ retained log/);
+  assert.match(current, /Last completed Succeeded · .*\(35s ago\) · 12s duration/);
+  assert.match(current, /Run scope Current worker · retained log/);
 }
 
 test("combined default retains paired statistics and one matched remote sample while hiding zero detail debt", () => {
@@ -104,7 +104,7 @@ test("combined default retains paired statistics and one matched remote sample w
     const output = render(report, columns);
     pairedStats(output);
     assert.equal(occurrences(output, "Remote sample"), 1);
-    assert.match(section(output, "Messages & progress"), /Remote sample Sample matched · 12 messages \/ 3 discovered chats · checked/);
+    assert.match(section(output, "Messages & progress"), /Remote sample Cached sample matched · 3\/3 chats checked · 12 messages · 10 static bodies confirmed · checked/);
     assert.doesNotMatch(output, /Message details|0 pending|0 due for retry|^Problems$/m);
     assert.doesNotMatch(output, /all remote messages|fully up.to.date|real.time coverage/i);
   }
@@ -119,7 +119,7 @@ test("combined default moves detail debt to Problems once without moving or dupl
     assert.match(section(output, "Problems"), /^Message details 4 pending · 2 due for retry · 3 sources$/);
     assert.equal(occurrences(output, "Message details"), 1);
     assert.equal(occurrences(output, "Remote sample"), 1);
-    assert.match(section(output, "Messages & progress"), /Sample matched/);
+    assert.match(section(output, "Messages & progress"), /[Ss]ample matched/);
     assert.ok(output.indexOf("Remote sample") < output.indexOf("\nProblems\n"));
   }
 });
@@ -131,12 +131,12 @@ test("unavailable detail and worker evidence stay explicit beside a confirmed re
   for (const columns of [40, 96]) {
     const output = render(report, columns);
     const current = section(output, "Health & current work");
-    assert.match(current, /Runs Unavailable · current worker unverified Last completed Unavailable/);
+    assert.match(current, /Runs Unavailable · current worker unverified Run scope Current worker · retained log Last completed Unavailable/);
     assert.match(section(output, "Problems"), /^Message details Evidence unavailable$/);
-    assert.match(section(output, "Messages & progress"), /Remote sample 1 confirmed missing · 12 messages \/ 3 discovered chats/);
+    assert.match(section(output, "Messages & progress"), /Remote sample Cached sample · 1 confirmed missing · 3\/3 chats checked · 12 messages/);
     assert.equal(occurrences(output, "Message details"), 1);
     assert.equal(occurrences(output, "Remote sample"), 1);
-    assert.doesNotMatch(output, /0 pending|Runs\s+0 total|Sample matched/);
+    assert.doesNotMatch(output, /0 pending|Runs\s+0 total|[Ss]ample matched/);
   }
   const rejected = project({ details: { pending_count: 4, due_count: 2, scopes_pending: 3 }, freshness: remote({ corrupt: true }) });
   assert.equal(rejected.freshness.status, "unknown");
@@ -147,7 +147,7 @@ test("unavailable detail and worker evidence stay explicit beside a confirmed re
     pairedStats(output);
     assert.match(section(output, "Messages & progress"), /Remote sample Not verified/);
     assert.match(section(output, "Problems"), /^Message details 4 pending · 2 due for retry · 3 sources$/);
-    assert.doesNotMatch(output, /Sample matched|discovered chats/);
+    assert.doesNotMatch(output, /[Ss]ample matched|discovered chats/);
   }
 });
 
@@ -170,7 +170,7 @@ test("remote states remain distinct after runtime pairing and ordinary-detail re
       assert.match(section(output, "Messages & progress"), expected);
       assert.equal(occurrences(output, "Remote sample"), 1);
       assert.doesNotMatch(output, /Message details|^Problems$/m);
-      assert.doesNotMatch(section(output, "Messages & progress"), /Sample matched/);
+      assert.doesNotMatch(section(output, "Messages & progress"), /[Ss]ample matched/);
     }
   }
 });
@@ -180,11 +180,11 @@ test("combined detail keeps normal detail counts, runtime scope and bounded remo
   for (const columns of [40, 96]) {
     const output = render(report, columns);
     pairedStats(output, true);
-    assert.match(section(output, "Health & current work"), /Run scope Completed rounds · current worker \/ retained log/);
+    assert.match(section(output, "Health & current work"), /Run scope Current worker · retained log/);
     const progress = section(output, "Messages & progress");
     assert.match(progress, /Message details 0 pending · 0 due for retry · 0 sources/);
     assert.match(progress, /Sample coverage 2 hot \+ 1 rotating · 17 eligible chats · 1 truncated/);
-    assert.match(progress, /Sample content 10 static bodies matched · 2 unverified/);
+    assert.match(progress, /Sample content 2 bodies unverified/);
     assert.match(progress, /Sample identity Matched at check · stored sent identity/);
     assert.match(progress, /Sample limits Discovered chat creation window; thread-only replies and client dynamic cards unverified/);
     assert.match(progress, /Sample window .* Sample coverage/);
@@ -235,7 +235,7 @@ test("valid mixed findings remain complete in default and detail without changin
       for (const text of ["1 confirmed missing", "1 suspected missing", "1 awaiting sync", "2 local versions behind",
         "1 content differences", "1 message identity conflicts", "2 prior findings unresolved"]) assert.ok(progress.includes(text), text);
       assert.equal(occurrences(output, "Remote sample"), 1);
-      assert.doesNotMatch(progress, /Sample matched/);
+      assert.doesNotMatch(progress, /[Ss]ample matched/);
       if (detail) assert.match(progress, /Unresolved targets excluding this sample's listed differences; revisited targets may remain unresolved/);
     }
   }
@@ -248,8 +248,8 @@ test("message identity conflicts remain distinct from the verified account assoc
     assert.equal(report.freshness.binding.state, "verified");
     for (const columns of [40, 96]) {
       const progress = section(render(report, columns), "Messages & progress");
-      assert.match(progress, /Remote sample 1 message identity conflicts/);
-      assert.doesNotMatch(progress, /Remote sample Not verified|Sample matched/);
+      assert.match(progress, /Remote sample Cached sample · 1 message identity conflicts/);
+      assert.doesNotMatch(progress, /Remote sample Not verified|[Ss]ample matched/);
       if (detail) assert.match(progress, /Sample identity Matched at check/);
     }
   }
@@ -272,7 +272,7 @@ test("rejected sample evidence cannot promote retained differences or body match
     for (const columns of [40, 96]) {
       const progress = section(render(report, columns), "Messages & progress");
       assert.match(progress, expected);
-      assert.doesNotMatch(progress, /1 confirmed missing|1 local versions behind|1 message identity conflicts|static bodies matched|Sample matched|Matched at check/);
+      assert.doesNotMatch(progress, /1 confirmed missing|1 local versions behind|1 message identity conflicts|static bodies confirmed|[Ss]ample matched|Matched at check/);
     }
   }
 });
@@ -289,11 +289,57 @@ test("inconclusive and cooldown reasons stay explicit while healthy samples stay
     const failed = project({ detail, freshness: remote({ result: "unavailable", reason: "sample_failed" }) });
     const failedProgress = section(render(failed, columns), "Messages & progress");
     assert.match(failedProgress, /Not verified · sample attempt failed/);
-    assert.doesNotMatch(failedProgress, /static bodies matched|Sample matched/);
+    assert.doesNotMatch(failedProgress, /static bodies confirmed|[Ss]ample matched/);
     if (detail) assert.match(failedProgress, /Sample identity Matched at check/, "account binding alone cannot validate the comparison");
     const healthy = section(render(project({ detail }), columns), "Messages & progress");
-    assert.match(healthy, /Sample matched/);
+    assert.match(healthy, /[Ss]ample matched/);
     assert.doesNotMatch(healthy, /0 confirmed|0 older|0 message identity|Sample result unknown/);
     if (detail) assert.match(healthy, /Sample result Matched/);
+  }
+});
+
+test("partial cache states completed routes against the selection plan and preserves bounded body confirmation", () => {
+  const report = project({ freshness: remote({ result: "inconclusive", reason: "partial_sample", probe: { hot_chats_found: 5, hot_chats: 2, fair_chats: 3 } }) });
+  assert.equal(report.freshness.status, "unknown");
+  assert.equal(report.freshness.result, "inconclusive");
+  for (const columns of [40, 80, 96]) {
+    const progress = section(render(report, columns), "Messages & progress");
+    assert.match(progress, /Partial cached sample · 3\/5 chats checked · 12 messages · 10 static bodies confirmed/);
+    assert.doesNotMatch(progress, /sample matched|confirmed missing|content differences|awaiting sync/i);
+  }
+});
+
+test("unknown planned, actual and body counts never turn into zeros", () => {
+  for (const columns of [40, 96]) {
+    for (const missing of [undefined, null, -1, "0"]) {
+      const report = project();
+      report.freshness.sample.fair_chats = missing;
+      report.freshness.findings.content_equal = missing;
+      let progress = section(render(report, columns), "Messages & progress");
+      assert.match(progress, /3\/unavailable chats checked · 12 messages · static body comparison unavailable/);
+      assert.doesNotMatch(progress, /3\/0 chats|0 static bodies/);
+      report.freshness.chat_count = missing;
+      progress = section(render(report, columns), "Messages & progress");
+      assert.match(progress, /unavailable\/unavailable chats checked/);
+      assert.doesNotMatch(progress, /0\/|\/0 chats/);
+    }
+  }
+});
+
+test("no compared messages is not applicable while missing comparison evidence stays unavailable", () => {
+  for (const columns of [40, 96]) {
+    const empty = project();
+    Object.assign(empty.freshness, { status: "unknown", result: "inconclusive", reason: "no_usable_remote_messages", sample_count: 0 });
+    Object.assign(empty.freshness.findings, { content_equal: 0, content_unverified: 0 });
+    const noComparison = section(render(empty, columns), "Messages & progress");
+    assert.match(noComparison, /0 messages · static body comparison not applicable/);
+    assert.doesNotMatch(noComparison, /0 static bodies confirmed|sample matched/i);
+    empty.freshness.sample_count = null;
+    const unknown = section(render(empty, columns), "Messages & progress");
+    assert.match(unknown, /unavailable messages · static body comparison unavailable/);
+    assert.doesNotMatch(unknown, /not applicable|0 static bodies/);
+    const unavailable = project({ freshness: remote({ result: "unavailable", reason: "sample_failed" }) });
+    assert.match(section(render(unavailable, columns), "Messages & progress"), /static body comparison unavailable/);
+    assert.doesNotMatch(section(render(unavailable, columns), "Messages & progress"), /\d+ static bodies confirmed/);
   }
 });

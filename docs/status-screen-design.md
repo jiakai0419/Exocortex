@@ -1,13 +1,15 @@
 # Status screen contract
 
-This design replaces the whole public `status` text screen. It preserves the JSON
-schema and existing fields, adding evidence needed for honest human summaries.
+This design replaces the whole public `status` text screen. It preserves existing
+JSON fields and meanings, with additive runtime projections for human summaries.
 All examples and tests are invented from scratch. No operational records,
 screenshots, accounts, paths, IDs or log excerpts belong in this document or Git.
 
-The [four runtime statistics](status-runtime-stats.md) appear in two rows after
-current work: total/successful runs, then last completion/duration. Their scope is
-shown in `--detail`. Remote evidence follows the separate [bounded sample
+The [runtime statistics](status-runtime-stats.md) follow current work:
+total/successful runs share one logical row, and the last completion's
+result/time/duration share another. `Run scope` always names the current worker's
+retained log; rotation can reduce these counts. The latest task results appear
+when that round failed or `--detail` is requested. Remote evidence follows the separate [bounded sample
 contract](remote-sample-design.md); the screen retains its default/detail hierarchy.
 
 ## Reading order and visual grammar
@@ -49,6 +51,24 @@ Unavailable, positive or malformed evidence is never converted into normal zero.
 Unbound log failures remain detail-only diagnostic facts with their source stated;
 they cannot lower or raise the selected database's health, even if recent and explicit.
 
+### Runtime result contract
+
+`Last completed` and `Last tasks` use only `runtime_stats.last_completion`, whose
+result, timestamp, duration and failure steps all refer to the same bound cycle.
+Neither the legacy scalar aliases nor the unbound `worker.last_cycle` can fill a
+missing value. Missing duration or reasons remain unavailable. Failure reasons
+come from a finite vocabulary, never arbitrary log text.
+
+`Last tasks` separates Message sync, History task and Retention. A failed history
+task leaves the whole round failed even when message sync succeeded. These are
+scheduler step outcomes: Message sync includes discovery and catch-up work, and
+History task can succeed with no eligible work or a deferred batch. Neither is a
+claim that messages were actually fetched or that all remote content is complete.
+An absent optional task is omitted from the default failure summary and says
+`not run` in detail, never `succeeded`. Detail shows each
+group's total/successful/failed counts over the same retained completions; missing
+runtime evidence remains unavailable rather than becoming zero.
+
 ### Remote sample text contract
 
 Text first respects the public freshness validity state. An unknown, expired,
@@ -57,8 +77,22 @@ counts cannot become current confirmed findings. Valid samples show every nonzer
 actionable finding together: confirmed/suspected missing, awaiting sync, older
 versions, static-content differences, message identity conflicts and unresolved
 prior observations. Account binding and message identity are separate facts.
-The default healthy sample remains one compact row. Nonzero local-newer,
+The default sample stays one logical row: cached result, actual/planned recent
+chat routes, compared message count, confirmed static-body count and check time.
+The planned route count is the safe sum of selected hot and rotating chats; it
+is not the eligible-chat inventory or the configured maximum. An unknown count
+says unavailable. If no messages were compared, body comparison is not
+applicable; unavailable or rejected comparison evidence never says zero bodies
+confirmed. Detail adds the unverified-body count without repeating confirmations.
+`Partial cached sample` is inconclusive, distinct from observed differences and
+from a matched sample. A confirmed body within that sample does not promote the
+whole partial sample to a match. Status reads this cache without requesting a
+new sample. Nonzero local-newer,
 expired-observation and observation-overflow counts remain explicit too.
+Known/historical target observations remain separate from recent-chat routes and
+recent-message counts. The body-confirmation count covers the whole compared
+sample, including any targets; it is not an extra count of messages. Historical
+and verification windows remain separately labelled in detail.
 A healthy detail result says Matched, never unknown merely because its optional
 reason is absent. JSON keys and values remain unchanged. Acceptance covers the
 actual cache-validator-to-text path, default/detail at 40 and 96 columns, mixed
@@ -103,6 +137,9 @@ clipped, and errors/categories are not silently limited to three entries.
 | Background | OS service state and separate current database association | Installed config alone cannot verify the selected DB; loaded without verified process means running state unverified |
 | Current work | Existing process/database/phase validation; named task only from the verified current phase | Missing, stale, damaged or contradictory phases explain why work is unconfirmed; locks/history cannot prove syncing |
 | Phase timing | Actual phase update and finite validity deadline | Deadline is evidence validity, not promised completion; waiting deadline is scheduled interval end |
+| Runs / Run scope | Distinct completed rounds for the verified current worker and selected database in the retained current log | Rotation can reduce counts; unavailable evidence is not zero; failed history maintenance still makes a failed round |
+| Last completed / Last tasks | Result, time, duration and grouped task outcomes from one bound completion | No borrowing from an unbound summary; absent tasks are not run and missing failure reasons remain unavailable |
+| Task run counts | Detail-only message-sync, history-task and retention totals over those same completions | Successful steps may have no eligible work; counts do not measure fetched or reviewed messages |
 | Stored messages | Local retained record total, sent/received and unclassified directions | Zero records does not prove absence of remote messages |
 | Conversation discovery | Initial full conversation-list cursor and completion time | Remaining pages are backlog, not proof discovery is currently running |
 | Received conversations | Enabled received scopes and scopes missing full-content cursors | Scope = received conversation in this adapter; presence of cursor is not fixed-target complete coverage |
@@ -162,7 +199,8 @@ Health & current work
   Background         Running
   Current work       Waiting · between background rounds
   Runs               4 total · 4 successful
-  Last completed     Today 11:59:25 (35s ago) · 12s duration
+  Run scope          Current worker · retained log
+  Last completed     Succeeded · Today 11:59:25 (35s ago) · 12s duration
 
 Messages & progress
   Stored messages    240 total · 40 sent · 200 received
@@ -176,5 +214,6 @@ Problems
 
 Counts/times are invented. Known debt is not a fixed-target completion measure.
 Scenarios cover waiting, syncing, missing/invalid progress, detail debt, empty DB,
-stopped service, failures, old/unbound logs,
-missing evidence, 40-column output, color/no-color and DST.
+stopped service, grouped history failures, absent optional tasks, missing failure
+reasons, old/unbound logs, partial/expired/different samples, unavailable counts,
+historical targets, 40-column output, color/no-color and DST.

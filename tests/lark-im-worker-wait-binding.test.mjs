@@ -221,6 +221,11 @@ for (const [zone, offset] of [["Z", 0], ["+08:00", 8], ["-04:00", -4]]) {
     assert.deepEqual(summarizeRuntimeStats(collected.report, collected.binding, f.start + 1000), {
       scope: "current_worker_retained_log", state: "available", total_runs: 1, successful_runs: 1,
       last_completed_at: new Date(end).toISOString(), last_duration_ms: end - start, reason: null,
+      groups: { sync: { total_runs: 1, successful_runs: 1, failed_runs: 0 },
+        history: { total_runs: 1, successful_runs: 1, failed_runs: 0 },
+        retention: { total_runs: 0, successful_runs: 0, failed_runs: 0 } },
+      last_completion: { cycle: 1, at: new Date(end).toISOString(), ok: true, duration_ms: end - start,
+        failed_steps: [], failures: [], groups: { sync: "succeeded", history: "succeeded", retention: "not_run" } },
     });
   });
 }

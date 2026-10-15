@@ -2,12 +2,15 @@
 
 import { evaluateActivityEvent, validateActivityEventShape } from "./lark-im-activity-evidence.mjs";
 import { parseWorkerEventTimestamp as timestamp } from "./worker-event-time.mjs";
-import { expectedCycleSteps } from "../../dist/runtime/worker/lark-im-worker-core.js";
+import { expectedCycleSteps, REQUIRED_CYCLE_STEPS } from "../../dist/runtime/worker/lark-im-worker-core.js";
 
 /** @typedef {Record<string, any>} JsonObject */
 /** @typedef {"worker_unverified" | "log_unavailable" | "log_damaged" | "completion_unbound" | "completion_invalid" | "completion_conflict"} UnavailableReason */
 
 const SCOPE = "current_worker_retained_log";
+const GROUP_STEPS = Object.freeze({ sync: REQUIRED_CYCLE_STEPS, history: ["history"], retention: ["retention"] });
+const HISTORY_STOP_REASONS = new Set(["cli_budget", "self_budget", "time_budget", "clock_unavailable", "sync_busy",
+  "lease_unavailable", "rate_cooldown", "rate_limited", "shared_cooldown_unavailable"]);
 const positive = (/** @type {unknown} */ value) => Number.isSafeInteger(value) && Number(value) > 0;
 const instance = (/** @type {unknown} */ value) => typeof value === "string" && /^[a-zA-Z0-9-]{1,80}$/.test(value);
 const database = (/** @type {unknown} */ value) => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
@@ -15,7 +18,7 @@ const database = (/** @type {unknown} */ value) => typeof value === "string" && 
 /** @param {UnavailableReason} reason */
 function unavailable(reason) {
   return { scope: SCOPE, state: "unavailable", total_runs: null, successful_runs: null,
-    last_completed_at: null, last_duration_ms: null, reason };
+    last_completed_at: null, last_duration_ms: null, last_completion: null, groups: null, reason };
 }
 
 /** Recheck supplied evidence using the final observation clock, without any I/O.
@@ -50,11 +53,12 @@ function completionValid(event, worker, nowMs) {
     event.ok === (event.failed_steps.length === 0);
 }
 
-/** Duration covers the first step's start through the completion record. It
+/** Validate the entire bound trail before using duration or step reasons.
+ * Duration covers the first step's start through the completion record. It
  * excludes the subsequent wait and never substitutes inter-cycle spacing.
  * @param {JsonObject[]} events @param {{event: JsonObject, index: number}} completion @param {JsonObject} worker
  * @param {{event: JsonObject, index: number} | undefined} previous */
-function duration(events, completion, worker, previous) {
+function completeStepTrail(events, completion, worker, previous) {
   const cycle = completion.event;
   const expected = expectedSteps(cycle);
   const at = timestamp(cycle.at);
@@ -81,10 +85,36 @@ function duration(events, completion, worker, previous) {
     if (!step.ok) failed.push(step.name);
   }
   if (JSON.stringify(failed) !== JSON.stringify(cycle.failed_steps) || firstStart === null) return null;
-  return at - firstStart;
+  return { duration_ms: at - firstStart, steps: steps.map(({ event }) => event) };
 }
 
-/** Four statistics from the already-read, bounded current log. The scope is
+/** Group outcomes use the completion receipt, independently of optional trail
+ * retention. An optional step that was not scheduled is never a success.
+ * @param {JsonObject} event */
+function completionGroups(event) {
+  const expected = expectedSteps(event) || [];
+  return Object.fromEntries(Object.entries(GROUP_STEPS).map(([group, names]) => {
+    const present = names.filter((name) => expected.includes(name));
+    return [group, !present.length ? "not_run" : present.some((name) => event.failed_steps.includes(name)) ? "failed" : "succeeded"];
+  }));
+}
+
+/** Never turn a raw error, a neighboring step or an unsuccessful process into
+ * a guessed budget failure. Only the known history summary protocol supplies
+ * the finite reason; a valid receipt can still have no supported reason.
+ * @param {JsonObject | undefined} step */
+function failureReason(step) {
+  const summary = step?.summary;
+  const budget = summary?.request_budget;
+  if (step?.name !== "history" || step.ok !== false || step.guardian_diagnostic !== undefined ||
+    !Number.isInteger(step.exit_code) || step.exit_code <= 0 ||
+    !summary || typeof summary !== "object" || Array.isArray(summary) || summary.ok !== false ||
+    summary.profile !== "known_record_history/v1" || !budget || typeof budget !== "object" || Array.isArray(budget) ||
+    !HISTORY_STOP_REASONS.has(budget.stop_reason)) return "reason_unavailable";
+  return budget.stop_reason;
+}
+
+/** Statistics from the already-read, bounded current log. The scope is
  * retained completion records, never worker lifetime or the last 24 hours.
  * No raw identity, path, event payload or exception is returned.
  * @param {JsonObject | undefined} report @param {JsonObject | undefined} binding @param {number} nowMs */
@@ -115,7 +145,7 @@ function summarizeRuntimeStats(report, binding, nowMs) {
       continue;
     }
     if (!completionValid(event, worker, nowMs)) return unavailable("completion_invalid");
-    const fingerprint = JSON.stringify([event.ok, timestamp(event.at), event.step_count, event.failed_steps]);
+    const fingerprint = JSON.stringify([event.ok, timestamp(event.at), expectedSteps(event), event.failed_steps]);
     const prior = completed.get(event.cycle);
     if (prior) {
       if (prior.fingerprint !== fingerprint) return unavailable("completion_conflict");
@@ -129,10 +159,26 @@ function summarizeRuntimeStats(report, binding, nowMs) {
   }
   if (completed.size === 0 && sawUnbound) return unavailable("completion_unbound");
   const completions = [...completed.values()];
+  const groups = Object.fromEntries(Object.keys(GROUP_STEPS).map((name) => [name, { total_runs: 0, successful_runs: 0, failed_runs: 0 }]));
+  for (const { event } of completions) {
+    for (const [name, result] of Object.entries(completionGroups(event))) {
+      if (result === "not_run") continue;
+      groups[name].total_runs += 1;
+      if (result === "succeeded") groups[name].successful_runs += 1;
+      else groups[name].failed_runs += 1;
+    }
+  }
+  const trail = latest ? completeStepTrail(log.events, latest, worker, completions.at(-2)) : null;
+  const lastCompletion = latest ? { cycle: latest.event.cycle,
+    at: new Date(Number(timestamp(latest.event.at))).toISOString(), ok: latest.event.ok,
+    duration_ms: trail?.duration_ms ?? null, failed_steps: [...latest.event.failed_steps],
+    failures: latest.event.failed_steps.map((/** @type {string} */ step) => ({ step,
+      reason: failureReason(trail?.steps.find((event) => event.name === step)) })),
+    groups: completionGroups(latest.event) } : null;
   return { scope: SCOPE, state: "available", total_runs: completed.size,
     successful_runs: completions.filter(({ event }) => event.ok === true).length,
-    last_completed_at: latest ? new Date(Number(timestamp(latest.event.at))).toISOString() : null,
-    last_duration_ms: latest ? duration(log.events, latest, worker, completions.at(-2)) : null, reason: null };
+    last_completed_at: lastCompletion?.at ?? null, last_duration_ms: lastCompletion?.duration_ms ?? null,
+    last_completion: lastCompletion, groups, reason: null };
 }
 
 export { summarizeRuntimeStats };

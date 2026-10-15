@@ -14,8 +14,8 @@ const PRIVATE = "SYNTHETIC_PRIVATE_RUNTIME_DATA";
 const iso = (value) => new Date(value).toISOString();
 const bind = (event) => ({ ...event, version: 1, instance_id: INSTANCE, database_key: KEY, private: PRIVATE });
 
-function round(cycle = 1, { start = NOW - 10_000, failed = [], retention = false } = {}) {
-  const names = retention ? [...REQUIRED_CYCLE_STEPS, "retention"] : REQUIRED_CYCLE_STEPS;
+function round(cycle = 1, { start = NOW - 10_000, failed = [], retention = false, history = false } = {}) {
+  const names = [...REQUIRED_CYCLE_STEPS, ...(retention ? ["retention"] : []), ...(history ? ["history"] : [])];
   const steps = names.map((name, index) => bind({ type: "lark_im_worker_step", cycle, step_index: index, name,
     ok: !failed.includes(name), exit_code: failed.includes(name) ? 2 : 0,
     started_at: iso(start + index * 100), finished_at: iso(start + index * 100 + 80), stderr: PRIVATE }));
@@ -39,7 +39,7 @@ function fixture(events = round()) {
 
 function unavailable(value, reason) {
   assert.deepEqual(value, { scope: "current_worker_retained_log", state: "unavailable", total_runs: null,
-    successful_runs: null, last_completed_at: null, last_duration_ms: null, reason });
+    successful_runs: null, last_completed_at: null, last_duration_ms: null, last_completion: null, groups: null, reason });
 }
 
 test("counts retained completed rounds and successes without using cycle numbers, 24-hour totals or spacing", () => {
@@ -47,7 +47,11 @@ test("counts retained completed rounds and successes without using cycle numbers
     ...round(9, { start: NOW - 10_000 })];
   const f = fixture(events);
   assert.deepEqual(f.collect(), { scope: "current_worker_retained_log", state: "available", total_runs: 3,
-    successful_runs: 2, last_completed_at: iso(NOW - 9400), last_duration_ms: 600, reason: null });
+    successful_runs: 2, last_completed_at: iso(NOW - 9400), last_duration_ms: 600,
+    last_completion: { cycle: 9, at: iso(NOW - 9400), ok: true, duration_ms: 600, failed_steps: [], failures: [],
+      groups: { sync: "succeeded", history: "not_run", retention: "not_run" } },
+    groups: { sync: { total_runs: 3, successful_runs: 2, failed_runs: 1 },
+      history: { total_runs: 0, successful_runs: 0, failed_runs: 0 }, retention: { total_runs: 0, successful_runs: 0, failed_runs: 0 } }, reason: null });
 });
 
 for (const retention of [false, true]) for (const failed of [[], ["received-fair"], ["sent", "received-hot"]]) {
@@ -97,7 +101,9 @@ test("retained-log truncation does not pretend to cover startup and does not era
 test("empty readable retained evidence is zero while a missing log is unknown", () => {
   const f = fixture([]);
   assert.deepEqual(f.collect(), { scope: "current_worker_retained_log", state: "available", total_runs: 0,
-    successful_runs: 0, last_completed_at: null, last_duration_ms: null, reason: null });
+    successful_runs: 0, last_completed_at: null, last_duration_ms: null, last_completion: null,
+    groups: { sync: { total_runs: 0, successful_runs: 0, failed_runs: 0 }, history: { total_runs: 0, successful_runs: 0, failed_runs: 0 },
+      retention: { total_runs: 0, successful_runs: 0, failed_runs: 0 } }, reason: null });
   f.report.worker.log.exists = false;
   unavailable(f.collect(), "log_unavailable");
   delete f.report.worker.log;
@@ -217,7 +223,11 @@ const invalidSteps = {
 for (const [name, mutate] of Object.entries(invalidSteps)) test(`incomplete steps affect only duration: ${name}`, () => {
   const rows = round(); mutate(rows);
   assert.deepEqual(fixture(rows).collect(), { scope: "current_worker_retained_log", state: "available", total_runs: 1,
-    successful_runs: 1, last_completed_at: iso(NOW - 9400), last_duration_ms: null, reason: null });
+    successful_runs: 1, last_completed_at: iso(NOW - 9400), last_duration_ms: null,
+    last_completion: { cycle: 1, at: iso(NOW - 9400), ok: true, duration_ms: null, failed_steps: [], failures: [],
+      groups: { sync: "succeeded", history: "not_run", retention: "not_run" } },
+    groups: { sync: { total_runs: 1, successful_runs: 1, failed_runs: 0 },
+      history: { total_runs: 0, successful_runs: 0, failed_runs: 0 }, retention: { total_runs: 0, successful_runs: 0, failed_runs: 0 } }, reason: null });
 });
 
 test("failed process steps without an exit code can still establish a completed round duration", () => {
@@ -271,7 +281,188 @@ test("damaged or malformed retained logs are unavailable, never empty", () => {
 test("output is a finite public whitelist and collection never mutates input evidence", () => {
   const f = fixture(); const before = structuredClone({ report: f.report, binding: f.binding });
   const value = f.collect();
-  assert.deepEqual(Object.keys(value).sort(), ["scope", "state", "total_runs", "successful_runs", "last_completed_at", "last_duration_ms", "reason"].sort());
+  assert.deepEqual(Object.keys(value).sort(), ["scope", "state", "total_runs", "successful_runs", "last_completed_at", "last_duration_ms", "last_completion", "groups", "reason"].sort());
   assert.doesNotMatch(JSON.stringify(value), new RegExp(`${PRIVATE}|${INSTANCE}|${KEY}`));
   assert.deepEqual({ report: f.report, binding: f.binding }, before);
+});
+
+test("mixed task groups count the same bound completions without promoting failed rounds", () => {
+  const rows = [
+    ...round(1, { start: NOW - 40_000 }),
+    ...round(2, { start: NOW - 30_000, history: true, failed: ["history"] }),
+    ...round(3, { start: NOW - 20_000, history: true, retention: true, failed: ["sent", "retention"] }),
+    ...round(4, { history: true, retention: true }),
+  ];
+  const result = fixture(rows).collect();
+  assert.equal(result.total_runs, 4);
+  assert.equal(result.successful_runs, 2);
+  assert.deepEqual(result.groups, {
+    sync: { total_runs: 4, successful_runs: 3, failed_runs: 1 },
+    history: { total_runs: 3, successful_runs: 2, failed_runs: 1 },
+    retention: { total_runs: 2, successful_runs: 1, failed_runs: 1 },
+  });
+  assert.deepEqual(result.last_completion, { cycle: 4, at: iso(NOW - 9200), ok: true, duration_ms: 800,
+    failed_steps: [], failures: [], groups: { sync: "succeeded", history: "succeeded", retention: "succeeded" } });
+  assert.equal(result.last_completed_at, result.last_completion.at);
+  assert.equal(result.last_duration_ms, result.last_completion.duration_ms);
+});
+
+test("last completion uses its own bound failed result instead of an unbound latest success", () => {
+  const f = fixture(round(2, { history: true, failed: ["history"] }));
+  f.report.worker.summary.last_cycle = { cycle: 999, ok: true, at: iso(NOW) };
+  const result = f.collect();
+  assert.equal(result.total_runs, 1);
+  assert.equal(result.successful_runs, 0);
+  assert.deepEqual(result.last_completion, { cycle: 2, at: iso(NOW - 9300), ok: false, duration_ms: 700,
+    failed_steps: ["history"], failures: [{ step: "history", reason: "reason_unavailable" }],
+    groups: { sync: "succeeded", history: "failed", retention: "not_run" } });
+  assert.deepEqual(result.groups.sync, { total_runs: 1, successful_runs: 1, failed_runs: 0 });
+  assert.deepEqual(result.groups.history, { total_runs: 1, successful_runs: 0, failed_runs: 1 });
+});
+
+test("optional tasks absent from the latest receipt are not run even if older rounds ran them", () => {
+  const result = fixture([
+    ...round(1, { start: NOW - 20_000, history: true, retention: true, failed: ["history"] }),
+    ...round(2),
+  ]).collect();
+  assert.deepEqual(result.last_completion.groups, { sync: "succeeded", history: "not_run", retention: "not_run" });
+  assert.deepEqual(result.groups.history, { total_runs: 1, successful_runs: 0, failed_runs: 1 });
+  assert.deepEqual(result.groups.retention, { total_runs: 1, successful_runs: 1, failed_runs: 0 });
+});
+
+for (const outcome of ["batch_deferred", "no_eligible_known_record"]) test(`history ${outcome} preserves logical success without inventing work`, () => {
+  const rows = round(1, { history: true });
+  rows.at(-2).summary = { ok: true, profile: "known_record_history/v1", outcome, processed: 0,
+    request_budget: { stop_reason: null, cli_attempts: 0, self_attempts: 0 } };
+  const result = fixture(rows).collect();
+  assert.equal(result.successful_runs, 1);
+  assert.equal(result.last_completion.ok, true);
+  assert.equal(result.last_completion.groups.history, "succeeded");
+  assert.deepEqual(result.groups.history, { total_runs: 1, successful_runs: 1, failed_runs: 0 });
+  assert.deepEqual(result.last_completion.failures, []);
+  assert.equal(Object.hasOwn(result.last_completion, "processed"), false);
+});
+
+test("completion-only records retain group outcomes but never invent duration or a reason", () => {
+  const event = round(8, { history: true, retention: true, failed: ["sent", "history"] }).at(-1);
+  event.summary = { ok: false, profile: "known_record_history/v1", request_budget: { stop_reason: "time_budget" } };
+  const result = fixture([event]).collect();
+  assert.deepEqual(result.last_completion, { cycle: 8, at: iso(NOW - 9200), ok: false, duration_ms: null,
+    failed_steps: ["sent", "history"], failures: [{ step: "sent", reason: "reason_unavailable" }, { step: "history", reason: "reason_unavailable" }],
+    groups: { sync: "failed", history: "failed", retention: "succeeded" } });
+});
+
+function historyFailure(reason = "time_budget") {
+  const rows = round(3, { history: true, failed: ["history"] });
+  const history = rows.at(-2);
+  history.summary = { ok: false, profile: "known_record_history/v1", request_budget: { stop_reason: reason, raw: PRIVATE }, error: PRIVATE };
+  return { rows, history };
+}
+
+for (const reason of ["cli_budget", "self_budget", "time_budget", "clock_unavailable", "sync_busy", "lease_unavailable",
+  "rate_cooldown", "rate_limited", "shared_cooldown_unavailable"]) {
+  test(`complete bound history evidence permits the finite reason ${reason}`, () => {
+    const { rows } = historyFailure(reason);
+    const result = fixture(rows).collect();
+    assert.deepEqual(result.last_completion.failures, [{ step: "history", reason }]);
+    assert.equal(result.last_completion.ok, false);
+    assert.equal(result.successful_runs, 0);
+    assert.doesNotMatch(JSON.stringify(result), new RegExp(`${PRIVATE}|${INSTANCE}|${KEY}`));
+  });
+}
+
+const invalidReasons = {
+  "missing summary": ({ history }) => { delete history.summary; },
+  "legacy summary without profile": ({ history }) => { delete history.summary.profile; },
+  "unknown profile": ({ history }) => { history.summary.profile = PRIVATE; },
+  "success summary on failed step": ({ history }) => { history.summary.ok = true; },
+  "nonboolean summary result": ({ history }) => { history.summary.ok = "false"; },
+  "missing budget": ({ history }) => { delete history.summary.request_budget; },
+  "array budget": ({ history }) => { history.summary.request_budget = []; },
+  "missing stop reason": ({ history }) => { delete history.summary.request_budget.stop_reason; },
+  "null stop reason": ({ history }) => { history.summary.request_budget.stop_reason = null; },
+  "private stop reason": ({ history }) => { history.summary.request_budget.stop_reason = PRIVATE; },
+  "unknown finite-looking reason": ({ history }) => { history.summary.request_budget.stop_reason = "request_timeout"; },
+  "object stop reason": ({ history }) => { history.summary.request_budget.stop_reason = { reason: "time_budget" }; },
+  "missing process exit": ({ history }) => { delete history.exit_code; },
+  "zero process exit": ({ history }) => { history.exit_code = 0; },
+  "negative process exit": ({ history }) => { history.exit_code = -1; },
+  "string process exit": ({ history }) => { history.exit_code = "2"; },
+  "process guardian failure": ({ history }) => { history.guardian_diagnostic = { primary: { stage: PRIVATE } }; },
+};
+for (const [name, mutate] of Object.entries(invalidReasons)) test(`failure reason stays unavailable for ${name}`, () => {
+  const f = historyFailure(); mutate(f);
+  const result = fixture(f.rows).collect();
+  assert.equal(result.last_completion.ok, false);
+  assert.deepEqual(result.last_completion.failures, [{ step: "history", reason: "reason_unavailable" }]);
+  assert.doesNotMatch(JSON.stringify(result), new RegExp(`${PRIVATE}|${INSTANCE}|${KEY}`));
+});
+
+for (const [name, mutate] of Object.entries(invalidSteps)) test(`a damaged whole trail cannot lend its history reason: ${name}`, () => {
+  const { rows } = historyFailure();
+  // This mutator's old six-step finish value needs to exceed this seven-step completion too.
+  if (name === "finish after completion") rows[5].finished_at = iso(NOW - 9000);
+  else mutate(rows);
+  const result = fixture(rows).collect();
+  assert.equal(result.state, "available");
+  assert.equal(result.last_completion.duration_ms, null);
+  assert.deepEqual(result.last_completion.failed_steps, ["history"]);
+  assert.deepEqual(result.last_completion.failures, [{ step: "history", reason: "reason_unavailable" }]);
+  assert.deepEqual(result.last_completion.groups, { sync: "succeeded", history: "failed", retention: "not_run" });
+});
+
+test("a foreign or previous cycle's safe history reason cannot fill the latest failed step", () => {
+  const earlier = historyFailure();
+  const latest = round(4, { start: NOW - 8000, history: true, failed: ["history"] });
+  const foreign = { ...earlier.history, cycle: 4, instance_id: "invented-other-worker" };
+  const result = fixture([...earlier.rows, foreign, ...latest]).collect();
+  assert.equal(result.total_runs, 2);
+  assert.deepEqual(result.last_completion.failures, [{ step: "history", reason: "reason_unavailable" }]);
+});
+
+test("sync and retention failures never borrow history budget-shaped summary fields", () => {
+  const rows = round(4, { history: true, retention: true, failed: ["sent", "retention", "history"] });
+  for (const step of rows.slice(0, -1)) step.summary = {
+    ok: false, profile: "known_record_history/v1", request_budget: { stop_reason: "time_budget" },
+  };
+  const result = fixture(rows).collect();
+  assert.deepEqual(result.last_completion.failures, [
+    { step: "sent", reason: "reason_unavailable" }, { step: "retention", reason: "reason_unavailable" },
+    { step: "history", reason: "time_budget" },
+  ]);
+  assert.deepEqual(result.last_completion.groups, { sync: "failed", history: "failed", retention: "failed" });
+});
+
+test("rotation limits group counts to retained completions and preserves missing-trail uncertainty", () => {
+  const { rows } = historyFailure();
+  const f = fixture(rows.slice(-2));
+  f.report.worker.log.truncated = true;
+  const result = f.collect();
+  assert.equal(result.total_runs, 1);
+  assert.deepEqual(result.groups, { sync: { total_runs: 1, successful_runs: 1, failed_runs: 0 },
+    history: { total_runs: 1, successful_runs: 0, failed_runs: 1 }, retention: { total_runs: 0, successful_runs: 0, failed_runs: 0 } });
+  assert.equal(result.last_completion.duration_ms, null);
+  assert.deepEqual(result.last_completion.failures, [{ step: "history", reason: "reason_unavailable" }]);
+});
+
+test("same cycle and step count with contradictory optional task policy is a conflict", () => {
+  const rows = round(1, { retention: true });
+  unavailable(fixture([...rows, { ...rows.at(-1), cycle_policy: "bounded_history/v1" }]).collect(), "completion_conflict");
+});
+
+test("equivalent history policies deduplicate while historical step order remains explicit", () => {
+  const rows = round(1, { history: true });
+  const result = fixture([...rows, { ...rows.at(-1), cycle_policy: "bounded_history/v1" }]).collect();
+  assert.equal(result.total_runs, 1);
+  assert.equal(result.groups.history.total_runs, 1);
+  assert.equal(result.last_completion.duration_ms, 700);
+  const old = round(1, { history: true, retention: true, failed: ["retention"] });
+  [old[6], old[7]] = [old[7], old[6]];
+  old[6].step_index = 6; old[7].step_index = 7;
+  old[6].started_at = iso(NOW - 9400); old[6].finished_at = iso(NOW - 9320);
+  old[7].started_at = iso(NOW - 9300); old[7].finished_at = iso(NOW - 9220);
+  old.at(-1).cycle_policy = "bounded_history/v1";
+  const historical = fixture(old).collect();
+  assert.equal(historical.last_completion.duration_ms, 800);
+  assert.deepEqual(historical.last_completion.groups, { sync: "succeeded", history: "succeeded", retention: "failed" });
 });

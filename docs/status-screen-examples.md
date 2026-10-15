@@ -17,7 +17,8 @@ Health & current work
   Background             Running
   Current work           Waiting · between background rounds
   Runs                   4 total · 4 successful
-  Last completed         Today 11:59:25 (35s ago) · 12s duration
+  Run scope              Current worker · retained log
+  Last completed         Succeeded · Today 11:59:25 (35s ago) · 12s duration
 
 Messages & progress
   Stored messages        293 total · 54 sent · 232 received · 7 unclassified
@@ -36,7 +37,8 @@ Health & current work
   Background             Running
   Current work           Syncing · conversation list review
   Runs                   4 total · 4 successful
-  Last completed         Today 11:59:25 (35s ago) · 12s duration
+  Run scope              Current worker · retained log
+  Last completed         Succeeded · Today 11:59:25 (35s ago) · 12s duration
 
 Messages & progress
   Stored messages        293 total · 54 sent · 232 received · 7 unclassified
@@ -55,7 +57,8 @@ Health & current work
   Background             Running
   Current work           Syncing · other conversation messages
   Runs                   4 total · 4 successful
-  Last completed         Today 11:59:25 (35s ago) · 12s duration
+  Run scope              Current worker · retained log
+  Last completed         Succeeded · Today 11:59:25 (35s ago) · 12s duration
 
 Messages & progress
   Stored messages        293 total · 54 sent · 232 received · 7 unclassified
@@ -83,6 +86,7 @@ Health & current work
   Current work           Unconfirmed · no current background phase could be
                          verified
   Runs                   Unavailable · current worker unverified
+  Run scope              Current worker · retained log
   Last completed         Unavailable
 
 Messages & progress
@@ -104,6 +108,7 @@ Health & current work
   Background             Stopped (service not loaded)
   Current work           Syncing · foreground command
   Runs                   Unavailable · current worker unverified
+  Run scope              Current worker · retained log
   Last completed         Unavailable
 
 Messages & progress
@@ -124,6 +129,7 @@ Health & current work
   Current work           Unconfirmed · no current background phase could be
                          verified
   Runs                   Unavailable · current worker unverified
+  Run scope              Current worker · retained log
   Last completed         Unavailable
 
 Messages & progress
@@ -145,8 +151,14 @@ Health & current work
   Current work           Waiting · between background rounds
   Phase observed         Today 11:59:50 · evidence valid until Today 12:00:20
   Runs                   4 total · 3 successful
-  Last completed         Today 11:59:25 (35s ago) · 12s duration
-  Run scope              Completed rounds · current worker / retained log
+  Run scope              Current worker · retained log
+  Last completed         Failed · Today 11:59:25 (35s ago) · 12s duration
+  Last tasks             Message sync failed (active conversation messages:
+                         reason unavailable) · History task not run · Retention
+                         not run
+  Message sync runs      4 total · 3 successful · 1 failed
+  History task runs      0 total · 0 successful · 0 failed
+  Retention runs         0 total · 0 successful · 0 failed
 
 Messages & progress
   Stored messages        293 total · 54 sent · 232 received · 7 unclassified
@@ -223,9 +235,11 @@ Health & current work
     messages
   Runs
     4 total · 4 successful
+  Run scope
+    Current worker · retained log
   Last completed
-    Today 11:59:25 (35s ago) · 12s
-    duration
+    Succeeded · Today 11:59:25 (35s ago)
+    · 12s duration
 
 Messages & progress
   Stored messages
@@ -251,4 +265,117 @@ Problems
   Message details
     6 pending · 2 due for retry · 3
     sources
+```
+
+## history_failed-80.txt
+
+```text
+Exocortex status
+Observed Today 12:00:00 · UTC
+
+Health & current work
+  Local health           OK
+  Background             Running
+  Current work           Waiting · between background rounds
+  Runs                   4 total · 3 successful
+  Run scope              Current worker · retained log
+  Last completed         Failed · Today 11:59:25 (35s ago) · 16s duration
+  Last tasks             Message sync succeeded · History task failed (time
+                         budget) · Retention succeeded
+
+Messages & progress
+  Stored messages        293 total · 54 sent · 232 received · 7 unclassified
+  Received chats         14 enabled
+  Remote sample          Not verified · no cached remote sample
+```
+
+## history_reason_missing-40.txt
+
+```text
+Exocortex status
+Observed Today 12:00:00 · UTC
+
+Health & current work
+  Local health
+    OK
+  Background
+    Running
+  Current work
+    Waiting · between background rounds
+  Runs
+    4 total · 3 successful
+  Run scope
+    Current worker · retained log
+  Last completed
+    Failed · Today 11:59:25 (35s ago) ·
+    16s duration
+  Last tasks
+    Message sync succeeded · History
+    task failed (reason unavailable) ·
+    Retention succeeded
+
+Messages & progress
+  Stored messages
+    293 total · 54 sent · 232 received ·
+    7 unclassified
+  Received chats
+    14 enabled
+  Remote sample
+    Not verified · no cached remote
+    sample
+```
+
+## partial_sample-80.txt
+
+```text
+Exocortex status
+Observed Today 12:00:00 · UTC
+
+Health & current work
+  Local health           OK
+  Background             Running
+  Current work           Waiting · between background rounds
+  Runs                   4 total · 4 successful
+  Run scope              Current worker · retained log
+  Last completed         Succeeded · Today 11:59:25 (35s ago) · 12s duration
+
+Messages & progress
+  Stored messages        293 total · 54 sent · 232 received · 7 unclassified
+  Received chats         14 enabled
+  Remote sample          Partial cached sample · 3/5 chats checked · 8 messages
+                         · 2 static bodies confirmed · checked Today 11:50:00
+```
+
+## partial_sample-40.txt
+
+```text
+Exocortex status
+Observed Today 12:00:00 · UTC
+
+Health & current work
+  Local health
+    OK
+  Background
+    Running
+  Current work
+    Waiting · between background rounds
+  Runs
+    4 total · 4 successful
+  Run scope
+    Current worker · retained log
+  Last completed
+    Succeeded · Today 11:59:25 (35s ago)
+    · 12s duration
+
+Messages & progress
+  Stored messages
+    293 total · 54 sent · 232 received ·
+    7 unclassified
+  Received chats
+    14 enabled
+  Remote sample
+    Partial cached sample · 3/5 chats
+    checked · 8 messages · 2 static
+    bodies confirmed · checked Today
+    11:50:00
 ```

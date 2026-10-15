@@ -14,7 +14,11 @@ process.env.TZ = "UTC";
 process.env.NO_COLOR = "1";
 delete process.env.FORCE_COLOR;
 const stream = new Writable({ write(_chunk, _encoding, done) { done(); } });
-const LABELS = ["Runs", "Last completed"];
+const LABELS = ["Runs", "Run scope", "Last completed"];
+const GROUP_LABELS = ["Message sync runs", "History task runs", "Retention runs"];
+const BASELINE_SCENARIOS = ["healthy", "syncing", "catching_up", "empty", "stopped", "failed", "old_history",
+  "unavailable", "legacy", "truncated", "sampled", "behind", "expired", "invalid_history",
+  "foreground_stopped", "expired_phase", "old_instance_history", "unbound_failure"];
 const PRIVATE = "SYNTHETIC-RUNTIME-PRIVATE-ID";
 const DATABASE_KEY = "a".repeat(64);
 const OTHER_DATABASE_KEY = "b".repeat(64);
@@ -38,6 +42,11 @@ const hash = (text) => createHash("sha256").update(text).digest("hex");
 // runtime layout and default detail-row placement are exempt from this baseline;
 // hashes protect all other text, including indentation, wrapping, headings,
 // blank lines, diagnostics and the final newline.
+// The unified status revision additionally exempts its explicit runtime logical
+// rows (including wrapped continuations) and tests their exact values below.
+// Keep the original 18 scenarios and fixed hashes: new scenarios are checked
+// separately, never folded into a regenerated baseline. Their remote sample
+// presentation is unchanged, so no remote or surrounding section is removed.
 const BASELINE_TEXT = {
   "default:96": "0739e9f515304cf03444c2700fe0390e4520bfe2c437bba5609f316668e3703a",
   "default:80": "7a6c4d40382234cbed7eff58844c122fa9a8a2f5bad9475243b9e1ecf2c3b710",
@@ -58,17 +67,18 @@ function runtimeRows(text, detail = false) {
   const retained = [];
   const rows = [];
   for (let index = 0; index < lines.length; index++) {
-    const match = /^ {2}(Runs|Last completed|Run scope)(?:\s+(.*))?$/.exec(lines[index]);
+    const match = /^ {2}(Runs|Last completed|Run scope|Last tasks|Message sync runs|History task runs|Retention runs)(?:\s+(.*))?$/.exec(lines[index]);
     if (!match) { retained.push(lines[index]); continue; }
     const parts = [match[2] || ""];
     const preceding = lines.slice(0, index).findLast((line) => /^ {2}\S/.test(line));
     while (index + 1 < lines.length && /^ {4}\s*\S/.test(lines[index + 1])) parts.push(lines[++index].trim());
     rows.push({ label: match[1], value: parts.join(" ").trim(), preceding });
   }
-  assert.deepEqual(rows.map(({ label }) => label), detail ? [...LABELS, "Run scope"] : LABELS,
-    "exactly two runtime rows, plus scope only in detail, once each and in order");
-  if (detail) assert.match(rows[2].value, /^(?:Completed rounds · )?current worker \/ retained log$/);
-  else assert.doesNotMatch(text, /current worker \/ retained log/);
+  const last = rows.find(({ label }) => label === "Last completed")?.value || "";
+  const showTasks = /^Failed ·/.test(last) || detail && /^Succeeded ·/.test(last);
+  assert.deepEqual(rows.map(({ label }) => label), [...LABELS, ...(showTasks ? ["Last tasks"] : []), ...(detail ? GROUP_LABELS : [])],
+    "runtime result, scope and optional task rows appear exactly once in order");
+  assert.equal(rows[1].value, "Current worker · retained log");
   return { retained: retained.join("\n"), rows, values: Object.fromEntries(rows.map(({ label, value }) => [label, value])) };
 }
 
@@ -92,7 +102,7 @@ function withoutDefaultDetails(text) {
 for (const detail of [false, true]) {
   for (const columns of [96, 80, 56, 40]) {
     test(`only approved ${detail ? "runtime rows change detailed" : "runtime and detail rows change default"} status at ${columns} columns`, () => {
-      const joined = STATUS_SCREEN_SCENARIOS.map((name) => {
+      const joined = BASELINE_SCENARIOS.map((name) => {
         const report = statusScreenFixture(name, { detail });
         const output = renderStatusText(report, { columns, stream });
         const { retained, rows } = runtimeRows(output, detail);
@@ -107,10 +117,10 @@ for (const detail of [false, true]) {
     });
   }
   test(`public JSON preserves the approved projection outside runtime_stats (${detail ? "detail" : "default"})`, () => {
-    const joined = STATUS_SCREEN_SCENARIOS.map((name) => {
+    const joined = BASELINE_SCENARIOS.map((name) => {
       const { runtime_stats, ...existing } = statusScreenFixture(name, { detail });
       assert.equal(runtime_stats.scope, "current_worker_retained_log");
-      assert.deepEqual(Object.keys(runtime_stats).sort(), ["scope", "state", "total_runs", "successful_runs", "last_completed_at", "last_duration_ms", "reason"].sort());
+      assert.deepEqual(Object.keys(runtime_stats).sort(), ["scope", "state", "total_runs", "successful_runs", "last_completed_at", "last_duration_ms", "last_completion", "groups", "reason"].sort());
       assert.ok(["available", "unavailable"].includes(runtime_stats.state));
       return `${name}\n${JSON.stringify(existing)}`;
     }).join("\n---\n");
@@ -166,10 +176,20 @@ test("bound runtime facts survive public projection and render independently of 
     const fixture = collectedFixture();
     const report = project(fixture, detail);
     assert.deepEqual(report.runtime_stats, { scope: "current_worker_retained_log", state: "available",
-      total_runs: 2, successful_runs: 1, last_completed_at: iso(-5000), last_duration_ms: REQUIRED_CYCLE_STEPS.length * 1000, reason: null });
+      total_runs: 2, successful_runs: 1, last_completed_at: iso(-5000), last_duration_ms: REQUIRED_CYCLE_STEPS.length * 1000,
+      last_completion: { cycle: 2, at: iso(-5000), ok: false, duration_ms: 6000, failed_steps: ["sent"],
+        failures: [{ step: "sent", reason: "reason_unavailable" }], groups: { sync: "failed", history: "not_run", retention: "not_run" } },
+      groups: { sync: { total_runs: 2, successful_runs: 1, failed_runs: 1 }, history: { total_runs: 0, successful_runs: 0, failed_runs: 0 },
+        retention: { total_runs: 0, successful_runs: 0, failed_runs: 0 } }, reason: null });
     const rows = renderStats(report, columns);
     assert.equal(rows.Runs, "2 total · 1 successful");
-    assert.equal(rows["Last completed"], `Today 11:59:55 (5s ago) · ${REQUIRED_CYCLE_STEPS.length}s duration`);
+    assert.equal(rows["Last completed"], `Failed · Today 11:59:55 (5s ago) · ${REQUIRED_CYCLE_STEPS.length}s duration`);
+    assert.equal(rows["Last tasks"], `Message sync failed (sent messages: reason unavailable)${detail ? " · History task not run · Retention not run" : ""}`);
+    if (detail) {
+      assert.equal(rows["Message sync runs"], "2 total · 1 successful · 1 failed");
+      assert.equal(rows["History task runs"], "0 total · 0 successful · 0 failed");
+      assert.equal(rows["Retention runs"], "0 total · 0 successful · 0 failed");
+    }
     assert.notEqual(report.runtime_stats.last_duration_ms, report.stability.longest_between_successes_ms);
   }
 });
@@ -197,7 +217,7 @@ test("failed completions preserve total, zero successes, completion time and dur
     assert.equal(report.runtime_stats.successful_runs, 0);
     const rows = renderStats(report, 40);
     assert.equal(rows.Runs, "2 total · 0 successful");
-    assert.equal(rows["Last completed"], `Today 11:59:55 (5s ago) · ${REQUIRED_CYCLE_STEPS.length}s duration`);
+    assert.equal(rows["Last completed"], `Failed · Today 11:59:55 (5s ago) · ${REQUIRED_CYCLE_STEPS.length}s duration`);
   }
 });
 
@@ -207,7 +227,9 @@ test("a bound empty retained log is zero completed runs with no invented time or
   for (const detail of [false, true]) {
     const report = project(fixture, detail);
     assert.deepEqual(report.runtime_stats, { scope: "current_worker_retained_log", state: "available", total_runs: 0,
-      successful_runs: 0, last_completed_at: null, last_duration_ms: null, reason: null });
+      successful_runs: 0, last_completed_at: null, last_duration_ms: null, last_completion: null,
+      groups: { sync: { total_runs: 0, successful_runs: 0, failed_runs: 0 }, history: { total_runs: 0, successful_runs: 0, failed_runs: 0 },
+        retention: { total_runs: 0, successful_runs: 0, failed_runs: 0 } }, reason: null });
     const rows = renderStats(report, 40);
     assert.equal(rows.Runs, "0 total · 0 successful");
     assert.equal(rows["Last completed"], "None recorded");
@@ -227,7 +249,7 @@ for (const [name, change] of [
       const report = project(fixture, detail);
       assert.equal(report.runtime_stats.state, "unavailable");
       assert.ok(["worker_unverified", "log_unavailable", "log_damaged", "completion_unbound", "completion_invalid", "completion_conflict"].includes(report.runtime_stats.reason));
-      for (const key of ["total_runs", "successful_runs", "last_completed_at", "last_duration_ms"]) assert.equal(report.runtime_stats[key], null, key);
+      for (const key of ["total_runs", "successful_runs", "last_completed_at", "last_duration_ms", "last_completion", "groups"]) assert.equal(report.runtime_stats[key], null, key);
       const rows = renderStats(report, 40);
       assert.match(rows.Runs, /^Unavailable · \S.+/, "the reason survives narrow wrapping");
       assert.equal(rows["Last completed"], "Unavailable");
@@ -247,7 +269,7 @@ test("missing step timestamps keep completion counts but cannot borrow a duratio
   assert.equal(report.runtime_stats.last_duration_ms, null);
   const rows = renderStats(report, 40);
   assert.equal(rows.Runs, "2 total · 1 successful");
-  assert.match(rows["Last completed"], /^Today 11:59:55 \(5s ago\).*duration unavailable.*incomplete step evidence/i);
+  assert.match(rows["Last completed"], /^Failed · Today 11:59:55 \(5s ago\).*duration unavailable.*incomplete step evidence/i);
 });
 
 test("last duration includes completion bookkeeping after the last finished step", () => {
@@ -257,5 +279,37 @@ test("last duration includes completion bookkeeping after the last finished step
   assert.equal(report.runtime_stats.last_completed_at, iso(-3000));
   assert.equal(report.runtime_stats.last_duration_ms, REQUIRED_CYCLE_STEPS.length * 1000 + 2000);
   const rows = renderStats(report);
-  assert.equal(rows["Last completed"], `Today 11:59:57 (3s ago) · ${REQUIRED_CYCLE_STEPS.length + 2}s duration`);
+  assert.equal(rows["Last completed"], `Failed · Today 11:59:57 (3s ago) · ${REQUIRED_CYCLE_STEPS.length + 2}s duration`);
+});
+
+test("new synthetic completion scenarios retain exact group and reason meaning at every width", () => {
+  for (const detail of [false, true]) for (const columns of [96, 80, 56, 40]) {
+    for (const [name, reason] of [["history_failed", "time budget"], ["history_reason_missing", "reason unavailable"]]) {
+      assert.ok(STATUS_SCREEN_SCENARIOS.includes(name));
+      const report = statusScreenFixture(name, { detail });
+      const rows = renderStats(report, columns);
+      assert.equal(rows.Runs, "4 total · 3 successful");
+      assert.equal(rows["Last completed"], "Failed · Today 11:59:25 (35s ago) · 16s duration");
+      assert.equal(rows["Last tasks"], `Message sync succeeded · History task failed (${reason}) · Retention succeeded`);
+      if (detail) {
+        assert.equal(rows["Message sync runs"], "4 total · 4 successful · 0 failed");
+        assert.equal(rows["History task runs"], "1 total · 0 successful · 1 failed");
+        assert.equal(rows["Retention runs"], "1 total · 1 successful · 0 failed");
+      }
+    }
+  }
+});
+
+test("healthy and empty runtime rows distinguish succeeded, not run and no completion", () => {
+  for (const detail of [false, true]) for (const columns of [96, 80, 56, 40]) {
+    const healthy = renderStats(statusScreenFixture("healthy", { detail }), columns);
+    assert.equal(healthy["Last completed"], "Succeeded · Today 11:59:25 (35s ago) · 12s duration");
+    if (detail) assert.equal(healthy["Last tasks"], "Message sync succeeded · History task not run · Retention not run");
+    else assert.equal(healthy["Last tasks"], undefined);
+    const empty = renderStats(statusScreenFixture("no_completed", { detail }), columns);
+    assert.equal(empty.Runs, "0 total · 0 successful");
+    assert.equal(empty["Last completed"], "None recorded");
+    assert.equal(empty["Last tasks"], undefined);
+    if (detail) for (const label of GROUP_LABELS) assert.equal(empty[label], "0 total · 0 successful · 0 failed");
+  }
 });

@@ -18,6 +18,7 @@ export const STATUS_SCREEN_SCENARIOS = Object.freeze([
   "healthy", "syncing", "catching_up", "empty", "stopped", "failed", "old_history",
   "unavailable", "legacy", "truncated", "sampled", "behind", "expired", "invalid_history",
   "foreground_stopped", "expired_phase", "old_instance_history", "unbound_failure",
+  "history_failed", "history_reason_missing", "partial_sample", "no_completed",
 ]);
 
 export function rawStatusScreenFixture(name = "healthy") {
@@ -171,6 +172,16 @@ export function rawStatusScreenFixture(name = "healthy") {
       sample_count: 11, window: { start: iso(-10 * 60_000), end: iso(-60_000) }, checked_at: iso(-30_000), expires_at: iso(4 * 60_000) };
   }
   if (name === "expired") report.overview.freshness = unavailableFreshness("expired");
+  if (name === "partial_sample") {
+    report.overview.freshness = { scope: "discovered_chats_rotating", status: "unknown", result: "inconclusive",
+      reason: "partial_sample", auth_identity: "verified_at_check", binding: { state: "verified", evidence: "single_sent_actor" },
+      sample_count: 8, chat_count: 3, checked_at: iso(-10 * 60_000), expires_at: iso(20 * 60_000),
+      window: { start: iso(-24 * HOUR - 20 * 60_000), end: iso(-20 * 60_000) },
+      sample: { hot_chats: 2, fair_chats: 3, eligible_chats: 19, truncated_chats: 0 },
+      findings: { present: 8, missing: 0, confirmed_missing: 0, pending_sync: 0, suspected_missing: 0,
+        stale_version: 0, content_mismatch: 0, identity_conflict: 0, content_equal: 2, content_unverified: 6,
+        local_newer: 0, unresolved_prior: 0, expired_observations: 0, observation_overflow: 0 } };
+  }
   if (name === "invalid_history") {
     worker.last_cycle = { cycle: 5, ok: true, at: iso(HOUR), age_ms: 0 };
     worker.last_step = { cycle: 5, ok: true, name: "sent", at: "synthetic-invalid-time", age_ms: 0 };
@@ -186,16 +197,31 @@ export function rawStatusScreenFixture(name = "healthy") {
   }));
   const last = report.worker.log.events.at(-1);
   if (last) {
-    if (name === "failed") Object.assign(last, { ok: false, failed_steps: ["received-hot"] });
-    const steps = REQUIRED_CYCLE_STEPS.map((stepName, stepIndex) => ({ ...identity,
+    const historyFailed = ["history_failed", "history_reason_missing"].includes(name);
+    const names = [...REQUIRED_CYCLE_STEPS, ...(historyFailed ? ["retention", "history"] : [])];
+    const failedStep = name === "failed" ? "received-hot" : historyFailed ? "history" : null;
+    if (failedStep) Object.assign(last, { ok: false, failed_steps: [failedStep], step_count: names.length });
+    if (historyFailed) {
+      last.cycle_policy = "idle_history/v2";
+      worker.last_cycle = summaryEvent(-35_000, 4, false);
+      worker.last_step = { ...summaryEvent(-35_000, 4, false), name: "history" };
+      worker.last_failure = { ...worker.last_step, type: "lark_im_worker_step" };
+      Object.assign(stability.cycles, { ok: 3, failed: 1 });
+      stability.last_success = summaryEvent(-80_000, 3);
+      Object.assign(stability.failures, { failed_cycles: 1, failed_steps: 1, by_step: [{ name: "history", count: 1 }] });
+    }
+    const steps = names.map((stepName, stepIndex) => ({ ...identity,
       type: "lark_im_worker_step", cycle: last.cycle, step_index: stepIndex, name: stepName,
-      ok: !(name === "failed" && stepName === "received-hot"),
-      exit_code: name === "failed" && stepName === "received-hot" ? 1 : 0,
-      started_at: iso(-47_000 + stepIndex * 2_000), finished_at: iso(-45_000 + stepIndex * 2_000),
+      ok: stepName !== failedStep, exit_code: stepName === failedStep ? 1 : 0,
+      started_at: iso(-35_000 - names.length * 2_000 + stepIndex * 2_000),
+      finished_at: iso(-35_000 - names.length * 2_000 + (stepIndex + 1) * 2_000),
+      ...(stepName === "history" && name === "history_failed" ? {
+        summary: { profile: "known_record_history/v1", ok: false, request_budget: { stop_reason: "time_budget" } },
+      } : {}),
     }));
     report.worker.log.events.splice(-1, 0, ...steps);
   }
-  if (["empty", "unavailable"].includes(name)) report.worker.log.events = [];
+  if (["empty", "unavailable", "no_completed"].includes(name)) report.worker.log.events = [];
   if (name === "unavailable") report.worker.log.exists = false;
   if (name === "truncated") Object.assign(report.worker.log, { truncated: true, activity_integrity: false });
   if (name === "unbound_failure") report.worker.log.events.forEach((event) => { event.database_key = "b".repeat(64); });

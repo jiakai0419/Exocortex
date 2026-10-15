@@ -151,11 +151,15 @@ function runEvidenceSql(where, { limit, cutoffSql = "CAST((julianday('now') - 24
     .map((name) => `'${name}', ${["metadata_json", "cursor_before_json", "cursor_after_json"].includes(name)
       ? `CASE WHEN c.${name} IS NULL THEN NULL WHEN length(c.${name})<=16384 THEN c.${name}
           ELSE ${name === "metadata_json" ? "NULL" : "'!unavailable!'"} END` : `c.${name}`}`).join(", ");
+  // Keep this correlated lookup scoped: the global status index can otherwise
+  // rescan unrelated successful history for every retained failure. Unary +
+  // disqualifies only that index term; TEXT status compared with the fixed
+  // nonnumeric literal keeps the same accepted values. All proof fences remain.
   return `SELECT ${columns}, ${cutoffSql} AS evidence_cutoff_ms,
     CASE WHEN ${LEGACY_TRANSITION_SQL} THEN
       CASE WHEN ${budget} THEN (WITH candidates AS MATERIALIZED (
         SELECT c.* FROM sync_runs c WHERE c.source_id=r.source_id AND c.scope_id=r.scope_id
-          AND c.id > r.id AND c.status='succeeded' AND julianday(c.started_at) >= julianday(r.finished_at)
+          AND c.id > r.id AND +c.status='succeeded' AND julianday(c.started_at) >= julianday(r.finished_at)
           AND julianday(c.finished_at) <= julianday((${cutoffSql}) / 1000.0, 'unixepoch')
           AND CASE WHEN json_valid(c.metadata_json) THEN
             json_extract(c.metadata_json,'$.adapter')='lark.im.details'

@@ -3,7 +3,7 @@ import { serviceTimeRange, serviceTimestamp, durationText, formatStabilityInterv
 import { statusLayout } from "./status-layout.mjs";
 import { formatLogLine } from "./status-log-view.mjs";
 import { safeCollectorDiagnostic } from "../diagnostics/remote-sample-diagnostic.mjs";
-import { WORKER_STEP_LABELS } from "../runtime/worker/step-vocabulary.mjs";
+import { WORKER_STEP_LABELS, REQUIRED_CYCLE_STEPS } from "../runtime/worker/step-vocabulary.mjs";
 import { parseWorkerEventTimestamp } from "../diagnostics/worker-event-time.mjs";
 
 /** @typedef {Record<string, any>} Report */
@@ -54,6 +54,27 @@ const SAMPLE_UNCERTAINTIES = [["unresolved_prior", "prior findings unresolved"],
   ["expired_observations", "expired observations"], ["observation_overflow", "observations beyond retained capacity"]];
 const FAILURE = Object.freeze({ command_unavailable: "Required command unavailable", internal_error: "Internal error", network_error: "Network error", network_timeout: "Network timeout", service_unavailable: "Service unavailable", spawn_error: "Could not start sync command", permission_denied: "Permission denied", rate_limited: "Rate limited", timeout: "Timed out", transient: "Temporary service error",
   authentication: "Authentication failed", auth: "Authentication failed", invalid_request: "Invalid request", unavailable: "Service unavailable", detail_incomplete: "Merge-forward details pending at run end", unknown: "Unclassified failure" });
+const RUN_GROUPS = [["sync", "Message sync"], ["history", "History task"], ["retention", "Retention"]];
+const RUN_FAILURE_REASONS = Object.freeze({ cli_budget: "request budget", self_budget: "identity request budget", time_budget: "time budget",
+  clock_unavailable: "clock unavailable", sync_busy: "sync busy", lease_unavailable: "reservation unavailable",
+  rate_cooldown: "rate-limit cooldown", rate_limited: "rate limited", shared_cooldown_unavailable: "cooldown evidence unavailable" });
+/** @param {unknown} step @param {string} group */
+const inRunGroup = (step, group) => group === "sync" ? typeof step === "string" && REQUIRED_CYCLE_STEPS.includes(step) : step === group;
+/** @param {Report} completion @param {string} group @param {string} label */
+function lastTaskText(completion, group, label) {
+  const state = completion.groups?.[group];
+  if (state === "not_run") return `${label} not run`;
+  if (state === "succeeded") return `${label} succeeded`;
+  if (state !== "failed") return `${label} unavailable`;
+  const failedSteps = Array.isArray(completion.failed_steps) ? completion.failed_steps.filter((step) => inRunGroup(step, group)) : [];
+  const failures = Array.isArray(completion.failures) ? completion.failures : [];
+  const reasons = failedSteps.map((step) => {
+    const evidence = failures.find((entry) => entry?.step === step);
+    const reason = Object.hasOwn(RUN_FAILURE_REASONS, String(evidence?.reason)) ? RUN_FAILURE_REASONS[evidence.reason] : "reason unavailable";
+    return group === "sync" ? `${task(step).toLowerCase()}: ${reason}` : reason;
+  });
+  return `${label} failed (${reasons.join("; ") || "reason unavailable"})`;
+}
 /** @param {unknown} value */
 const number = (value) => Number.isSafeInteger(value) && Number(value) >= 0 ? String(value) : "unavailable";
 /** @param {unknown} name */
@@ -117,9 +138,22 @@ export function renderStatusText(report, options = {}) {
     log_damaged: "log evidence incomplete", completion_invalid: "completion evidence invalid",
     completion_conflict: "completion records conflict", completion_unbound: "log records lack binding" }[runtime.reason] || "runtime evidence unavailable";
   screen.row("Runs", runtimeAvailable ? `${number(runtime.total_runs)} total · ${number(runtime.successful_runs)} successful` : `Unavailable · ${runtimeReason}`);
-  const runtimeDuration = countValid(runtime.last_duration_ms) ? `${durationText(runtime.last_duration_ms)} duration` : "duration unavailable · incomplete step evidence";
-  screen.row("Last completed", runtimeAvailable ? runtime.last_completed_at ? `${timed(runtime.last_completed_at)} · ${runtimeDuration}` : "None recorded" : "Unavailable");
-  if (detailed) screen.row("Run scope", "Completed rounds · current worker / retained log");
+  screen.row("Run scope", "Current worker · retained log");
+  // Result, time, duration and tasks share this one verified completion. Neither
+  // legacy scalar aliases nor unbound worker history can supply a missing field.
+  const completion = runtimeAvailable ? runtime.last_completion : null;
+  const runtimeDuration = countValid(completion?.duration_ms) ? `${durationText(completion.duration_ms)} duration` : "duration unavailable · incomplete step evidence";
+  const runtimeResult = completion?.ok === true ? "Succeeded" : completion?.ok === false ? "Failed" : "Result unavailable";
+  screen.row("Last completed", completion ? `${runtimeResult} · ${timed(completion.at)} · ${runtimeDuration}`
+    : runtimeAvailable && runtime.total_runs === 0 ? "None recorded" : "Unavailable");
+  if (completion && (detailed || completion.ok === false)) {
+    const shownGroups = RUN_GROUPS.filter(([group]) => detailed || group === "sync" || completion.groups?.[group] !== "not_run");
+    screen.row("Last tasks", shownGroups.map(([group, label]) => lastTaskText(completion, group, label)).join(" · "));
+  }
+  if (detailed) for (const [group, label] of RUN_GROUPS) {
+    const counts = runtimeAvailable ? runtime.groups?.[group] : null;
+    screen.row(`${label} runs`, counts ? `${number(counts.total_runs)} total · ${number(counts.successful_runs)} successful · ${number(counts.failed_runs)} failed` : "Unavailable");
+  }
 
   screen.heading("Messages & progress");
   if (!sync) {
@@ -163,13 +197,23 @@ export function renderStatusText(report, options = {}) {
     const differences = usable && freshness.status === "behind" ? findingsText(SAMPLE_DIFFERENCES) : "";
     const uncertainties = usable ? findingsText(SAMPLE_UNCERTAINTIES) : "";
     const findings = [differences, uncertainties].filter(Boolean).join(" · ");
-    const result = matched ? "Sample matched" : freshness.reason === "expired" ? "Expired · cached sample expired"
-      : usable && freshness.status === "behind" && findings ? findings
+    const result = matched ? "Cached sample matched" : freshness.reason === "expired" ? "Expired cached sample"
+      : usable && freshness.status === "behind" && findings ? `Cached sample · ${findings}`
+      : usable && freshness.reason === "partial_sample" ? `Partial cached sample${uncertainties ? ` · ${uncertainties}` : ""}`
       : `Not verified · ${reason}${uncertainties ? ` · ${uncertainties}` : ""}`;
+    const plan = countValid(freshness.sample?.hot_chats) && countValid(freshness.sample?.fair_chats)
+      && countValid(freshness.sample.hot_chats + freshness.sample.fair_chats)
+      ? freshness.sample.hot_chats + freshness.sample.fair_chats : null;
+    const recentMessages = countValid(freshness.sample_count) && countValid(freshness.history?.messages_checked)
+      && freshness.sample_count >= freshness.history.messages_checked ? freshness.sample_count - freshness.history.messages_checked : null;
+    const routes = `${number(freshness.chat_count)}/${number(plan)} ${freshness.history ? "recent " : ""}chats checked`;
     const sampleCounts = freshness.history
-      ? `${number(Math.max(0, freshness.sample_count - freshness.history.messages_checked))} current messages / ${number(freshness.chat_count)} chats + ${number(freshness.history.messages_checked)} ${freshness.history.scope === 'known_verification' ? 'known' : 'historical'} target${freshness.history.messages_checked === 1 ? '' : 's'}`
-      : `${number(freshness.sample_count)} messages / ${number(freshness.chat_count)} discovered chats`;
-    screen.row("Remote sample", `${result} · ${sampleCounts} · checked ${stamp(freshness.checked_at)}`);
+      ? `${routes} · ${number(recentMessages)} recent messages + ${number(freshness.history.messages_checked)} ${freshness.history.scope === 'known_verification' ? 'known' : 'historical'} target${freshness.history.messages_checked === 1 ? '' : 's'}`
+      : `${routes} · ${number(freshness.sample_count)} messages`;
+    const bodyComparison = comparisonAvailable && countValid(freshness.sample_count) && freshness.sample_count > 0;
+    const bodies = comparisonAvailable && freshness.sample_count === 0 ? "static body comparison not applicable"
+      : bodyComparison && countValid(f.content_equal) ? `${number(f.content_equal)} static bodies confirmed` : "static body comparison unavailable";
+    screen.row("Remote sample", `${result} · ${sampleCounts} · ${bodies} · checked ${stamp(freshness.checked_at)}`);
     if (detailed) {
       const diagnostic = safeCollectorDiagnostic(freshness.collector_diagnostic);
       if (diagnostic) screen.row("Sample diagnostic", `${diagnostic.stage} · ${diagnostic.code}`);
@@ -180,7 +224,8 @@ export function renderStatusText(report, options = {}) {
         if (freshness.history.window) screen.row(known ? "Verification window" : "History window", range(freshness.history.window.start, freshness.history.window.end));
       }
       screen.row("Sample coverage", `${number(freshness.sample?.hot_chats)} hot + ${number(freshness.sample?.fair_chats)} rotating · ${number(freshness.sample?.eligible_chats)} eligible chats · ${number(freshness.sample?.truncated_chats)} truncated`);
-      screen.row("Sample content", comparisonAvailable ? `${number(f.content_equal)} static bodies matched · ${number(f.content_unverified)} unverified` : `Not verified · ${reason}`);
+      screen.row("Sample content", bodyComparison ? `${number(f.content_unverified)} bodies unverified`
+        : comparisonAvailable && freshness.sample_count === 0 ? "Not applicable · no sampled messages" : `Not verified · ${reason}`);
       if (f.unresolved_prior > 0) screen.row("Prior findings", "Unresolved targets excluding this sample's listed differences; revisited targets may remain unresolved");
       screen.row("Sample identity", usable ? `Matched at check · ${freshness.binding?.evidence === "single_sent_actor" ? "stored sent identity" : "initial empty database binding"}` : "Account association unverified");
       screen.row("Sample limits", "Discovered chat creation window; thread-only replies and client dynamic cards unverified");
