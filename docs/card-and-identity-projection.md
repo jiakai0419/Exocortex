@@ -26,9 +26,17 @@
 
 精确收件人补全使用官方 CLI 的会话批量查询合同：`POST /open-apis/im/v1/chats/batch_query`，query 为 `user_id_type=open_id`，body 为 `chat_ids`。只有唯一匹配的 `chat_id`、`chat_mode=p2p`、`p2p_target_type=user` 和有效 `p2p_target_id` 才能确认对端。契约来源为[官方 CLI 实现](https://github.com/larksuite/cli/blob/017b19a793ad71794a02887ede04757f3d82e10d/shortcuts/im/helpers.go)及其[消息搜索补全](https://github.com/larksuite/cli/blob/017b19a793ad71794a02887ede04757f3d82e10d/shortcuts/im/im_messages_search.go)。联系人查询仅按这个确切 open ID 提供姓名。昵称、仅自己发过消息、未分页完的成员列表或唯一出现的发送者均不建立对端关系；明确的 API self target 才能表示发给自己。
 
-补全在对应同源精确 chat scope 的 `config_json.p2p_recipient` 保存独立的 `lark_p2p_recipient/v1` 证据：来源、会话、账号哈希、typed 对端、姓名来源和观察时间。原始 records、canonical、正文、时间、排序和游标不改。发现更新的 JSON merge 保留此专属字段。读取只消费本条 sent 消息自身原始 typed sender、actor、canonical 身份与账号哈希一致的证据，不把 legacy `single_sent_actor` 升格为整个 received 历史的账号归属。消息内明确清空的姓名不被 scope 证据覆盖。
+补全在独立 `lark_im_recipient_state` 表中按来源、账号哈希和会话保存 `lark_p2p_recipient/v1` 证据：typed 对端、姓名来源和观察时间。原始 records、canonical、正文、时间、排序、sync scopes 和采集游标不改；不为收件人创建会话 scope，因此不改变 status 的会话数量。读取只消费本条 sent 消息自身原始 typed sender、actor、canonical 身份与账号哈希一致的证据，不把 legacy `single_sent_actor` 升格为整个 received 历史的账号归属。消息内明确清空的姓名不被证据覆盖。兼容已有 scope 内的同型证据，但非空损坏或冲突的新表证据不能借旧值恢复姓名；无效缓存经新的权威查询恢复。
 
-`messages` 仍完全离线、只读，不获取当前凭据，不触发补全，也不使用跨调用姓名缓存。证据丢失显示未知，证据恢复后下一次读取立即恢复；缺姓名但身份已确认时可显示真实个人 ID。观察时间表示本地保存的官方查询快照，不宣称此刻姓名仍然最新。此版本提供显式有界补全路径；尚未把收件人补全接入后台同步，新会话缺证据时仍需显式补全。
+原始消息接口没有必有的 `chat_partner` 字段；官方 CLI 的消息搜索流程在取得消息后再查询会话并附加对端，原始列表和 mget 不保证执行该补全。现有会话发现保留 ID、类型和标题，因此关系缺失必须独立补齐。上述关系查询要求 `im:chat:read`，使用用户身份；姓名查询沿用既有确切 open ID 联系人查询。未获授权或服务端不支持时保留未知并退避重试，不自动新增账号权限。
+
+日常 `sent/all` 同步完成消息提交、释放 scope lock、记录账号确认后，默认 runner 自动执行一次可选补全，继承外层 sync API lease，不新增 worker step。首次和旧会话均从本账号可信 sent 原始记录选取，不依赖 first-seen 会话、数字消息版本或会话发现；静音、仅自发、尚无接收 scope 的会话也能补齐。已有 scope 的明确 group/topic 或身份冲突会拒绝补全；缺 scope 或类型未知时仍必须取得官方明确 p2p 关系，才能在只读展示中确认私聊。
+
+一次最多 20 个会话、4 次额外 CLI 调用，采用 10 秒请求及处理预算；批量关系请求合并会话，姓名按确切 ID 合并查询。本地同步 SQLite 调用可能因锁等待超出该处理预算，它不是进程总墙钟硬期限。最新 40 条 sent、历史游标 40 条 sent、至多 10 个待处理会话各 8 条见证记录形成最多 160 条记录读取配额；旧记录扫描到尾后重新轮转。网络选择为待处理 10 个、新记录 5 个、历史记录 5 个，空额可补齐但总量不变。已扫到但未获网络配额的会话先持久排队，避免新消息持续到达时饿死旧记录。完整性仅对有限候选使用共享严格 JSON 校验；到期队列和证据变化队列分别按索引限量读取、各保留 5 个位置，不在每轮解析整张证据表。完整有效证据不发网络请求或改证据，仅推进必要的调度位置。`lark_im_recipient_state` 和 `lark_im_recipient_scan` 保存领取、扫描位置及退避，失败和进程中断后继续轮转，避免在 scope 配置频繁写重试时间而使无关历史核验失效。缺姓名、权限失败或缺字段从 5 分钟起退避，最高 24 小时；缓存丢失或变化不被旧成功状态遮挡。补全失败不改变已成功消息同步的结果。
+
+合法同账号同会话的新旧对端矛盾时保存冲突证据并显示未知；连续两次较晚查询确认同一个候选后才恢复。普通缺项、超时、权限失败不构成身份冲突，也不清空既有可信姓名。相同身份/姓名不会仅为刷新时间而改证据。消息已有的 user ID / union ID 姓名不因额外 open ID 观察被覆盖；跨命名空间不能猜别名关系。
+
+`messages` 仍完全离线、只读，不获取当前凭据，不触发补全，也不使用跨调用姓名缓存。证据丢失显示未知，证据恢复后下一次读取立即恢复；缺姓名但身份已确认时可显示真实个人 ID。观察时间表示本地保存的官方查询快照，不宣称此刻姓名仍然最新。显式 `maintenance enrich --target recipients --record-id N` 仍可用于有界预览与修复，不是日常补全的必要操作。
 
 已知来源只能确认特定群内应用的姓名时，可使用[本机局部应用名配置](local-chat-app-names.md)补充未知 sender 的阅读投影。配置绑定所选数据库文件及原始 tenant/chat/app，已有姓名与明确清空优先；命中仅改变 `display.sender` 并添加可选的 `display.sender_name_source`，不回写 canonical 或原始记录，不成为全局应用名或联网姓名缓存。
 

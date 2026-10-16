@@ -5,8 +5,8 @@ import { renderSystemProjection } from "../adapters/lark-im/system-content.mjs";
 import { renderCardContent } from "../adapters/lark-im/card-content.mjs";
 import { personName, senderIdentity, senderNameFromSource } from "../adapters/lark-im/sender-identity.mjs";
 import { chatScopeId } from "../adapters/lark-im/core.mjs";
-import { displayP2pRecipient } from "../adapters/lark-im/p2p-recipient.mjs";
-import { patchTopLevelJsonMemberText } from "../../dist/core/json-text-patch.js";
+import { displayP2pRecipient, readRecipientEvidence, recipientAccountKey, sentRecipientAccount } from "../adapters/lark-im/p2p-recipient.mjs";
+import { patchTopLevelJsonMemberText, validateJsonObjectText } from "../../dist/core/json-text-patch.js";
 
 /**
  * @typedef {"all" | "sent" | "received"} MessageDirection
@@ -111,17 +111,51 @@ function loadMessages(dbPath, opts, deps = {}) {
       const chatId = scopeIds.get(scope.id);
       const config = parseMaybeJson(scope.config_json);
       if (!chatId || scope.source_id !== "lark.im" || config?.chat_id !== chatId) continue;
+      try { validateJsonObjectText(scope.config_json); }
+      catch { delete config.p2p_recipient; } // Preserve existing type metadata; refuse ambiguous new evidence.
       chats.set(chatId, chats.has(chatId) ? null : config);
+    }
+  }
+  // Collection scopes are not conversation identities: muted/sent-only chats
+  // may have no received scope. Read only this page's exact trusted account/chat
+  // pairs; queue rows alone supply neither a mode nor a recipient.
+  const rowAccounts = new Map(rows.map(row => [row, sentRecipientAccount(row,
+    parseMaybeJson(row.canonical_json) || {}, parseMaybeJson(row.raw_json) || {})]));
+  const pairs = new Map(rows.filter(row => rowAccounts.get(row)).map(row => {
+    const account = rowAccounts.get(row), accountKey = recipientAccountKey(account);
+    return [`${accountKey}:${row.container_id}`, { account, accountKey, chatId: row.container_id }];
+  }));
+  const recipients = new Map();
+  if (pairs.size && queryJson(dbPath,
+    "SELECT 1 AS recipient_state_available FROM sqlite_schema WHERE type='table' AND name='lark_im_recipient_state';",
+    "check recipient evidence store").some(row => row.recipient_state_available === 1)) {
+    const saved = queryJson(dbPath, `WITH requested(account_key,chat_id) AS (VALUES
+      ${[...pairs.values()].map(pair => `(${quoteSql(pair.accountKey)},${quoteSql(pair.chatId)})`).join(',')})
+      SELECT s.source_id,s.account_key,s.chat_id,s.evidence_json FROM requested r
+      JOIN lark_im_recipient_state s ON s.source_id='lark.im' AND s.account_key=r.account_key AND s.chat_id=r.chat_id;`,
+    'read exact message recipient evidence');
+    for (const savedRow of saved) {
+      const key = `${savedRow.account_key}:${savedRow.chat_id}`, pair = pairs.get(key);
+      if (!pair || savedRow.source_id !== 'lark.im' || savedRow.evidence_json == null) continue;
+      let evidence = null;
+      try { validateJsonObjectText(savedRow.evidence_json); evidence = JSON.parse(savedRow.evidence_json); } catch { /* Invalid saved state must not resurrect old scope evidence. */ }
+      const config = { chat_id: pair.chatId, p2p_recipient: evidence };
+      const trusted = readRecipientEvidence(config, pair.account, { includeConflicted: true });
+      recipients.set(key, recipients.has(key) ? { chat_id: pair.chatId, p2p_recipient: null }
+        : { ...config, ...(trusted ? { chat_type: 'p2p' } : {}) });
     }
   }
   return rows.map(({ type_scope_id, type_scope_source_id, ...row }) => {
     // The internal recipient observation does not expand the existing public
     // first-seen scope fields, including messages first seen in a chat scope.
     if (Object.hasOwn(parseMaybeJson(row.scope_config_json) || {}, 'p2p_recipient')) {
-      row.scope_config_json = patchTopLevelJsonMemberText(row.scope_config_json, 'p2p_recipient');
+      try { row.scope_config_json = patchTopLevelJsonMemberText(row.scope_config_json, 'p2p_recipient'); }
+      catch { /* Keep malformed legacy public JSON byte-for-byte, never stop the page. */ }
     }
+    const account = sentRecipientAccount(row, parseMaybeJson(row.canonical_json) || {}, parseMaybeJson(row.raw_json) || {});
     return enrichRow(row, chats.get(row.container_id), type_scope_source_id === "lark.im"
-      && typeof row.container_id === "string" && type_scope_id === chatScopeId(row.container_id));
+      && typeof row.container_id === "string" && type_scope_id === chatScopeId(row.container_id),
+      account ? recipients.get(`${recipientAccountKey(account)}:${row.container_id}`) : undefined);
   });
 }
 
@@ -302,8 +336,9 @@ function displaySender(row, canonical, raw) {
  * Preserve the old group/topic preference; this is not a topic reclassification.
  * @param {Row} row @param {Row} canonical @param {Row} raw @param {Row} config
  * @param {Row | null | undefined} currentChat
+ * @param {Row | undefined} recipientConfig
  */
-function conversationType(row, canonical, raw, config, currentChat) {
+function conversationType(row, canonical, raw, config, currentChat, recipientConfig) {
   if (currentChat === null) return "unknown";
   const native = raw.raw_api && typeof raw.raw_api === "object" && !Array.isArray(raw.raw_api) ? raw.raw_api : {};
   const messages = [canonical, raw, native];
@@ -315,7 +350,7 @@ function conversationType(row, canonical, raw, config, currentChat) {
   }
   if ([raw, native].some((message) => message.id != null && message.id !== row.external_id)) return "unknown";
   const existing = [canonical, raw, raw.chat, config.chat_id === row.container_id ? config : null];
-  const declarations = [...existing, native, native.chat, currentChat];
+  const declarations = [...existing, native, native.chat, currentChat, recipientConfig];
   const modes = [...existing.map((entry) => entry?.chat_type),
     ...declarations.flatMap((entry) => [entry?.chat_type, entry?.chat_mode])]
     .filter((mode) => mode === "p2p" || mode === "group" || mode === "topic");
@@ -327,13 +362,14 @@ function conversationType(row, canonical, raw, config, currentChat) {
  * @param {Row} row
  * @param {Row | null} [currentChat]
  * @param {boolean} [scopeSourceMatches]
+ * @param {Row} [recipientConfig]
  * @returns {EnrichedMessage}
  */
-function enrichRow(row, currentChat, scopeSourceMatches = true) {
+function enrichRow(row, currentChat, scopeSourceMatches = true, recipientConfig) {
   const canonical = parseMaybeJson(row.canonical_json) || {};
   const raw = parseMaybeJson(row.raw_json) || {};
   const config = parseMaybeJson(row.scope_config_json) || {};
-  const chatType = conversationType(row, canonical, raw, scopeSourceMatches ? config : {}, currentChat);
+  const chatType = conversationType(row, canonical, raw, scopeSourceMatches ? config : {}, currentChat, recipientConfig);
   const chatName = canonical.chat_name || raw.chat_name || raw.chat?.name || config.chat_name || null;
   const chatId = canonical.chat_id || row.container_id || config.chat_id || raw.chat_id || null;
   const { id: senderId, name: senderName } = displaySender(row, canonical, raw);
@@ -358,7 +394,7 @@ function enrichRow(row, currentChat, scopeSourceMatches = true) {
       message_type: messageTypeLabel(messageType),
       recipient:
         isP2p
-          ? displayP2pRecipient(row, canonical, raw, currentChat)
+          ? displayP2pRecipient(row, canonical, raw, recipientConfig ?? currentChat)
           : null,
       chat: isGroupLike ? nameOrId(chatName, chatId) : null,
       body: system?.text || displayBody(row.body, canonical, raw),

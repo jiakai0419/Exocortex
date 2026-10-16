@@ -5,9 +5,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { executeEnrichment, EnrichmentInputError } from '../src/maintenance/enrich.mjs';
+import { enrichRecipients } from '../src/maintenance/enrich-recipients.mjs';
 import { chatScopeId } from '../src/adapters/lark-im/core.mjs';
 import { displayP2pRecipient, makeRecipientEvidence, recipientAccountKey } from '../src/adapters/lark-im/p2p-recipient.mjs';
-import { ensureInitialized, quoteSql, sqliteExec, sqliteQuery } from '../dist/storage/sqlite/ingestion-store.js';
+import { ensureInitialized, quoteSql, REVIEW_RECORD_COLUMNS, sqliteExec, sqliteQuery } from '../dist/storage/sqlite/ingestion-store.js';
 
 // All inputs are authored here. No existing account, source database, message,
 // diagnostic log or screenshot is read. The CLI test uses a fixture-owned fake.
@@ -19,6 +20,11 @@ const query = (f, value) => sqliteQuery(f.db, value, 'inspect authored recipient
 const records = f => query(f, 'SELECT * FROM records ORDER BY id;');
 const scopes = f => query(f, 'SELECT * FROM sync_scopes ORDER BY id;');
 const sources = f => query(f, 'SELECT * FROM sources ORDER BY id;');
+const states = f => query(f, 'SELECT * FROM lark_im_recipient_state ORDER BY source_id,account_key,chat_id;');
+const evidence = (f, chat = CHAT, account = SELF) => {
+  const text = states(f).find(row => row.chat_id === chat && row.account_key === recipientAccountKey(account))?.evidence_json;
+  return text == null ? null : JSON.parse(text);
+};
 function fixture(t, settings = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'exocortex-recipient-enrichment-'));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
@@ -28,14 +34,14 @@ function fixture(t, settings = {}) {
   return f;
 }
 function add(f, id, { chat = CHAT, type = 'p2p', account = SELF, direction = 'sent', source = 'lark.im',
-  raw = {}, canonical = {}, scope = {}, firstSeen = 'lark.im.sent_by_me' } = {}) {
+  raw = {}, canonical = {}, scope = {}, firstSeen = 'lark.im.sent_by_me', createScope = true } = {}) {
   const native = { message_id: `om_synthetic_recipient_${id}`, chat_id: chat, msg_type: 'text',
     sender: { id: account, id_type: 'open_id', sender_type: 'user' },
     create_time: String(NOW - 10000 + id), body: { content: JSON.stringify({ text: `Synthetic body ${id}  preserved.` }) }, ...raw };
   const projected = { message_id: native.message_id, chat_id: chat, chat_type: type, sender_id: account,
     sender_id_type: 'open_id', sender_type: 'user', sender_name: 'Synthetic Sender', arbitrary: { kept: true }, ...canonical };
   if (source !== 'lark.im') sql(f, `INSERT OR IGNORE INTO sources(id,kind,display_name) VALUES(${quoteSql(source)},'synthetic','Synthetic source');`);
-  sql(f, `INSERT OR IGNORE INTO sync_scopes(id,source_id,name,config_json,cursor_json) VALUES(
+  if (createScope) sql(f, `INSERT OR IGNORE INTO sync_scopes(id,source_id,name,config_json,cursor_json) VALUES(
     ${quoteSql(chatScopeId(chat))},${quoteSql(source)},${quoteSql(`synthetic.chat.${id}`)},
     ${quoteSql(JSON.stringify({ chat_id: chat, chat_type: type, chat_name: 'Synthetic chat title is not recipient', untouched: ['keep', 7], ...scope }))},'{"synthetic_cursor":8}');`);
   const row = { id, source_id: source, first_seen_scope_id: firstSeen, external_id: native.message_id,
@@ -64,9 +70,9 @@ function api(f, settings = {}) {
     if (args[0] === 'api' && args[1] === 'POST' && args[2] === '/open-apis/im/v1/chats/batch_query') {
       assert.deepEqual(JSON.parse(args[args.indexOf('--params') + 1]), { user_id_type: 'open_id' });
       const { chat_ids: ids } = JSON.parse(args[args.indexOf('--data') + 1]);
-      assert.equal(ids.length, 1);
+      assert.ok(ids.length >= 1 && ids.length <= 20);
       if (settings.batchError) throw new Error('Synthetic private batch error');
-      return settings.batchResponse?.(ids[0]) ?? batch(ids[0], settings.target || PEER);
+      return settings.batchResponse?.(ids[0]) ?? { code: 0, data: { items: ids.flatMap(id => batch(id, settings.target || PEER).data.items) } };
     }
     if (args[0] === 'contact' && args[1] === '+search-user') {
       if (settings.nameError) throw new Error('Synthetic private contact error');
@@ -78,13 +84,14 @@ function api(f, settings = {}) {
 }
 function run(f, options = {}, settings = {}, deps = {}) {
   return executeEnrichment({ target: 'recipients', db: f.db, recordIds: [1], ...options },
-    { runLark: api(f, settings), now: () => NOW, ...deps });
+    { runLark: api(f, settings), now: () => NOW, ...deps,
+      enrichRecipients: (opts, inner) => enrichRecipients(opts, { ...inner, onRecipientResult: deps.onRecipientResult }) });
 }
 function assertPublic(report) {
   assert.doesNotMatch(JSON.stringify(report), /ou_synthetic|oc_synthetic|om_synthetic|Synthetic Recipient|Synthetic body|synthetic\.sqlite/);
 }
 function recipient(f, id = 1) {
-  const row = records(f).find(row => row.id === id), config = JSON.parse(scopes(f).find(scope => scope.id === chatScopeId(row.container_id)).config_json);
+  const row = records(f).find(row => row.id === id), config = { chat_id: row.container_id, p2p_recipient: evidence(f, row.container_id) };
   return displayP2pRecipient(row, JSON.parse(row.canonical_json), JSON.parse(row.raw_json), config);
 }
 
@@ -100,7 +107,7 @@ test('default preview verifies exact identity and names without changing databas
   assertPublic(report);
 });
 
-test('apply changes only exact chat scope evidence; sent-first rows and all message bytes remain intact', t => {
+test('apply changes only independent relationship evidence; scope and message bytes remain intact', t => {
   const f = fixture(t);
   add(f, 2, { chat: 'oc_synthetic_unselected_chat' });
   const beforeRecords = records(f), beforeScopes = scopes(f), beforeSources = sources(f);
@@ -109,20 +116,98 @@ test('apply changes only exact chat scope evidence; sent-first rows and all mess
   assert.equal(report.partial, false);
   assert.deepEqual(records(f), beforeRecords);
   assert.deepEqual(sources(f), beforeSources, 'legacy source is never upgraded');
-  const afterScopes = scopes(f);
-  for (const old of beforeScopes) {
-    const current = afterScopes.find(item => item.id === old.id);
-    if (old.id !== chatScopeId(CHAT)) assert.deepEqual(current, old);
-    else {
-      for (const key of Object.keys(old)) if (!['config_json', 'updated_at'].includes(key)) assert.equal(current[key], old[key]);
-      const { p2p_recipient: evidence, ...unchanged } = JSON.parse(current.config_json);
-      assert.deepEqual(unchanged, JSON.parse(old.config_json));
-      assert.deepEqual(evidence, makeRecipientEvidence(CHAT, SELF, { id_type: 'open_id', id: PEER }, NAME, new Date(NOW).toISOString()));
-      assert.equal(evidence.account_key, recipientAccountKey(SELF));
-    }
-  }
+  assert.deepEqual(scopes(f), beforeScopes);
+  assert.deepEqual(evidence(f), makeRecipientEvidence(CHAT, SELF, { id_type: 'open_id', id: PEER }, NAME, new Date(NOW).toISOString()));
+  assert.equal(evidence(f).account_key, recipientAccountKey(SELF));
   assert.equal(recipient(f), NAME);
   assertPublic(report);
+});
+
+test('a never-discovered sent chat is resolved without creating a scope or changing status inputs', t => {
+  const f = fixture(t, { createScope: false, type: null }), beforeRecords = records(f), beforeScopes = scopes(f), beforeSources = sources(f);
+  const bytes = readFileSync(f.db);
+  assert.equal(run(f).planned, 1);
+  assert.deepEqual(readFileSync(f.db), bytes, 'preview does not even initialize a relationship row');
+  assert.deepEqual(states(f), []);
+  const report = run(f, { apply: true });
+  assert.equal(report.updated, 1);
+  assert.equal(recipient(f), NAME);
+  assert.deepEqual(records(f), beforeRecords);
+  assert.deepEqual(scopes(f), beforeScopes);
+  assert.deepEqual(sources(f), beforeSources);
+});
+
+test('a chat with no scope requires the official explicit private-user target', t => {
+  const f = fixture(t, { createScope: false, type: null }), before = readFileSync(f.db);
+  const report = run(f, { apply: true }, { batchResponse: () => batch(CHAT, PEER, { chat_mode: 'group' }) });
+  assert.deepEqual([report.updated, report.partial], [0, true]);
+  assert.deepEqual(readFileSync(f.db), before);
+  assert.deepEqual(states(f), []);
+});
+
+for (const chatType of [undefined, null, 'unknown']) test(`an existing ${String(chatType)} scope type can recover without modifying its scope`, t => {
+  const f = fixture(t, { scope: { chat_type: chatType }, canonical: { chat_type: null } });
+  const before = scopes(f), beforeRecords = records(f);
+  assert.equal(run(f, { apply: true }).updated, 1);
+  assert.equal(recipient(f), NAME);
+  assert.deepEqual(scopes(f), before);
+  assert.deepEqual(records(f), beforeRecords);
+});
+
+test('scope evidence can migrate into the independent relation while every scope byte is preserved', t => {
+  const prior = makeRecipientEvidence(CHAT, SELF, { id_type: 'open_id', id: PEER }, NAME, new Date(NOW - 1000).toISOString());
+  const f = fixture(t, { scope: { p2p_recipient: prior } }), before = scopes(f);
+  const report = run(f, { apply: true }, { nameError: true });
+  assert.equal(report.updated, 1);
+  assert.deepEqual(evidence(f), prior);
+  assert.deepEqual(scopes(f), before);
+});
+
+for (const invalid of ['duplicate keys', 'byte limit', 'depth limit']) test(`an invalid ${invalid} cache is restored without borrowing a scope name`, t => {
+  const prior = makeRecipientEvidence(CHAT, SELF, { id_type: 'open_id', id: PEER }, NAME, new Date(NOW - 1000).toISOString());
+  const f = fixture(t, { scope: { p2p_recipient: prior } });
+  let text;
+  if (invalid === 'duplicate keys') text = JSON.stringify(prior).replace(/}$/, `,"recipient":${JSON.stringify(prior.recipient)}}`);
+  if (invalid === 'byte limit') text = JSON.stringify({ ...prior, synthetic_padding: 's'.repeat(1024 * 1024) });
+  if (invalid === 'depth limit') {
+    let nested = {};
+    for (let depth = 0; depth < 70; depth++) nested = { synthetic: nested };
+    text = JSON.stringify({ ...prior, nested });
+  }
+  sql(f, `INSERT INTO lark_im_recipient_state(source_id,account_key,chat_id,evidence_json)
+    VALUES('lark.im',${quoteSql(recipientAccountKey(SELF))},${quoteSql(CHAT)},${quoteSql(text)});`);
+  const before = scopes(f);
+  assert.equal(run(f, { apply: true }, { nameError: true }).updated, 1);
+  assert.equal(evidence(f).recipient.id, PEER);
+  assert.equal(evidence(f).recipient.name, null, 'ambiguous cached name is not trusted');
+  assert.deepEqual(scopes(f), before);
+  assert.equal(run(f, { apply: true }).updated, 1);
+  assert.equal(recipient(f), NAME);
+});
+
+test('relationship writes keep scheduler metadata and other accounts isolated', t => {
+  const f = fixture(t), accountKey = recipientAccountKey(SELF), otherKey = recipientAccountKey('ou_synthetic_other_account');
+  const otherEvidence = makeRecipientEvidence(CHAT, 'ou_synthetic_other_account', { id_type: 'open_id', id: 'ou_synthetic_other_peer' }, 'Synthetic Other', new Date(NOW).toISOString());
+  sql(f, `INSERT INTO lark_im_recipient_state(source_id,account_key,chat_id,evidence_json,last_attempt_at_ms,retry_at_ms,failures,record_after_id,generation,attempt_token)
+    VALUES('lark.im',${quoteSql(accountKey)},${quoteSql(CHAT)},NULL,11,22,3,4,5,'synthetic_claim'),
+      ('lark.im',${quoteSql(otherKey)},${quoteSql(CHAT)},${quoteSql(JSON.stringify(otherEvidence))},31,32,1,8,7,'synthetic_other_claim');`);
+  const before = states(f);
+  assert.equal(run(f, { apply: true }).updated, 1);
+  for (const old of before) {
+    const next = states(f).find(row => row.account_key === old.account_key);
+    if (old.account_key === otherKey) assert.deepEqual(next, old);
+    else for (const key of Object.keys(old)) if (key !== 'evidence_json') assert.deepEqual(next[key], old[key], key);
+  }
+});
+
+test('an ordinary failed refresh keeps the previous identity and name byte-for-byte', t => {
+  const f = fixture(t);
+  run(f, { apply: true });
+  const before = readFileSync(f.db);
+  const report = run(f, { apply: true }, { batchError: true });
+  assert.equal(report.updated, 0);
+  assert.equal(recipient(f), NAME);
+  assert.deepEqual(readFileSync(f.db), before);
 });
 
 test('duplicate selected chat is queried and updated once while all exact rows remain fenced', t => {
@@ -130,6 +215,42 @@ test('duplicate selected chat is queried and updated once while all exact rows r
   const report = run(f, { apply: true, recordIds: [2, 1] });
   assert.deepEqual([report.scanned, report.chats, report.updated], [2, 1, 1]);
   assert.equal(f.calls.filter(args => args[0] === 'api').length, 1);
+});
+
+test('twenty distinct chats share one batch and four total requests', t => {
+  const f = fixture(t);
+  for (let id = 2; id <= 20; id++) add(f, id, { chat: `oc_synthetic_distinct_${id}` });
+  const before = records(f);
+  const report = run(f, { apply: true, recordIds: Array.from({ length: 20 }, (_, i) => i + 1) });
+  assert.equal(report.updated, 20);
+  assert.equal(f.calls.length, 4);
+  assert.deepEqual(records(f), before);
+});
+
+test('valid contradictory peers become unknown and require a second later matching observation to recover', t => {
+  const f = fixture(t), other = 'ou_synthetic_changed_peer', observed = [];
+  run(f, { apply: true });
+  const before = records(f);
+  const next = run(f, { apply: true }, { target: other }, { now: () => NOW + 1000,
+    onRecipientResult: result => observed.push(result) });
+  assert.equal(next.updated, 1);
+  assert.deepEqual(observed, [{ chat_id: CHAT, outcome: 'conflict' }]);
+  assert.equal(recipient(f), '未知');
+  const conflict = evidence(f);
+  assert.equal(conflict.recipient.id, PEER);
+  assert.equal(conflict.conflict.recipient.id, other);
+  assert.deepEqual(records(f), before);
+  run(f, { apply: true }, { batchError: true }, { now: () => NOW + 2000 });
+  assert.equal(recipient(f), '未知', 'a failed query cannot clear the contradiction');
+  run(f, { apply: true }, { target: other }, { now: () => NOW + 3000 });
+  assert.equal(recipient(f), NAME);
+  const restored = evidence(f);
+  assert.equal(restored.recipient.id, other);
+  assert.equal(restored.conflict, undefined);
+  const unchanged = states(f);
+  run(f, { apply: true }, { target: other }, { now: () => NOW + 4000 });
+  assert.deepEqual(states(f), unchanged, 'identical names and identities do not refresh relationship context');
+  assert.deepEqual(records(f), before);
 });
 
 test('empty or failed name lookup stores verified identity, then a new invocation restores the name', t => {
@@ -140,10 +261,10 @@ test('empty or failed name lookup stores verified identity, then a new invocatio
   const next = run(f, { apply: true });
   assert.equal(next.named, 1);
   assert.equal(recipient(f), NAME);
-  const saved = scopes(f).find(scope => scope.id === chatScopeId(CHAT)).config_json;
+  const saved = states(f);
   const failedRefresh = run(f, { apply: true }, { nameError: true }, { now: () => NOW + 1000 });
   assert.equal(failedRefresh.updated, 0);
-  assert.equal(scopes(f).find(scope => scope.id === chatScopeId(CHAT)).config_json, saved);
+  assert.deepEqual(states(f), saved);
   assert.deepEqual(records(f), before);
 });
 
@@ -172,6 +293,8 @@ for (const [label, settings] of [
   ['conflicting canonical type', { canonical: { chat_type: 'group' } }],
   ['conflicting native type', { raw: { chat_mode: 'topic' } }],
   ['conflicting scope mode', { scope: { chat_mode: 'group' } }],
+  ['invalid scope type', { scope: { chat_type: 'synthetic_invalid' } }],
+  ['object scope type', { scope: { chat_type: {} } }],
   ['wrong scope chat', { scope: { chat_id: 'oc_synthetic_wrong_chat' } }],
 ]) test(`${label} is rejected before any remote request`, t => {
   const f = fixture(t, settings), before = readFileSync(f.db);
@@ -195,8 +318,87 @@ for (const [label, mutation] of [
 ]) test(`full target and scope CAS reject ${label} before changing recipient evidence`, t => {
   const f = fixture(t);
   assert.throws(() => run(f, { apply: true }, {}, { withCommit(action) { sql(f, mutation); return action(); } }));
-  assert.equal(JSON.parse(scopes(f).find(scope => scope.id === chatScopeId(CHAT)).config_json).p2p_recipient, undefined);
+  assert.equal(evidence(f), null);
   assert.deepEqual(query(f, 'SELECT * FROM maintenance_locks;'), []);
+});
+
+test('a newly inserted scope invalidates a previously scope-less target before committing evidence', t => {
+  const f = fixture(t, { createScope: false, type: null });
+  assert.throws(() => run(f, { apply: true }, {}, { withCommit(action) {
+    sql(f, `INSERT INTO sync_scopes(id,source_id,name,config_json) VALUES(${quoteSql(chatScopeId(CHAT))},'lark.im','Synthetic concurrent scope',
+      ${quoteSql(JSON.stringify({ chat_id: CHAT, chat_type: 'group' }))});`);
+    return action();
+  } }));
+  assert.deepEqual(states(f), []);
+});
+
+test('an existing scope from another source is rejected even when the selected record is Lark', t => {
+  const f = fixture(t);
+  sql(f, `INSERT INTO sources(id,kind,display_name) VALUES('synthetic.other','synthetic','Synthetic other source');
+    UPDATE sync_scopes SET source_id='synthetic.other' WHERE id=${quoteSql(chatScopeId(CHAT))};`);
+  assert.throws(() => run(f, { apply: true }));
+  assert.equal(f.calls.length, 0);
+  assert.deepEqual(states(f), []);
+});
+
+for (const operation of ['insert', 'replace', 'delete']) test(`relationship evidence CAS rejects concurrent ${operation}`, t => {
+  const f = fixture(t), key = `source_id='lark.im' AND account_key=${quoteSql(recipientAccountKey(SELF))} AND chat_id=${quoteSql(CHAT)}`;
+  if (operation !== 'insert') {
+    run(f, { apply: true }, { nameError: true });
+    assert.equal(evidence(f).recipient.name, null);
+  }
+  const competing = makeRecipientEvidence(CHAT, SELF, { id_type: 'open_id', id: 'ou_synthetic_competing_peer' }, 'Synthetic Competing', new Date(NOW).toISOString());
+  const callbacks = [];
+  assert.throws(() => run(f, { apply: true }, {}, { onRecipientResult: result => callbacks.push(result), withCommit(action) {
+    if (operation === 'insert') sql(f, `INSERT INTO lark_im_recipient_state(source_id,account_key,chat_id,evidence_json)
+      VALUES('lark.im',${quoteSql(recipientAccountKey(SELF))},${quoteSql(CHAT)},${quoteSql(JSON.stringify(competing))});`);
+    if (operation === 'replace') sql(f, `UPDATE lark_im_recipient_state SET evidence_json=${quoteSql(JSON.stringify(competing))} WHERE ${key};`);
+    if (operation === 'delete') sql(f, `DELETE FROM lark_im_recipient_state WHERE ${key};`);
+    return action();
+  } }));
+  assert.deepEqual(evidence(f), operation === 'delete' ? null : competing);
+  assert.deepEqual(callbacks, [], 'a rejected proposal never reports a resolved relationship');
+});
+
+test('concurrent scheduler-only changes survive the independent evidence update', t => {
+  const f = fixture(t);
+  sql(f, `INSERT INTO lark_im_recipient_state(source_id,account_key,chat_id) VALUES('lark.im',${quoteSql(recipientAccountKey(SELF))},${quoteSql(CHAT)});`);
+  const report = run(f, { apply: true }, {}, { withCommit(action) {
+    sql(f, `UPDATE lark_im_recipient_state SET retry_at_ms=123,failures=4,generation=8,attempt_token='synthetic_new_claim';`);
+    return action();
+  } });
+  assert.equal(report.updated, 1);
+  assert.equal(recipient(f), NAME);
+  const saved = states(f)[0];
+  assert.deepEqual([saved.retry_at_ms, saved.failures, saved.generation, saved.attempt_token], [123, 4, 8, 'synthetic_new_claim']);
+});
+
+test('source changes invalidate the proposal without touching relationship evidence', t => {
+  const f = fixture(t);
+  assert.throws(() => run(f, { apply: true }, {}, { withCommit(action) {
+    sql(f, `UPDATE sources SET config_json=json_set(config_json,'$.synthetic_concurrent_config',true) WHERE id='lark.im';`);
+    return action();
+  } }));
+  assert.deepEqual(states(f), []);
+});
+
+const recordChanges = {
+  id: 99, source_id: 'synthetic.concurrent', first_seen_scope_id: chatScopeId(CHAT), external_id: 'om_synthetic_concurrent_message',
+  external_version: '181', record_type: 'synthetic.changed', occurred_at: '2025-02-03T04:05:00.000Z', occurred_at_ms: NOW + 1,
+  received_at: '2025-02-03T04:05:00.000Z', actor_id: 'ou_synthetic_concurrent_actor', container_id: 'oc_synthetic_concurrent_chat',
+  direction: 'received', title: 'Synthetic concurrent title', body: 'Synthetic concurrent body', content_hash: 'synthetic-concurrent-hash',
+  canonical_json: '{"synthetic":"changed"}', raw_json: '{"synthetic":"changed"}',
+  created_at: '2025-02-03T04:05:00.000Z', updated_at: '2025-02-03T04:05:00.000Z',
+};
+assert.deepEqual(Object.keys(recordChanges), REVIEW_RECORD_COLUMNS, 'the immutable record fence covers every current column');
+for (const column of REVIEW_RECORD_COLUMNS) test(`exact record CAS rejects a concurrent ${column} change`, t => {
+  const f = fixture(t);
+  sql(f, `INSERT INTO sources(id,kind,display_name) VALUES('synthetic.concurrent','synthetic','Synthetic concurrent source');`);
+  assert.throws(() => run(f, { apply: true }, {}, { withCommit(action) {
+    sql(f, `UPDATE records SET ${column}=${quoteSql(recordChanges[column])} WHERE id=1;`);
+    return action();
+  } }));
+  assert.deepEqual(states(f), []);
 });
 
 test('budget interruption after a parsed result cannot commit any evidence', t => {

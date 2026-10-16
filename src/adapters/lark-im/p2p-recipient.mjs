@@ -82,20 +82,39 @@ function makeRecipientEvidence(chatId, selfOpenId, target, name, observedAt) {
     observed_at: observedAt, identity_source: SOURCE, name_source: verifiedName ? 'contact' : null };
 }
 
-/** Evidence is persistent local observation, never a live-account assertion. */
-function scopeRecipient(row, canonical, raw, config) {
-  const account = sentRecipientAccount(row, canonical, raw), evidence = config?.p2p_recipient;
-  if (!account || !object(evidence) || config.chat_id !== row.container_id
+/** The scheduler and reader use the same strict evidence validator. A conflict
+ * keeps both observations; a missing lookup is not contradictory evidence. */
+function readRecipientEvidence(config, account, { includeConflicted = false, nowMs = Date.now() } = {}) {
+  const evidence = config?.p2p_recipient;
+  if (!openId(account) || !object(evidence) || typeof config.chat_id !== 'string'
     || evidence.schema !== SCHEMA || evidence.source_id !== 'lark.im'
-    || evidence.chat_id !== row.container_id || evidence.account_key !== recipientAccountKey(account)
+    || evidence.chat_id !== config.chat_id || evidence.account_key !== recipientAccountKey(account)
     || evidence.identity_source !== SOURCE || evidence.recipient?.id_type !== 'open_id'
     || !openId(evidence.recipient.id) || typeof evidence.observed_at !== 'string'
     || !Number.isFinite(Date.parse(evidence.observed_at))
     || new Date(evidence.observed_at).toISOString() !== evidence.observed_at
-    || Date.parse(evidence.observed_at) > Date.now()) return null;
+    || Date.parse(evidence.observed_at) < 0 || Date.parse(evidence.observed_at) > nowMs
+    || !/^\d{4}-/.test(evidence.observed_at)) return null;
+  const conflict = evidence.conflict;
+  if (conflict != null && (!object(conflict) || conflict.schema !== 'lark_p2p_recipient_conflict/v1'
+    || conflict.identity_source !== SOURCE || conflict.recipient?.id_type !== 'open_id'
+    || !openId(conflict.recipient.id) || typeof conflict.observed_at !== 'string'
+    || !Number.isFinite(Date.parse(conflict.observed_at))
+    || new Date(conflict.observed_at).toISOString() !== conflict.observed_at
+    || Date.parse(conflict.observed_at) < Date.parse(evidence.observed_at)
+    || Date.parse(conflict.observed_at) > nowMs)) return null;
+  if (conflict && !includeConflicted) return null;
   const peer = evidence.recipient;
   return { id: peer.id, type: 'open_id', name: evidence.name_source === 'contact'
-    ? personName(peer.name, [peer.id, account, row.container_id]) : '', self: peer.id === account };
+    ? personName(peer.name, [peer.id, account, config.chat_id]) : '', self: peer.id === account,
+    observed_at: evidence.observed_at, conflicted: Boolean(conflict), conflict };
+}
+
+/** Evidence is persistent local observation, never a live-account assertion. */
+function scopeRecipient(row, canonical, raw, config) {
+  const account = sentRecipientAccount(row, canonical, raw);
+  return account && config?.chat_id === row.container_id
+    ? readRecipientEvidence(config, account, { includeConflicted: true }) : null;
 }
 
 function explicitPartner(value) {
@@ -125,7 +144,13 @@ function displayP2pRecipient(row, canonical, raw, currentChat) {
   const partners = declarations.map(explicitPartner);
   if (partners.some(value => !value)) return '未知';
   const saved = scopeRecipient(row, canonical, raw, currentChat);
-  const candidates = [...partners.filter(value => value !== null), ...(saved ? [saved] : [])];
+  // A new open-ID observation cannot establish or contradict an unrelated
+  // user-ID/union-ID namespace. Preserve the message's typed name without
+  // inventing an alias mapping. Conflicting declarations within the message
+  // itself still fail the comparison below.
+  const comparableSaved = saved && (!partners.length || partners.some(value => value?.type === saved.type)) ? saved : null;
+  if (comparableSaved?.conflicted) return '未知';
+  const candidates = [...partners.filter(value => value !== null), ...(comparableSaved ? [comparableSaved] : [])];
   if (!candidates.length || candidates.some(value => value.id !== candidates[0].id || value.type !== candidates[0].type)) return '未知';
   // A clear in the message projection is not undone by a later local cache.
   const cleared = partners.some(value => value?.cleared) || legacyMistyped && old.name_state === 'cleared';
@@ -133,9 +158,9 @@ function displayP2pRecipient(row, canonical, raw, currentChat) {
   if (!cleared) {
     const name = candidates.find(value => value.name)?.name;
     if (name) return name;
-    if (saved?.self) return '我';
+    if (comparableSaved?.self) return '我';
   }
   return `${candidate.id.slice(0, 8)}...`;
 }
 
-export { recipientAccountKey, sentRecipientAccount, parseP2pTarget, makeRecipientEvidence, displayP2pRecipient };
+export { recipientAccountKey, sentRecipientAccount, parseP2pTarget, makeRecipientEvidence, readRecipientEvidence, displayP2pRecipient };

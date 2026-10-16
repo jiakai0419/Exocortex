@@ -84,7 +84,7 @@ export const COMMANDS = Object.freeze([
     positive("--backup-keep-days", "backupKeepDays", 30, "Same-source backup retention days."),
   ], ["backup-write", "same-source-backup-cleanup"]),
   route("maintenance.enrich", "Preview enrichment of one target; apply commits through its own CAS.", [db, format, apply,
-    option("--target", "target", "enum", "Explicit target; recipients verifies exact sent private-chat targets and changes only their chat scope evidence.", { choices: ["records", "scopes", "recipients"], required: true }),
+    option("--target", "target", "enum", "Explicit target; recipients verifies exact sent private-chat targets and stores independent account-bound relationship evidence.", { choices: ["records", "scopes", "recipients"], required: true }),
     option("--limit", "limit", "integer", "Records: 1000; scopes: 50; sender-only: 50 (maximum 100); unavailable for recipients.", { min: 1 }),
     bool("--probe-apps", "probeApps", "Force application-name probes; records only."),
     bool("--unsafe-details", "unsafeDetails", "Include private lookup details; records only."),

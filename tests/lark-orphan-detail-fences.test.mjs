@@ -254,7 +254,8 @@ test('migrations after 011 preserve every existing table value and initialize bo
     return [name, { columns, rows: store.sqliteQuery(f.db, `SELECT * FROM ${identifiers(name)};`) }];
   }));
   assert.equal(before.get('schema_migrations').rows.at(-1).version, '011');
-  assert.deepEqual(store.ensureInitialized(f.db).applied, ['012_pending_detail_observation.sql', '013_lark_history_debt.sql']);
+  assert.deepEqual(store.ensureInitialized(f.db).applied,
+    ['012_pending_detail_observation.sql', '013_lark_history_debt.sql', '014_lark_recipient_retry.sql']);
   for (const [name, saved] of before) {
     const current = store.sqliteQuery(f.db, `SELECT ${saved.columns.map(identifiers).join(',')} FROM ${identifiers(name)};`);
     assert.deepEqual(name === 'schema_migrations' ? current.filter(row => row.version <= '011') : current,
@@ -266,5 +267,7 @@ test('migrations after 011 preserve every existing table value and initialize bo
   for (const slot of slots) assert.deepEqual(slot, { descriptor_generation: 0, evidence_generation: 0,
     candidate_json: null, candidate_generation: null, candidate_attempt: null, candidate_policy: null,
     candidate_context: null, candidate_observed_at_ms: null });
+  assert.deepEqual(store.sqliteQuery(f.db, 'SELECT * FROM lark_im_recipient_state;'), []);
+  assert.deepEqual(store.sqliteQuery(f.db, 'SELECT * FROM lark_im_recipient_scan;'), []);
   assert.deepEqual(store.ensureInitialized(f.db).applied, [], 'upgrade is idempotent');
 });

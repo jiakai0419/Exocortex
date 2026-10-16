@@ -72,6 +72,8 @@ for (const [label, change] of [
   ['wrong identity authority', s => s.config.p2p_recipient.identity_source = 'chat_title'],
   ['future observation', s => s.config.p2p_recipient.observed_at = '2999-01-01T00:00:00.000Z'],
   ['invalid observation', s => s.config.p2p_recipient.observed_at = 'not-a-date'],
+  ['pre-epoch observation', s => s.config.p2p_recipient.observed_at = '1969-12-31T23:59:59.000Z'],
+  ['extended-year observation', s => s.config.p2p_recipient.observed_at = '-000001-01-01T00:00:00.000Z'],
   ['wrong recipient namespace', s => s.config.p2p_recipient.recipient.id_type = 'user_id'],
   ['recipient is a conversation ID', s => s.config.p2p_recipient.recipient.id = CHAT],
   ['contradictory explicit partner', s => s.canonical.chat_partner = { open_id: 'ou_synthetic_other_peer', name: NAME }],
@@ -110,8 +112,23 @@ test('existing message-bound typed partner names survive and clears cannot be re
   s.canonical.chat_partner = { user_id: 'synthetic_user_id', name: NAME };
   s.raw.chat_partner = { user_id: 'synthetic_user_id', name: NAME };
   assert.equal(recipient(s), NAME);
+  s.config.p2p_recipient = makeRecipientEvidence(CHAT, SELF, { id_type: 'open_id', id: PEER }, '合成新查询姓名', AT);
+  assert.equal(recipient(s), NAME, 'an open-ID observation cannot overwrite an existing name in another namespace');
   s.canonical.chat_partner = { name: NAME };
   assert.equal(recipient(s), '未知', 'name alone is not a recipient');
+});
+
+test('a valid relationship conflict cannot resurrect an older explicit partner name', () => {
+  const s = sample();
+  s.canonical.chat_partner = { open_id: PEER, name: NAME };
+  s.config.p2p_recipient.conflict = { schema: 'lark_p2p_recipient_conflict/v1',
+    identity_source: 'im.v1.chats.batch_query', recipient: { id_type: 'open_id', id: 'ou_synthetic_conflicting_target' },
+    observed_at: '2025-02-03T04:05:07.000Z' };
+  assert.equal(recipient(s), '未知');
+  s.canonical.chat_partner = { user_id: 'synthetic_namespace_person', name: '合成命名空间姓名' };
+  assert.equal(recipient(s), '合成命名空间姓名', 'an unrelated open-ID conflict cannot erase a typed user-ID name');
+  s.row.direction = 'received';
+  assert.equal(recipient(s), '我');
 });
 
 test('real legacy normalizer partner user_id keeps its trusted raw name without asserting an open-ID mapping', () => {

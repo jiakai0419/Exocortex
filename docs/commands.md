@@ -253,7 +253,7 @@ Preview enrichment of one target; apply commits through its own CAS.
 | `--db` | path | `data/exocortex.sqlite` | — | Database; default relative to installation root, explicit relative paths to cwd. |
 | `--format` | text/json | `text` | — | Output format. |
 | `--apply` | boolean | `false` | — | Commit the planned change; otherwise preview. |
-| `--target` | records/scopes/recipients | — | 必填 | Explicit target; recipients verifies exact sent private-chat targets and changes only their chat scope evidence. |
+| `--target` | records/scopes/recipients | — | 必填 | Explicit target; recipients verifies exact sent private-chat targets and stores independent account-bound relationship evidence. |
 | `--limit` | integer | — | ≥ 1 | Records: 1000; scopes: 50; sender-only: 50 (maximum 100); unavailable for recipients. |
 | `--probe-apps` | boolean | `false` | — | Force application-name probes; records only. |
 | `--unsafe-details` | boolean | `false` | — | Include private lookup details; records only. |

@@ -60,7 +60,7 @@ import { captureLarkWriteAdmission } from "../../diagnostics/lark-write-admissio
  * @property {(dbPath: string) => void=} ensureInitialized
  * @property {(dbPath: string, sourceId: string, candidateStartMs: number, options?: {explicit?: boolean, endMs?: number}) => number=} ensureSourceInitialSyncStart
  * @property {(opts: SyncOptions) => SelfProfile=} getSelfProfile
- * @property {Partial<Pick<import("./sync-runner.mjs").SyncRunner, "syncSent" | "syncDiscovery" | "syncReceived" | "retryDetails">>=} syncRunner
+ * @property {Partial<Pick<import("./sync-runner.mjs").SyncRunner, "syncSent" | "syncDiscovery" | "syncReceived" | "retryDetails" | "syncRecipients">>=} syncRunner
  * @property {Partial<import("./sync-runner.mjs").SyncRunnerDeps>=} syncRunnerDeps
  * @property {(dbPath: string) => string=} resolvePath
  * @property {() => JsonObject=} getTransportStats
@@ -234,6 +234,15 @@ function executeLarkImSync(opts, deps = {}) {
     successful: [summary.sent, summary.discovery, ...summary.received, ...(summary.details || [])]
       .some((run) => (run?.ok === true || run?.list_complete === true) && run.skipped !== true),
   });
+  // Existing worker cycles always perform sent work. Run once after its scope
+  // locks and account confirmation are complete, borrowing the CLI's API lease.
+  // Exact sent records also cover chats absent from discovery. Optional identity enrichment does not change
+  // message coverage, the public sync summary, or worker/status step contracts.
+  if ((opts.scope === 'sent' || opts.scope === 'all') && summary.sent?.skipped !== true
+    && (summary.sent?.ok === true || summary.sent?.list_complete === true)) {
+    try { runner.syncRecipients?.(dbPath, selfProfile); }
+    catch { /* Its durable claim remains retryable; committed messages stand. */ }
+  }
   return summary;
 }
 

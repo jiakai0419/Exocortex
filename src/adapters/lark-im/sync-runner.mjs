@@ -14,6 +14,7 @@ import { activityDatabaseKey } from "../../diagnostics/lark-im-activity-evidence
 import { pendingDetailContextKey } from "../../../dist/storage/sqlite/pending-detail-observation.js";
 import { isExhaustedLarkTransportFailure } from "./transport.mjs";
 import { bindCurrentSenderNames, reuseKnownSenderNames } from "./name-history.mjs";
+import { syncRecipients } from "./recipient-sync.mjs";
 import {
   acquireLock,
   confirmInitialLarkAccountSql,
@@ -128,6 +129,7 @@ import {
  * @property {(dbPath: string, opts: SyncOptions, scope: ScopeRow, selfProfile: SelfProfile) => RunResult} syncReceivedScope
  * @property {(dbPath: string, opts: SyncOptions, selfProfile: SelfProfile) => RunResult[]} syncReceived
  * @property {(dbPath: string, opts: SyncOptions, selfProfile: SelfProfile) => RunResult[]} retryDetails
+ * @property {(dbPath: string, selfProfile: SelfProfile) => JsonObject} syncRecipients
  */
 
 const defaultDeps = {
@@ -157,6 +159,7 @@ const defaultDeps = {
   sqlJson,
   sqliteExec,
   sqliteQuery,
+  syncRecipients,
 };
 
 /**
@@ -1125,6 +1128,7 @@ function createSyncRunner(deps = {}) {
       syncReceivedScope(dbPath, opts, scope, selfProfile, resolvedDeps),
     syncReceived: (dbPath, opts, selfProfile) => syncReceived(dbPath, opts, selfProfile, resolvedDeps),
     retryDetails: (dbPath, opts, selfProfile) => retryDetails(dbPath, opts, selfProfile, resolvedDeps),
+    syncRecipients: (dbPath, selfProfile) => resolvedDeps.syncRecipients(dbPath, selfProfile),
   };
 }
 
