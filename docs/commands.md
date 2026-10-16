@@ -253,13 +253,13 @@ Preview enrichment of one target; apply commits through its own CAS.
 | `--db` | path | `data/exocortex.sqlite` | — | Database; default relative to installation root, explicit relative paths to cwd. |
 | `--format` | text/json | `text` | — | Output format. |
 | `--apply` | boolean | `false` | — | Commit the planned change; otherwise preview. |
-| `--target` | records/scopes | — | 必填 | Explicit enrichment target. |
-| `--limit` | integer | — | ≥ 1 | Records: 1000; scopes: 50; sender-only: 50 (maximum 100). |
+| `--target` | records/scopes/recipients | — | 必填 | Explicit target; recipients verifies exact sent private-chat targets and changes only their chat scope evidence. |
+| `--limit` | integer | — | ≥ 1 | Records: 1000; scopes: 50; sender-only: 50 (maximum 100); unavailable for recipients. |
 | `--probe-apps` | boolean | `false` | — | Force application-name probes; records only. |
 | `--unsafe-details` | boolean | `false` | — | Include private lookup details; records only. |
 | `--sender-only` | boolean | `false` | — | Bounded lookup of one exact sender; requires --sender-id. |
 | `--sender-id` | string | — | — | Exact sender for --sender-only. |
-| `--record-id` | integer | — | 可重复；≥ 1 | One to 100 distinct stored record IDs; repeat this flag; requires --names-only and excludes --limit. |
+| `--record-id` | integer | — | 可重复；≥ 1 | Repeat for exact stored records: 1–100 with records --names-only, or 1–20 sent private-chat records with recipients; excludes --limit. |
 | `--names-only` | boolean | `false` | — | Fill missing sender names only for exact --record-id targets; excludes --sender-only and --probe-apps. |
 | `--max-cli-attempts` | integer | `12` | ≥ 1；≤ 1000 | Hard command-wide lark-cli process-attempt cap, including pages and fallbacks; not an HTTP request count. |
 | `--max-seconds` | integer | `30` | ≥ 1；≤ 180 | Command-wide remote-work deadline; stops without committing a budget-interrupted lookup. |

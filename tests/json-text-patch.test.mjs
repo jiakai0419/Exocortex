@@ -1,9 +1,28 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { patchJsonText, mergeJsonObjectText, validateJsonObjectText } from '../dist/core/json-text-patch.js';
+import { patchJsonText, patchTopLevelJsonMemberText, mergeJsonObjectText, validateJsonObjectText } from '../dist/core/json-text-patch.js';
 import { retainSourceRepresentation } from '../dist/core/lark-observation.js';
 
 const tokenValues = ['9007199254740993', '18446744073709551617', '0.12345678901234567890123456789', '1e400', '-0'];
+test('one owned root member preserves every original byte through append, refresh and removal', () => {
+  for (const original of ['{}', ' { \n }\n', '{"a":1}', '{\n  "a": [1, {"x": -0}],\n  "opaque": 9007199254740993\n}\n']) {
+    const added = patchTopLevelJsonMemberText(original, 'owned', '{"name":"synthetic"}');
+    assert.deepEqual(JSON.parse(added).owned, { name: 'synthetic' });
+    const refreshed = patchTopLevelJsonMemberText(added, 'owned', '{"name":"new"}');
+    assert.equal(patchTopLevelJsonMemberText(refreshed, 'owned'), original);
+    assert.equal(patchTopLevelJsonMemberText(original, 'absent'), original);
+  }
+  for (const key of ['a', 'b', 'c']) {
+    const original = ' { "a" : 1, "b" : 2, "c" : 3 }\n';
+    const changed = patchTopLevelJsonMemberText(original, key, '9007199254740993');
+    assert.equal(changed, original.replace(`"${key}" : ${{ a: 1, b: 2, c: 3 }[key]}`, `"${key}" : 9007199254740993`));
+    const deleted = JSON.parse(patchTopLevelJsonMemberText(original, key));
+    assert.equal(Object.hasOwn(deleted, key), false);
+    assert.equal(Object.keys(deleted).length, 2);
+  }
+  for (const invalid of ['[]', '{"a":1,"a":2}', '{bad}', '{"a":1}x']) assert.throws(() => patchTopLevelJsonMemberText(invalid, 'owned', '1'));
+  assert.throws(() => patchTopLevelJsonMemberText('{}', 'owned', 'not-json'));
+});
 for (const token of tokenValues) test(`owned field edit preserves unknown numeric token ${token}`, () => {
   const nested = `{ "arr" : [${token},null,{"inner":${token}}] }`;
   const before = `{ "unknown" : ${nested}, "owned" : "old" }`;

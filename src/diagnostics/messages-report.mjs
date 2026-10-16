@@ -5,6 +5,8 @@ import { renderSystemProjection } from "../adapters/lark-im/system-content.mjs";
 import { renderCardContent } from "../adapters/lark-im/card-content.mjs";
 import { personName, senderIdentity, senderNameFromSource } from "../adapters/lark-im/sender-identity.mjs";
 import { chatScopeId } from "../adapters/lark-im/core.mjs";
+import { displayP2pRecipient } from "../adapters/lark-im/p2p-recipient.mjs";
+import { patchTopLevelJsonMemberText } from "../../dist/core/json-text-patch.js";
 
 /**
  * @typedef {"all" | "sent" | "received"} MessageDirection
@@ -96,7 +98,8 @@ function loadMessages(dbPath, opts, deps = {}) {
     "read messages",
   );
   // First-seen scope is ingestion provenance. Look up only this page's exact
-  // chat scopes by primary key; their current metadata supplies type only.
+  // chat scopes by primary key; only type and independently account-bound
+  // recipient evidence are consumed. The public first-seen config is retained.
   const scopeIds = new Map(rows.filter((row) => typeof row.container_id === "string" && row.container_id)
     .map((row) => [chatScopeId(row.container_id), row.container_id]));
   /** @type {Map<string, Row | null>} */
@@ -111,9 +114,15 @@ function loadMessages(dbPath, opts, deps = {}) {
       chats.set(chatId, chats.has(chatId) ? null : config);
     }
   }
-  return rows.map(({ type_scope_id, type_scope_source_id, ...row }) =>
-    enrichRow(row, chats.get(row.container_id), type_scope_source_id === "lark.im"
-      && typeof row.container_id === "string" && type_scope_id === chatScopeId(row.container_id)));
+  return rows.map(({ type_scope_id, type_scope_source_id, ...row }) => {
+    // The internal recipient observation does not expand the existing public
+    // first-seen scope fields, including messages first seen in a chat scope.
+    if (Object.hasOwn(parseMaybeJson(row.scope_config_json) || {}, 'p2p_recipient')) {
+      row.scope_config_json = patchTopLevelJsonMemberText(row.scope_config_json, 'p2p_recipient');
+    }
+    return enrichRow(row, chats.get(row.container_id), type_scope_source_id === "lark.im"
+      && typeof row.container_id === "string" && type_scope_id === chatScopeId(row.container_id));
+  });
 }
 
 /** @param {unknown} value */
@@ -324,8 +333,6 @@ function enrichRow(row, currentChat, scopeSourceMatches = true) {
   const canonical = parseMaybeJson(row.canonical_json) || {};
   const raw = parseMaybeJson(row.raw_json) || {};
   const config = parseMaybeJson(row.scope_config_json) || {};
-  const chatPartner =
-    canonical.chat_partner || (raw.chat_partner && typeof raw.chat_partner === "object" ? raw.chat_partner : null);
   const chatType = conversationType(row, canonical, raw, scopeSourceMatches ? config : {}, currentChat);
   const chatName = canonical.chat_name || raw.chat_name || raw.chat?.name || config.chat_name || null;
   const chatId = canonical.chat_id || row.container_id || config.chat_id || raw.chat_id || null;
@@ -335,10 +342,6 @@ function enrichRow(row, currentChat, scopeSourceMatches = true) {
     canonical.sender_type ||
     (String(senderId || "").startsWith("cli_") ? "app" : null) ||
     (messageType === "system" ? "system" : null);
-  const partnerId = chatPartner?.open_id || chatPartner?.id || chatPartner?.user_id || null;
-  const partnerName = chatPartner?.name || chatPartner?.display_name || null;
-  const p2pPartnerName = partnerName || chatName;
-  const p2pPartnerId = partnerId || chatId;
   const isP2p = chatType === "p2p";
   const isGroupLike = !isP2p;
   const system = messageType === "system" ? displaySystem(row.body, canonical, raw, systemContext(row, canonical, raw, config)) : null;
@@ -355,9 +358,7 @@ function enrichRow(row, currentChat, scopeSourceMatches = true) {
       message_type: messageTypeLabel(messageType),
       recipient:
         isP2p
-          ? row.direction === "sent"
-            ? nameOrId(p2pPartnerName, p2pPartnerId)
-            : "我"
+          ? displayP2pRecipient(row, canonical, raw, currentChat)
           : null,
       chat: isGroupLike ? nameOrId(chatName, chatId) : null,
       body: system?.text || displayBody(row.body, canonical, raw),

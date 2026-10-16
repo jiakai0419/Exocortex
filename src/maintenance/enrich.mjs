@@ -3,6 +3,7 @@ import { createLarkImAdapter } from "../adapters/lark-im/adapter.mjs";
 import { NAME_LOOKUP_RETRY_BUDGET_MS } from "../adapters/lark-im/name-resolver.mjs";
 import { enrichRecords } from "./enrich-records.mjs";
 import { enrichScopes } from "./enrich-scopes.mjs";
+import { enrichRecipients } from "./enrich-recipients.mjs";
 import { createMaintenanceRequestSession } from "./request-session.mjs";
 import { validateReviewOptions } from "./review-artifact.mjs";
 
@@ -11,15 +12,25 @@ class EnrichmentInputError extends Error {}
 /** One workflow entrance; target-specific planning and CAS remain separate.
  * @param {Record<string, any>} options @param {Record<string, any>} [deps] */
 function executeEnrichment(options, deps = {}) {
+  const recipients = options.target === 'recipients';
+  if (recipients && (options.probeApps || options.unsafeDetails || options.senderOnly || options.senderId || options.namesOnly
+    || options.limit !== undefined || options.reviewOut !== undefined || options.reviewIn !== undefined || options.reviewSha256 !== undefined)) {
+    throw new EnrichmentInputError('--target recipients accepts only exact --record-id targets and request budgets');
+  }
   validateReviewOptions(options, 'names');
-  if (!["records", "scopes"].includes(options.target)) throw new EnrichmentInputError("--target must be records or scopes");
+  if (!["records", "scopes", "recipients"].includes(options.target)) throw new EnrichmentInputError("--target must be records, scopes or recipients");
   if (options.recordIds !== undefined && !Array.isArray(options.recordIds)) throw new EnrichmentInputError("--record-id requires an integer selection");
   const hasRecordIds = Array.isArray(options.recordIds) && options.recordIds.length > 0;
-  if (options.target !== "records" && (options.probeApps || options.unsafeDetails || options.senderOnly || options.senderId || options.namesOnly || hasRecordIds)) {
+  if (options.target === "scopes" && (options.probeApps || options.unsafeDetails || options.senderOnly || options.senderId || options.namesOnly || hasRecordIds)) {
     throw new EnrichmentInputError("sender, app probing and unsafe detail options require --target records");
   }
   if (Boolean(options.senderOnly) !== Boolean(options.senderId)) throw new EnrichmentInputError("--sender-only and --sender-id are required together");
-  if (Boolean(options.namesOnly) !== hasRecordIds) throw new EnrichmentInputError("--names-only and --record-id are required together");
+  if (!recipients && Boolean(options.namesOnly) !== hasRecordIds) throw new EnrichmentInputError("--names-only and --record-id are required together");
+  if (recipients && (!hasRecordIds || options.recordIds.length > 20
+    || options.recordIds.some(id => !Number.isSafeInteger(id) || id < 1)
+    || new Set(options.recordIds).size !== options.recordIds.length)) {
+    throw new EnrichmentInputError('--target recipients requires 1 to 20 unique positive --record-id values');
+  }
   if (options.namesOnly) {
     if (!Array.isArray(options.recordIds) || options.recordIds.length < 1 || options.recordIds.length > 100
       || options.recordIds.some((/** @type {unknown} */ id) => !Number.isSafeInteger(id) || Number(id) < 1)
@@ -55,7 +66,9 @@ function executeEnrichment(options, deps = {}) {
     retryBudgetMs: Math.min(NAME_LOOKUP_RETRY_BUDGET_MS, Number(settings.retryBudgetMs || NAME_LOOKUP_RETRY_BUDGET_MS)) });
   const assertReady = session?.assertReady || deps.assertReady || (() => {});
   const withCommit = session?.withCommit || deps.withCommit;
-  const report = opts.target === "records"
+  const report = recipients
+    ? (deps.enrichRecipients || enrichRecipients)(opts, { runLark, assertReady, withCommit, now: deps.now })
+    : opts.target === "records"
     ? (deps.enrichRecords || enrichRecords)(opts, { runLark, assertReady, withCommit, now: deps.now })
     : (deps.enrichScopes || enrichScopes)(opts, { assertReady, withCommit, fetchChatMetadata: deps.fetchChatMetadata || createLarkImAdapter({ run: runLark }).fetchChatMetadata });
   return { ...report, target: opts.target,

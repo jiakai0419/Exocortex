@@ -4,6 +4,9 @@ type JsonTextPatch = {
 };
 /** Validate all nested syntax/keys without converting any number. */
 declare function validateJsonObjectText(text: string): void;
+/** One owned root member, preserving separators as well as unknown value
+ * tokens. Appending then removing that member restores the original bytes. */
+declare function patchTopLevelJsonMemberText(text: string, key: string, value?: string): string;
 /** A raw JSON value is supplied only for an owned path; omitted value deletes
  * that path. Missing intermediate objects are created for sets, not deletions.
  * Existing non-object intermediates are rejected instead of silently replaced.
@@ -17,5 +20,5 @@ declare function mergeJsonObjectText(before: string, incoming: string, options: 
     retain: readonly string[];
     deleteMissing: readonly string[];
 }): string;
-export { patchJsonText, mergeJsonObjectText, validateJsonObjectText };
+export { patchJsonText, patchTopLevelJsonMemberText, mergeJsonObjectText, validateJsonObjectText };
 export type { JsonTextPatch };

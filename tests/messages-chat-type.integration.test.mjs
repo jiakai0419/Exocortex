@@ -169,9 +169,9 @@ test('sent-first messages use only an exact legal same-source conversation scope
     { key: 'cross_first', firstConfig: { chat_id: 'oc_synthetic_type_cross_first', chat_type: 'p2p' }, firstSource: 'synthetic.other' },
   ]);
   const json = assertRows(f, {
-    sent_p2p: { scene: '私聊', recipient: NAME, chat: null },
-    sent_p2p_id: { scene: '私聊', recipient: 'oc_synth...', chat: null },
-    sent_group: {}, legal_with_duplicate: { scene: '私聊', recipient: NAME, chat: null },
+    sent_p2p: { scene: '私聊', recipient: '未知', chat: null },
+    sent_p2p_id: { scene: '私聊', recipient: '未知', chat: null },
+    sent_group: {}, legal_with_duplicate: { scene: '私聊', recipient: '未知', chat: null },
     other_source: { scene: '会话类型未知' }, invalid_scope_id: { scene: '会话类型未知' },
     wrong_scope_chat: { scene: '会话类型未知' }, wrong_first_chat: { scene: '会话类型未知' }, cross_first: { scene: '会话类型未知' },
   });
@@ -211,8 +211,8 @@ test('legacy raw.id must agree with record identity even when a correct message_
       id: 'om_synthetic_unrelated_native_legacy', chat_id: 'oc_synthetic_type_native_legacy_wrong', chat_type: 'p2p' } } },
   ]);
   const json = assertRows(f, {
-    legacy_valid: { scene: '私聊', recipient: NAME, chat: null },
-    legacy_both_valid: { scene: '私聊', recipient: NAME, chat: null },
+    legacy_valid: { scene: '私聊', recipient: '未知', chat: null },
+    legacy_both_valid: { scene: '私聊', recipient: '未知', chat: null },
     legacy_wrong: { scene: '会话类型未知' }, legacy_shadowed: { scene: '会话类型未知' },
     native_legacy_wrong: { scene: '会话类型未知' },
   });
@@ -258,7 +258,7 @@ test('explicit conversation modes keep visibility separate without upgrading an 
     { key: 'old_group_topic', canonical: { chat_type: 'group' }, scope: { chat_type: 'topic' } },
   ]);
   const json = assertRows(f, { private_group: {}, public_group: {},
-    private_p2p_mode: { scene: '私聊', recipient: NAME, chat: null }, old_group_topic: {} });
+    private_p2p_mode: { scene: '私聊', recipient: '未知', chat: null }, old_group_topic: {} });
   assert.equal(f.run('text'), screen(json));
 });
 
@@ -268,7 +268,7 @@ test('real CLI keeps ordering, filters and narrow screen content while unknown s
     { key: 'narrow_b', offset: 0, direction: 'received', body: '合成正文乙。' },
     { key: 'narrow_c', offset: 1, canonical: { chat_type: 'group' }, body: '合成正文丙。' },
   ]);
-  const json = assertRows(f, { narrow_a: { scene: '私聊', recipient: NAME, chat: null },
+  const json = assertRows(f, { narrow_a: { scene: '私聊', recipient: '未知', chat: null },
     narrow_b: { scene: '会话类型未知' }, narrow_c: {} });
   assert.deepEqual(json.map(row => row.external_id), ['om_synthetic_type_narrow_c', 'om_synthetic_type_narrow_b', 'om_synthetic_type_narrow_a']);
   assert.deepEqual(f.run('json', 80, ['--limit', '2']), json.slice(0, 2));

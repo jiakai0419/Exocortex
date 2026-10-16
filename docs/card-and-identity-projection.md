@@ -20,6 +20,16 @@
 
 ## 身份与姓名证据
 
+### 私聊收件人
+
+收件人身份与会话标题分开：`chat_name` 和 `oc_…` 只能表示会话，不能证明某个人是收件人。自发私聊缺少可信身份时，既有“接收人”行显示“未知”；收到的私聊保留“我”，群聊和话题群不增加个人收件人。明确的消息内 typed `chat_partner` 保留原姓名；命名空间、消息或会话冲突时不选择任意一方。
+
+精确收件人补全使用官方 CLI 的会话批量查询合同：`POST /open-apis/im/v1/chats/batch_query`，query 为 `user_id_type=open_id`，body 为 `chat_ids`。只有唯一匹配的 `chat_id`、`chat_mode=p2p`、`p2p_target_type=user` 和有效 `p2p_target_id` 才能确认对端。契约来源为[官方 CLI 实现](https://github.com/larksuite/cli/blob/017b19a793ad71794a02887ede04757f3d82e10d/shortcuts/im/helpers.go)及其[消息搜索补全](https://github.com/larksuite/cli/blob/017b19a793ad71794a02887ede04757f3d82e10d/shortcuts/im/im_messages_search.go)。联系人查询仅按这个确切 open ID 提供姓名。昵称、仅自己发过消息、未分页完的成员列表或唯一出现的发送者均不建立对端关系；明确的 API self target 才能表示发给自己。
+
+补全在对应同源精确 chat scope 的 `config_json.p2p_recipient` 保存独立的 `lark_p2p_recipient/v1` 证据：来源、会话、账号哈希、typed 对端、姓名来源和观察时间。原始 records、canonical、正文、时间、排序和游标不改。发现更新的 JSON merge 保留此专属字段。读取只消费本条 sent 消息自身原始 typed sender、actor、canonical 身份与账号哈希一致的证据，不把 legacy `single_sent_actor` 升格为整个 received 历史的账号归属。消息内明确清空的姓名不被 scope 证据覆盖。
+
+`messages` 仍完全离线、只读，不获取当前凭据，不触发补全，也不使用跨调用姓名缓存。证据丢失显示未知，证据恢复后下一次读取立即恢复；缺姓名但身份已确认时可显示真实个人 ID。观察时间表示本地保存的官方查询快照，不宣称此刻姓名仍然最新。此版本提供显式有界补全路径；尚未把收件人补全接入后台同步，新会话缺证据时仍需显式补全。
+
 已知来源只能确认特定群内应用的姓名时，可使用[本机局部应用名配置](local-chat-app-names.md)补充未知 sender 的阅读投影。配置绑定所选数据库文件及原始 tenant/chat/app，已有姓名与明确清空优先；命中仅改变 `display.sender` 并添加可选的 `display.sender_name_source`，不回写 canonical 或原始记录，不成为全局应用名或联网姓名缓存。
 
 统一规则是先确认身份命名空间，再取姓名；共同规则不要求把纯本地卡片解析和可联网 sender resolver 合成一个服务。

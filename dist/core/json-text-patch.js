@@ -80,6 +80,45 @@ function validateJsonObjectText(text) {
     if (!parseText(text).members)
         throw new Error('json_patch_object_required');
 }
+/** One owned root member, preserving separators as well as unknown value
+ * tokens. Appending then removing that member restores the original bytes. */
+function patchTopLevelJsonMemberText(text, key, value) {
+    const root = parseText(text);
+    if (!root.members || typeof key !== 'string')
+        throw new Error('json_patch_object_required');
+    if (value !== undefined)
+        parseText(value);
+    const index = root.members.findIndex(member => member.key === key);
+    let start, end, replacement = value ?? '';
+    if (index < 0) {
+        if (value === undefined)
+            return text;
+        start = end = root.members.at(-1)?.value.end ?? root.start + 1;
+        replacement = `${root.members.length ? ',' : ''}${JSON.stringify(key)}:${value}`;
+    }
+    else {
+        const member = root.members[index];
+        if (value !== undefined) {
+            start = member.value.start;
+            end = member.value.end;
+        }
+        else if (index > 0) {
+            start = root.members[index - 1].value.end;
+            end = member.value.end;
+        }
+        else if (root.members.length > 1) {
+            start = member.keyStart;
+            end = root.members[1].keyStart;
+        }
+        else {
+            start = member.keyStart;
+            end = member.value.end;
+        }
+    }
+    const result = text.slice(0, start) + replacement + text.slice(end);
+    parseText(result);
+    return result;
+}
 /** A raw JSON value is supplied only for an owned path; omitted value deletes
  * that path. Missing intermediate objects are created for sets, not deletions.
  * Existing non-object intermediates are rejected instead of silently replaced.
@@ -172,4 +211,4 @@ function mergeJsonObjectText(before, incoming, options) {
             patches.push({ path: [key] });
     return patchJsonText(before, patches, patches.map(patch => patch.path));
 }
-export { patchJsonText, mergeJsonObjectText, validateJsonObjectText };
+export { patchJsonText, patchTopLevelJsonMemberText, mergeJsonObjectText, validateJsonObjectText };
