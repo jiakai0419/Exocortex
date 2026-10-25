@@ -5,6 +5,8 @@ import { renderSystemProjection } from "../adapters/lark-im/system-content.mjs";
 import { renderCardContent } from "../adapters/lark-im/card-content.mjs";
 import { personName, senderIdentity, senderNameFromSource } from "../adapters/lark-im/sender-identity.mjs";
 import { chatScopeId } from "../adapters/lark-im/core.mjs";
+import { displayChatTitle } from "../adapters/lark-im/chat-title.mjs";
+import { messageNameAccount, readChatNameEvidence } from "../adapters/lark-im/name-evidence.mjs";
 import { displayP2pRecipient, readRecipientEvidence, recipientAccountKey, sentRecipientAccount } from "../adapters/lark-im/p2p-recipient.mjs";
 import { patchTopLevelJsonMemberText, validateJsonObjectText } from "../../dist/core/json-text-patch.js";
 
@@ -98,8 +100,7 @@ function loadMessages(dbPath, opts, deps = {}) {
     "read messages",
   );
   // First-seen scope is ingestion provenance. Look up only this page's exact
-  // chat scopes by primary key; only type and independently account-bound
-  // recipient evidence are consumed. The public first-seen config is retained.
+  // chat scopes by primary key. The public first-seen config is retained.
   const scopeIds = new Map(rows.filter((row) => typeof row.container_id === "string" && row.container_id)
     .map((row) => [chatScopeId(row.container_id), row.container_id]));
   /** @type {Map<string, Row | null>} */
@@ -112,7 +113,7 @@ function loadMessages(dbPath, opts, deps = {}) {
       const config = parseMaybeJson(scope.config_json);
       if (!chatId || scope.source_id !== "lark.im" || config?.chat_id !== chatId) continue;
       try { validateJsonObjectText(scope.config_json); }
-      catch { delete config.p2p_recipient; } // Preserve existing type metadata; refuse ambiguous new evidence.
+      catch { delete config.p2p_recipient; delete config.chat_name; } // Ambiguous names cannot donate evidence.
       chats.set(chatId, chats.has(chatId) ? null : config);
     }
   }
@@ -145,6 +146,26 @@ function loadMessages(dbPath, opts, deps = {}) {
         : { ...config, ...(trusted ? { chat_type: 'p2p' } : {}) });
     }
   }
+  const titlePairs = new Map(rows.flatMap(row => {
+    const accountKey=messageNameAccount(row,parseMaybeJson(row.canonical_json)||{},parseMaybeJson(row.raw_json)||{});
+    return accountKey ? [[`${accountKey}:${row.container_id}`,{accountKey,chatId:row.container_id}]] : [];
+  }));
+  const titles = new Map();
+  if (titlePairs.size && queryJson(dbPath,
+    "SELECT 1 AS name_state_available FROM sqlite_schema WHERE type='table' AND name='lark_im_name_tasks';",
+    'check chat name evidence store').some(row=>row.name_state_available===1)) {
+    const saved=queryJson(dbPath,`WITH requested(account_key,chat_id) AS (VALUES
+      ${[...titlePairs.values()].map(pair=>`(${quoteSql(pair.accountKey)},${quoteSql(pair.chatId)})`).join(',')})
+      SELECT s.source_id,s.account_key,s.chat_id,s.evidence_json FROM requested r
+      JOIN lark_im_name_tasks s ON s.source_id='lark.im' AND s.account_key=r.account_key AND s.kind='chat' AND s.chat_id=r.chat_id;`,
+      'read exact message chat name evidence');
+    for(const value of saved) {
+      const key=`${value.account_key}:${value.chat_id}`;
+      if(value.source_id!=='lark.im'||!titlePairs.has(key)) continue;
+      const evidence=readChatNameEvidence(value.evidence_json,value.chat_id,value.account_key);
+      titles.set(key,titles.has(key)?null:evidence);
+    }
+  }
   return rows.map(({ type_scope_id, type_scope_source_id, ...row }) => {
     // The internal recipient observation does not expand the existing public
     // first-seen scope fields, including messages first seen in a chat scope.
@@ -153,9 +174,11 @@ function loadMessages(dbPath, opts, deps = {}) {
       catch { /* Keep malformed legacy public JSON byte-for-byte, never stop the page. */ }
     }
     const account = sentRecipientAccount(row, parseMaybeJson(row.canonical_json) || {}, parseMaybeJson(row.raw_json) || {});
+    const nameAccount = messageNameAccount(row,parseMaybeJson(row.canonical_json)||{},parseMaybeJson(row.raw_json)||{});
     return enrichRow(row, chats.get(row.container_id), type_scope_source_id === "lark.im"
       && typeof row.container_id === "string" && type_scope_id === chatScopeId(row.container_id),
-      account ? recipients.get(`${recipientAccountKey(account)}:${row.container_id}`) : undefined);
+      account ? recipients.get(`${recipientAccountKey(account)}:${row.container_id}`) : undefined,
+      nameAccount ? titles.get(`${nameAccount}:${row.container_id}`) : undefined);
   });
 }
 
@@ -363,14 +386,15 @@ function conversationType(row, canonical, raw, config, currentChat, recipientCon
  * @param {Row | null} [currentChat]
  * @param {boolean} [scopeSourceMatches]
  * @param {Row} [recipientConfig]
+ * @param {Row | null} [currentName]
  * @returns {EnrichedMessage}
  */
-function enrichRow(row, currentChat, scopeSourceMatches = true, recipientConfig) {
+function enrichRow(row, currentChat, scopeSourceMatches = true, recipientConfig, currentName) {
   const canonical = parseMaybeJson(row.canonical_json) || {};
   const raw = parseMaybeJson(row.raw_json) || {};
   const config = parseMaybeJson(row.scope_config_json) || {};
   const chatType = conversationType(row, canonical, raw, scopeSourceMatches ? config : {}, currentChat, recipientConfig);
-  const chatName = canonical.chat_name || raw.chat_name || raw.chat?.name || config.chat_name || null;
+  const chatName = displayChatTitle(row, canonical, raw, config, currentChat, scopeSourceMatches, currentName);
   const chatId = canonical.chat_id || row.container_id || config.chat_id || raw.chat_id || null;
   const { id: senderId, name: senderName } = displaySender(row, canonical, raw);
   const messageType = canonical.msg_type || raw.msg_type || raw.message_type || null;

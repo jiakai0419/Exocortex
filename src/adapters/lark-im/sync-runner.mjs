@@ -15,6 +15,7 @@ import { pendingDetailContextKey } from "../../../dist/storage/sqlite/pending-de
 import { isExhaustedLarkTransportFailure } from "./transport.mjs";
 import { bindCurrentSenderNames, reuseKnownSenderNames } from "./name-history.mjs";
 import { syncRecipients } from "./recipient-sync.mjs";
+import { syncNames } from "./name-sync.mjs";
 import {
   acquireLock,
   confirmInitialLarkAccountSql,
@@ -130,6 +131,7 @@ import {
  * @property {(dbPath: string, opts: SyncOptions, selfProfile: SelfProfile) => RunResult[]} syncReceived
  * @property {(dbPath: string, opts: SyncOptions, selfProfile: SelfProfile) => RunResult[]} retryDetails
  * @property {(dbPath: string, selfProfile: SelfProfile) => JsonObject} syncRecipients
+ * @property {(dbPath: string, selfProfile: SelfProfile) => JsonObject} syncNames
  */
 
 const defaultDeps = {
@@ -160,6 +162,7 @@ const defaultDeps = {
   sqliteExec,
   sqliteQuery,
   syncRecipients,
+  syncNames,
 };
 
 /**
@@ -849,7 +852,7 @@ COMMIT;
           ? {
               chat_id: chat.chat_id,
               chat_type: chat.chat_type,
-              chat_name: chat.chat_name,
+              ...(typeof chat.chat_name === 'string' && chat.chat_name.trim() ? { chat_name: chat.chat_name } : {}),
               hot_rank: chat.hot_rank,
               hot_seen_at: chat.hot_seen_at,
               last_hot_snapshot_id: discovered.snapshot_id,
@@ -857,7 +860,7 @@ COMMIT;
           : {
               chat_id: chat.chat_id,
               chat_type: chat.chat_type,
-              chat_name: chat.chat_name,
+              ...(typeof chat.chat_name === 'string' && chat.chat_name.trim() ? { chat_name: chat.chat_name } : {}),
               discovery_rank: chat.discovery_rank,
               [fullSnapshotField]: discovered.snapshot_id,
             };
@@ -1129,6 +1132,7 @@ function createSyncRunner(deps = {}) {
     syncReceived: (dbPath, opts, selfProfile) => syncReceived(dbPath, opts, selfProfile, resolvedDeps),
     retryDetails: (dbPath, opts, selfProfile) => retryDetails(dbPath, opts, selfProfile, resolvedDeps),
     syncRecipients: (dbPath, selfProfile) => resolvedDeps.syncRecipients(dbPath, selfProfile),
+    syncNames: (dbPath, selfProfile) => resolvedDeps.syncNames(dbPath, selfProfile),
   };
 }
 

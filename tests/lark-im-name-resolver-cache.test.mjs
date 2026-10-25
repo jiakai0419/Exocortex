@@ -252,26 +252,57 @@ test("the 1000-name bound is shared by user, app, and chat member caches with LR
   assert.deepEqual(contactRequests.at(-1), ["ou_1"]);
 });
 
-test("bot inference is reevaluated when a chat becomes ambiguous and never reused across chats", () => {
-  const calls = [];
-  let ambiguous = false;
+test("exact bot evidence is refreshed, rejects ambiguity and never crosses chats", () => {
+  const calls = [], events = [];
+  let phase = "initial";
   const resolver = createNameResolver({
     now: () => 0,
+    onLookup: event => events.push(event),
     run(args) {
       const chat = JSON.parse(commandValue(args, "--params")).chat_id;
       calls.push(chat);
-      return { items: ambiguous && chat === "oc_a"
-        ? [{ bot_name: "First Bot" }, { bot_name: "Other Bot" }]
-        : [{ bot_name: `Bot in ${chat}` }] };
+      if (chat === "oc_a" && phase === "conflicting") return { items: [
+        { app_id: "cli_app", bot_name: "First Bot" },
+        { app_id: "cli_app", bot_name: "Other Bot" },
+      ] };
+      if (chat === "oc_a" && phase === "unbound") return { items: [{ bot_name: "Unbound Bot" }] };
+      if (chat === "oc_a" && phase === "ambiguous") return { items: [
+        { bot_name: "First Unbound Bot" }, { bot_name: "Other Unbound Bot" },
+      ] };
+      return { items: [{ app_id: "cli_app", bot_name: `Bot in ${chat} ${phase}` }] };
     },
   });
   const lookup = (chat) => resolver.resolveChatBotAppFallbackNames(
     new Map([[chat, new Set(["cli_app"])]]), new Map(), opts,
   );
+  const observed = chat => resolver.senderNameObservation("cli_app", chat, "app_id");
 
-  assert.equal(lookup("oc_a").get("oc_a:cli_app").name, "Bot in oc_a");
-  ambiguous = true;
+  assert.deepEqual(lookup("oc_a").get("oc_a:cli_app"), {
+    name: "Bot in oc_a initial", source: "chat_bot_app_id", confidence: "high",
+  });
+  assert.equal(observed("oc_b"), null, "another chat cannot borrow this exact bot observation");
+  phase = "renamed";
+  assert.equal(lookup("oc_a").get("oc_a:cli_app").name, "Bot in oc_a renamed",
+    "bot names are rechecked even before a name-cache TTL can expire");
+  assert.equal(observed("oc_a").cached, false);
+  phase = "conflicting";
   assert.equal(lookup("oc_a").size, 0);
-  assert.equal(lookup("oc_b").get("oc_b:cli_app").name, "Bot in oc_b");
-  assert.deepEqual(calls, ["oc_a", "oc_a", "oc_b"]);
+  assert.equal(observed("oc_a").status, "conflict");
+  assert.equal(observed("oc_a").name, undefined, "conflicts cannot resurrect a cached name");
+  assert.equal(lookup("oc_b").get("oc_b:cli_app").name, "Bot in oc_b conflicting");
+  assert.equal(observed("oc_b").status, "resolved");
+  assert.equal(observed("oc_a").status, "conflict", "another chat cannot overwrite the first chat's conflict");
+
+  for (const mode of ["unbound", "ambiguous"]) {
+    phase = mode;
+    assert.equal(lookup("oc_a").size, 0, "neither one nor multiple unbound bots prove an app identity");
+    assert.equal(observed("oc_a").status, "unresolved");
+    assert.equal(observed("oc_a").name, undefined);
+    assert.equal(events.at(-1).status, "ambiguous");
+  }
+  phase = "recovered";
+  assert.equal(lookup("oc_a").get("oc_a:cli_app").name, "Bot in oc_a recovered");
+  assert.equal(observed("oc_a").status, "resolved");
+  assert.equal(observed("oc_b").name, "Bot in oc_b conflicting");
+  assert.deepEqual(calls, ["oc_a", "oc_a", "oc_a", "oc_b", "oc_a", "oc_a", "oc_a"]);
 });

@@ -312,7 +312,7 @@ test("buildPeopleContext resolves app sender from application API", () => {
   assert.equal(canonical.sender_name_confidence, "high");
 });
 
-test("buildPeopleContext falls back to a unique chat bot when application API is unavailable", () => {
+test("buildPeopleContext refuses a unique unbound chat bot when application API is unavailable", () => {
   const adapter = createLarkImAdapter({
     run(args) {
       if (args[0] === "api") throw new Error("210508 insufficient permission level");
@@ -338,12 +338,12 @@ test("buildPeopleContext falls back to a unique chat bot when application API is
   const context = adapter.buildPeopleContext(messages, adapterOpts(), null);
 
   assert.equal(context.apps.has("cli_app"), false);
-  assert.equal(context.app_fallbacks.get("oc_group:cli_app").name, "Demo Workflow Bot");
+  assert.equal(context.app_fallbacks.size, 0);
   const record = recordFromMessage(messages[0], "scope", "received", context);
   const canonical = JSON.parse(record.canonical_json);
-  assert.equal(canonical.sender_name, "Demo Workflow Bot");
-  assert.equal(canonical.sender_name_source, "chat_bot_unique");
-  assert.equal(canonical.sender_name_confidence, "medium");
+  assert.equal(canonical.sender_name, null);
+  assert.equal(canonical.sender_name_source, null);
+  assert.equal(canonical.sender_name_confidence, null);
 });
 
 test("buildPeopleContext does not infer an app sender from ambiguous chat bots", () => {

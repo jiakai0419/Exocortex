@@ -1152,7 +1152,7 @@ test("probe-apps makes an actual request for a known app and keeps source facts 
 
 for (const [label, bots, expectedSource] of [
   ["direct", [{ app_id: LAB.app.id, bot_name: "Synthetic Direct Bot" }], "chat_bot_app_id"],
-  ["unique", [{ bot_name: "Synthetic Unique Bot" }], "chat_bot_unique"],
+  ["unique", [{ bot_name: "Synthetic Unique Bot" }], null],
 ]) {
   test(`record enrichment consumes shared ${label} bot fallback evidence and keeps public output safe`, (t) => {
     const fixture = enrichmentFixture(t, { applicationResponse: {}, botResponse: { data: { items: bots } }, record: {
@@ -1160,17 +1160,17 @@ for (const [label, bots, expectedSource] of [
     } });
     const before = readRecords(fixture.dbPath)[0];
     const result = runEnrichment(fixture);
-    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.status, expectedSource ? 0 : 2, result.stderr);
     const summary = JSON.parse(result.stdout);
     assert.equal(summary.app_lookup_failures, 1);
     assert.equal(summary.app_lookup_other_failures, 1);
     assert.equal(summary.app_fallback_chats_requested, 1);
-    assert.equal(summary.app_fallback_names, 1);
+    assert.equal(summary.app_fallback_names, expectedSource ? 1 : 0);
     for (const value of [LAB.app.id, LAB.room.id, bots[0].bot_name]) assert.equal(result.stdout.includes(value), false);
     const after = readRecords(fixture.dbPath)[0];
     const canonical = JSON.parse(after.canonical_json);
-    assert.equal(canonical.sender_name, bots[0].bot_name);
-    assert.equal(canonical.sender_name_source, expectedSource);
+    assert.equal(canonical.sender_name, expectedSource ? bots[0].bot_name : null);
+    assert.equal(canonical.sender_name_source, expectedSource || undefined);
     for (const field of ["raw_json", "content_hash", "external_version", "body"]) assert.equal(after[field], before[field]);
   });
 }

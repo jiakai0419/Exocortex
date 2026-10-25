@@ -60,6 +60,19 @@ for (const scope of ['discover', 'received', 'details']) test(`${scope} does not
   assert.deepEqual(f.calls, [scope, 'binding']);
 });
 
+for (const scope of ['sent', 'all', 'discover', 'received', 'details']) test(`${scope} chooses one shared name scheduler after successful ingestion`, () => {
+  const f = fixture(scope);
+  f.deps.syncRunner.syncNames = (db, self) => {
+    assert.equal(db, f.opts.db); assert.equal(self, SELF);
+    f.calls.push('names');
+  };
+  const report = executeLarkImSync(f.opts, f.deps);
+  assert.deepEqual(f.calls, [...(scope === 'all' ? ['sent', 'discover', 'received'] : [scope]), 'binding', 'names']);
+  assert.equal(report.ok, true);
+  assert.equal(Object.hasOwn(report, 'names'), false);
+  assert.equal(Object.hasOwn(report, 'recipients'), false);
+});
+
 test('optional failure does not change already committed sync summary or disclose its error', () => {
   const f = fixture('sent', undefined, () => { throw new Error('Synthetic private lookup error'); });
   const baseline = fixture('sent'); delete baseline.deps.syncRunner.syncRecipients;

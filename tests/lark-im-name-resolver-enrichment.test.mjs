@@ -56,7 +56,7 @@ test("application diagnostics distinguish localized success, missing name and re
   assert.deepEqual(events.map((event) => event.app_id), [APP, "cli_synthetic_empty", "cli_synthetic_fail"]);
 });
 
-test("bot fallback diagnostics preserve direct matching, unique inference, ambiguity and failures", () => {
+test("bot fallback diagnostics preserve exact matching and reject unbound candidates", () => {
   const events = [];
   let mode = "direct";
   const resolver = createNameResolver({ onLookup: (event) => events.push(event), run(_args, options) {
@@ -69,7 +69,7 @@ test("bot fallback diagnostics preserve direct matching, unique inference, ambig
   const lookup = () => resolver.resolveChatBotAppFallbackNames(new Map([[CHAT, new Set([APP])]]), new Map(), opts);
   assert.deepEqual(lookup().get(`${CHAT}:${APP}`), { name: "Direct Clock", source: "chat_bot_app_id", confidence: "high" });
   mode = "unique";
-  assert.equal(lookup().get(`${CHAT}:${APP}`).source, "chat_bot_unique");
+  assert.equal(lookup().size, 0);
   mode = "ambiguous";
   assert.equal(lookup().size, 0);
   assert.equal(events.at(-1).pending_app_ids, 1);
@@ -79,7 +79,7 @@ test("bot fallback diagnostics preserve direct matching, unique inference, ambig
   mode = "fail";
   assert.equal(lookup().size, 0);
   assert.deepEqual(events.map((event) => [event.kind, event.status]), [
-    ["chat_bots", "resolved"], ["chat_bots", "resolved"], ["chat_bots", "ambiguous"],
+    ["chat_bots", "resolved"], ["chat_bots", "ambiguous"], ["chat_bots", "ambiguous"],
     ["chat_bots", "unresolved"], ["chat_bots", "failed"],
   ]);
   assert.equal(resolver.resolveChatBotAppFallbackNames(new Map([[CHAT, new Set([APP])]]), new Map([[APP, "Official"]]), opts).size, 0);

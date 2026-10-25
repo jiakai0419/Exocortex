@@ -108,6 +108,19 @@ function personName(value, identifiers = []) {
   return identifiers.some((id) => typeof id === "string" && id === name) ? "" : name;
 }
 
+/** Old sole-bot guesses remain visible until fresh exact evidence replaces
+ * them, but must remain retryable and never become trusted history donors.
+ * @param {unknown} raw @param {Record<string, any>} canonical */
+function legacyAppNameNeedsVerification(raw, canonical) {
+  const identity = senderIdentity(raw);
+  return canonical.sender_name_source === 'chat_bot_unique'
+    && canonical.sender_name_state !== 'cleared'
+    && identity.verified && identity.type === 'app_id' && senderLookupNamespace(raw) === 'app_id'
+    && canonical.sender_id === identity.id
+    && (!canonical.sender_id_type || canonical.sender_id_type === 'app_id')
+    && Boolean(personName(canonical.sender_name, identity.identifiers));
+}
+
 /** @param {unknown} user @param {unknown[]} [aliases] */
 function displayNameFromUser(user, aliases = []) {
   if (!object(user)) return "";
@@ -119,4 +132,4 @@ function displayNameFromUser(user, aliases = []) {
   return "";
 }
 
-export { displayNameFromUser, personName, senderAliasesByOpenId, senderIdentity, senderLookupNamespace, senderNameFromSource, senderOpenId };
+export { legacyAppNameNeedsVerification, displayNameFromUser, personName, senderAliasesByOpenId, senderIdentity, senderLookupNamespace, senderNameFromSource, senderOpenId };

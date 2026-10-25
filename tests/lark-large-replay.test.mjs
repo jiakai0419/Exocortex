@@ -36,8 +36,10 @@ function fixture(t) {
   const parent = new URL('../../tmp/', import.meta.url).pathname;
   mkdirSync(parent, { recursive: true });
   const directory = mkdtempSync(join(parent, 'large-replay-fixture-'));
-  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  let preserveFixture = false;
+  t.after(() => { if (!preserveFixture) rmSync(directory, { recursive: true, force: true }); });
   const f = { directory, db: join(directory, 'synthetic.sqlite'), sent: [], received: [], details: new Map(), calls: [],
+    preserveFixture: () => { preserveFixture = true; },
     project: records => records };
   store.ensureInitialized(f.db);
   store.ensureSourceInitialSyncStart(f.db, 'lark.im', START, { explicit: true });
@@ -100,7 +102,12 @@ for (const children of [30, 60]) test(`unchanged ${children}-child merge survive
   assert.equal(Buffer.byteLength(before.canonical_json) > MiB, children === 60);
   f.received = [root, healthy]; restart(f);
   const result = received(f);
-  assert.equal(result.ok, true); assert.equal(result.inserted, 1);
+  if (!result.ok) {
+    f.preserveFixture();
+    assert.equal(result.ok, true, JSON.stringify({ result, syntheticDatabase: f.db,
+      rootTask: task(f, root.message_id), siblingTask: task(f, healthy.message_id) }));
+  }
+  assert.equal(result.ok, true, JSON.stringify(result)); assert.equal(result.inserted, 1);
   assert.equal(record(f, root.message_id).raw_json, before.raw_json);
   assert.equal(record(f, root.message_id).content_hash, before.content_hash);
   assert.equal(task(f, root.message_id).status, 'complete');

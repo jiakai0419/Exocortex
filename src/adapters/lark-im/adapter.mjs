@@ -823,6 +823,8 @@ function createLarkImAdapter({ run = runLark, clock = Date.now } = {}) {
         data.chat_id !== undefined && data.chat_id !== chatIdValue) {
       throw new Error("chat metadata returned invalid identity metadata");
     }
+    const modes=[data.chat_mode,data.chat_type].filter(mode=>['p2p','group','topic'].includes(mode));
+    if(modes.includes('p2p') && modes.some(mode=>mode!=='p2p')) throw new Error('chat metadata returned conflicting conversation modes');
     return normalizeChat({ ...data, chat_id: chatIdValue }, 0);
   }
 

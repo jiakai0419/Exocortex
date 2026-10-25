@@ -65,6 +65,7 @@ const fence = predicate => `CREATE TEMP TABLE IF NOT EXISTS __recipient_state_fe
 function syncRecipients(db, self, deps = {}) {
   const now = deps.now || Date.now, monotonic = deps.monotonicNow || (() => performance.now());
   const started = monotonic(), nowMs = now(), accountKey = recipientAccountKey(self?.open_id);
+  const budgetMs = Number.isSafeInteger(deps.budgetMs) && deps.budgetMs > 0 ? Math.min(BUDGET_MS,deps.budgetMs) : BUDGET_MS;
   let calls = 0, claimed = 0, clockLast = started, deferredTransport = false;
   const report = { attempted: 0, updated: 0, deferred: 0, calls: 0, reason: 'idle' };
   if (!deps.runLark && !getLarkApiLeaseStdio()) return { ...report, reason: 'lease_unavailable' };
@@ -72,7 +73,7 @@ function syncRecipients(db, self, deps = {}) {
   const remaining = () => {
     const current = monotonic();
     if (!Number.isFinite(current) || current < clockLast) throw new RecipientBudgetError('recipient clock unavailable');
-    clockLast = current; return Math.floor(BUDGET_MS - (current - started));
+    clockLast = current; return Math.floor(budgetMs - (current - started));
   };
   const assertReady = () => { if (!(remaining() > 0)) throw new RecipientBudgetError('recipient budget exhausted'); };
   const query = (sql, label) => { assertReady(); return (deps.readOnlyQuery || readOnlySqliteJson)(db, sql, label, { timeoutMs: Math.max(1, remaining()) }); };

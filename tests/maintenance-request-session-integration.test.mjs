@@ -7,6 +7,7 @@ import { performance } from 'node:perf_hooks';
 import { spawnSync } from 'node:child_process';
 import { ensureInitialized, quoteSql, sqliteExec } from '../dist/storage/sqlite/ingestion-store.js';
 import { executeEnrichment } from '../src/maintenance/enrich.mjs';
+import { chatScopeId } from '../src/adapters/lark-im/core.mjs';
 import { createMaintenanceRequestSession, MaintenanceRequestError } from '../src/maintenance/request-session.mjs';
 import { tryAcquireLarkApiLease, readSharedLarkCooldown, writeSharedLarkCooldown } from '../src/runtime/lark-api-lease.mjs';
 
@@ -27,11 +28,11 @@ function fixture(t) {
   const db = join(root, 'synthetic.sqlite'); ensureInitialized(db);
   for (let index = 1; index <= 2; index++) {
     const cid = `oc_synthetic_budget_${index}`, app = `cli_synthetic_budget_${index}`;
-    const scope = `lark.im.received.chat.synthetic-budget-${index}`;
+    const scope = chatScopeId(cid);
     const raw = { message_id: `om_synthetic_budget_${index}`, chat_id: cid, msg_type: 'text',
       create_time: String(2_700_000_000_000 + index), sender: { id: app, id_type: 'app_id', sender_type: 'app' },
       content: { text: `Synthetic receipt ${index}.` } };
-    const canonical = { sender_id: app, sender_id_type: 'app_id', sender_type: 'app', sender_name: null,
+    const canonical = { message_id: raw.message_id, sender_id: app, sender_id_type: 'app_id', sender_type: 'app', sender_name: null,
       chat_id: cid, chat_type: 'group', chat_name: null, msg_type: 'text', content: raw.content };
     sqliteExec(db, `INSERT INTO sync_scopes(id,source_id,name,config_json,updated_at)
       VALUES(${q(scope)},'lark.im',${q(`Synthetic budget scope ${index}`)},${q(JSON.stringify({ chat_id: cid, chat_type: 'group', chat_name: null }))},'2055-01-01T00:00:00.000Z');

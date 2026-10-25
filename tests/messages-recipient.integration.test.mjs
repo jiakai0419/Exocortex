@@ -131,19 +131,23 @@ test('a valid relationship conflict cannot resurrect an older explicit partner n
   assert.equal(recipient(s), '我');
 });
 
-test('real legacy normalizer partner user_id keeps its trusted raw name without asserting an open-ID mapping', () => {
+test('stored legacy mistyped partner user_id keeps its trusted raw name without asserting an open-ID mapping', () => {
   const s = sample(); delete s.config.p2p_recipient;
   const input = { ...s.raw, id: ID, chat_type: 'p2p', chat_partner: { user_id: 'synthetic_tenant_person', name: NAME } };
   delete input.message_id;
   const stored = recordFromMessage(input, SENT_SCOPE_ID, 'sent');
   const canonical = JSON.parse(stored.canonical_json), raw = JSON.parse(stored.raw_json);
+  // Preserve the historical fixture after the normalizer stops creating it.
+  canonical.chat_partner = { open_id: input.chat_partner.user_id, name: NAME };
   assert.equal(canonical.chat_partner.open_id, 'synthetic_tenant_person', 'exercise the actual historical normalizer shape');
   assert.equal(displayP2pRecipient(stored, canonical, raw, s.config), NAME);
   assert.equal(sentRecipientAccount(stored, canonical, raw), SELF, 'legacy raw.id is an exact message identity');
   raw.id = 'om_synthetic_other_message';
   assert.equal(displayP2pRecipient(stored, canonical, raw, s.config), '未知');
   const collision = recordFromMessage({ ...input, chat_partner: { user_id: PEER, name: NAME } }, SENT_SCOPE_ID, 'sent');
-  assert.equal(displayP2pRecipient(collision, JSON.parse(collision.canonical_json), JSON.parse(collision.raw_json), s.config), '未知');
+  const collisionCanonical = JSON.parse(collision.canonical_json);
+  collisionCanonical.chat_partner = { open_id: PEER, name: NAME };
+  assert.equal(displayP2pRecipient(collision, collisionCanonical, JSON.parse(collision.raw_json), s.config), '未知');
 });
 
 test('batch response uses only an explicit unique p2p user target in the requested namespace', () => {

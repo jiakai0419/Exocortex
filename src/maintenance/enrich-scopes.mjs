@@ -9,6 +9,8 @@ import { patchJsonText, validateJsonObjectText } from "../../dist/core/json-text
 import { readOnlySqliteJson as sqliteJson } from "../storage/sqlite/readonly-query.mjs";
 import { commitEnrichmentUpdates, publicEnrichmentError } from "./enrichment-commit.mjs";
 import { fetchChatMetadata } from "../adapters/lark-im/adapter.mjs";
+import { chatScopeId } from "../adapters/lark-im/core.mjs";
+import { chatTitle } from "../adapters/lark-im/chat-title.mjs";
 
 /** @returns {JsonObject[]} */
 function loadScopes(dbPath, limit) {
@@ -16,10 +18,12 @@ function loadScopes(dbPath, limit) {
     dbPath,
     `SELECT DISTINCT s.id, s.source_id, s.config_json, s.updated_at
      FROM sync_scopes s
-     JOIN records r ON r.first_seen_scope_id = s.id
      WHERE s.id LIKE 'lark.im.received.chat.%'
        AND s.source_id = 'lark.im'
+       AND EXISTS(SELECT 1 FROM records r WHERE r.source_id=s.source_id
+         AND r.record_type='lark.im.message' AND r.container_id=json_extract(s.config_json,'$.chat_id'))
        AND COALESCE(json_extract(s.config_json, '$.chat_name'), '') = ''
+       AND COALESCE(json_extract(s.config_json, '$.chat_name_state'), '') <> 'cleared'
      ORDER BY s.updated_at DESC
      LIMIT ${Number(limit)};`,
     "load scopes",
@@ -36,11 +40,11 @@ function enrichScopes(opts, deps = {}) {
   let failed = 0;
   const updates = [];
   for (const scope of scopes) {
-    if (!scope.config.chat_id) continue;
+    if (!scope.config.chat_id || scope.id !== chatScopeId(scope.config.chat_id)) continue;
     try {
       validateJsonObjectText(scope.config_json);
       const { chat_name: chatName } = (deps.fetchChatMetadata || fetchChatMetadata)(scope.config.chat_id);
-      if (!chatName) continue;
+      if (!chatTitle(chatName,scope.config.chat_id)) continue;
       const nextConfig = patchJsonText(scope.config_json,
         [{ path: ['chat_name'], value: JSON.stringify(chatName) }], [['chat_name']]);
       updates.push(`UPDATE sync_scopes

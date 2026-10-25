@@ -759,7 +759,7 @@ node bin/exocortex.mjs maintenance enrich --target records --db "$DB_PATH" \
   --max-cli-attempts 4 --max-seconds 20
 ```
 
-`--record-id` 与 `--names-only` 成对使用，1–100 个不同 ID，不兼容 `--limit`、`--sender-only` 或 `--probe-apps`。先验证全部目标存在且为 Lark 消息，再访问远端。只有缺名、非 system、未明确 cleared、发送者身份一致的目标可补；已知姓名和未解析目标保持原状。只写 sender 姓名投影、来源/置信度及必要 open-ID 类型，保留 raw、hash、版本、正文、chat、partner 与其他字段。应用 fallback 只接受明确 app_id 匹配，不能由选中子集推断唯一机器人。提交继续使用原始快照 CAS；同步并发变更会跳过并报告，不能被覆盖。报告不泄露具体目标 ID 或姓名。
+`--record-id` 与 `--names-only` 成对使用，1–100 个不同 ID，不兼容 `--limit`、`--sender-only` 或 `--probe-apps`。先验证全部目标存在且为 Lark 消息，再访问远端。只有缺名或历史 `chat_bot_unique` 猜名、非 system、未明确 cleared、发送者身份一致的目标可补或复核；其他已知姓名和未解析目标保持原状，猜名复核失败也保留原展示。只写 sender 姓名投影、来源/置信度及必要 open-ID 类型，保留 raw、hash、版本、正文、chat、partner 与其他字段。应用 fallback 只接受明确 app_id 匹配，不能由选中子集推断唯一机器人。提交继续使用原始快照 CAS；同步并发变更会跳过并报告，不能被覆盖。报告不泄露具体目标 ID 或姓名。
 
 精确卡片回放可在一个 scope、一个固定窗口内重复 `--message-id "$MESSAGE_ID"`（1–100 个不同 ID），并明确给出上述两个预算。所有目标必须已存在于选定会话及窗口，且具有已知数字版本；未知版本直接拒绝。仍须完整读取该窗口，可能读到其他消息并消耗预算，但只有授权 ID 进入提交。缺失或重复的目标、错误会话及不完整分页整轮失败；提交在同一事务内检查读取时的记录 ID、会话、创建时间和版本，目标被删除、替换、同版本移动身份或并发更新时不会被重新插入或覆盖。版本必须严格变新才更新；相同版本内容冲突保留现状。多条消息可按已确认会话与时间窗分组，不能将窗口读取范围误称为只读那几个 ID。
 

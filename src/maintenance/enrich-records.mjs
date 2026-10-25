@@ -11,7 +11,7 @@ import { patchJsonText, validateJsonObjectText } from "../../dist/core/json-text
 
 import { larkSenderNameIsUnknownSql, larkSenderNamespaceSql, mergeLarkNameProjectionSql } from "../../dist/storage/sqlite/lark-name-projection.js";
 import { createNameResolver, NAME_LOOKUP_RETRY_BUDGET_MS, uniqueAppIds } from "../adapters/lark-im/name-resolver.mjs";
-import { displayNameFromUser, personName, senderAliasesByOpenId, senderIdentity, senderNameFromSource, senderOpenId } from "../adapters/lark-im/sender-identity.mjs";
+import { legacyAppNameNeedsVerification, displayNameFromUser, personName, senderAliasesByOpenId, senderIdentity, senderLookupNamespace, senderNameFromSource, senderOpenId } from "../adapters/lark-im/sender-identity.mjs";
 import { classifyLarkFailure, createLarkCliRunner, createTransportState } from "../adapters/lark-im/transport.mjs";
 import { beginMaintenanceReview, reviewRequested, effectiveRecord, MaintenanceReviewError } from './review-artifact.mjs';
 
@@ -30,7 +30,7 @@ const SENDER_FIELDS = ['sender_id', 'sender_id_type', 'sender_name', 'sender_nam
   'sender_name_confidence', 'sender_name_resolution_status', 'sender_name_resolution_reason',
   'sender_name_authority_source', 'sender_name_account_key', 'sender_name_observed_at', 'sender_name_verification'];
 const RECORD_FIELDS = [...SENDER_FIELDS, 'sender_type', 'chat_id', 'chat_type', 'chat_name', 'chat_name_state', 'chat_name_source', 'deleted'];
-const PARTNER_FIELDS = ['open_id', 'name', 'name_state'];
+const PARTNER_FIELDS = ['id', 'id_type', 'open_id', 'user_id', 'union_id', 'app_id', 'sender_id', 'name', 'name_state'];
 function patchEnrichmentProjection(row, next, senderOnly) {
   const fields = senderOnly ? SENDER_FIELDS : RECORD_FIELDS;
   const changed = (before, after, key) => Object.hasOwn(before, key) !== Object.hasOwn(after, key) || !Object.is(before[key], after[key]);
@@ -93,9 +93,15 @@ function senderName(raw, canonical) {
   return senderNameFromSource(raw);
 }
 
-function senderType(raw, canonical) {
-  const sender = raw?.sender && typeof raw.sender === "object" ? raw.sender : {};
-  return canonical.sender_type || sender.sender_type || sender.type || (String(sender.id || "").startsWith("cli_") ? "app" : "");
+/** The app route follows source identity, never an ID prefix or another row's
+ * context. Preserve legacy untyped app-kind compatibility without accepting an
+ * explicit person namespace or contradictory canonical actor. */
+function rowAppId(row) {
+  const identity = senderIdentity(row.raw), canonical = row.canonical;
+  return senderLookupNamespace(row.raw) === 'app_id' && identity.id === row.actor_id
+    && canonical.sender_id === identity.id
+    && (!canonical.sender_id_type || canonical.sender_id_type === 'app_id')
+    && (!canonical.sender_type || canonical.sender_type === 'app') ? identity.id : '';
 }
 
 function chatId(raw, row, canonical, config) {
@@ -111,7 +117,34 @@ function chatName(raw, canonical, config) {
 }
 
 function chatPartner(raw, canonical) {
-  return canonical.chat_partner || (raw?.chat_partner && typeof raw.chat_partner === "object" ? raw.chat_partner : null);
+  const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+  const stored = canonical.chat_partner, source = raw?.chat_partner;
+  if ([stored, source].some(value => value != null && !object(value))) return null;
+  const values = [stored, source].filter(object);
+  if (!values.length) return null;
+  const identities = values.map(value => senderIdentity({ sender: value })), identity = identities[0];
+  if (identities.some(value => !value.verified || value.conflict || !['open_id', 'user_id', 'union_id'].includes(value.type || '')
+    || value.type !== identity.type || value.id !== identity.id)) return null;
+  // Do not preserve a selected open ID while silently changing a second explicit
+  // alias. Legacy mistyped canonical partners stay untouched for the reader's
+  // existing raw-evidence compatibility rule, rather than authorizing a lookup.
+  for (const type of ['open_id', 'user_id', 'union_id', 'app_id']) {
+    const aliases = values.flatMap(value => [value[type], value.sender_id?.[type],
+      ...(value.id_type === type ? [value.id] : [])]).filter(value => typeof value === 'string' && value);
+    if (new Set(aliases).size > 1) return null;
+  }
+  const aliases = [...new Set(identities.flatMap(value => value.identifiers))];
+  const cleared = values.some(value => value.name_state === 'cleared');
+  // Explicit maintenance retains its legacy refresh behavior for a stale
+  // canonical-only clear with a valid known name. A source clear remains
+  // authoritative, and an echoed alias cannot supply a replacement name.
+  const name = source?.name_state === 'cleared' ? ''
+    : values.map(value => personName(value.name, aliases) || personName(value.display_name, aliases)).find(Boolean) || '';
+  // An explicit maintenance refresh may replace a canonical clear; a clear in
+  // the original source itself must not be resurrected by a contact lookup.
+  const lookupId = identity.type === 'open_id' && /^ou_[A-Za-z0-9_-]+$/.test(identity.id) && identity.id.length <= 512
+    && source?.name_state !== 'cleared' ? identity.id : '';
+  return { value: stored || source, aliases, name, cleared, lookupId };
 }
 
 // The resolver owns request/response and matching rules. This workflow only
@@ -425,7 +458,8 @@ function namesOnlyExclusion(row) {
   const identity = senderIdentity(raw);
   if (canonical.msg_type === 'system' || raw.msg_type === 'system') return 'system_message';
   if (canonical.sender_name_state === 'cleared') return 'explicitly_cleared';
-  if (personName(canonical.sender_name, [row.actor_id, ...identity.identifiers])) return 'known_name';
+  if (personName(canonical.sender_name, [row.actor_id, ...identity.identifiers])
+    && !legacyAppNameNeedsVerification(raw, canonical)) return 'known_name';
   if (!identity.id || identity.conflict || identity.id !== row.actor_id || canonical.sender_id !== row.actor_id
     || !row.container_id || canonical.chat_id !== row.container_id || raw.chat_id !== row.container_id
     || canonical.sender_id_type && identity.type && canonical.sender_id_type !== identity.type) return 'unverified_identity';
@@ -486,7 +520,7 @@ function enrichRecords(opts, deps = {}) {
   for (const row of rows) {
     const sid = senderId(row.raw, row, row.canonical);
     const sname = senderName(row.raw, row.canonical);
-    const isAppSender = senderType(row.raw, row.canonical) === "app" || String(sid || "").startsWith("cli_");
+    const isAppSender = Boolean(rowAppId(row));
     const cid = chatId(row.raw, row, row.canonical, row.config);
     const openId = rowOpenId(row);
     if (openId && !sname && !isAppSender) contactIds.push(openId);
@@ -496,7 +530,7 @@ function enrichRecords(opts, deps = {}) {
       stat.records += 1;
       if (sname) stat.existing_names.add(sname);
     }
-    if (sid && isAppSender && (opts.probeApps || !sname)) {
+    if (sid && isAppSender && (opts.probeApps || !sname || legacyAppNameNeedsVerification(row.raw, row.canonical))) {
       appIds.push(sid);
       if (cid) {
         if (!appIdsByChat.has(cid)) appIdsByChat.set(cid, new Set());
@@ -505,8 +539,8 @@ function enrichRecords(opts, deps = {}) {
     }
 
     const partner = chatPartner(row.raw, row.canonical);
-    const partnerId = partner?.open_id || partner?.id || partner?.user_id || "";
-    const partnerName = partner?.name || partner?.display_name || "";
+    const partnerId = partner?.lookupId || "";
+    const partnerName = partner?.name || "";
     if (!opts.namesOnly && partnerId && !partnerName) contactIds.push(partnerId);
 
     const ctype = chatType(row.raw, row.canonical, row.config);
@@ -563,6 +597,11 @@ function enrichRecords(opts, deps = {}) {
   } });
   const lookupOpts = { retries: 0, retryDelayMs: 0 };
   const aliases = senderAliasesByOpenId(rows.map((row) => row.raw));
+  if (!opts.namesOnly) for (const row of rows) {
+    const partner = chatPartner(row.raw, row.canonical);
+    if (partner?.lookupId) aliases.set(partner.lookupId,
+      [...new Set([...(aliases.get(partner.lookupId) || []), ...partner.aliases])]);
+  }
   const contactNames = resolver.resolveContactNames(contactIds, lookupOpts, seed, aliases);
   const memberNames = new Map();
   for (const [cid, ids] of groupUnresolved.entries()) {
@@ -572,12 +611,8 @@ function enrichRecords(opts, deps = {}) {
   diagnostics.app_ids_requested = uniqueAppIds(appIds).length;
   const appNames = resolver.resolveApplicationNames(appIds, { ...lookupOpts, forceRefresh: opts.probeApps });
   const appFallbackNames = resolver.resolveChatBotAppFallbackNames(appIdsByChat, appNames, lookupOpts);
-  if (opts.namesOnly) {
-    // Exact records are only a subset of a chat. Apparent uniqueness among
-    // selected app IDs cannot prove that an unbound bot belongs to that app.
-    for (const [key, value] of appFallbackNames) {
-      if (value.source !== 'chat_bot_app_id') appFallbackNames.delete(key);
-    }
+  for (const [key, value] of appFallbackNames) {
+    if (value.source !== 'chat_bot_app_id' || value.confidence !== 'high') appFallbackNames.delete(key);
   }
   diagnostics.app_fallback_names = appFallbackNames.size;
   const appProbeResultsById = new Map(diagnostics.app_lookup_results.map((result) => [result.app_id, result]));
@@ -590,15 +625,22 @@ function enrichRecords(opts, deps = {}) {
     const ctype = chatType(row.raw, row.canonical, row.config);
     const cname = chatName(row.raw, row.canonical, row.config) || knownChatNames.get(cid) || "";
     const sid = senderId(row.raw, row, row.canonical);
-    const isAppSender = senderType(row.raw, row.canonical) === "app" || String(sid || "").startsWith("cli_");
+    const isAppSender = Boolean(rowAppId(row));
     const existingSenderName = senderName(row.raw, row.canonical);
+    const needsVerification = legacyAppNameNeedsVerification(row.raw, row.canonical);
     const openId = rowOpenId(row);
     const memberName = openId ? memberNames.get(`${cid}:${openId}`) : null;
     const contactName = openId ? contactNames.get(openId) : null;
-    const appName = appNames.get(sid);
-    const appFallback = appFallbackNames.get(`${cid}:${sid}`);
+    const appName = isAppSender ? appNames.get(sid) : null;
+    const appFallback = isAppSender ? appFallbackNames.get(`${cid}:${sid}`) : null;
     const appFallbackName = appFallback?.name || "";
-    const preferredAppName = appName || (opts.probeApps ? appFallbackName : "");
+    const preferredAppName = appName || (opts.probeApps || needsVerification ? appFallbackName : "");
+    if (needsVerification && !preferredAppName) {
+      // Failure cannot promote a guess to message_sender or rewrite its
+      // provenance. Keep the visible projection and expose unresolved debt.
+      failedTargets.push({ row, kind: 'sender', key: JSON.stringify(['sender', cid, sid]) });
+      continue;
+    }
     let sname =
       preferredAppName ||
       existingSenderName ||
@@ -614,8 +656,8 @@ function enrichRecords(opts, deps = {}) {
       if (!sname) continue;
     }
     const partner = chatPartner(row.raw, row.canonical);
-    const partnerId = partner?.open_id || partner?.id || partner?.user_id || null;
-    const partnerName = partner?.name || partner?.display_name || contactNames.get(partnerId) || null;
+    const partnerId = partner?.lookupId || null;
+    const partnerName = partner?.name || (partnerId ? personName(contactNames.get(partnerId), partner?.aliases) : '') || null;
     const senderLookupFailed = isAppSender
       ? String(sid).startsWith("cli_") && (failedAppIds.has(sid) || failedBotChats.has(cid) && appIdsByChat.get(cid)?.has(sid))
       : openId && (failedContactIds.has(openId) || failedMemberChats.has(cid) && groupUnresolved.get(cid)?.has(openId));
@@ -639,26 +681,26 @@ function enrichRecords(opts, deps = {}) {
     if (appName) {
       next.sender_name_source = "application_api";
       next.sender_name_confidence = "high";
-    } else if (appFallbackName && (opts.probeApps || !existingSenderName)) {
-      next.sender_name_source = appFallback?.source || "chat_bot_unique";
-      next.sender_name_confidence = appFallback?.confidence || "medium";
+    } else if (appFallbackName && (opts.probeApps || needsVerification || !existingSenderName)) {
+      next.sender_name_source = "chat_bot_app_id";
+      next.sender_name_confidence = "high";
     } else if (!existingSenderName && memberName) {
       next.sender_name_source = "chat_member";
       next.sender_name_confidence = "high";
     } else if (!existingSenderName && contactName) {
       next.sender_name_source = "contact";
       next.sender_name_confidence = "high";
-    } else if (opts.namesOnly && existingSenderName) {
+    } else if (opts.namesOnly && existingSenderName && !needsVerification) {
       next.sender_name_source = "message_sender";
       next.sender_name_confidence = "high";
     }
     if (next.sender_name_source !== 'local_history') delete next.sender_name_authority_source;
     // This workflow does not stamp the admitted sync account. A new lookup
     // cannot inherit an older observation's account provenance by object spread.
-    if (appName || appFallbackName && (opts.probeApps || !existingSenderName)
-      || !existingSenderName && (memberName || contactName) || opts.namesOnly && existingSenderName) {
+    if (appName || appFallbackName && (opts.probeApps || needsVerification || !existingSenderName)
+      || !existingSenderName && (memberName || contactName) || opts.namesOnly && existingSenderName && !needsVerification) {
       delete next.sender_name_account_key;
-      setAdoptedNameObservation(next, reviewRequested(opts) || opts.namesOnly && existingSenderName
+      setAdoptedNameObservation(next, reviewRequested(opts) || opts.namesOnly && existingSenderName && !needsVerification
         ? null : resolver.senderNameObservation(sid, cid, isAppSender ? 'app_id' : 'open_id'));
     }
     if (!opts.namesOnly) {
@@ -672,13 +714,13 @@ function enrichRecords(opts, deps = {}) {
         delete next.chat_name_state;
         if (cname) next.chat_name_source = "local_history";
       }
-      if (partnerId || next.chat_partner) {
+      if (partner) {
         next.chat_partner = {
-          ...(next.chat_partner && typeof next.chat_partner === "object" ? next.chat_partner : {}),
-          open_id: partnerId,
+          ...partner.value,
           name: partnerName,
         };
-        delete next.chat_partner.name_state;
+        if (partnerName) delete next.chat_partner.name_state;
+        else if (partner.cleared) next.chat_partner.name_state = 'cleared';
       }
       if (typeof row.raw.deleted === "boolean" && typeof next.deleted !== "boolean") next.deleted = row.raw.deleted;
     }
@@ -692,18 +734,21 @@ function enrichRecords(opts, deps = {}) {
   }
 
   const { updates, projections, projectionJson } = prepareUpdates(dbPath, rows, proposals, opts.namesOnly, admission);
-  const unresolved = opts.namesOnly ? rows.filter((row) => !personName(projections.get(row.id)?.sender_name,
-    [row.actor_id, ...senderIdentity(row.raw).identifiers])).length : 0;
+  const stillUnresolved = row => !personName(projections.get(row.id)?.sender_name,
+    [row.actor_id, ...senderIdentity(row.raw).identifiers])
+    || legacyAppNameNeedsVerification(row.raw, projections.get(row.id) || row.canonical);
+  const unresolved = opts.namesOnly ? rows.filter(stillUnresolved).length : 0;
   const unresolvedNameTargets = new Set();
   if (opts.namesOnly) for (const row of rows) {
-    if (!personName(projections.get(row.id)?.sender_name, [row.actor_id, ...senderIdentity(row.raw).identifiers])) {
+    if (stillUnresolved(row)) {
       unresolvedNameTargets.add(JSON.stringify(['sender', row.container_id, row.actor_id]));
     }
   }
   for (const target of failedTargets) {
     const canonical = projections.get(target.row.id) || {};
     const unresolved = target.kind === "sender"
-      ? canonical.sender_name_state !== "cleared" && !senderName(target.row.raw, canonical)
+      ? canonical.sender_name_state !== "cleared" && (!senderName(target.row.raw, canonical)
+        || legacyAppNameNeedsVerification(target.row.raw, canonical))
       : canonical.chat_partner?.name_state !== "cleared" && !canonical.chat_partner?.name && !canonical.chat_partner?.display_name;
     if (unresolved) unresolvedNameTargets.add(target.key);
   }
@@ -711,7 +756,7 @@ function enrichRecords(opts, deps = {}) {
   const reviewed = review?.finish(selected.map(row => {
     const exclusion = namesOnlyExclusion(row);
     const after = { ...effectiveRecord(row), canonical_json: projectionJson.get(row.id) ?? row.canonical_json };
-    const resolved = personName(projections.get(row.id)?.sender_name, [row.actor_id, ...senderIdentity(row.raw).identifiers]);
+    const resolved = !stillUnresolved(row);
     return { before: row, after, exclusion, outcome: exclusion ? 'excluded' : after.canonical_json !== row.canonical_json ? 'update' : resolved ? 'unchanged' : 'unresolved' };
   }), deps.assertReady);
   if (!opts.dryRun || !reviewed) deps.assertReady?.();

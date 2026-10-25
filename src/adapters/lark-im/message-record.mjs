@@ -270,7 +270,9 @@ function lookupDisplayNameDetails(context, id, chatIdValue, identifiers = id ? [
   const app = nameCandidate(context.apps?.get(id), "application_api", "high");
   if (app && (app.state === "cleared" || personName(app.name, identifiers))) return app;
   const appFallback = nameCandidate(context.app_fallbacks?.get(`${chatIdValue}:${id}`), "chat_bot_unique", "medium");
-  if (appFallback && (appFallback.state === "cleared" || personName(appFallback.name, identifiers))) return appFallback;
+  // Reject legacy guessed contexts even when supplied by another caller.
+  if (appFallback?.source === "chat_bot_app_id" && appFallback.confidence === "high"
+    && (appFallback.state === "cleared" || personName(appFallback.name, identifiers))) return appFallback;
   const chatMember = nameCandidate(context.chat_members?.get(`${chatIdValue}:${id}`), "chat_member", "high");
   if (chatMember && (chatMember.state === "cleared" || personName(chatMember.name, identifiers))) return chatMember;
   const contact = nameCandidate(context.contacts?.get(id), "contact", "high");
@@ -289,6 +291,33 @@ function lookupDisplayNameDetails(context, id, chatIdValue, identifiers = id ? [
  */
 function lookupDisplayName(context, id, chatIdValue) {
   return lookupDisplayNameDetails(context, id, chatIdValue)?.name || "";
+}
+
+/** Preserve the source's identity declarations, including invalid/conflicting
+ * ones: selecting one ID must not turn an ambiguous partner into a valid person.
+ * Contact/member maps contain open IDs only; a source user/union ID or an untyped
+ * ID with the same spelling cannot consume them.
+ * @param {Record<string, any> | null} partner
+ * @param {PeopleContext} context
+ * @param {string} chatIdValue
+ */
+function projectChatPartner(partner, context, chatIdValue) {
+  if (!partner) return null;
+  const identity = senderIdentity({ sender: partner });
+  const fields = Object.fromEntries(["id", "id_type", "open_id", "user_id", "union_id", "app_id", "sender_id"]
+    .filter((field) => Object.hasOwn(partner, field)).map((field) => [field, partner[field]]));
+  const directName = identity.conflict ? ""
+    : personName(partner.name, identity.identifiers) || personName(partner.display_name, identity.identifiers);
+  /** @type {NameDetails | null} */
+  const details = partner.name_state === "cleared"
+    ? { name: null, state: "cleared", source: "message_partner", confidence: "high" }
+    : directName ? { name: directName, source: "message_partner", confidence: "high" }
+      : identity.verified && identity.type === "open_id" && /^ou_[A-Za-z0-9_-]+$/.test(identity.id) && identity.id.length <= 512
+        ? lookupDisplayNameDetails({ contacts: context.contacts, chat_members: context.chat_members, self: context.self },
+          identity.id, chatIdValue, identity.identifiers)
+        : null;
+  return { ...fields, name: details?.state === "cleared" ? null : details?.name || null,
+    ...(details?.state === "cleared" ? { name_state: "cleared" } : {}) };
 }
 
 /**
@@ -311,9 +340,8 @@ function recordFromMessage(message, scopeId, direction, context = {}, scopeConfi
   const containerId = chatId(message) || scopeConfig.chat_id || "";
   const sender = message?.sender && typeof message.sender === "object" ? message.sender : {};
   const chatPartner =
-    message?.chat_partner && typeof message.chat_partner === "object" ? message.chat_partner : null;
+    message?.chat_partner && typeof message.chat_partner === "object" && !Array.isArray(message.chat_partner) ? message.chat_partner : null;
   const chatType = message?.chat_type || message?.chat?.chat_type || scopeConfig.chat_type || null;
-  const partnerId = chatPartner?.open_id || chatPartner?.id || chatPartner?.user_id || null;
   const directChatName = message?.chat_name || message?.chat?.name || "";
   const chatName = directChatName || scopeConfig.chat_name || null;
   const senderDirectName = senderIdentityConflict ? "" : senderName(message);
@@ -333,12 +361,6 @@ function recordFromMessage(message, scopeId, direction, context = {}, scopeConfi
   // Do not invent one from normalization time or the message timestamp.
   const nameObservation = !senderDirectName && Boolean(lookupNamespace)
     ? context.sender_name_observations?.get(JSON.stringify([containerId, actorId, identity.type])) : null;
-  const partnerDirectName = chatPartner?.name || chatPartner?.display_name || "";
-  /** @type {NameDetails | null} */
-  const partnerNameDetails = partnerDirectName
-    ? { name: partnerDirectName, source: "message_partner", confidence: "high" }
-    : lookupDisplayNameDetails(context, partnerId, containerId);
-  const partnerDisplayName = partnerNameDetails?.name || "";
   const canonical = {
     message_id: externalId,
     msg_type: message?.msg_type || message?.message_type || null,
@@ -362,13 +384,7 @@ function recordFromMessage(message, scopeId, direction, context = {}, scopeConfi
     chat_name: chatName,
     // Scope configuration is cached discovery metadata, not a new naming event.
     ...(chatName ? { chat_name_source: directChatName ? "message" : "scope_config" } : {}),
-    chat_partner: chatPartner
-      ? {
-          open_id: partnerId,
-          name: partnerDisplayName || null,
-          ...(partnerNameDetails?.state === "cleared" ? { name_state: "cleared" } : {}),
-        }
-      : null,
+    chat_partner: projectChatPartner(chatPartner, context, containerId),
     thread_id: message?.thread_id || null,
     deleted: typeof message?.deleted === "boolean" ? message.deleted : null,
     updated: typeof message?.updated === "boolean" ? message.updated : null,

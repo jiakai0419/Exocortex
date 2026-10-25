@@ -4,6 +4,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { chatScopeId } from "../src/adapters/lark-im/core.mjs";
 
 function assertJsonExecutionError(result, message) {
   assert.deepEqual(JSON.parse(result.stdout), {
@@ -74,7 +75,8 @@ function fixture(t, options = {}) {
       id TEXT PRIMARY KEY, source_id TEXT NOT NULL, config_json TEXT NOT NULL,
       updated_at TEXT, cursor_json TEXT, cursor_updated_at TEXT, enabled INTEGER DEFAULT 1
     );
-    CREATE TABLE records (id INTEGER PRIMARY KEY, first_seen_scope_id TEXT NOT NULL, source_id TEXT DEFAULT 'lark.im', direction TEXT, actor_id TEXT, canonical_json TEXT);
+    CREATE TABLE records (id INTEGER PRIMARY KEY, first_seen_scope_id TEXT NOT NULL, source_id TEXT DEFAULT 'lark.im',
+      record_type TEXT DEFAULT 'lark.im.message',container_id TEXT,direction TEXT, actor_id TEXT, canonical_json TEXT);
     CREATE TABLE sync_locks (scope_id TEXT PRIMARY KEY);
     CREATE TABLE maintenance_locks (
       name TEXT PRIMARY KEY, owner TEXT NOT NULL, acquired_at TEXT NOT NULL,
@@ -90,10 +92,10 @@ function addScope(dbPath, suffix, overrides = {}) {
   const config = { chat_id: `oc_shape_${suffix}`, chat_type: "group", chat_name: null, marker: "preserve", ...overrides };
   sqlite(dbPath, `
     INSERT INTO sync_scopes(id,source_id,config_json,updated_at,cursor_json,cursor_updated_at) VALUES (
-      ${sqlValue(`lark.im.received.chat.${suffix}`)}, 'lark.im', ${sqlValue(JSON.stringify(config))},
+      ${sqlValue(chatScopeId(config.chat_id))}, 'lark.im', ${sqlValue(JSON.stringify(config))},
       '2027-01-01T00:00:00.000Z', '{"created_at_ms":1800000000000}', '2027-01-01T00:00:00.000Z'
     );
-    INSERT INTO records (first_seen_scope_id) VALUES (${sqlValue(`lark.im.received.chat.${suffix}`)});
+    INSERT INTO records (first_seen_scope_id,container_id) VALUES (${sqlValue(chatScopeId(config.chat_id))},${sqlValue(config.chat_id)});
   `);
 }
 
@@ -106,7 +108,7 @@ function run(fixture, args = [], env = {}) {
 }
 
 function scopes(dbPath) {
-  return sqlite(dbPath, "SELECT * FROM sync_scopes ORDER BY id;", true);
+  return sqlite(dbPath, "SELECT * FROM sync_scopes ORDER BY json_extract(config_json,'$.chat_id');", true);
 }
 
 function locks(dbPath) {
@@ -165,7 +167,7 @@ test("partial conflicts preserve new discovery config while unchanged scopes are
   const newCursor = '{"created_at_ms":1800000600000}';
   const f = fixture(t, { beforeLookupSql: `UPDATE sync_scopes SET config_json = ${sqlValue(newConfig)},
     cursor_json = ${sqlValue(newCursor)}, updated_at = '2030-01-01T00:00:00.000Z'
-    WHERE id = 'lark.im.received.chat.a';` });
+    WHERE id = ${sqlValue(chatScopeId('oc_shape_a'))};` });
   addScope(f.dbPath, "b");
   const result = run(f);
   assert.equal(result.status, 2, result.stderr);

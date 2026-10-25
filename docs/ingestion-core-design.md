@@ -596,12 +596,9 @@ params: { "lang": "zh_cn" }
 token: tenant_access_token
 ```
 
-该接口需要应用具备“获取应用信息”相关权限，例如 `admin:app.info:readonly`。如果权限不足，系统允许降级到会话机器人列表做 best-effort 推断，但必须满足两个条件：
+该接口需要应用具备“获取应用信息”相关权限，例如 `admin:app.info:readonly`。如果权限不足，可以查询会话机器人列表，但只有明确返回匹配 app_id 且身份和名称均无冲突时才能采用名称，记为 `sender_name_source=chat_bot_app_id`、`sender_name_confidence=high`。
 
-1. 如果机器人列表返回可直接匹配的 app_id，才视为高置信度。
-2. 如果无法直接匹配，只能在“同一会话里只有一个待解析 app sender，且只有一个机器人候选”的唯一场景下使用中置信度 fallback。
-
-fallback 结果必须写入来源和置信度，例如 `sender_name_source=chat_bot_unique`、`sender_name_confidence=medium`。多机器人群、多个待解析 app sender、或机器人列表不可用时不能猜，必须保留 app_id 并让质量检查暴露缺口。
+唯一机器人或唯一待解析 app sender 不能证明应用身份。没有精确证据时保留 app_id 与未解析结果。历史 `chat_bot_unique/medium` 名称保留展示并进入持久复核任务，只有新的精确证据才能替换；它们不能作为其他消息的名称供体。后台预算、进度与重试契约见 `name-convergence.md`。
 
 ### `unmuted_chat_discovery`
 

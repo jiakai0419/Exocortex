@@ -2,6 +2,10 @@
 
 This describes the current Node candidate, not production acceptance. [Operations](operations.md) covers commands and maintenance; [Node reliability fixes](node-reliability-fixes.md) retains the original counterexamples. All test sources, identities, messages and databases are invented.
 
+The [name reading and recovery contract](name-convergence.md) describes exact chat
+title fallback, account-bound current observations, typed partner compatibility
+and the shared bounded sender/chat/recipient maintenance tail added by migration 015.
+
 ## Transactions and leases
 
 ### Sync account association (candidate)

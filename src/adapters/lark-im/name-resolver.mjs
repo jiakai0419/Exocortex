@@ -524,19 +524,11 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
 
         const remainingIds = pendingIds.filter((id) => !directMatches.has(id) && !conflicting.has(id));
         const remainingBots = bots.filter((bot) => !directMatches.has(botAppId(bot)) && !conflicting.has(botAppId(bot)));
-        const uniqueFallback = remainingIds.length === 1 && remainingBots.length === 1
-          && botAppIds(remainingBots[0]).length === 0
-          && Boolean(personName(botName(remainingBots[0]), [remainingIds[0], remainingBots[0]?.bot_id, remainingBots[0]?.open_id]));
-        if (uniqueFallback) {
-          names.set(`${chatIdValue}:${remainingIds[0]}`, {
-            name: botName(remainingBots[0]),
-            source: "chat_bot_unique",
-            confidence: "medium",
-          });
-        }
-        const ambiguous = remainingIds.length > 0 && remainingBots.length > 0 && !uniqueFallback;
+        // A chat's sole unbound bot does not establish an app identity. Only
+        // explicit, consistent app IDs above can supply a display name.
+        const ambiguous = remainingIds.length > 0 && remainingBots.length > 0;
         reportLookup({ kind: "chat_bots", chat_id: chatIdValue,
-          status: ambiguous ? "ambiguous" : directMatches.size > 0 || uniqueFallback ? "resolved" : "unresolved",
+          status: ambiguous ? "ambiguous" : directMatches.size > 0 ? "resolved" : "unresolved",
           pending_app_ids: remainingIds.length, bot_candidates: remainingBots.length });
       } catch (error) {
         for (const id of pendingIds) observe(`bot:${JSON.stringify([chatIdValue, id])}`, {
@@ -583,9 +575,15 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
         }
       }
 
-      const partner = message?.chat_partner && typeof message.chat_partner === "object" ? message.chat_partner : null;
-      const partnerId = partner?.open_id || partner?.id || partner?.user_id || "";
-      if (partnerId && !(partner.name || partner.display_name)) contactIds.push(partnerId);
+      const partner = message?.chat_partner && typeof message.chat_partner === "object" && !Array.isArray(message.chat_partner)
+        ? message.chat_partner : null;
+      const partnerMessage = { sender: partner || {} };
+      const partnerId = senderLookupNamespace(partnerMessage) === "open_id" ? senderOpenId(partnerMessage) : "";
+      if (partnerId && /^ou_[A-Za-z0-9_-]+$/.test(partnerId) && partnerId.length <= 512
+        && partner?.name_state !== "cleared" && !senderName(partnerMessage)) {
+        contactIds.push(partnerId);
+        aliases.set(partnerId, [...new Set([...(aliases.get(partnerId) || []), ...senderIdentity(partnerMessage).identifiers])]);
+      }
 
       const effectiveChatType = message?.chat_type || message?.chat?.chat_type || scopeConfig.chat_type || "";
       if (effectiveChatId && effectiveChatType !== "p2p" && openId && !senderName(message) && !isAppSender) {

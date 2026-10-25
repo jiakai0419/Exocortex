@@ -49,9 +49,11 @@ deadline, no retries, and at most one contact request plus two member pages, or
 one application request plus one bot-list request. Unique unbound bot inference
 cannot resolve an explicit verification.
 
-This adds no CLI, scheduled name refresh, global people table, or network activity
-to `messages`. Existing names-only repair still selects unknown names and does
-not silently become a refresh of all known names. Successful unreviewed maintenance lookups
+These observation helpers add no CLI, global people table, or network activity
+to `messages`. The separate bounded recovery scheduler is described in
+`name-convergence.md`. Names-only repair selects unknown names and historical
+`chat_bot_unique` guesses for exact verification; it does not refresh all known
+names. Unresolved historical guesses retain their adopted display. Successful unreviewed maintenance lookups
 record their own observation time; a name recovered only from stored message
 data clears unrelated old timing instead of inventing a fresh API observation.
 An unresolved names-only target still makes no proposal or metadata write. Callers must retain their
@@ -83,9 +85,10 @@ source metadata labels an ID as `open_id`. Member IDs must match the requested
 namespace; contradictory explicit `open_id` values are rejected. Bot mappings
 check every explicit app-ID alias before adopting a name; duplicate entries
 with missing or conflicting names cannot become success by filtering away the
-contradictory entry. The legacy medium-confidence unique-bot fallback applies
-only to an unbound bot, never a bot explicitly belonging to a different app;
-it remains unavailable to exact verification.
+contradictory entry. An unbound bot cannot establish an app identity, even when
+it is the only bot in the chat. Historical medium-confidence `chat_bot_unique`
+displays are retained while awaiting exact verification; they are not lookup
+evidence or donors for another message.
 
 Native actor-kind conflicts also reject local-history recipients, historical
 donors and SQL name inheritance. Binding an official lookup to the current

@@ -101,7 +101,7 @@ for (const alias of ['app_id', 'application_id', 'bot_app_id', 'cli_id']) {
   });
 }
 
-test('a truly unbound unique bot remains a scoped medium-confidence fallback, not exact verification', () => {
+test('an unbound unique bot supplies neither a display name nor exact verification', () => {
   const calls = [];
   const resolver = createNameResolver({ run(args) {
     calls.push(args[0]);
@@ -109,7 +109,7 @@ test('a truly unbound unique bot remains a scoped medium-confidence fallback, no
       : { items: [{ bot_name: CANDIDATE }] };
   } });
   const names = resolver.resolveChatBotAppFallbackNames(new Map([[CHAT, new Set([APP])]]), new Map(), {});
-  assert.deepEqual(names.get(`${CHAT}:${APP}`), { name: CANDIDATE, source: 'chat_bot_unique', confidence: 'medium' });
+  assert.equal(names.size, 0);
   const report = resolver.verifySenderName(appMessage(), ADOPTED, SELF);
   assert.equal(report.status, 'unresolved');
   assert.equal(report.adopted_name, ADOPTED);
