@@ -260,7 +260,7 @@ test('real offline JSON and terminal contracts preserve all fields, ordering, li
     'a schema-only preflight is followed by one consistent page/evidence read');
   assert.match(calls[0].sql, /FROM sqlite_schema/);
   assert.doesNotMatch(calls[0].sql, /FROM records|FROM sync_scopes/);
-  const scopes = JSON.parse(calls[1].result[0].scopes_json);
+  const scopes = calls[1].result.filter(row=>row.kind==='scope').map(row=>JSON.parse(row.payload));
   assert.deepEqual(scopes.map(scope => scope.id).sort(), [...new Set(f.records.map(record => chatScopeId(record.container_id)))].sort(),
     'the same snapshot contains two distinct page chat scopes, without repeated same-chat reads');
   const limitedCalls = [];
@@ -268,7 +268,7 @@ test('real offline JSON and terminal contracts preserve all fields, ordering, li
     const result = sqliteJson(db, sql, label); limitedCalls.push({ label, result }); return result;
   } }), [rows[0]]);
   assert.deepEqual(limitedCalls.map(call => call.label), ['read message snapshot schema', 'read message snapshot']);
-  assert.deepEqual(JSON.parse(limitedCalls[1].result[0].scopes_json).map(scope => scope.id), [chatScopeId(expected[0].container_id)],
+  assert.deepEqual(limitedCalls[1].result.filter(row=>row.kind==='scope').map(row=>JSON.parse(row.payload).id), [chatScopeId(expected[0].container_id)],
     'the limit-one snapshot excludes the other chat still present in this database');
   f.unchanged();
 });
