@@ -282,7 +282,10 @@ test("new projections reach SQLite and messages JSON/text; reads preserve raw, h
     native("post", { content: [[{ tag: "text", text: KEY }]] }, [amber, birch]),
     native("post", { content: [[{ tag: "at", user_id: "synthetic_stored_bridge" }]] },
       [{ key: KEY, id: "synthetic_stored_bridge", open_id: "synthetic_stored_bridge", name: "Synthetic Stored Bridge" }]),
-  ].map((value, index) => ({ ...value, message_id: `om_synthetic_mentions_${index}`, create_time: String(START + index) }));
+  ].map((value, index) => ({ ...value, message_id: `om_synthetic_mentions_${index}`, create_time: String(START + index),
+    // Supply ordinary conversation facts for this rendering integration test;
+    // ambiguity in the mention itself remains deliberately unresolved below.
+    chat_type: "group", chat_name: "Synthetic Mentions Room" }));
   const before = JSON.stringify(payloads);
   const rows = payloads.map((value) => recordFromMessage(normalizeApiMessage(value), "lark.im.sent_by_me", "sent"));
   assert.equal(rows[3].body, "@Synthetic Stored Bridge");
@@ -308,13 +311,24 @@ test("new projections reach SQLite and messages JSON/text; reads preserve raw, h
     return format === "json" ? JSON.parse(output.stdout) : output.stdout;
   }
   const json = messages("json");
-  for (const displayed of [loaded, json]) for (const row of rows) {
+  for (const displayed of [loaded, json]) for (const [index, row] of rows.entries()) {
     const value = displayed.find((item) => item.external_id === row.external_id);
     assert.equal(value.display.body, row.body);
     assert.equal(value.raw_json, row.raw_json);
     assert.equal(value.canonical_json, row.canonical_json);
     assert.equal(row.content_hash, hash(row.raw_json));
     assert.equal(value.raw.update_time, JSON.parse(row.raw_json).update_time);
+    assert.equal(value.actor_id, row.actor_id);
+    assert.equal(value.container_id, row.container_id);
+    assert.equal(value.occurred_at, row.occurred_at);
+    assert.equal(value.occurred_at_ms, row.occurred_at_ms);
+    assert.deepEqual(value.readiness, { version: 1, state: index === 0 ? "enriching" : "ready", requirements: [
+      { field: "sender", state: "satisfied", reason: null, evidence: "message_sender" },
+      { field: "recipient", state: "not_applicable", reason: null, evidence: "chat_destination" },
+      { field: "conversation", state: "satisfied", reason: null, evidence: "canonical" },
+      { field: "content", state: index === 0 ? "missing" : "satisfied", reason: index === 0 ? "content_partial" : null,
+        evidence: index === 0 ? null : "content_projection" },
+    ], reasons: index === 0 ? ["content_partial"] : [], next_action: index === 0 ? "resolve_content" : "none" });
   }
   for (const saved of store.sqliteQuery(db, "SELECT external_id, external_version, content_hash FROM records")) {
     const row = rows.find((value) => value.external_id === saved.external_id);
@@ -324,10 +338,21 @@ test("new projections reach SQLite and messages JSON/text; reads preserve raw, h
   assert.equal(loaded.find((value) => value.external_id === rows[0].external_id).canonical.content_rendering.reason,
     "unresolved_message_mention");
   const text = messages("text");
-  assert.match(text, /Owner: @_user_1/);
+  assert.match(json.find(value => value.external_id === rows[0].external_id).display.body, /Owner: @_user_1/,
+    "JSON preserves the original partial body without presenting it as complete terminal prose");
+  assert.doesNotMatch(text, /Owner: @_user_1/);
   assert.match(text, /@Synthetic @_user_2 Amber/);
   assert.match(text, /https:\/\/example.invalid\/@_user_2/);
   assert.match(text, /HISTORICAL_STORED_POST_BODY/);
+  assert.deepEqual(json.map(value => value.external_id), [...rows].reverse().map(row => row.external_id));
+  const blocks = text.trimEnd().split("\n\n");
+  assert.equal(blocks.length, 5, "all four selected messages keep their positions, including the partial one");
+  assert.equal(blocks[0], "Messages (4)\n完整 3 · 待补全 1 · 受阻 0");
+  assert.match(blocks[1], /@Synthetic Stored Bridge/);
+  assert.match(blocks[2], /HISTORICAL_STORED_POST_BODY/);
+  assert.match(blocks[3], /@Synthetic @_user_2 Amber/);
+  assert.equal(blocks[4], `SENT ${new Date(rows[0].occurred_at).toLocaleString()}  om_synth...  群聊\n  状态    等待完整信息\n  原因    消息内容未完整解析\n  查看    messages --format json 可检查已保存内容与原因`,
+    "the partial message keeps its actual event header and selected position");
   assert.equal(messages("json", ["--search", "HISTORICAL_STORED_POST_BODY"]).length, 1);
   assert.equal(state(), snapshot, "reads do not write back projections or alter the cursor");
   assert.equal(JSON.stringify(payloads), before);

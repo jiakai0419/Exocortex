@@ -6,7 +6,8 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { stripVTControlCharacters } from "node:util";
 import { quoteSql, sqliteExec } from "../dist/storage/sqlite/ingestion-store.js";
-import { createLegacyCardFixture, snapshot, assertOriginalContract } from "./helpers/card-projection-fixture.mjs";
+import { createLegacyCardFixture, snapshot, assertOriginalContract, assertPageContract,
+  expectedCardReadiness as expectedReadiness, renderedCardText as rendererText } from "./helpers/card-projection-fixture.mjs";
 
 // All messages, names, clocks and business descriptions are newly invented.
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -40,6 +41,10 @@ function inventedRows() {
     const entry = row(name, { text: body }, { body, direction });
     entry.raw.msg_type = "text";
     entry.canonical.msg_type = "text";
+    entry.raw.content = body;
+    entry.canonical.content = body;
+    delete entry.raw.content_rendering;
+    delete entry.canonical.content_rendering;
     return entry;
   };
   return [pending, completed,
@@ -58,7 +63,21 @@ function seed(t, rows = inventedRows()) {
     sqliteExec(fixture.dbPath, `UPDATE records SET direction='sent' WHERE external_id=${quoteSql(entry.raw.message_id)};`);
   }
   before = snapshot(fixture);
+  const selected = JSON.parse(messages(fixture, ['--format', 'json']));
+  assert.deepEqual(selected.map(item => item.external_id), [...rows].reverse().map(item => item.raw.message_id));
+  for (const original of rows) {
+    const item = selected.find(item => item.external_id === original.raw.message_id);
+    assertOriginalContract(item, original);
+    assert.deepEqual(item.readiness, expectedReadiness(original.expectedState, original.expectedReason));
+  }
   return fixture;
+}
+
+function assertException(output, state) {
+  assert.match(output, /  状态    /);
+  assert.match(output, state === 'blocked' ? /准备受阻/ : /等待完整信息/);
+  assert.match(output, /messages --format json/);
+  assert.doesNotMatch(output, /  消息\s|  发送人\s/);
 }
 
 // The shared messages helper always adds --format and NO_COLOR. This local
@@ -91,7 +110,7 @@ function expectedJson(entry, index) {
   const card = entry.expectedCard;
   const config = { chat_id: CHAT, chat_type: "group" };
   return {
-    id: index + 1, direction: entry.direction || "received", record_type: "lark.im.message",
+    id: index + 1, source_id: 'lark.im', direction: entry.direction || "received", record_type: "lark.im.message",
     occurred_at: new Date(START + index * 1000).toISOString(), occurred_at_ms: START + index * 1000,
     actor_id: entry.raw.sender.id, container_id: CHAT, external_id: entry.raw.message_id,
     body: entry.body, canonical_json: JSON.stringify(entry.canonical), raw_json: JSON.stringify(entry.raw),
@@ -99,6 +118,7 @@ function expectedJson(entry, index) {
     display: { external_id: `${entry.raw.message_id.slice(0, 8)}...`, scene: "群聊", sender: "Synthetic Sender",
       sender_type: "user", message_type: card ? "卡片" : "文本", recipient: null, chat: "Synthetic Cards",
       body: entry.body, ...(card ? { card } : {}) },
+    readiness: expectedReadiness(entry.expectedState, entry.expectedReason),
   };
 }
 
@@ -170,10 +190,11 @@ for (const [label, args, selected] of [
 
 test("partial, empty and action-only cards keep content and machine diagnostics without generic partial notes", (t) => {
   const partial = row("snapshot_partial", { elements: [textNode("Invented decision remains unknown."),
-    { tag: "invented_unsupported_tile", private_value: "INVENTED_HIDDEN_PAYLOAD" }] });
+    { tag: "invented_unsupported_tile", private_value: "INVENTED_HIDDEN_PAYLOAD" }] },
+  { expectedState: 'blocked', expectedReason: 'content_unsupported' });
   const actions = row("snapshot_actions", { elements: [{ tag: "button", text: textNode("Send invented request"),
     actions: [{ type: "action_request", action: { desired_result: "INVENTED_SUCCESS_PAYLOAD" } }] }] });
-  const empty = row("snapshot_empty", { elements: [] });
+  const empty = row("snapshot_empty", { elements: [] }, { expectedState: 'enriching', expectedReason: 'content_partial' });
   const fixture = seed(t, [partial, actions, empty]);
   const json = JSON.parse(messages(fixture, ["--format", "json"]));
   assert.equal(json[0].display.card.status, "structured_fallback");
@@ -184,11 +205,15 @@ test("partial, empty and action-only cards keep content and machine diagnostics 
   assert.equal(json[2].display.card.reason, "unsupported_card_structure");
   assert.equal(json[2].display.card.text, `Invented decision remains unknown.\n${PARTIAL_NOTICE}`);
   const output = messages(fixture);
+  assertPageContract(json, output, fixture.rows, { timeZone: 'UTC' });
   assert.equal(occurrences(output, NOTICE), 0);
   assert.equal(occurrences(output, ORDER_NOTICE), 0);
-  assert.match(output, /Invented decision remains unknown\./);
+  assert.doesNotMatch(output, /Invented decision remains unknown\./);
+  assert.match(rendererText(partial), /Invented decision remains unknown\./);
   assert.match(output, /卡片仅含交互操作，文本视图已收起/);
-  assert.match(output, /卡片未展开：没有可识别正文/);
+  assert.match(rendererText(empty), /卡片未展开：没有可识别正文/);
+  assert.match(output, /等待完整信息/);
+  assert.match(output, /准备受阻/);
   assert.doesNotMatch(output, /部分内容未展开/);
   assert.doesNotMatch(output, /INVENTED_HIDDEN_PAYLOAD|INVENTED_SUCCESS_PAYLOAD|Send invented request|已完成|已同意/);
 });
@@ -223,7 +248,7 @@ test("partial card projection preserves all source prose even when it matches om
   const prose = ["Invented opening.", ORDER_NOTICE, NOTICE, PARTIAL_NOTICE, "Invented closing."].join("\n");
   const original = row("snapshot_matching_source_notices", {
     elements: [textNode(prose), { tag: "invented_unsupported_widget", private_payload: "INVENTED_DO_NOT_DUMP" }],
-  });
+  }, { expectedState: 'blocked', expectedReason: 'content_unsupported' });
   const fixture = seed(t, [original]);
   const before = messages(fixture, ["--format", "json"]);
   const [json] = JSON.parse(before);
@@ -232,10 +257,13 @@ test("partial card projection preserves all source prose even when it matches om
     reason: "unsupported_card_structure", version: 3 });
   for (const mode of ["no-color", "force-color", "pipe"]) {
     const output = stripVTControlCharacters(messages(fixture, ["--limit", "5"], mode));
-    for (const line of prose.split("\n")) assert.ok(output.includes(`    ${line}\n`), line);
-    assert.equal(occurrences(output, ORDER_NOTICE), 1);
-    assert.equal(occurrences(output, NOTICE), 1);
-    assert.equal(occurrences(output, PARTIAL_NOTICE), 1, "only the source-authored text remains");
+    assertException(output, 'blocked');
+    assertPageContract([json], output, [original], { timeZone: 'UTC' });
+    const rendered = rendererText(original);
+    for (const line of prose.split("\n")) assert.ok(rendered.split('\n').includes(line), line);
+    assert.equal(occurrences(rendered, ORDER_NOTICE), 1);
+    assert.equal(occurrences(rendered, NOTICE), 1);
+    assert.equal(occurrences(rendered, PARTIAL_NOTICE), 1, "the pure renderer preserves the source-authored notice without adding its own");
     assert.doesNotMatch(output, /INVENTED_DO_NOT_DUMP/);
   }
   assert.equal(messages(fixture, ["--format", "json"]), before, "reading text must not mutate any JSON projection");
@@ -246,7 +274,7 @@ test("partial cards retain unknown values at their actual position and leave ori
     textNode("Invented owner: "), { tag: "at", user_id: "ou_invented_unresolved_owner" },
     textNode("Known final paragraph."),
     textNode("Invented destination: javascript:INVENTED_HIDDEN_LINK"),
-  ] });
+  ] }, { expectedState: 'blocked', expectedReason: 'content_unsupported' });
   const fixture = seed(t, [original]);
   const [json] = JSON.parse(messages(fixture, ["--format", "json"]));
   assertOriginalContract(json, original);
@@ -254,10 +282,14 @@ test("partial cards retain unknown values at their actual position and leave ori
   assert.equal(json.display.card.reason, "unsupported_card_link");
   assert.match(json.display.card.text, /部分内容未展开/);
   const output = messages(fixture);
-  assert.match(output, /Invented owner:/);
-  assert.match(output, /@未知用户/);
-  assert.match(output, /Known final paragraph\./);
-  assert.match(output, /\[不支持的链接\]/);
+  assertException(output, 'blocked');
+  assertPageContract([json], output, [original], { timeZone: 'UTC' });
+  const rendered = rendererText(original);
+  assert.match(rendered, /Invented owner:/);
+  assert.match(rendered, /@未知用户/);
+  assert.match(rendered, /Known final paragraph\./);
+  assert.match(rendered, /\[不支持的链接\]/);
+  assert.doesNotMatch(rendered, /部分内容未展开|INVENTED_HIDDEN_LINK/);
   assert.doesNotMatch(output, /部分内容未展开|INVENTED_HIDDEN_LINK/);
 });
 
@@ -298,7 +330,7 @@ for (const limit of ["output", "node", "depth", "input"]) {
       output: "[正文在此达到展示上限]", node: "[解析在此达到元素数量上限]",
       depth: "[此处嵌套超过解析深度上限]", input: "[此处输入超过解析上限]",
     };
-    const original = row(`snapshot_${limit}_limit`, sources[limit]);
+    const original = row(`snapshot_${limit}_limit`, sources[limit], { expectedState: 'enriching', expectedReason: 'content_partial' });
     const fixture = seed(t, [original]);
     const before = messages(fixture, ["--format", "json"]);
     const [json] = JSON.parse(before);
@@ -307,18 +339,18 @@ for (const limit of ["output", "node", "depth", "input"]) {
     assert.doesNotMatch(json.display.card.text, /在此达到|此处输入|此处嵌套/);
     for (const mode of ["no-color", "force-color", "pipe"]) {
       const output = stripVTControlCharacters(messages(fixture, [], mode));
-      assert.ok(output.includes(markers[limit]));
+      assertException(output, 'enriching');
+      assertPageContract([json], output, [original], { timeZone: 'UTC' });
+      const rendered = rendererText(original);
+      assert.ok(rendered.includes(markers[limit]));
+      assert.doesNotMatch(rendered, /部分内容未展开|INVENTED_HIDDEN_/);
       assert.doesNotMatch(output, /部分内容未展开|INVENTED_HIDDEN_/);
       if (limit === "output") {
-        const body = output.split("  消息\n")[1].replace(/\n$/, "").split("\n").map((line) => {
-          assert.ok(line.startsWith("    "));
-          return line.slice(4);
-        }).join("");
-        assert.equal(body.length, 16_000, "soft line breaks and indentation are outside the unchanged card budget");
-        assert.ok(body.endsWith(markers.output));
+        assert.equal(rendered.length, 16_000, "the independent renderer keeps its original bounded source output");
+        assert.ok(rendered.endsWith(markers.output));
       }
-      if (limit === "depth") assert.ok(output.includes(`    Invented opening\n    ${markers.depth}\n    Invented readable sibling`));
-      if (limit === "node") assert.doesNotMatch(output, /正文在此|    ---/);
+      if (limit === "depth") assert.ok(rendered.includes(`Invented opening\n${markers.depth}\nInvented readable sibling`));
+      if (limit === "node") assert.doesNotMatch(rendered, /正文在此|---/);
     }
     assert.equal(messages(fixture, ["--format", "json"]), before);
   });

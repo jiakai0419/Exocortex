@@ -24,8 +24,14 @@ const OLD = 'Synthetic Adopted Room';
 const FIRST_CONFIG = '{\n  "mode": "sent_by_me", "opaque": 9007199254740993\n}';
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const sqlValue = value => value == null ? 'NULL' : typeof value === 'number' ? String(value) : quoteSql(value);
-const selectedFields = ['id', 'direction', 'record_type', 'occurred_at', 'occurred_at_ms', 'actor_id',
+const selectedFields = ['id', 'source_id', 'direction', 'record_type', 'occurred_at', 'occurred_at_ms', 'actor_id',
   'container_id', 'external_id', 'body', 'canonical_json', 'raw_json'];
+const readyGroup = { version: 1, state: 'ready', requirements: [
+  { field: 'sender', state: 'satisfied', reason: null, evidence: 'message_sender' },
+  { field: 'recipient', state: 'not_applicable', reason: null, evidence: 'chat_destination' },
+  { field: 'conversation', state: 'satisfied', reason: null, evidence: 'scope_config' },
+  { field: 'content', state: 'satisfied', reason: null, evidence: 'content_projection' },
+], reasons: [], next_action: 'none' };
 
 function fixture(t, entries) {
   const dir = mkdtempSync(join(tmpdir(), 'exocortex-title-contract-synthetic-'));
@@ -233,6 +239,7 @@ test('real offline JSON and terminal contracts preserve all fields, ordering, li
     scope_config_json: FIRST_CONFIG, canonical: JSON.parse(stored.canonical_json), raw: JSON.parse(stored.raw_json),
     scope_config: JSON.parse(FIRST_CONFIG), display: { external_id: 'om_synth...', scene: '群聊', sender: AUTHOR,
       sender_type: 'user', message_type: '文本', recipient: null, chat: TITLE, body: stored.body },
+    readiness: readyGroup,
   })), 'public first-seen JSON text and all stored/display fields retain their complete contract');
   const expectedText = `Messages (3)\n\n${expected.map(stored => `${stored.direction.toUpperCase()} ${new Date(stored.occurred_at).toLocaleString('en-US', { timeZone: 'UTC' })}  om_synth...  群聊\n  发送人  ${AUTHOR}\n  群      ${TITLE}\n  类型    user / 文本\n  消息    ${stored.body}\n`).join('\n')}`;
   assert.equal(f.run({ format: 'text' }), expectedText);
@@ -247,11 +254,22 @@ test('real offline JSON and terminal contracts preserve all fields, ordering, li
   assert.deepEqual(f.run({ args: ['--search', 'body a'] }).map(value => value.external_id), ['om_synthetic_title_a']);
   const calls = [];
   assert.deepEqual(loadMessages(f.db, { direction: 'all', limit: 100, search: '' }, { sqliteJson: (db, sql, label) => {
-    calls.push({ sql, label }); return sqliteJson(db, sql, label);
+    const result = sqliteJson(db, sql, label); calls.push({ sql, label, result }); return result;
   } }), rows);
-  const exactQueries = calls.filter(call => call.label === 'read message conversation types');
-  assert.equal(exactQueries.length, 1, 'same-chat messages use one page-bounded scope batch');
-  assert.equal((exactQueries[0].sql.match(/lark\.im\.received\.chat\./g) || []).length, 2, 'the batch contains distinct page chats only');
+  assert.deepEqual(calls.map(call => call.label), ['read message snapshot schema', 'read message snapshot'],
+    'a schema-only preflight is followed by one consistent page/evidence read');
+  assert.match(calls[0].sql, /FROM sqlite_schema/);
+  assert.doesNotMatch(calls[0].sql, /FROM records|FROM sync_scopes/);
+  const scopes = JSON.parse(calls[1].result[0].scopes_json);
+  assert.deepEqual(scopes.map(scope => scope.id).sort(), [...new Set(f.records.map(record => chatScopeId(record.container_id)))].sort(),
+    'the same snapshot contains two distinct page chat scopes, without repeated same-chat reads');
+  const limitedCalls = [];
+  assert.deepEqual(loadMessages(f.db, { direction: 'all', limit: 1, search: '' }, { sqliteJson: (db, sql, label) => {
+    const result = sqliteJson(db, sql, label); limitedCalls.push({ label, result }); return result;
+  } }), [rows[0]]);
+  assert.deepEqual(limitedCalls.map(call => call.label), ['read message snapshot schema', 'read message snapshot']);
+  assert.deepEqual(JSON.parse(limitedCalls[1].result[0].scopes_json).map(scope => scope.id), [chatScopeId(expected[0].container_id)],
+    'the limit-one snapshot excludes the other chat still present in this database');
   f.unchanged();
 });
 
@@ -277,9 +295,20 @@ test('sent-first title fallback leaves historical system and card content untouc
   assert.deepEqual(system.display.system.missing_parameters, ['group_name']);
   assert.equal(system.display.system.current_group_context, null);
   assert.equal(system.display.body.includes(TITLE), false);
-  assert.equal(row(f, 'card', rows).display.card.text, 'Synthetic card body');
+  assert.match(system.display.body, /\[未知参数：group_name\]/, 'JSON retains the exact historical missing-parameter projection');
+  const partialSystem = structuredClone(readyGroup);
+  partialSystem.state = 'enriching'; partialSystem.reasons = ['content_partial']; partialSystem.next_action = 'resolve_content';
+  partialSystem.requirements[3] = { field: 'content', state: 'missing', reason: 'content_partial', evidence: null };
+  assert.deepEqual(system.readiness, partialSystem, 'a current title does not complete missing historical system parameters');
+  const card = row(f, 'card', rows);
+  assert.equal(card.display.card.text, 'Synthetic card body');
+  assert.deepEqual(card.readiness, readyGroup);
   const text = f.run({ format: 'text' });
   assert.match(text, /Synthetic card body/);
-  assert.match(text, /\[未知参数：group_name\]/);
+  const header = message => `SENT ${new Date(message.occurred_at).toLocaleString('en-US', { timeZone: 'UTC' })}  om_synth...  群聊`;
+  assert.equal(text, `Messages (2)\n完整 1 · 待补全 1 · 受阻 0\n\n${header(card)}\n  发送人  ${AUTHOR}\n  群      ${TITLE}\n  类型    user / 卡片\n  消息\n    Synthetic card body\n\n${header(system)}\n  状态    等待完整信息\n  原因    消息内容未完整解析\n  查看    messages --format json 可检查已保存内容与原因\n`,
+    'the complete card keeps its exact layout while the partial historical message keeps its selected position and event time');
+  assert.doesNotMatch(text, /\[未知参数：group_name\]/, 'the partial system projection remains inspectable in JSON rather than an ordinary complete text row');
   assert.doesNotMatch(text, /当前本地标题来源/);
+  assert.deepEqual(f.run(), rows, 'exception rendering never rewrites the raw, stored body or JSON projection');
 });

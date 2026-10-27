@@ -100,13 +100,33 @@ test('normalize → SQLite → messages separates the local scope title from his
     assert.deepEqual(row.display.system.context_parameters, [], key);
   }
   assert.match(byId.get('om_synthetic_operator').display.body, /\[未知参数：operator\]/);
+  assert.equal(explicit.readiness.state, 'ready');
+  assert.deepEqual(explicit.readiness.reasons, []);
+  assert.equal(good.readiness.state, 'enriching');
+  assert.deepEqual(good.readiness.reasons, ['content_partial']);
+  for (const row of output.filter(value => value !== explicit)) assert.notEqual(row.readiness.state, 'ready', row.external_id);
   const text = f.run('text');
   assert.match(text, /Synthetic snapshot room/);
-  assert.match(text, /current local title:\s+CURRENT SCOPE NAME MUST NOT BECOME EVENT NAME/);
-  assert.match(text, /当前本地标题来源\s+会话配置；观察时间未知/);
+  assert.match(good.display.body, /current local title:\s+CURRENT SCOPE NAME MUST NOT BECOME EVENT NAME/);
+  assert.doesNotMatch(text, /current local title:|当前本地标题来源/, 'current context remains inspectable in JSON without completing the historical event');
   assert.doesNotMatch(text, /群名来源/);
   assert.match(text, /Explicit historical room/);
-  assert.match(text, /\[未知参数：group_name\]/);
+  assert.doesNotMatch(text, /\[未知参数：group_name\]/);
+  const blocks = text.trimEnd().split('\n\n');
+  assert.equal(blocks.length, output.length + 1, 'every selected message retains one block, including each exception');
+  for (const [index, row] of output.entries()) {
+    const header = `RECEIVED ${new Date(row.occurred_at).toLocaleString('en-US', { timeZone: 'UTC' })}  om_synth...  ${row.display.scene}`;
+    assert.ok(blocks[index + 1].startsWith(`${header}\n`), row.external_id);
+    if (row === explicit) {
+      assert.ok(blocks[index + 1].includes('  发送人  系统\n'));
+      assert.ok(blocks[index + 1].includes('  类型    system / 系统\n'));
+      assert.ok(blocks[index + 1].includes('Explicit historical room'));
+    } else {
+      assert.ok(blocks[index + 1].includes(`  状态    ${row.readiness.state === 'blocked' ? '准备受阻' : '等待完整信息'}\n`), row.external_id);
+      assert.doesNotMatch(blocks[index + 1], /\n  消息 /);
+    }
+  }
+  assert.deepEqual(f.run('json'), output, 'exception rendering does not change historical bodies, source identity or JSON provenance');
 });
 
 test('only explicit event-time container context fills the limited semantic profile', () => {
@@ -132,9 +152,13 @@ for (const type of ['text', 'post', 'system']) test(`${type} CLI keeps complete 
     const body = 'x'.repeat(236) + cluster + ' synthetic tail';
     const parameters = type === 'system' ? { template: body } : type === 'text' ? { text: body }
       : { en_us: { title: '', content: [[{ tag: 'text', text: body }]] } };
-    const f = fixture(t, [{ raw: message(`${type}_unicode`, parameters, { msg_type: type }) }]);
+    const f = fixture(t, [{ raw: message(`${type}_unicode`, parameters, { msg_type: type,
+      ...(type === 'system' ? {} : { sender: { id: 'ou_synthetic_grapheme_author', id_type: 'open_id',
+        sender_type: 'user', name: 'Synthetic Grapheme Author' } }) }) }]);
     const row = f.run('json')[0];
     assert.equal(row.body, body); assert.equal(row.display.body, body);
+    assert.equal(row.readiness.state, 'ready', 'grapheme truncation is tested on a complete message, not an exception placeholder');
+    assert.deepEqual(row.readiness.reasons, []);
     const text = f.run('text');
     const bodyLines = text.split('\n').slice(text.split('\n').findIndex(line => /^  消息\s/.test(line)));
     const displayed = bodyLines.map((line, index) => index ? line.trim() : line.replace(/^  消息\s+/, '')).join('');

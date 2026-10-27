@@ -112,16 +112,24 @@ test("loadMessages builds stable direction and search SQL", () => {
   }, {
     sqliteJson: (dbPath, sql, label) => {
       calls.push({ dbPath, sql, label });
-      return [row()];
+      if (label==='read message snapshot schema') return [];
+      return [{kind:'metadata',position:0,payload:null,total:1,evaluated:1,not_evaluated:0,
+        source_max_record_id:1,read_at:'2026-06-20T00:00:00.000Z',schema_consistent:1},
+      {kind:'row',position:1,payload:JSON.stringify(row({source_id:'lark.im'})),total:null,
+        evaluated:null,not_evaluated:null,source_max_record_id:null,read_at:null,schema_consistent:null}];
     },
   });
 
   assert.equal(messages.length, 1);
   assert.equal(calls[0].dbPath, "/abs/db.sqlite");
-  assert.equal(calls[0].label, "read messages");
-  assert.match(calls[0].sql, /direction = 'received'/);
-  assert.match(calls[0].sql, /body LIKE '%O''Hara%'/);
-  assert.match(calls[0].sql, /LIMIT 7/);
+  assert.equal(calls.length,2);
+  assert.equal(calls[0].label,'read message snapshot schema');
+  assert.doesNotMatch(calls[0].sql,/FROM records/);
+  assert.equal(calls[1].label,'read message snapshot');
+  assert.match(calls[1].sql,/r.direction='received'/);
+  assert.match(calls[1].sql,/body LIKE '%O''Hara%'/);
+  assert.match(calls[1].sql,/LIMIT 7/);
+  assert.equal(messages[0].readiness.state,'blocked','incomplete synthetic source is not silently ready');
 });
 
 test("messages view renders system sender without unknown", () => {

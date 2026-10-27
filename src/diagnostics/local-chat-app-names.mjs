@@ -4,7 +4,8 @@ import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, realpat
 import { TextDecoder } from "node:util";
 import { personName, senderIdentity, senderNameFromSource } from "../adapters/lark-im/sender-identity.mjs";
 import { liveProbeContext } from "./live-probe-cache.mjs";
-import { senderLabel } from "./messages-report.mjs";
+import { applyVerifiedSenderMapping, senderLabel } from "./messages-report.mjs";
+import { validateJsonObjectText } from "../../dist/core/json-text-patch.js";
 
 const MAX_BYTES = 64 * 1024;
 /** @typedef {Record<string, any>} JsonObject */
@@ -105,7 +106,11 @@ function readLocalChatAppNames(dbPath) {
     if (BigInt(count) !== opened.size || !sameFile(opened, fstatSync(fd, { bigint: true }))
         || !sameFile(opened, lstatSync(sidecarPath, { bigint: true }))) fail("changed");
     let parsed;
-    try { parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(0, count))); }
+    try {
+      const text = new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(0, count));
+      validateJsonObjectText(text);
+      parsed = JSON.parse(text);
+    }
     catch { fail("invalid"); }
     const entries = validate(parsed, context.database_key);
     const state = { dbPath: canonicalPath, requestedDbPath: dbPath, databaseKey: context.database_key, sidecarPath, file: opened, entries };
@@ -143,6 +148,13 @@ function agree(values, expected) { return values.every((value) => value === unde
 function findEntry(message, entries) {
   const { raw, canonical, scope_config: config } = message;
   if (!object(raw) || !object(canonical) || !object(config) || message.record_type !== "lark.im.message") return null;
+  // Parsed last-key-wins objects cannot authorize a mapping across conflicting
+  // source bytes, even when their final values appear to match the sidecar.
+  try {
+    validateJsonObjectText(message.raw_json);
+    validateJsonObjectText(message.canonical_json);
+    if (message.scope_config_json != null) validateJsonObjectText(message.scope_config_json);
+  } catch { return null; }
   if (Object.hasOwn(raw, "raw_api") && !object(raw.raw_api)) return null;
   const native = object(raw.raw_api) ? raw.raw_api : raw;
   const sender = object(native.sender) ? native.sender : {};
@@ -182,7 +194,15 @@ function applyLocalChatAppNames(messages, state) {
   return messages.map((message) => {
     const entry = findEntry(message, state.entries);
     if (!entry) return message;
-    return { ...message, display: { ...message.display, sender: senderLabel(entry.name, entry.app_id, "app"),
+    // Only this current, file-bound validation produces the mapping envelope.
+    // A canonical source label alone never establishes these relationships.
+    const projected = message.readiness ? applyVerifiedSenderMapping(message, {
+      id: entry.app_id, id_type: 'app_id', name: entry.name, source: 'local_chat_app_name',
+      mapping: { database_key: state.databaseKey, source_id: 'lark.im', chat_id: entry.chat_id,
+        app_id: entry.app_id, tenant_key: entry.tenant_key, source_kind: entry.source.kind,
+        recorded_at: entry.source.recorded_at },
+    }) : { ...message, display: { ...message.display, sender: senderLabel(entry.name, entry.app_id, 'app') } };
+    return { ...projected, display: { ...projected.display,
       sender_name_source: { kind: "local_chat_app_name", source_kind: entry.source.kind,
         recorded_at: entry.source.recorded_at, evidence_refs: [...entry.source.evidence_refs] } } };
   });

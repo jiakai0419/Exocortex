@@ -109,7 +109,7 @@ function queueWithContactHistory(f) {
   return old;
 }
 
-function retryWithoutRemoteNames(f) {
+function retryWithoutRemoteNames(f, expectedNameCalls = 0) {
   const calls = [];
   // A fresh adapter also removes the previous resolver's in-memory cache.
   const runner = makeRunner((args) => {
@@ -121,8 +121,8 @@ function retryWithoutRemoteNames(f) {
     return page([f.root, f.child]);
   });
   const [result] = runner.retryDetails(f.db, OPTIONS, PROFILE);
-  assert.equal(calls.filter(isContact).length, 1);
-  assert.equal(calls.filter(isMember).length, 1);
+  assert.equal(calls.filter(isContact).length, expectedNameCalls);
+  assert.equal(calls.filter(isMember).length, expectedNameCalls);
   assert.equal(calls.filter((args) => args[0] === "api").length, 1);
   return result;
 }
@@ -151,7 +151,7 @@ test("merge-forward detail completion resolves its sender through the real conta
   assert.equal(calls.length, 3, "only list, detail and the target contact are requested");
 });
 
-test("standalone detail retry reuses verified contact history after name APIs fail and a resolver restart", (t) => {
+test("standalone detail retry reuses verified contact history before name APIs after a resolver restart", (t) => {
   const f = fixture(t);
   const historyBefore = queueWithContactHistory(f);
   const canonical = assertCompletedSource(f, retryWithoutRemoteNames(f));
@@ -174,7 +174,7 @@ for (const state of ["known", "cleared"]) {
       ...(state === "cleared" ? { sender_name_state: "cleared" } : {}),
     };
     sqliteExec(f.db, upsertRecordsSql([{ ...record, canonical_json: JSON.stringify(canonical) }]));
-    const after = assertCompletedSource(f, retryWithoutRemoteNames(f));
+    const after = assertCompletedSource(f, retryWithoutRemoteNames(f, state === 'cleared' ? 1 : 0));
     for (const key of ["sender_name", "sender_name_source", "sender_name_confidence", "sender_name_state"]) {
       assert.equal(after[key], canonical[key], key);
     }

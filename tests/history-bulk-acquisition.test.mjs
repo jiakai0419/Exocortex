@@ -12,11 +12,22 @@ import { activityDatabaseKey } from '../src/diagnostics/lark-im-activity-evidenc
 import { digest, sampleScopeHash } from '../src/diagnostics/remote-sample-core.mjs';
 import { writeRemoteSampleState, remoteSamplePaths } from '../src/runtime/worker/remote-sample-scheduler.mjs';
 import { executeLarkImHistory } from '../src/maintenance/history.mjs';
+import { readMessageAccountEvidence } from '../src/adapters/lark-im/message-account-evidence.mjs';
 import { loadHistoryDebtHints, mergeHistoryDebtHints, readHistoryDebtSchedule, readHistoryFairRound } from '../src/maintenance/history-debt.mjs';
 
 const SELF = { open_id: 'ou_synthetic_debt_observer', name: 'Synthetic observer' };
 const hash = text => createHash('sha256').update(text).digest('hex');
 const q = store.quoteSql;
+
+function assertOnlyAcquisitionProof(before,after) {
+  const canonical=JSON.parse(after.canonical_json);
+  const proof=readMessageAccountEvidence(after,canonical,JSON.parse(after.raw_json));
+  assert.ok(proof);assert.equal(proof.account_key,hash(`lark.im\0${SELF.open_id}`));
+  delete canonical.message_account_evidence;
+  assert.deepEqual(canonical,JSON.parse(before.canonical_json));
+  assert.ok(Date.parse(after.updated_at)>=Date.parse(before.updated_at));
+  assert.deepEqual({...after,canonical_json:before.canonical_json,updated_at:before.updated_at},before);
+}
 
 /** Everything is authored here. Real selector, shared session and transaction;
  * only the OS API/lease boundary and deterministic wall/monotonic clocks differ. */
@@ -143,9 +154,10 @@ test('metadata generation changed during the request cannot be refreshed from th
 });
 
 test('committed prefix remains exact when a later per-record CAS fails',t=>{
-  const f=fixture(t);let n=0;
+  const f=fixture(t),before=f.query('SELECT * FROM records WHERE id=1')[0];let n=0;
   const r=f.run({}, {commit:(db,o)=>{if(++n===2)store.sqliteExec(db,'UPDATE lark_im_history_scheduler SET generation=generation+1;');return store.commitBoundedReplayRecords(db,o);}});
-  assert.equal(r.ok,false);assert.equal(r.processed,1);assert.equal(r.failed,0);assert.equal(r.duplicate,1);
+  assert.equal(r.ok,false);assert.equal(r.processed,1);assert.equal(r.failed,0);assert.equal(r.duplicate,0);assert.equal(r.updated,1);
+  assertOnlyAcquisitionProof(before,f.query('SELECT * FROM records WHERE id=1')[0]);
   assert.equal(f.query('SELECT after_id FROM lark_im_history_progress')[0].after_id,1);
 });
 
@@ -178,14 +190,18 @@ test('a deadline reached during one local commit cannot start another row from t
 });
 
 test('a shared response cannot confirm its own same-version candidate on the next sweep',t=>{
-  const f=fixture(t,[2]);f.messages[0].body={content:'{"text":"Synthetic changed source"}'};
-  const first=f.run({maxSelfAttempts:2});assert.equal(first.processed,2);assert.equal(first.conflicts,1);assert.equal(first.updated,0);
+  const f=fixture(t,[2]),before=f.query('SELECT * FROM records ORDER BY id');f.messages[0].body={content:'{"text":"Synthetic changed source"}'};
+  const first=f.run({maxSelfAttempts:2});assert.equal(first.processed,2);assert.equal(first.conflicts,1);assert.equal(first.updated,1);
+  const after=f.query('SELECT * FROM records ORDER BY id');assert.deepEqual(after[0],before[0]);
+  assertOnlyAcquisitionProof(before[1],after[1]);
   assert.notEqual(f.query('SELECT candidate_json FROM record_observation_state WHERE record_id=1')[0].candidate_json,null);
   const second=f.run({maxSelfAttempts:2});assert.equal(second.updated,1);
 });
 
 test('single-record public execution retains its original self then list acquisition',t=>{
-  const f=fixture(t),r=f.run({maxRecords:1,maxCliAttempts:4});assert.equal(r.duplicate,1);assert.equal(r.request_budget.cli_attempts,2);
+  const f=fixture(t),before=f.query('SELECT * FROM records WHERE id=1')[0],r=f.run({maxRecords:1,maxCliAttempts:4});
+  assert.equal(r.duplicate,0);assert.equal(r.updated,1);assert.equal(r.request_budget.cli_attempts,2);
+  assertOnlyAcquisitionProof(before,f.query('SELECT * FROM records WHERE id=1')[0]);
   assert.equal(f.calls[0][0],'contact');assert.equal(f.calls[1][2],'/open-apis/im/v1/messages');
 });
 

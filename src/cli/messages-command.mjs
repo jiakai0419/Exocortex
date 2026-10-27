@@ -2,7 +2,7 @@
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { CliExecutionError } from "./context.mjs";
-import { loadMessages } from "../diagnostics/messages-report.mjs";
+import { loadMessages, retainMessagesMetadata, readMessagesMetadata } from "../diagnostics/messages-report.mjs";
 import { applyLocalChatAppNames, LocalChatAppNamesError, readLocalChatAppNames } from "../diagnostics/local-chat-app-names.mjs";
 import { renderMessagesText } from "../terminal/messages-view.mjs";
 import { SqliteReadError } from "../storage/sqlite/readonly-query.mjs";
@@ -21,7 +21,10 @@ export function executeMessages(options, deps = {}) {
   try {
     const names = (deps.readLocalChatAppNames || readLocalChatAppNames)(dbPath);
     const messages = (deps.loadMessages || loadMessages)(names?.dbPath || dbPath, options);
-    return (deps.applyLocalChatAppNames || applyLocalChatAppNames)(messages, names);
+    const result=retainMessagesMetadata(messages,(deps.applyLocalChatAppNames || applyLocalChatAppNames)(messages,names));
+    const metadata=readMessagesMetadata(result);
+    if(metadata) metadata.observation_complete=true;
+    return result;
   } catch (error) {
     if (error instanceof LocalChatAppNamesError) throw new CliExecutionError(error.message);
     if (error instanceof SqliteReadError && Object.hasOwn(READ_ERRORS, error.reason)) {

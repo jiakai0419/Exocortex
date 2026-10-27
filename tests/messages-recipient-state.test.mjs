@@ -45,11 +45,25 @@ test('orphan sent chat consumes only explicit account-bound evidence, with uncha
   const records = sqliteJson(db, 'SELECT * FROM records;', 'synthetic records');
   const scopes = sqliteJson(db, 'SELECT * FROM sync_scopes;', 'synthetic scopes');
   assert.equal(before[0].display.scene, '会话类型未知');
+  assert.deepEqual(before[0].readiness, { version: 1, state: 'enriching', requirements: [
+    { field: 'sender', state: 'missing', reason: 'sender_name_unverified', evidence: null },
+    { field: 'recipient', state: 'missing', reason: 'recipient_identity_unknown', evidence: null },
+    { field: 'conversation', state: 'missing', reason: 'conversation_type_unknown', evidence: null },
+    { field: 'content', state: 'satisfied', reason: null, evidence: 'content_projection' },
+  ], reasons: ['sender_name_unverified', 'recipient_identity_unknown', 'conversation_type_unknown'], next_action: 'resolve_sender' });
   sqliteExec(db, evidenceSql({ text: null }));
   assert.deepEqual(loadMessages(db, opts), before, 'queue presence is not a conversation identity');
   sqliteExec(db, evidenceSql());
   const expected = structuredClone(before);
   Object.assign(expected[0].display, { scene: '私聊', recipient: NAME, chat: null });
+  // This legacy sender name still lacks authority. Recipient recovery can
+  // satisfy its own fields without promoting the entire row to ready.
+  expected[0].readiness = { version: 1, state: 'enriching', requirements: [
+    { field: 'sender', state: 'missing', reason: 'sender_name_unverified', evidence: null },
+    { field: 'recipient', state: 'satisfied', reason: null, evidence: 'contact' },
+    { field: 'conversation', state: 'satisfied', reason: null, evidence: 'exact_conversation' },
+    { field: 'content', state: 'satisfied', reason: null, evidence: 'content_projection' },
+  ], reasons: ['sender_name_unverified'], next_action: 'resolve_sender' };
   assert.deepEqual(loadMessages(db, opts), expected);
   assert.deepEqual(buildStatus(db), status, 'recipient evidence does not change status shape or counts');
   assert.deepEqual(sqliteJson(db, 'SELECT * FROM records;', 'synthetic records'), records);
@@ -60,6 +74,13 @@ test('orphan sent chat consumes only explicit account-bound evidence, with uncha
     { encoding: 'utf8', env: { ...process.env, LARK_CLI: join(dir, 'absent-cli') }, timeout: 5000 });
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(JSON.parse(result.stdout), expected);
+  const text = spawnSync(process.execPath, ['bin/exocortex.mjs', 'messages', '--db', db, '--format', 'text'],
+    { encoding: 'utf8', env: { ...process.env, NO_COLOR: '1', LARK_CLI: join(dir, 'absent-cli') }, timeout: 5000 });
+  assert.equal(text.status, 0, text.stderr);
+  assert.match(text.stdout, /Messages \(1\)\n完整 0 · 待补全 1 · 受阻 0/);
+  assert.ok(text.stdout.includes(`SENT ${new Date(AT).toLocaleString()}  om_synth...  私聊\n`));
+  assert.match(text.stdout, /状态\s+等待完整信息\n.*原因\s+发送人名称待核验/);
+  assert.doesNotMatch(text.stdout, /\n  发送人  |\n  接收人  /);
   assert.deepEqual(readFileSync(db), bytes, 'messages remains offline and strictly read-only');
 });
 

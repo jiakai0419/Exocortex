@@ -24,7 +24,7 @@ const hash = (value) => createHash("sha256").update(value).digest("hex");
 
 function record(key, sender, { canonical = {}, omit = [], actor, wrap = false, msgType = "text" } = {}) {
   const source = { message_id: `om_synthetic_sender_${key}`, create_time: String(START),
-    update_time: String(START + 17), chat_id: "oc_synthetic_sender_workshop", chat_type: "group",
+    update_time: String(START + 17), chat_id: "oc_synthetic_sender_workshop", chat_type: "group", chat_name: "Synthetic Sender Workshop",
     msg_type: msgType, content: { text: `SYNTHETIC_BODY_${key}` }, sender };
   const result = recordFromMessage(source, SCOPE, "received");
   const projected = { ...JSON.parse(result.canonical_json), ...canonical };
@@ -87,6 +87,14 @@ function messages(f, format) {
   return format === "json" ? JSON.parse(result.stdout) : result.stdout;
 }
 
+const states = {
+  canonical_conflict:'blocked',raw_conflict_legacy:'blocked',canonical_conflict_only:'blocked',malformed_source:'blocked',
+  source_actor_disagrees:'blocked',row_actor_disagrees:'blocked',namespace_disagrees:'blocked',malformed_namespace:'blocked',idless_cannot_name_actor:'blocked',
+  cleared:'blocked',stale_name_with_clear:'blocked',source_alias_echo:'enriching',canonical_alias_echo:'enriching',canonical_actor_echo:'enriching',
+  display_name_after_echo:'ready',echo_can_fall_back:'ready',legacy_untyped:'enriching',legacy_typed:'ready',nested:'ready',wrapped:'blocked',
+  idless:'enriching',canonical_first:'ready',canonical_without_raw_name:'enriching',unknown_person:'enriching',no_sender:'enriching',system:'enriching',
+  known_app:'ready',legacy_app:'enriching',unknown_app:'enriching',
+};
 function verify(t, cases) {
   const rows = cases.map(({ row }) => row);
   const f = fixture(t, rows);
@@ -94,6 +102,9 @@ function verify(t, cases) {
   const json = messages(f, "json");
   const text = messages(f, "text");
   assert.equal(json.length, cases.length);
+  assert.deepEqual(json.map(item=>item.external_id),rows.map(item=>item.external_id).sort().reverse());
+  const blocks=text.split(/\n\n/).filter(part=>/^RECEIVED |^SENT /m.test(part));
+  assert.equal(blocks.length,cases.length,'exceptions keep the selected population and positions');
   for (const { row, expected } of cases) {
     const actual = json.find((entry) => entry.external_id === row.external_id);
     assert.ok(actual, row.external_id);
@@ -102,9 +113,21 @@ function verify(t, cases) {
     assert.deepEqual(actual.raw, JSON.parse(row.raw_json));
     assert.deepEqual(actual.canonical, JSON.parse(row.canonical_json));
     assert.equal(actual.display.body, row.body);
-    const block = text.split("\n\n").find((part) => part.includes(row.body));
-    assert.ok(block, row.external_id);
-    assert.equal(block.match(/发送人\s+([^\n]+)/)?.[1], expected, row.external_id);
+    const expectedState=states[row.external_id.replace('om_synthetic_sender_','')];
+    assert.ok(expectedState,'each authored case must declare readiness');
+    assert.equal(actual.readiness.state,expectedState,JSON.stringify(actual.readiness));
+    const block=blocks[json.indexOf(actual)];
+    assert.ok(block.includes(actual.display.external_id));
+    if(expectedState==='ready') {
+      assert.ok(block.includes(row.body));
+      assert.equal(block.match(/发送人\s+([^\n]+)/)?.[1],expected,row.external_id);
+      assert.deepEqual(actual.readiness.reasons,[]);
+    } else {
+      assert.ok(actual.readiness.reasons.length>0);
+      assert.match(block,/状态\s+(?:等待完整信息|准备受阻)/);
+      assert.doesNotMatch(block,/^  发送人\s/m);
+      assert.ok(!block.includes(row.body),'incomplete source remains inspectable in exact JSON, not ordinary text');
+    }
   }
   assert.deepEqual(messages(f, "json"), json, "text reading cannot affect subsequent JSON");
   assert.deepEqual(snapshot(f), before, "reading preserves bytes, all tables, schema, hash/version, times and directory contents");
@@ -163,10 +186,10 @@ test("clear and every source alias echo remain unknown while a valid display_nam
   ]);
 });
 
-test("trusted legacy, typed nested and wrapped sender names remain readable", (t) => {
+test("legacy sender candidates retain exact JSON while only trusted typed sources become ordinary text", (t) => {
   verify(t, [
     { row: record("legacy_untyped", { id: ACTOR, name: "Invented Legacy Sender" },
-      { omit: ["sender_name", "sender_id_type"] }), expected: "Invented Legacy Sender" },
+      { omit: ["sender_name", "sender_id_type"] }), expected: unknown },
     { row: record("legacy_typed", { open_id: ACTOR, name: "Invented Typed Sender" },
       { omit: ["sender_name", "sender_id_type", "sender_id"] }), expected: "Invented Typed Sender" },
     { row: record("nested", { sender_id: { open_id: ACTOR, user_id: ALIAS }, display_name: "Invented Nested Sender" },
@@ -174,15 +197,15 @@ test("trusted legacy, typed nested and wrapped sender names remain readable", (t
     { row: record("wrapped", { id: ACTOR, id_type: "open_id", name: "Invented Native Sender" },
       { canonical: { sender_name: null }, wrap: true }), expected: "Invented Native Sender" },
     { row: record("idless", { name: "Invented IDless Sender" },
-      { omit: ["sender_name", "sender_id_type"] }), expected: "Invented IDless Sender" },
+      { omit: ["sender_name", "sender_id_type"] }), expected: "unknown" },
     { row: record("canonical_first", { id: ACTOR, id_type: "open_id", name: "Lesser Source Name" },
-      { canonical: { sender_name: "Invented Known Sender" } }), expected: "Invented Known Sender" },
+      { canonical: { sender_name: "Invented Known Sender" } }), expected: "Lesser Source Name" },
     { row: record("canonical_without_raw_name", { id: ACTOR, id_type: "open_id" },
       { canonical: { sender_name: "Invented Enriched Sender" } }), expected: "Invented Enriched Sender" },
   ]);
 });
 
-test("unknown sender IDs, applications and senderless systems keep their daily labels", (t) => {
+test("unknown sender candidates retain daily JSON labels and explicit text exceptions", (t) => {
   verify(t, [
     { row: record("unknown_person", { id: ACTOR, id_type: "open_id" }), expected: unknown },
     { row: record("no_sender", {}), expected: "unknown" },
@@ -190,7 +213,7 @@ test("unknown sender IDs, applications and senderless systems keep their daily l
     { row: record("known_app", { id: APP, id_type: "app_id", sender_type: "app", name: "Invented Lantern App" },
       { canonical: { sender_name: null } }), expected: "应用：Invented Lantern App" },
     { row: record("legacy_app", { id: APP, sender_type: "app", name: "Invented Legacy App" },
-      { omit: ["sender_name", "sender_id_type"] }), expected: "应用：Invented Legacy App" },
+      { omit: ["sender_name", "sender_id_type"] }), expected: `应用：${APP.slice(0,8)}...` },
     { row: record("unknown_app", { id: APP, id_type: "app_id", sender_type: "app" }), expected: `应用：${APP.slice(0, 8)}...` },
   ]);
 });

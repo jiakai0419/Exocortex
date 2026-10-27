@@ -4,8 +4,9 @@ import { quoteSql, REVIEW_RECORD_COLUMNS } from '../../../dist/storage/sqlite/in
 import { patchJsonText, validateJsonObjectText } from '../../../dist/core/json-text-patch.js';
 import { readOnlySqliteJson } from '../../storage/sqlite/readonly-query.mjs';
 import { createNameResolver } from './name-resolver.mjs';
-import { displayNameFromUser, personName, senderNameFromSource } from './sender-identity.mjs';
+import { displayNameFromUser, personName } from './sender-identity.mjs';
 import { senderNameTarget, nameTaskKey } from './name-evidence.mjs';
+import { senderNeedsAuthorityRepair } from './sender-authority-repair.mjs';
 import { recipientAccountKey } from './p2p-recipient.mjs';
 import { readNameProjectionPage } from './name-projection-progress.mjs';
 
@@ -102,7 +103,7 @@ function applyEvidence(task, evidence, query) {
   let capacityDeferred = page.capacityDeferred;
   for (const row of page.rows) {
     const target = matchingTarget(row, task);
-    if (!(target?.unknown || target?.needsVerification) || senderNameFromSource(target.raw)) continue;
+    if (!target || !senderNeedsAuthorityRepair(target,task.account_key)) continue;
     const observation = evidence.observation;
     if (!personName(observation.name, [row.actor_id, ...target.identity.identifiers])) continue;
     const next = { sender_name: observation.name, sender_name_source: observation.source,

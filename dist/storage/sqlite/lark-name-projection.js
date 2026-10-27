@@ -1,3 +1,4 @@
+import { messageAccountRetentionStages } from './message-account-projection.js';
 // Mirrors senderIdentity's finite source slots and string selection order.
 // Keep this SQL-side contract covered through actual record/store/enrich tests.
 const senderIdPaths = ['$.sender.id', '$.sender.open_id', '$.sender.sender_id.open_id',
@@ -172,13 +173,14 @@ function removeChatAccountTextSql(text) {
  * Keep name provenance together, and never carry it across different identities.
  * Ingestion evaluates this inside its write transaction; enrichment evaluates
  * a snapshot and commits only if that exact snapshot still matches. */
-function mergeLarkNameProjectionSql(existingJson, incomingJson, existingActor, incomingActor, existingContainer, incomingContainer, existingRaw = "'{}'", incomingRaw = "'{}'") {
-    const sameActor = `${existingActor} IS NOT NULL AND ${existingActor} <> ''
+function mergeLarkNameProjectionSql(existingJson, incomingJson, existingActor, incomingActor, existingContainer, incomingContainer, existingRaw = "'{}'", incomingRaw = "'{}'", accountRetention) {
+    const actorMatches = (allowLegacy = true) => `${existingActor} IS NOT NULL AND ${existingActor} <> ''
     AND ${existingActor} IS ${incomingActor}
     AND json_extract(old, '$.sender_id') IS ${existingActor}
     AND json_extract(next, '$.sender_id') IS ${incomingActor}
-    AND ${larkSenderNamespaceSql(existingJson, existingRaw, existingActor)}
-      = ${larkSenderNamespaceSql(incomingJson, incomingRaw, incomingActor)}`;
+    AND ${larkSenderNamespaceSql(existingJson, existingRaw, existingActor, allowLegacy)}
+      = ${larkSenderNamespaceSql(incomingJson, incomingRaw, incomingActor, allowLegacy)}`;
+    const sameActor = actorMatches();
     const sameContainer = `${existingContainer} IS NOT NULL AND ${existingContainer} <> ''
     AND ${existingContainer} IS ${incomingContainer}
     AND json_extract(old, '$.chat_id') IS ${existingContainer}
@@ -260,17 +262,69 @@ function mergeLarkNameProjectionSql(existingJson, incomingJson, existingActor, i
         AND (${sameActor}) AND (${sameContainer}) AND (${compatibleNameAccount})),0)
     THEN json('unverified_app_name_projection') ELSE next END AS next FROM ${beforeGuessGuard})`);
     // A lookup failure preserves the adopted name but records its own latest
-    // result. No lookup must not erase an earlier result or invent a new time.
+    // result. An absent lookup can retain an already account-bound diagnostic;
+    // it never binds the incoming record to a new account or invents a time.
+    // Inspect original incoming markers: name merging may already have restored
+    // adopted fields, which must not hide an explicit incompatible marker.
+    const adoptedAccount = `json_extract(old, '$.sender_name_account_key')`;
+    const diagnosticAccountPaths = ['$.sender_name_account_key', '$.chat_name_account_key',
+        '$.sender_name_verification.account_key'];
+    const diagnosticAccountsMatch = ['old', incomingJson].flatMap(json => diagnosticAccountPaths.map(path => `(json_type(${json}, '${path}') IS NULL OR json_type(${json}, '${path}') = 'text'
+      AND json_extract(${json}, '${path}') IS ${adoptedAccount})`)).join(' AND ');
+    // Legacy diagnostics with no account anywhere remain unbound. Null, invalid
+    // values, or a marker on only one side are not absence and cannot use this
+    // compatibility branch to manufacture or borrow account evidence.
+    const diagnosticAccountsAbsent = ['old', incomingJson].flatMap(json => diagnosticAccountPaths.map(path => `json_type(${json}, '${path}') IS NULL`)).join(' AND ');
+    const diagnosticKeysUnique = ['old', incomingJson].map(json => `NOT EXISTS (
+    SELECT key FROM json_each(${json})
+    WHERE key IN ('message_id','sender_id','sender_id_type','chat_id','sender_name','sender_name_source',
+      'sender_name_state','sender_name_account_key','chat_name_account_key','sender_name_verification')
+    GROUP BY key HAVING COUNT(*) > 1) AND NOT EXISTS (
+      SELECT key FROM json_each(CASE WHEN json_type(${json}, '$.sender_name_verification') = 'object'
+        THEN json_extract(${json}, '$.sender_name_verification') ELSE '{}' END)
+      WHERE key = 'account_key' GROUP BY key HAVING COUNT(*) > 1)`).join(' AND ');
+    const diagnosticSourceKeys = [
+        ['$', ['id', 'message_id', 'chat_id', 'sender_name_state', 'sender', 'chat', 'raw_api']],
+        ['$.sender', ['id', 'id_type', 'sender_id', 'open_id', 'user_id', 'union_id', 'app_id', 'sender_type', 'type', 'name_state']],
+        ['$.sender.sender_id', ['open_id', 'user_id', 'union_id', 'app_id']],
+        ['$.chat', ['id', 'chat_id']],
+    ];
+    const diagnosticSourceMatches = [existingRaw, incomingRaw].map(raw => `(WITH source AS MATERIALIZED (
+      SELECT CASE WHEN json_valid(${raw}) THEN ${raw} ELSE '{}' END AS raw
+    ), documents AS MATERIALIZED (
+      SELECT raw AS document FROM source UNION ALL
+      SELECT json_extract(raw, '$.raw_api') FROM source WHERE json_type(raw, '$.raw_api') = 'object'
+    ) SELECT json_valid(${raw}) AND (SELECT json_type(raw) FROM source) = 'object'
+      AND NOT EXISTS (SELECT 1 FROM documents WHERE
+        COALESCE(json_extract(document, '$.sender_name_state'), '') = 'cleared'
+        OR COALESCE(json_extract(document, '$.sender.name_state'), '') = 'cleared'
+        OR ${diagnosticSourceKeys.map(([path, keys]) => `EXISTS (SELECT key FROM json_each(
+          CASE WHEN json_type(document, '${path}') = 'object' THEN json_extract(document, '${path}') ELSE '{}' END)
+          WHERE key IN (${keys.map(key => `'${key}'`).join(',')}) GROUP BY key HAVING COUNT(*) > 1)`).join(' OR ')}
+        OR ${['$.message_id', '$.id'].map(path => `(json_type(document, '${path}') IS NOT NULL
+          AND (json_type(document, '${path}') <> 'text' OR json_extract(document, '${path}') IS NOT json_extract(old, '$.message_id')))`)
+        .concat(['$.chat_id', '$.chat.chat_id', '$.chat.id'].map(path => `(json_type(document, '${path}') IS NOT NULL
+          AND (json_type(document, '${path}') <> 'text' OR json_extract(document, '${path}') IS NOT ${existingContainer}))`)).join(' OR ')}
+      ))`).join(' AND ');
     const previous = `n${index}`;
     index += 1;
     stages.push(`n${index} AS MATERIALIZED (SELECT old, CASE
-    WHEN (${sameActor}) AND (${sameContainer})
+    WHEN (${actorMatches(false)}) AND (${sameContainer})
+      AND json_type(old, '$.message_id') = 'text' AND json_extract(old, '$.message_id') <> ''
+      AND json_extract(old, '$.message_id') IS json_extract(next, '$.message_id')
       AND json_type(next, '$.sender_name_verification') IS NULL
       AND json_type(old, '$.sender_name_verification') = 'object'
+      AND COALESCE(json_extract(old, '$.sender_name_state'), '') <> 'cleared'
+      AND COALESCE(json_extract(next, '$.sender_name_state'), '') <> 'cleared'
       AND json_extract(old, '$.sender_name') IS json_extract(next, '$.sender_name')
       AND json_extract(old, '$.sender_name_source') IS json_extract(next, '$.sender_name_source')
-      AND json_extract(old, '$.sender_name_verification.account_key')
-        IS json_extract(${incomingJson}, '$.sender_name_account_key')
+      AND ((json_type(old, '$.sender_name_account_key') = 'text'
+        AND length(${adoptedAccount}) = 64 AND ${adoptedAccount} NOT GLOB '*[^0-9a-f]*'
+        AND json_extract(old, '$.sender_name_verification.account_key') IS ${adoptedAccount}
+        AND json_extract(next, '$.sender_name_account_key') IS ${adoptedAccount}
+        AND (${diagnosticAccountsMatch}))
+        OR ((${diagnosticAccountsAbsent}) AND json_type(next, '$.sender_name_account_key') IS NULL))
+      AND (${diagnosticKeysUnique}) AND (${diagnosticSourceMatches})
     THEN json_set(next, '$.sender_name_verification', json_extract(old, '$.sender_name_verification'))
     ELSE next END AS next FROM ${previous})`);
     // This marker is written only by the fenced current-chat observation task.
@@ -337,9 +391,15 @@ function mergeLarkNameProjectionSql(existingJson, incomingJson, existingActor, i
     const comparable = (json) => `SELECT fullkey, type,
     CASE WHEN type IN ('integer', 'real') THEN ${json} -> fullkey ELSE atom END
     FROM json_tree(${json})`;
-    return `(WITH ${stages.join(',\n')} SELECT CASE WHEN
+    let resultStage = `n${index}`;
+    if (accountRetention) {
+        const retention = messageAccountRetentionStages(accountRetention.existingAlias, accountRetention.incomingAlias, resultStage);
+        stages.push(...retention.stages);
+        resultStage = retention.resultStage;
+    }
+    return `(WITH RECURSIVE ${stages.join(',\n')} SELECT CASE WHEN
     NOT EXISTS (${comparable('next')} EXCEPT ${comparable('old')})
     AND NOT EXISTS (${comparable('old')} EXCEPT ${comparable('next')})
-    THEN old ELSE next END FROM n${index})`;
+    THEN old ELSE next END FROM ${resultStage})`;
 }
 export { larkSenderNameIsUnknownSql, larkSenderNamespaceSql, mergeLarkNameProjectionSql };

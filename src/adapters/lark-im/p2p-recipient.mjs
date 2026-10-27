@@ -121,17 +121,26 @@ function explicitPartner(value) {
   if (!object(value)) return null;
   const identity = senderIdentity({ sender: value });
   if (!identity.verified || identity.conflict || !['open_id', 'user_id', 'union_id'].includes(identity.type || '')
-    || identity.type === 'open_id' && !openId(identity.id)) return null;
+    || identity.type === 'open_id' && !openId(identity.id)
+    || [value.sender_type, value.type].some(kind => kind != null && kind !== '' && kind !== 'user')
+    || [value.app_id, value.sender_id?.app_id].some(id => typeof id === 'string' && id)) return null;
+  // Keep every declared person alias until all message projections agree. A
+  // shared primary ID does not excuse a different user/union ID in a wrapper.
+  const aliases = Object.fromEntries(['open_id', 'user_id', 'union_id'].map(type => [type,
+    [value[type], value.sender_id?.[type], ...(value.id_type === type ? [value.id] : [])]
+      .filter(id => typeof id === 'string' && id)]));
   return { id: identity.id, type: identity.type, name: value.name_state === 'cleared' ? ''
     : personName(value.name, identity.identifiers) || personName(value.display_name, identity.identifiers),
-    cleared: value.name_state === 'cleared', self: false };
+    cleared: value.name_state === 'cleared', self: false, aliases };
 }
 
 /** Return only a person identity, never a chat title/ID. Unknown is explicit so
  * the existing recipient line remains visible without inventing a recipient. */
-function displayP2pRecipient(row, canonical, raw, currentChat) {
-  if (row.direction === 'received') return '我';
-  if (row.direction !== 'sent' || !messageMatches(row, canonical, raw)) return '未知';
+function resolveP2pRecipient(row, canonical, raw, currentChat) {
+  const unknown = (reason = 'recipient_identity_unknown') => ({ label: '未知', reason, evidence: null });
+  if (row.direction === 'received') return { label: '我', reason: null,
+    evidence: { is_self: true, name: '我', source: 'account_self', relationship_source: 'admitted_account' } };
+  if (row.direction !== 'sent' || !messageMatches(row, canonical, raw)) return unknown();
   // Older recordFromMessage stored every partner under open_id. A malformed
   // open-ID-shaped canonical projection cannot override an explicit raw user ID.
   // Do not accept an open-ID-shaped collision as a cross-namespace mapping.
@@ -142,25 +151,43 @@ function displayP2pRecipient(row, canonical, raw, currentChat) {
   const declarations = [...(legacyMistyped ? [] : [canonical.chat_partner]), raw.chat_partner, native(raw)?.chat_partner]
     .filter(value => value != null);
   const partners = declarations.map(explicitPartner);
-  if (partners.some(value => !value)) return '未知';
+  if (partners.some(value => !value)) return unknown('recipient_identity_conflict');
+  if (['open_id', 'user_id', 'union_id'].some(type =>
+    new Set(partners.flatMap(partner => partner?.aliases[type] || [])).size > 1)) {
+    return unknown('recipient_identity_conflict');
+  }
   const saved = scopeRecipient(row, canonical, raw, currentChat);
   // A new open-ID observation cannot establish or contradict an unrelated
   // user-ID/union-ID namespace. Preserve the message's typed name without
   // inventing an alias mapping. Conflicting declarations within the message
   // itself still fail the comparison below.
   const comparableSaved = saved && (!partners.length || partners.some(value => value?.type === saved.type)) ? saved : null;
-  if (comparableSaved?.conflicted) return '未知';
+  if (comparableSaved?.conflicted) return unknown('recipient_identity_conflict');
   const candidates = [...partners.filter(value => value !== null), ...(comparableSaved ? [comparableSaved] : [])];
-  if (!candidates.length || candidates.some(value => value.id !== candidates[0].id || value.type !== candidates[0].type)) return '未知';
+  if (!candidates.length) return unknown();
+  if (candidates.some(value => value.id !== candidates[0].id || value.type !== candidates[0].type)) return unknown('recipient_identity_conflict');
   // A clear in the message projection is not undone by a later local cache.
   const cleared = partners.some(value => value?.cleared) || legacyMistyped && old.name_state === 'cleared';
   const candidate = candidates[0];
   if (!cleared) {
-    const name = candidates.find(value => value.name)?.name;
-    if (name) return name;
-    if (comparableSaved?.self) return '我';
+    const named = candidates.find(value => value.name);
+    if (named) return { label: named.name, reason: null, evidence: {
+      id: candidate.id, id_type: candidate.type, name: named.name,
+      source: named === comparableSaved ? 'contact' : 'message_partner',
+      relationship_source: partners.length ? 'message_partner' : SOURCE, is_self: false } };
+    if (comparableSaved?.self) return { label: '我', reason: null, evidence: {
+      id: candidate.id, id_type: candidate.type, name: '我', source: 'account_self',
+      relationship_source: SOURCE, is_self: true } };
   }
-  return `${candidate.id.slice(0, 8)}...`;
+  return { label: `${candidate.id.slice(0, 8)}...`,
+    reason: cleared ? 'name_explicitly_cleared' : 'recipient_name_missing', evidence: {
+      id: candidate.id, id_type: candidate.type, name: '',
+      source: partners.length ? 'message_partner' : 'contact',
+      relationship_source: partners.length ? 'message_partner' : SOURCE, is_self: false } };
 }
 
-export { recipientAccountKey, sentRecipientAccount, parseP2pTarget, makeRecipientEvidence, readRecipientEvidence, displayP2pRecipient };
+function displayP2pRecipient(row, canonical, raw, currentChat) {
+  return resolveP2pRecipient(row, canonical, raw, currentChat).label;
+}
+
+export { recipientAccountKey, sentRecipientAccount, parseP2pTarget, makeRecipientEvidence, readRecipientEvidence, resolveP2pRecipient, displayP2pRecipient };

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createLegacyCardFixture, snapshot, messages, assertOriginalContract } from "./helpers/card-projection-fixture.mjs";
+import { createLegacyCardFixture, snapshot, messages, assertOriginalContract,
+  assertCardReadiness, expectedCardReadiness, assertPageContract, renderedCardText } from "./helpers/card-projection-fixture.mjs";
 
 // Newly authored fictional clocks, scope, identities and card prose only.
 const START = Date.UTC(2049, 5, 11, 9, 14);
@@ -36,17 +37,19 @@ test("historical card raw reprojects explicit at_all without rewriting source or
   const first = messages(fixture, "json");
   assert.equal(first.length, 1);
   assertOriginalContract(first[0], original);
+  assertCardReadiness(first[0]);
   assert.deepEqual(first[0].display.card, { text: "Invented workshop audience: @所有人; bring the paper compass.",
     status: "rendered", reason: null, version: 3 });
   assert.equal(first[0].raw.content_rendering.version, 1, "historical derived metadata must not be rewritten");
   assert.equal(first[0].canonical.content_rendering.version, 1);
   const human = messages(fixture, "text");
+  assertPageContract(first, human, [original]);
   assert.match(human, /    Invented workshop audience: @所有人; bring the paper compass\./);
   assert.doesNotMatch(human, /OLD_STORED_BODY_|LEGACY_DERIVED_CONTENT|部分内容未展开/);
   assert.deepEqual(messages(fixture, "json"), first, "text reading must leave every JSON value stable");
 });
 
-test("message JSON keeps exact legacy fields while only display.card gains explicit all semantics", (t) => {
+test("message JSON preserves legacy fields with explicit readiness and all semantics", (t) => {
   const original = row("audience_json_contract", { elements: [
     { tag: "markdown", elements: [text("Synthetic audience "), { tag: "at_all" }, text(" / owner "),
       { tag: "at", property: { user_id: "invented-missing-reader" } }] },
@@ -55,7 +58,7 @@ test("message JSON keeps exact legacy fields while only display.card gains expli
   const [actual] = messages(fixture, "json");
   assertOriginalContract(actual, original);
   const expectedWithoutCard = {
-    id: 1, direction: "received", record_type: "lark.im.message",
+    id: 1, source_id: "lark.im", direction: "received", record_type: "lark.im.message",
     occurred_at: new Date(START).toISOString(), occurred_at_ms: START,
     actor_id: original.raw.sender.id, container_id: original.raw.chat_id, external_id: original.raw.message_id,
     body: original.body, canonical_json: JSON.stringify(original.canonical), raw_json: JSON.stringify(original.raw),
@@ -64,12 +67,15 @@ test("message JSON keeps exact legacy fields while only display.card gains expli
     scope_config: { chat_id: original.raw.chat_id, chat_type: "group" },
     display: { external_id: `${original.raw.message_id.slice(0, 8)}...`, scene: "群聊", sender: "Synthetic Sender",
       sender_type: "user", message_type: "卡片", recipient: null, chat: "Synthetic Cards", body: original.body },
+    readiness: expectedCardReadiness("enriching", "content_partial"),
   };
   assert.deepEqual(withoutProjectedCard(actual), expectedWithoutCard);
   assert.deepEqual(actual.display.card, { text: "Synthetic audience @所有人 / owner @未知用户",
     status: "partial", reason: "unresolved_card_mention", version: 3 });
   const human = messages(fixture, "text");
-  assert.match(human, /Synthetic audience @所有人 \/ owner @未知用户/);
+  assertCardReadiness(actual, "enriching", "content_partial");
+  assertPageContract([actual], human, [original]);
+  assert.match(renderedCardText(original), /Synthetic audience @所有人 \/ owner @未知用户/);
   assert.deepEqual(messages(fixture, "json"), [actual]);
 });
 
@@ -84,7 +90,9 @@ test("historical unknown siblings keep machine diagnostics and human source orde
   assert.deepEqual(actual.display.card, { text: "Synthetic opening\n@所有人\nSynthetic closing\n[卡片部分内容未展开：部分结构尚未支持]",
     status: "partial", reason: "unsupported_card_structure", version: 3 });
   const human = messages(fixture, "text");
-  assert.match(human, /    Synthetic opening\n    @所有人\n    Synthetic closing/);
+  assertCardReadiness(actual, "blocked", "content_unsupported");
+  assertPageContract([actual], human, [original]);
+  assert.match(renderedCardText(original), /Synthetic opening\n@所有人\nSynthetic closing/);
   assert.doesNotMatch(human, /HIDDEN_SYNTHETIC_PAYLOAD|部分内容未展开/);
   assert.deepEqual(messages(fixture, "json"), [actual]);
 });

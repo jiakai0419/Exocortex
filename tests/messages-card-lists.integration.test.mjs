@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createLegacyCardFixture, snapshot, messages, assertOriginalContract } from "./helpers/card-projection-fixture.mjs";
+import { createLegacyCardFixture, snapshot, messages, assertOriginalContract,
+  assertCardReadiness, expectedCardReadiness, assertPageContract, renderedCardText } from "./helpers/card-projection-fixture.mjs";
 
 // All prose, dates, identities and URLs were authored from scratch.
 const START = Date.UTC(2064, 3, 6, 9, 20);
@@ -42,11 +43,13 @@ test("historical raw list content reprojects link labels and following dates wit
   const first = messages(fixture, "json");
   assert.equal(first.length, 1);
   assertOriginalContract(first[0], original);
+  assertCardReadiness(first[0]);
   assert.deepEqual(first[0].display.card, { text: "3. Paper Comet Archive （链接：https://example.invalid/archive/comet） opens on 2064-04-18; catalog closes 2064-05-02.",
     status: "rendered", reason: null, version: 3 });
   assert.equal(first[0].raw.content_rendering.version, 1);
   assert.equal(first[0].canonical.content_rendering.version, 1);
   const human = messages(fixture, "text");
+  assertPageContract(first, human, [original]);
   assert.equal(singleParagraphBody(human), first[0].display.card.text);
   assert.doesNotMatch(human, /HIDDEN_ENGLISH_COPY|OLD_STORED_BODY_|LEGACY_DERIVED_CONTENT/);
   assert.deepEqual(messages(fixture, "json"), first);
@@ -60,7 +63,7 @@ test("message JSON keeps the complete legacy contract while display.card gains a
   const [actual] = messages(fixture, "json");
   const { card: projectedCard, ...display } = actual.display;
   assert.deepEqual({ ...actual, display }, {
-    id: 1, direction: "received", record_type: "lark.im.message",
+    id: 1, source_id: "lark.im", direction: "received", record_type: "lark.im.message",
     occurred_at: new Date(START).toISOString(), occurred_at_ms: START,
     actor_id: original.raw.sender.id, container_id: original.raw.chat_id, external_id: original.raw.message_id,
     body: original.body, canonical_json: JSON.stringify(original.canonical), raw_json: JSON.stringify(original.raw),
@@ -69,6 +72,7 @@ test("message JSON keeps the complete legacy contract while display.card gains a
     scope_config: { chat_id: original.raw.chat_id, chat_type: "group" },
     display: { external_id: `${original.raw.message_id.slice(0, 8)}...`, scene: "群聊", sender: "Synthetic Sender",
       sender_type: "user", message_type: "卡片", recipient: null, chat: "Synthetic Cards", body: original.body },
+    readiness: expectedCardReadiness(),
   });
   assert.deepEqual(projectedCard, { text: "- Exhibition visitors @所有人 can browse the paper atlas on 2064-07-08.",
     status: "rendered", reason: null, version: 3 });
@@ -91,8 +95,10 @@ test("unknown list items remain diagnostic while following item prose and unknow
     status: "partial", reason: "unsupported_card_structure", version: 3,
   });
   const human = messages(fixture, "text");
-  assert.match(human, /\[序号未知\] Readable catalogue entry on 2069-08-14\./);
-  assert.match(human, /11\. Following known item\./);
+  assertCardReadiness(actual, "blocked", "content_unsupported");
+  assertPageContract([actual], human, [original]);
+  assert.match(renderedCardText(original), /\[序号未知\] Readable catalogue entry on 2069-08-14\./);
+  assert.match(renderedCardText(original), /11\. Following known item\./);
   assert.doesNotMatch(human, /HIDDEN_|卡片部分内容未展开/);
   assert.deepEqual(messages(fixture, "json"), [actual]);
 });
@@ -111,6 +117,8 @@ test("list projection hides request buttons, keeps navigation and dates, and san
   assert.deepEqual(actual.display.card, { text: "6. Paper Observatory Catalogue （链接：https://example.invalid/catalogue [链接敏感部分已省略]） is available until 2070-11-12.",
     status: "rendered", reason: null, version: 3, omitted_actions: 1 });
   const human = messages(fixture, "text");
+  assertCardReadiness(actual);
+  assertPageContract([actual], human, [original]);
   assert.equal(singleParagraphBody(human), actual.display.card.text);
   assert.doesNotMatch(human, /HIDDEN_|SYNTHETIC_PASSWORD|SYNTHETIC_QUERY|SYNTHETIC_FRAGMENT|archive:/);
   assert.deepEqual(messages(fixture, "json"), [actual]);
@@ -127,6 +135,8 @@ test("historical whitespace-only list items do not manufacture numbered entries 
   assert.deepEqual(actual.display.card, { text: "Exhibit opens\n8.   Paper sky catalogue on 2071-03-09.\nExhibit closes",
     status: "rendered", reason: null, version: 3 });
   const human = messages(fixture, "text");
+  assertCardReadiness(actual);
+  assertPageContract([actual], human, [original]);
   assert.match(human, /8\.   Paper sky catalogue on 2071-03-09\./);
   assert.doesNotMatch(human, /\n\s*[345]\.\s*(?:\n|$)/);
   assert.deepEqual(messages(fixture, "json"), [actual]);

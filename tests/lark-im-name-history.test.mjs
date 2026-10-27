@@ -20,6 +20,7 @@ const ACTOR = 'ou_synthetic_orchard_keeper';
 const CHAT = 'oc_synthetic_orchard_north';
 const SCOPE = 'lark.im.received.chat.synthetic_orchard_north';
 const SELF = { open_id: 'ou_synthetic_orchard_owner', name: 'Orchard Owner' };
+const ACCOUNT_KEY = createHash('sha256').update(`lark.im\0${SELF.open_id}`).digest('hex');
 function raw(id, overrides = {}) {
   return { message_id: `om_synthetic_orchard_${id}`, chat_id: CHAT, chat_type: 'group', msg_type: 'text',
     create_time: String(EPOCH + 100), update_time: String(EPOCH + 101),
@@ -32,7 +33,8 @@ function record(id, fields = {}, overrides = {}) {
   return value;
 }
 const known = (id = 'authority', source = 'contact', name = 'Orchard Keeper', overrides = {}) =>
-  record(id, { sender_name: name, sender_name_source: source, sender_name_confidence: 'high' }, overrides);
+  record(id, { sender_name: name, sender_name_source: source, sender_name_confidence: 'high',
+    sender_name_account_key: ACCOUNT_KEY }, overrides);
 const canonical = (value) => JSON.parse(value.canonical_json);
 function fixture(t, bound = true) {
   const dir = mkdtempSync(join(tmpdir(), 'exocortex-orchard-history-'));
@@ -59,6 +61,7 @@ test('verified history fills a new message without changing source facts; repeat
   assert.equal(canonical(filled).sender_name, 'Orchard Keeper');
   assert.equal(canonical(filled).sender_name_source, 'local_history');
   assert.equal(canonical(filled).sender_name_authority_source, 'contact');
+  assert.equal(canonical(filled).sender_name_account_key, ACCOUNT_KEY);
   for (const key of Object.keys(next).filter((key) => key !== 'canonical_json')) assert.equal(filled[key], next[key], key);
   put(db, filled);
   const snapshot = sqliteQuery(db, 'SELECT * FROM records ORDER BY id;');
@@ -115,16 +118,20 @@ test('typed namespace conflicts and newly revealed ID aliases cannot consume his
   }
 });
 
-test('a legacy single sent actor cannot authorize reuse from unrelated received history', (t) => {
+test('a legacy single sent actor cannot authorize unmarked history; explicit same-account adoption can', (t) => {
   const db = fixture(t, false);
   const self = record('legacy_self', { sender_name: 'Orchard Owner', sender_name_source: 'self', sender_name_confidence: 'high' },
     { sender: { id: SELF.open_id, id_type: 'open_id', sender_type: 'user' } });
   self.direction = 'sent';
-  put(db, self, known());
+  const unmarked = known();
+  unmarked.canonical_json = JSON.stringify({ ...canonical(unmarked), sender_name_account_key: undefined });
+  put(db, self, unmarked);
   const next = record('next');
   assert.strictEqual(reuse(db, next), next);
   const selfNext = record('self_next', {}, { sender: { id: SELF.open_id, id_type: 'open_id', sender_type: 'user' } });
   selfNext.direction = 'sent';
+  assert.strictEqual(reuse(db, selfNext), selfNext);
+  put(db, bindCurrentSenderNames([self], SELF)[0]);
   assert.equal(canonical(reuse(db, selfNext)).sender_name, 'Orchard Owner');
 });
 
@@ -163,7 +170,7 @@ test('application history requires typed app identity and exact matching bot evi
   }
 });
 
-test('ordinary incremental sync reuses persisted contact authority after a resolver restart and API failure', (t) => {
+test('ordinary incremental sync reuses persisted contact authority before name APIs after a resolver restart', (t) => {
   const db = fixture(t);
   put(db, known());
   const next = raw('incremental', { body: { content: JSON.stringify({ text: 'Invented incremental pear count.' }) } });
@@ -182,7 +189,7 @@ test('ordinary incremental sync reuses persisted contact authority after a resol
   const saved = canonical(sqliteQuery(db, `SELECT canonical_json FROM records WHERE external_id=${quoteSql(next.message_id)};`)[0]);
   assert.equal(saved.sender_name, 'Orchard Keeper');
   assert.equal(saved.sender_name_source, 'local_history');
-  assert.ok(calls.some((args) => args[0] === 'contact'));
+  assert.equal(calls.filter((args) => args[0] === 'contact').length, 0);
 });
 
 test('detail lookup deadline bounds requests and an expired budget prevents every remote name call', () => {

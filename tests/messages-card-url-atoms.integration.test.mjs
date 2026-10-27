@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { normalizeApiMessage } from "../src/adapters/lark-im/raw-message.mjs";
-import { createLegacyCardFixture, snapshot, messages, assertOriginalContract }
+import { createLegacyCardFixture, snapshot, messages, assertOriginalContract,
+  assertCardReadiness, assertPageContract, renderedCardText }
   from "./helpers/card-projection-fixture.mjs";
 
 // Freshly invented records represent persisted legacy projections.
@@ -16,6 +17,7 @@ function verifyReadOnlyProjection(t, originals, verify) {
   const before = snapshot(fixture);
   const json = messages(fixture, "json");
   const text = messages(fixture, "text");
+  assertPageContract(json, text, originals);
   for (const original of originals) {
     const displayed = json.find((record) => record.external_id === original.raw.message_id);
     assertOriginalContract(displayed, original);
@@ -79,11 +81,14 @@ for (const scenario of CASES) {
     verifyReadOnlyProjection(t, [original], (json, text) => {
       const projection = json[0].display.card;
       assert.ok((scenario.mayBePartial ? ["rendered", "partial"] : ["rendered"]).includes(projection.status), projection.status);
+      assertCardReadiness(json[0], projection.status === "rendered" ? "ready" : "blocked",
+        projection.status === "rendered" ? null : "content_unsupported");
+      const readable = projection.status === "rendered" ? text : renderedCardText(original);
       assert.doesNotMatch(projection.text, scenario.forbidden);
       assert.doesNotMatch(text, scenario.forbidden);
       for (const visible of scenario.visible) {
         assert.ok(projection.text.includes(visible), `${scenario.name}: projection lost ${visible}`);
-        assert.ok(text.includes(visible), `${scenario.name}: CLI lost ${visible}`);
+        assert.ok(readable.includes(visible), `${scenario.name}: source projection lost ${visible}`);
       }
       assert.doesNotMatch(text, /[\u0000-\u0009\u000B-\u001F\u007F-\u009F]/);
       assert.equal(JSON.parse(json[0].raw.body.content).elements[0].text.content, scenario.input);

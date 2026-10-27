@@ -9,6 +9,7 @@ import { chatScopeId } from '../src/adapters/lark-im/core.mjs';
 import { normalizeApiMessage } from '../src/adapters/lark-im/raw-message.mjs';
 import { prepareChatWindowRecords } from '../src/adapters/lark-im/sync-runner.mjs';
 import { executeLarkImHistory } from '../src/maintenance/history.mjs';
+import { readMessageAccountEvidence } from '../src/adapters/lark-im/message-account-evidence.mjs';
 
 // Real history selector, adapter, request-session budget and database transaction.
 // Only OS transport/lease boundaries are injected, never an actual API call.
@@ -30,7 +31,7 @@ test('unrelated merge roots never consume the selected ordinary history target b
   store.sqliteExec(db,store.upsertRecordsSql(prepareChatWindowRecords([normalizeApiMessage(target)],scope,null,start,start+60000,
     self.open_id,{self},{chat_id:chat,chat_type:'group'})));
   const before=store.sqliteQuery(db,'SELECT * FROM records;');
-  const outcomes=[];
+  const outcomes=[];let acquired;
   for(let sweep=0;sweep<2;sweep++){
     const calls=[];let tick=0,held=false;
     const result=executeLarkImHistory({db,maxCliAttempts:4,maxSeconds:30},{requestSessionDeps:{
@@ -50,7 +51,18 @@ test('unrelated merge roots never consume the selected ordinary history target b
     }});
     assert.equal(result.ok,true);assert.equal(result.outcome,'processed');assert.equal(calls.length,2);
     assert.equal(result.request_budget.cli_attempts,2);assert.equal(held,false);
-    assert.deepEqual(store.sqliteQuery(db,'SELECT * FROM records;'),before);
+    const after=store.sqliteQuery(db,'SELECT * FROM records;');
+    if(sweep===0){
+      const canonical=JSON.parse(after[0].canonical_json);
+      const proof=readMessageAccountEvidence(after[0],canonical,JSON.parse(after[0].raw_json));
+      assert.ok(proof);assert.equal(proof.account_key,hash(`lark.im\0${self.open_id}`));
+      delete canonical.message_account_evidence;
+      assert.deepEqual(canonical,JSON.parse(before[0].canonical_json));
+      assert.ok(Date.parse(after[0].updated_at)>=Date.parse(before[0].updated_at));
+      assert.deepEqual(after.map(row=>({...row,canonical_json:before[0].canonical_json,updated_at:before[0].updated_at})),before,
+        'first admitted acquisition changes only its proof and update clock');
+      acquired=after;
+    }else assert.deepEqual(after,acquired,'same source retains its first acquisition proof without renewing its clock');
     outcomes.push({outcome:result.outcome,calls:calls.map(args=>args[2]),budget:result.request_budget});
   }
   const progress=store.sqliteQuery(db,'SELECT completed_sweeps FROM lark_im_history_progress;')[0];

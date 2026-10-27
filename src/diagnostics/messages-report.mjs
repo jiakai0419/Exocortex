@@ -6,9 +6,17 @@ import { renderCardContent } from "../adapters/lark-im/card-content.mjs";
 import { personName, senderIdentity, senderNameFromSource } from "../adapters/lark-im/sender-identity.mjs";
 import { chatScopeId } from "../adapters/lark-im/core.mjs";
 import { displayChatTitle } from "../adapters/lark-im/chat-title.mjs";
-import { messageNameAccount, readChatNameEvidence } from "../adapters/lark-im/name-evidence.mjs";
+import { readChatNameEvidence } from "../adapters/lark-im/name-evidence.mjs";
 import { displayP2pRecipient, readRecipientEvidence, recipientAccountKey, sentRecipientAccount } from "../adapters/lark-im/p2p-recipient.mjs";
 import { patchTopLevelJsonMemberText, validateJsonObjectText } from "../../dist/core/json-text-patch.js";
+import { projectionAccount, readSenderProjectionEvidence, senderProjection, messageProjectionEvidence } from "../adapters/lark-im/message-projection-evidence.mjs";
+import { readMessageSnapshot } from "./message-read-snapshot.mjs";
+import { evaluateMessageCompleteness } from "../adapters/lark-im/message-completeness.mjs";
+import { readLocalSenderProjectionEvidence } from "../adapters/lark-im/name-history.mjs";
+
+// Ephemeral proof used only during this read. Never serialize it as canonical
+// authority or accept a caller-supplied source label in its place.
+const projectionEvidence = new WeakMap();
 
 /**
  * @typedef {"all" | "sent" | "received"} MessageDirection
@@ -18,6 +26,7 @@ import { patchTopLevelJsonMemberText, validateJsonObjectText } from "../../dist/
  * @property {MessageDirection} direction
  * @property {number} limit
  * @property {string} search
+ * @property {number[]=} recordIds Internal bounded observer selection; never a public CLI flag.
  *
  * @typedef {Record<string, any>} Row
  *
@@ -25,6 +34,7 @@ import { patchTopLevelJsonMemberText, validateJsonObjectText } from "../../dist/
  *   canonical: Row,
  *   raw: Row,
  *   scope_config: Row,
+ *   readiness?: Row,
  *   display: {
  *     external_id: string,
  *     scene: string,
@@ -74,112 +84,88 @@ function buildWhere(opts) {
  * @returns {EnrichedMessage[]}
  */
 function loadMessages(dbPath, opts, deps = {}) {
-  const queryJson = deps.sqliteJson || sqliteJson;
-  const rows = queryJson(
-    dbPath,
-    `SELECT
-       r.id,
-       r.direction,
-       r.record_type,
-       r.occurred_at,
-       r.occurred_at_ms,
-       r.actor_id,
-       r.container_id,
-       r.external_id,
-       r.body,
-       r.canonical_json,
-       r.raw_json,
-       s.config_json AS scope_config_json,
-       s.id AS type_scope_id,
-       s.source_id AS type_scope_source_id
-     FROM records r
-     LEFT JOIN sync_scopes s ON s.id = r.first_seen_scope_id
-     ${buildWhere(opts)}
-     ORDER BY r.occurred_at_ms DESC, r.external_id DESC
-     LIMIT ${Number(opts.limit)};`,
-    "read messages",
-  );
-  // First-seen scope is ingestion provenance. Look up only this page's exact
-  // chat scopes by primary key. The public first-seen config is retained.
-  const scopeIds = new Map(rows.filter((row) => typeof row.container_id === "string" && row.container_id)
-    .map((row) => [chatScopeId(row.container_id), row.container_id]));
+  const snapshot=readMessageSnapshot(dbPath,opts,deps), {rows}=snapshot;
+  const scopeIds=new Map(rows.filter(row=>typeof row.container_id==='string' && row.container_id)
+    .map(row=>[chatScopeId(row.container_id),row.container_id]));
   /** @type {Map<string, Row | null>} */
-  const chats = new Map();
-  if (scopeIds.size) {
-    const scopes = queryJson(dbPath, `SELECT id, source_id, config_json FROM sync_scopes
-      WHERE source_id = 'lark.im' AND id IN (${[...scopeIds.keys()].map(quoteSql).join(",")});`, "read message conversation types");
-    for (const scope of scopes) {
-      const chatId = scopeIds.get(scope.id);
-      const config = parseMaybeJson(scope.config_json);
-      if (!chatId || scope.source_id !== "lark.im" || config?.chat_id !== chatId) continue;
-      try { validateJsonObjectText(scope.config_json); }
-      catch { delete config.p2p_recipient; delete config.chat_name; } // Ambiguous names cannot donate evidence.
-      chats.set(chatId, chats.has(chatId) ? null : config);
-    }
+  const chats=new Map();
+  for (const scope of snapshot.scopes) {
+    const chatId=scopeIds.get(scope.id), config=parseMaybeJson(scope.config_json);
+    if (!chatId || scope.source_id!=='lark.im' || config?.chat_id!==chatId) continue;
+    try { validateJsonObjectText(scope.config_json); }
+    catch { delete config.p2p_recipient; delete config.chat_name; }
+    chats.set(chatId,chats.has(chatId)?null:config);
   }
-  // Collection scopes are not conversation identities: muted/sent-only chats
-  // may have no received scope. Read only this page's exact trusted account/chat
-  // pairs; queue rows alone supply neither a mode nor a recipient.
-  const rowAccounts = new Map(rows.map(row => [row, sentRecipientAccount(row,
-    parseMaybeJson(row.canonical_json) || {}, parseMaybeJson(row.raw_json) || {})]));
-  const pairs = new Map(rows.filter(row => rowAccounts.get(row)).map(row => {
-    const account = rowAccounts.get(row), accountKey = recipientAccountKey(account);
-    return [`${accountKey}:${row.container_id}`, { account, accountKey, chatId: row.container_id }];
+  const rowAccounts=new Map(rows.map(row=>[row,sentRecipientAccount(row,
+    parseMaybeJson(row.canonical_json)||{},parseMaybeJson(row.raw_json)||{})]));
+  const pairs=new Map(rows.filter(row=>rowAccounts.get(row)).map(row=>{
+    const account=rowAccounts.get(row),accountKey=recipientAccountKey(account);
+    return [`${accountKey}:${row.container_id}`,{account,accountKey,chatId:row.container_id}];
   }));
-  const recipients = new Map();
-  if (pairs.size && queryJson(dbPath,
-    "SELECT 1 AS recipient_state_available FROM sqlite_schema WHERE type='table' AND name='lark_im_recipient_state';",
-    "check recipient evidence store").some(row => row.recipient_state_available === 1)) {
-    const saved = queryJson(dbPath, `WITH requested(account_key,chat_id) AS (VALUES
-      ${[...pairs.values()].map(pair => `(${quoteSql(pair.accountKey)},${quoteSql(pair.chatId)})`).join(',')})
-      SELECT s.source_id,s.account_key,s.chat_id,s.evidence_json FROM requested r
-      JOIN lark_im_recipient_state s ON s.source_id='lark.im' AND s.account_key=r.account_key AND s.chat_id=r.chat_id;`,
-    'read exact message recipient evidence');
-    for (const savedRow of saved) {
-      const key = `${savedRow.account_key}:${savedRow.chat_id}`, pair = pairs.get(key);
-      if (!pair || savedRow.source_id !== 'lark.im' || savedRow.evidence_json == null) continue;
-      let evidence = null;
-      try { validateJsonObjectText(savedRow.evidence_json); evidence = JSON.parse(savedRow.evidence_json); } catch { /* Invalid saved state must not resurrect old scope evidence. */ }
-      const config = { chat_id: pair.chatId, p2p_recipient: evidence };
-      const trusted = readRecipientEvidence(config, pair.account, { includeConflicted: true });
-      recipients.set(key, recipients.has(key) ? { chat_id: pair.chatId, p2p_recipient: null }
-        : { ...config, ...(trusted ? { chat_type: 'p2p' } : {}) });
-    }
+  const recipients=new Map();
+  for (const savedRow of snapshot.recipients) {
+    const key=`${savedRow.account_key}:${savedRow.chat_id}`,pair=pairs.get(key);
+    if (!pair || savedRow.source_id!=='lark.im' || savedRow.evidence_json==null) continue;
+    let evidence=null;
+    try {validateJsonObjectText(savedRow.evidence_json);evidence=JSON.parse(savedRow.evidence_json);} catch {}
+    const config={chat_id:pair.chatId,p2p_recipient:evidence};
+    const trusted=readRecipientEvidence(config,pair.account,{includeConflicted:true});
+    recipients.set(key,recipients.has(key)?{chat_id:pair.chatId,p2p_recipient:null}
+      :{...config,...(trusted?{chat_type:'p2p'}:{})});
   }
-  const titlePairs = new Map(rows.flatMap(row => {
-    const accountKey=messageNameAccount(row,parseMaybeJson(row.canonical_json)||{},parseMaybeJson(row.raw_json)||{});
-    return accountKey ? [[`${accountKey}:${row.container_id}`,{accountKey,chatId:row.container_id}]] : [];
+  const titlePairs=new Set(rows.flatMap(row=>{
+    const owner=projectionAccount(row,parseMaybeJson(row.canonical_json)||{},parseMaybeJson(row.raw_json)||{});
+    const key=owner.state==='verified'?owner.account_key:null;
+    return key?[`${key}:${row.container_id}`]:[];
   }));
-  const titles = new Map();
-  if (titlePairs.size && queryJson(dbPath,
-    "SELECT 1 AS name_state_available FROM sqlite_schema WHERE type='table' AND name='lark_im_name_tasks';",
-    'check chat name evidence store').some(row=>row.name_state_available===1)) {
-    const saved=queryJson(dbPath,`WITH requested(account_key,chat_id) AS (VALUES
-      ${[...titlePairs.values()].map(pair=>`(${quoteSql(pair.accountKey)},${quoteSql(pair.chatId)})`).join(',')})
-      SELECT s.source_id,s.account_key,s.chat_id,s.evidence_json FROM requested r
-      JOIN lark_im_name_tasks s ON s.source_id='lark.im' AND s.account_key=r.account_key AND s.kind='chat' AND s.chat_id=r.chat_id;`,
-      'read exact message chat name evidence');
-    for(const value of saved) {
+  const titles=new Map(),senderTasks=new Map();
+  for (const value of snapshot.nameTasks) {
+    if (value.source_id!=='lark.im') continue;
+    if (value.kind==='chat') {
       const key=`${value.account_key}:${value.chat_id}`;
-      if(value.source_id!=='lark.im'||!titlePairs.has(key)) continue;
-      const evidence=readChatNameEvidence(value.evidence_json,value.chat_id,value.account_key);
-      titles.set(key,titles.has(key)?null:evidence);
+      if (!titlePairs.has(key)) continue;
+      titles.set(key,titles.has(key)?null:readChatNameEvidence(value.evidence_json,value.chat_id,value.account_key));
+    } else if (value.kind==='sender') {
+      const key=JSON.stringify([value.account_key,value.chat_id,value.actor_id,value.namespace]);
+      senderTasks.set(key,senderTasks.has(key)?null:value);
     }
   }
-  return rows.map(({ type_scope_id, type_scope_source_id, ...row }) => {
-    // The internal recipient observation does not expand the existing public
-    // first-seen scope fields, including messages first seen in a chat scope.
-    if (Object.hasOwn(parseMaybeJson(row.scope_config_json) || {}, 'p2p_recipient')) {
-      try { row.scope_config_json = patchTopLevelJsonMemberText(row.scope_config_json, 'p2p_recipient'); }
-      catch { /* Keep malformed legacy public JSON byte-for-byte, never stop the page. */ }
+  const messages=rows.map(({type_scope_id,type_scope_source_id,external_version,content_hash,...row})=>{
+    // Source-version proof inputs stay internal; the established public fields
+    // do not acquire a second serialized source payload or hashing contract.
+    Object.defineProperties(row,{external_version:{value:external_version},content_hash:{value:content_hash}});
+    if (Object.hasOwn(parseMaybeJson(row.scope_config_json)||{},'p2p_recipient')) {
+      try {row.scope_config_json=patchTopLevelJsonMemberText(row.scope_config_json,'p2p_recipient');} catch {}
     }
-    const account = sentRecipientAccount(row, parseMaybeJson(row.canonical_json) || {}, parseMaybeJson(row.raw_json) || {});
-    const nameAccount = messageNameAccount(row,parseMaybeJson(row.canonical_json)||{},parseMaybeJson(row.raw_json)||{});
-    return enrichRow(row, chats.get(row.container_id), type_scope_source_id === "lark.im"
-      && typeof row.container_id === "string" && type_scope_id === chatScopeId(row.container_id),
-      account ? recipients.get(`${recipientAccountKey(account)}:${row.container_id}`) : undefined,
-      nameAccount ? titles.get(`${nameAccount}:${row.container_id}`) : undefined);
+    const canonical=parseMaybeJson(row.canonical_json)||{},raw=parseMaybeJson(row.raw_json)||{};
+    const account=sentRecipientAccount(row,canonical,raw);
+    const owner=projectionAccount(row,canonical,raw),identity=senderIdentity(raw);
+    const nameAccount=owner.state==='verified'?owner.account_key:null;
+    const task=senderTasks.get(JSON.stringify([owner.account_key,row.container_id,row.actor_id,identity.type]));
+    const saved=owner.state==='verified' ? (task && readSenderProjectionEvidence(task,row,owner.account_key||'')
+      || readLocalSenderProjectionEvidence(row,canonical,raw,owner.account_key||'',snapshot.senderDonors)) : null;
+    return enrichRow(row,chats.get(row.container_id),type_scope_source_id==='lark.im'
+      && typeof row.container_id==='string' && type_scope_id===chatScopeId(row.container_id),
+      account?recipients.get(`${recipientAccountKey(account)}:${row.container_id}`):undefined,
+      nameAccount?titles.get(`${nameAccount}:${row.container_id}`):undefined,saved,true);
   });
+  messageReadMetadata.set(messages,{population:snapshot.population,as_of:snapshot.as_of,
+    observations:snapshot.observations,
+    available:snapshot.available,filter:{direction:opts.direction,has_search:Boolean(opts.search)},limit:opts.limit,
+    source_records:snapshot.rows.map(row=>Object.fromEntries(['id','source_id','record_type','external_id',
+      'external_version','content_hash','actor_id','container_id','direction','occurred_at','occurred_at_ms','raw_json']
+      .map(key=>[key,row[key]])))});
+  return messages;
+}
+
+const messageReadMetadata=new WeakMap();
+/** @param {EnrichedMessage[]} messages */
+function readMessagesMetadata(messages) { return messageReadMetadata.get(messages) || null; }
+/** @param {EnrichedMessage[]} from @param {EnrichedMessage[]} to */
+function retainMessagesMetadata(from,to) {
+  const value=messageReadMetadata.get(from);
+  if (value) messageReadMetadata.set(to,value);
+  return to;
 }
 
 /** @param {unknown} value */
@@ -205,7 +191,6 @@ function shortId(value, length = 8) {
  * @param {unknown} id
  */
 function nameOrId(name, id) {
-  if (!name && String(id || "").startsWith("cli_")) return `应用 ${shortId(id, 8)}`;
   return name ? String(name) : shortId(id, 8);
 }
 
@@ -217,7 +202,7 @@ function nameOrId(name, id) {
 function senderLabel(name, id, senderType) {
   if (senderType === "system" && !name && !id) return "系统";
   const display = nameOrId(name, id);
-  return senderType === "app" ? `应用：${display.replace(/^应用\s+/, "")}` : display;
+  return senderType === "app" ? `应用：${display}` : display;
 }
 
 /** @param {unknown} type */
@@ -361,7 +346,7 @@ function displaySender(row, canonical, raw) {
  * @param {Row | null | undefined} currentChat
  * @param {Row | undefined} recipientConfig
  */
-function conversationType(row, canonical, raw, config, currentChat, recipientConfig) {
+function conversationType(row, canonical, raw, config, currentChat, recipientConfig, currentName) {
   if (currentChat === null) return "unknown";
   const native = raw.raw_api && typeof raw.raw_api === "object" && !Array.isArray(raw.raw_api) ? raw.raw_api : {};
   const messages = [canonical, raw, native];
@@ -373,7 +358,9 @@ function conversationType(row, canonical, raw, config, currentChat, recipientCon
   }
   if ([raw, native].some((message) => message.id != null && message.id !== row.external_id)) return "unknown";
   const existing = [canonical, raw, raw.chat, config.chat_id === row.container_id ? config : null];
-  const declarations = [...existing, native, native.chat, currentChat, recipientConfig];
+  const declaredCurrentName=currentName?.chat_id===row.container_id
+    && ['group','topic'].includes(currentName.chat_type) ? currentName : null;
+  const declarations = [...existing, native, native.chat, currentChat, recipientConfig, declaredCurrentName];
   const modes = [...existing.map((entry) => entry?.chat_type),
     ...declarations.flatMap((entry) => [entry?.chat_type, entry?.chat_mode])]
     .filter((mode) => mode === "p2p" || mode === "group" || mode === "topic");
@@ -389,23 +376,26 @@ function conversationType(row, canonical, raw, config, currentChat, recipientCon
  * @param {Row | null} [currentName]
  * @returns {EnrichedMessage}
  */
-function enrichRow(row, currentChat, scopeSourceMatches = true, recipientConfig, currentName) {
+function enrichRow(row, currentChat, scopeSourceMatches = true, recipientConfig, currentName, savedSender = null, includeReadiness = false) {
   const canonical = parseMaybeJson(row.canonical_json) || {};
   const raw = parseMaybeJson(row.raw_json) || {};
   const config = parseMaybeJson(row.scope_config_json) || {};
-  const chatType = conversationType(row, canonical, raw, scopeSourceMatches ? config : {}, currentChat, recipientConfig);
+  const chatType = conversationType(row, canonical, raw, scopeSourceMatches ? config : {}, currentChat, recipientConfig, currentName);
   const chatName = displayChatTitle(row, canonical, raw, config, currentChat, scopeSourceMatches, currentName);
   const chatId = canonical.chat_id || row.container_id || config.chat_id || raw.chat_id || null;
-  const { id: senderId, name: senderName } = displaySender(row, canonical, raw);
+  const { id: senderId, name: senderName } = includeReadiness || savedSender
+    ? senderProjection(row,canonical,raw,savedSender) : displaySender(row, canonical, raw);
   const messageType = canonical.msg_type || raw.msg_type || raw.message_type || null;
-  const senderType =
-    canonical.sender_type ||
-    (String(senderId || "").startsWith("cli_") ? "app" : null) ||
-    (messageType === "system" ? "system" : null);
+  const identity = senderIdentity(raw);
+  const senderType = canonical.sender_type
+    || (identity.verified && identity.type === 'app_id' ? 'app'
+      : identity.verified && ['open_id','user_id','union_id'].includes(identity.type || '') ? 'user' : null)
+    || (messageType === "system" ? "system" : null);
   const isP2p = chatType === "p2p";
   const isGroupLike = !isP2p;
   const system = messageType === "system" ? displaySystem(row.body, canonical, raw, systemContext(row, canonical, raw, config)) : null;
-  return {
+  /** @type {EnrichedMessage} */
+  const result = {
     ...row,
     canonical,
     raw,
@@ -426,15 +416,42 @@ function enrichRow(row, currentChat, scopeSourceMatches = true, recipientConfig,
       ...(messageType === "interactive" ? { card: displayCard(raw) } : {}),
     },
   };
+  if (includeReadiness) {
+    const evidence=messageProjectionEvidence(row,canonical,raw,result.display,{
+      chatType,chatName,titleSource:currentName?.name===chatName?'im.chats.get'
+        :canonical.chat_name===chatName?'canonical':'scope_config',
+      recipientConfig:recipientConfig??currentChat,senderEvidence:savedSender });
+    result.readiness=evaluateMessageCompleteness({row,canonical,raw,display:result.display,evidence});
+    projectionEvidence.set(result,evidence);
+  }
+  return result;
+}
+
+/** Called only after the local mapping reader has verified its file/database
+ * binding and exact tenant/chat/app entry. It cannot promote a canonical label.
+ * @param {EnrichedMessage} message @param {Row} sender */
+function applyVerifiedSenderMapping(message,sender) {
+  const result={...message,display:{...message.display,sender:senderLabel(sender.name,sender.id,'app')}};
+  const previous=projectionEvidence.get(message);
+  if (previous) {
+    const evidence={...previous,sender};
+    result.readiness=evaluateMessageCompleteness({row:message,canonical:message.canonical,
+      raw:message.raw,display:result.display,evidence});
+    projectionEvidence.set(result,evidence);
+  }
+  return result;
 }
 
 export {
+  applyVerifiedSenderMapping,
   buildWhere,
   displayBody,
   displayCard,
   enrichRow,
   isInvalidRenderedContent,
   loadMessages,
+  readMessagesMetadata,
+  retainMessagesMetadata,
   messageTypeLabel,
   nameOrId,
   parseMaybeJson,

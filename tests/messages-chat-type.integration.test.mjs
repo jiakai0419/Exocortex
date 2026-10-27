@@ -9,6 +9,7 @@ import test from 'node:test';
 import { ensureInitialized, quoteSql, sqliteExec } from '../dist/storage/sqlite/ingestion-store.js';
 import { plain } from '../dist/terminal/index.js';
 import { chatScopeId, SENT_SCOPE_ID } from '../src/adapters/lark-im/core.mjs';
+import { bindAcquiredMessageAccounts } from '../src/adapters/lark-im/message-account-evidence.mjs';
 import { loadMessages, sqliteJson } from '../src/diagnostics/messages-report.mjs';
 import { renderMessagesText } from '../src/terminal/messages-view.mjs';
 import { textWidth } from '../src/terminal/text-layout.mjs';
@@ -16,14 +17,14 @@ import { textWidth } from '../src/terminal/text-layout.mjs';
 // Entirely fictional inputs, including names, messages, IDs and dates. These
 // fixtures never use screenshots, production rows or an authenticated account.
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
-const AT = Date.UTC(2061, 2, 4, 5, 6, 7);
+const AT = Date.UTC(2021, 2, 4, 5, 6, 7);
 const ACTOR = 'ou_synthetic_type_sender';
 const SENDER = '合成寄件人';
 const NAME = '合成会话名';
 const SENT_CONFIG = { mode: 'sent_by_me', synthetic_marker: 'keep-first-seen-config' };
 const hash = value => createHash('sha256').update(value).digest('hex');
 const sqlValue = value => value == null ? 'NULL' : typeof value === 'number' ? String(value) : quoteSql(value);
-const selectedFields = ['id', 'direction', 'record_type', 'occurred_at', 'occurred_at_ms', 'actor_id',
+const selectedFields = ['id', 'source_id', 'direction', 'record_type', 'occurred_at', 'occurred_at_ms', 'actor_id',
   'container_id', 'external_id', 'body', 'canonical_json', 'raw_json'];
 
 function fixture(t, inputs) {
@@ -56,11 +57,17 @@ Object.defineProperty(process.stdout, 'columns', { value: Number(process.env.SYN
     const id = `om_synthetic_type_${entry.key}`;
     const body = entry.body ?? `合成正文 ${entry.key}。`;
     const at = AT + (entry.offset ?? index) * 1000;
-    const canonical = { chat_id: chat, msg_type: 'text', sender_id: ACTOR,
-      sender_name: SENDER, sender_type: 'user', chat_name: NAME, ...entry.canonical };
-    const raw = { message_id: id, chat_id: chat, msg_type: 'text', create_time: String(at),
+    const canonical = { message_id: id, chat_id: chat, msg_type: 'text', sender_id: ACTOR, sender_id_type: 'open_id',
+      create_time_ms: at, update_time: null, update_time_ms: null,
+      sender_name: SENDER, sender_name_source: 'message_sender', sender_name_confidence: 'high',
+      sender_type: 'user', chat_name: NAME, ...entry.canonical };
+    const baseRaw = { message_id: id, chat_id: chat, msg_type: 'text', create_time: String(at),
       sender: { id: ACTOR, id_type: 'open_id', sender_type: 'user', name: SENDER },
-      body: { content: JSON.stringify({ text: body }) }, ...entry.raw };
+      body: { content: JSON.stringify({ text: body }) } };
+    const raw = { ...baseRaw, ...entry.raw };
+    // Each adversarial wrapper changes only the identity/type under test, not
+    // unrelated required source content or actor facts.
+    if (raw.raw_api) raw.raw_api = { ...baseRaw, ...raw.raw_api };
     if (entry.scope) addScope(entry.scopeId ?? chatScopeId(chat), { chat_id: chat, ...entry.scope }, entry.scopeSource);
     for (const extra of entry.extraScopes ?? []) {
       addScope(extra.id ?? `${chatScopeId(chat)}.synthetic-duplicate`, { chat_id: chat, ...extra.config }, extra.source);
@@ -71,11 +78,14 @@ Object.defineProperty(process.stdout, 'columns', { value: Number(process.env.SYN
       first = `synthetic.origin.${entry.key}`;
       addScope(first, entry.firstConfig, entry.firstSource);
     }
-    const stored = { source_id: 'lark.im', first_seen_scope_id: first, external_id: id,
-      external_version: 'synthetic-version-1', record_type: 'lark.im.message',
+    const normalized = { source_id: 'lark.im', first_seen_scope_id: first, external_id: id,
+      external_version: null, record_type: 'lark.im.message',
       occurred_at: new Date(at).toISOString(), occurred_at_ms: at, actor_id: ACTOR,
-      container_id: chat, direction: entry.direction ?? 'sent', body, content_hash: hash(body),
+      container_id: chat, direction: entry.direction ?? 'sent', body, content_hash: hash(JSON.stringify(raw)),
       canonical_json: JSON.stringify(canonical), raw_json: JSON.stringify(raw) };
+    const [stored] = bindAcquiredMessageAccounts([normalized],
+      { open_id: normalized.direction === 'sent' ? ACTOR : 'ou_synthetic_type_receiving_self' },
+      { acquiredAt: new Date(AT + 86400000).toISOString() });
     const fields = Object.keys(stored);
     sqliteExec(db, `INSERT INTO records(${fields.join(',')}) VALUES(${fields.map(field => sqlValue(stored[field])).join(',')});`);
     return { ...stored, id: index + 1, scope_config_json: JSON.stringify(scopes.get(first)), key: entry.key };
@@ -105,32 +115,70 @@ Object.defineProperty(process.stdout, 'columns', { value: Number(process.env.SYN
   return { db, records, direct, run, unchanged };
 }
 
-function displayFor(stored, { scene = '群聊', recipient = null, chat = NAME } = {}) {
-  return { external_id: 'om_synth...', scene, sender: SENDER, sender_type: 'user',
+function displayFor(stored, { scene = '群聊', recipient = null, chat = NAME, invalidIdentity = false } = {}) {
+  return { external_id: 'om_synth...', scene, sender: invalidIdentity ? 'ou_synth...' : SENDER, sender_type: 'user',
     message_type: '文本', recipient, chat, body: stored.body };
 }
 
-function publicRow(stored, display) {
+function publicRow(stored, display, readiness) {
   return { ...Object.fromEntries(selectedFields.map(field => [field, stored[field]])),
     scope_config_json: stored.scope_config_json,
     canonical: JSON.parse(stored.canonical_json), raw: JSON.parse(stored.raw_json),
-    scope_config: JSON.parse(stored.scope_config_json), display };
+    scope_config: JSON.parse(stored.scope_config_json), display, readiness };
+}
+
+const requirement = (field, state, reason = null, evidence = null) => ({ field, state, reason, evidence });
+// Independent expected contract: test cases declare identity conflicts; normal
+// display scenarios specify whether an actual recipient relationship exists.
+function expectedReadiness(display, { invalidIdentity = false, conflictingMode = false } = {}) {
+  const privateChat = display.scene === '私聊', unknown = display.scene === '会话类型未知';
+  const requirements = [requirement('sender', 'satisfied', null, 'message_sender'),
+    unknown || privateChat && display.recipient === '未知'
+      ? requirement('recipient', 'missing', 'recipient_identity_unknown')
+      : privateChat ? requirement('recipient', 'satisfied', null, display.recipient === '我' ? 'admitted_account' : 'message_partner')
+        : requirement('recipient', 'not_applicable', null, 'chat_destination'),
+    unknown ? requirement('conversation', 'missing', 'conversation_type_unknown')
+      : requirement('conversation', 'satisfied', null, privateChat ? 'exact_conversation' : 'canonical'),
+    requirement('content', 'satisfied', null, 'content_projection')];
+  if (conflictingMode) requirements[2] = requirement('conversation', 'conflict', 'conversation_identity_conflict');
+  if (invalidIdentity) {
+    requirements[0] = requirement('sender', 'conflict', 'sender_identity_conflict');
+    requirements[2] = requirement('conversation', 'conflict', 'message_identity_invalid');
+  }
+  const reasons = [...new Set(requirements.map(item => item.reason).filter(Boolean))];
+  const state = invalidIdentity || conflictingMode ? 'blocked' : reasons.length ? 'enriching' : 'ready';
+  return { version: 1, state, requirements, reasons,
+    next_action: state === 'ready' ? 'none' : state === 'blocked' ? 'review_identity' : 'resolve_recipient' };
 }
 
 function assertRows(f, expected) {
   const json = f.run();
   const rows = [...f.records].sort((a, b) => b.occurred_at_ms - a.occurred_at_ms || b.external_id.localeCompare(a.external_id));
-  assert.deepEqual(json, rows.map(stored => publicRow(stored, displayFor(stored, expected[stored.key]))),
-    'JSON retains all original fields and their values, ordering and first-seen config, with no public metadata additions');
+  assert.deepEqual(json, rows.map(stored => {
+    const display = displayFor(stored, expected[stored.key]);
+    return publicRow(stored, display, expectedReadiness(display, expected[stored.key]));
+  }), 'JSON preserves source/body/identity/time/order/config exactly and adds the explicitly asserted completeness contract');
   assert.deepEqual(json, f.direct, 'real CLI JSON equals the real loadMessages projection');
   return json;
 }
 
 function screen(rows) {
-  return `Messages (${rows.length})\n\n${rows.map(row => {
+  const incomplete = rows.filter(row => row.readiness.state !== 'ready');
+  const blocked = incomplete.filter(row => row.readiness.state === 'blocked').length;
+  const summary = incomplete.length ? `\n完整 ${rows.length - incomplete.length} · 待补全 ${incomplete.length - blocked} · 受阻 ${blocked}` : '';
+  const reasonLabels = { sender_identity_conflict: '发送人身份冲突', recipient_identity_unknown: '接收人身份待核验',
+    conversation_type_unknown: '会话类型待核验', conversation_identity_conflict: '会话身份冲突', message_identity_invalid: '消息身份需核验' };
+  return `Messages (${rows.length})${summary}\n\n${rows.map(row => {
     const time = new Date(row.occurred_at).toLocaleString(undefined, { timeZone: 'UTC' });
     const d = row.display;
-    return `${row.direction.toUpperCase()} ${time}  ${d.external_id}  ${d.scene}\n`
+    const header = `${row.direction.toUpperCase()} ${time}  ${d.external_id}  ${d.scene}\n`;
+    if (row.readiness.state !== 'ready') {
+      assert(row.readiness.reasons.every(reason => Object.hasOwn(reasonLabels, reason)));
+      return header + `  状态    ${row.readiness.state === 'blocked' ? '准备受阻' : '等待完整信息'}\n`
+        + `  原因    ${row.readiness.reasons.map(reason => reasonLabels[reason]).join('；')}\n`
+        + '  查看    messages --format json 可检查已保存内容与原因\n';
+    }
+    return header
       + `  发送人  ${d.sender}\n`
       + (d.recipient ? `  接收人  ${d.recipient}\n` : '')
       + (d.chat ? `${d.scene === '会话类型未知' ? '  会话    ' : '  群      '}${d.chat}\n` : '')
@@ -160,7 +208,7 @@ test('sent-first messages use only an exact legal same-source conversation scope
   const f = fixture(t, [
     { key: 'sent_p2p', scope: { chat_type: 'p2p', chat_name: '不得采用的新名称' }, body: '合成原文  保留空格。' },
     { key: 'sent_p2p_id', scope: { chat_type: 'p2p', chat_name: '不得引入的名称' }, canonical: { chat_name: null } },
-    { key: 'sent_group', scope: { chat_type: 'group' } },
+    { key: 'sent_group', scope: { chat_type: 'group' }, body: '合成群正文  保留空格。' },
     { key: 'legal_with_duplicate', scope: { chat_type: 'p2p' }, extraScopes: [{ config: { chat_type: 'group' } }] },
     { key: 'other_source', scope: { chat_type: 'p2p' }, scopeSource: 'synthetic.other' },
     { key: 'invalid_scope_id', scope: { chat_type: 'p2p' }, scopeId: 'synthetic.not-a-chat-scope' },
@@ -175,8 +223,8 @@ test('sent-first messages use only an exact legal same-source conversation scope
     other_source: { scene: '会话类型未知' }, invalid_scope_id: { scene: '会话类型未知' },
     wrong_scope_chat: { scene: '会话类型未知' }, wrong_first_chat: { scene: '会话类型未知' }, cross_first: { scene: '会话类型未知' },
   });
-  assert.equal(f.run('text'), screen(json).replace('合成原文  保留空格。', '合成原文 保留空格。'),
-    'whole screen changes only the required scene and recipient/conversation labels; original body compacting remains');
+  assert.equal(f.run('text'), screen(json).replace('合成群正文  保留空格。', '合成群正文 保留空格。'),
+    'ready group text retains original body compacting while incomplete rows remain explicit exceptions');
   for (const stored of f.records.filter(row => row.first_seen_scope_id === SENT_SCOPE_ID)) {
     assert.equal(json.find(row => row.id === stored.id).scope_config_json, JSON.stringify(SENT_CONFIG));
   }
@@ -213,8 +261,8 @@ test('legacy raw.id must agree with record identity even when a correct message_
   const json = assertRows(f, {
     legacy_valid: { scene: '私聊', recipient: '未知', chat: null },
     legacy_both_valid: { scene: '私聊', recipient: '未知', chat: null },
-    legacy_wrong: { scene: '会话类型未知' }, legacy_shadowed: { scene: '会话类型未知' },
-    native_legacy_wrong: { scene: '会话类型未知' },
+    legacy_wrong: { scene: '会话类型未知', invalidIdentity: true }, legacy_shadowed: { scene: '会话类型未知', invalidIdentity: true },
+    native_legacy_wrong: { scene: '会话类型未知', invalidIdentity: true },
   });
   assert.equal(f.run('text'), screen(json));
 });
@@ -241,13 +289,17 @@ test('missing, malformed, visibility-only, conflicting and mismatched evidence n
     { key: 'unknown_id', canonical: { chat_name: null } },
   ];
   const f = fixture(t, entries);
+  const invalidIdentity = new Set(['canonical_wrong_chat', 'raw_wrong_chat', 'nested_wrong_chat',
+    'wrong_message', 'native_wrong_chat']);
+  const conflictingMode = new Set(['raw_conflict', 'reverse_conflict', 'native_conflict']);
   const expected = Object.fromEntries(entries.map(entry => [entry.key, { scene: '会话类型未知',
+    invalidIdentity: invalidIdentity.has(entry.key), conflictingMode: conflictingMode.has(entry.key),
     ...(entry.key === 'unknown_id' ? { chat: 'oc_synth...' } : {}) }]));
   const json = assertRows(f, expected);
   const text = f.run('text');
   assert.equal(text, screen(json));
-  assert.doesNotMatch(text, /  群\s|  接收人\s|  群聊|  私聊/);
-  assert.equal((text.match(/  会话    /g) ?? []).length, entries.length);
+  assert.doesNotMatch(text, /  群\s|  接收人\s|  群聊|  私聊|  发送人\s|  消息\s/);
+  assert.equal((text.match(/  状态    /g) ?? []).length, entries.length, 'every selected incomplete row retains its original position as an exception');
 });
 
 test('explicit conversation modes keep visibility separate without upgrading an existing ordinary group to topic', t => {
@@ -277,39 +329,49 @@ test('real CLI keeps ordering, filters and narrow screen content while unknown s
   for (const columns of [1, 20, 40, 80]) {
     const text = f.run('text', columns);
     for (const line of text.split('\n')) assert.ok(textWidth(line) <= Math.max(columns, 20), `${columns} columns: ${line}`);
-    assert.equal((text.match(/发送人/g) ?? []).length, 3);
-    assert.equal((text.match(/接收人/g) ?? []).length, 1);
-    assert.equal((text.match(/  会话    /g) ?? []).length, 1);
+    assert.equal((text.match(/发送人/g) ?? []).length, 1);
+    assert.equal((text.match(/  状态    /g) ?? []).length, 2);
+    assert.equal((text.match(/  会话    /g) ?? []).length, 0);
     assert.equal((text.match(/  群      /g) ?? []).length, 1);
-    for (const value of [SENDER, NAME, '合成正文甲。', '合成正文乙。', '合成正文丙。']) {
+    for (const value of [SENDER, NAME, '合成正文丙。']) {
       assert.ok(text.replace(/\n +/g, '').includes(value), `no content loss at ${columns} columns: ${value}`);
     }
+    assert.doesNotMatch(text, /合成正文甲。|合成正文乙。/, 'exception rows do not masquerade as ordinary completed messages');
+    assert.equal((text.match(/SENT/g) ?? []).length, 2);
+    assert.equal((text.match(/RECEIVED/g) ?? []).length, 1);
     assert.deepEqual(f.run('json', columns), json, 'terminal width cannot affect any JSON field');
   }
   assert.equal(f.run('text'), screen(json));
   f.unchanged();
 });
 
-test('duplicate legal-scope query results fail closed regardless of row order without adding public fields', t => {
+test('duplicate legal-scope snapshot entries fail closed regardless of row order with explicit readiness', t => {
   const f = fixture(t, [{ key: 'duplicate_query', scope: { chat_type: 'p2p' } }]);
   const stored = f.records[0];
   for (const types of [['p2p', 'group'], ['group', 'p2p'], ['group', 'p2p', 'group']]) {
+    const calls = [];
     const rows = loadMessages(f.db, { db: f.db, direction: 'all', limit: 1, search: '' }, {
       sqliteJson(db, sql, label) {
+        calls.push(label);
         const result = sqliteJson(db, sql, label);
-        if (label !== 'read message conversation types') return result;
-        assert.equal(result.length, 1);
+        if (label !== 'read message snapshot') return result;
+        const scopes = result.filter(item => item.kind === 'scope');
+        assert.equal(scopes.length, 1);
+        const scope = JSON.parse(scopes[0].payload);
         // A SQLite primary key excludes this on disk. Inject duplicate query
-        // results to prove the boundary never chooses an arbitrary candidate.
-        return types.map(chat_type => ({ ...result[0],
-          config_json: JSON.stringify({ chat_id: stored.container_id, chat_type }) }));
+        // entries inside the same snapshot envelope, not a retired second read.
+        return result.flatMap(item => item.kind !== 'scope' ? [item]
+          : types.map((chat_type, index) => ({ ...item, position: index + 1,
+            payload: JSON.stringify({ ...scope, config_json: JSON.stringify({ chat_id: stored.container_id, chat_type }) }) })));
       },
     });
-    assert.deepEqual(JSON.parse(JSON.stringify(rows)), [publicRow(stored, displayFor(stored, { scene: '会话类型未知' }))]);
+    assert.deepEqual(calls, ['read message snapshot schema', 'read message snapshot']);
+    const display = displayFor(stored, { scene: '会话类型未知' });
+    assert.deepEqual(JSON.parse(JSON.stringify(rows)), [publicRow(stored, display, expectedReadiness(display))]);
     const text = plain(renderMessagesText(rows));
     assert.match(text, /会话类型未知/);
-    assert.match(text, /  会话    合成会话名/);
-    assert.doesNotMatch(text, /  群\s|  接收人\s/);
+    assert.match(text, /  状态    等待完整信息/);
+    assert.doesNotMatch(text, /  群\s|  接收人\s|  发送人\s|  消息\s/);
     f.unchanged();
   }
 });

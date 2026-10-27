@@ -3,6 +3,7 @@ import { randomUUID, createHash } from 'node:crypto';
 import { createLarkImAdapter, MessageScopeError } from '../adapters/lark-im/adapter.mjs';
 import { messageId, chatId, chatScopeId } from '../adapters/lark-im/core.mjs';
 import { prepareChatWindowRecords } from '../adapters/lark-im/sync-runner.mjs';
+import { bindAcquiredMessageAccounts } from '../adapters/lark-im/message-account-evidence.mjs';
 import { createMaintenanceRequestSession } from './request-session.mjs';
 import { readOnlySqliteJson } from '../storage/sqlite/readonly-query.mjs';
 import { captureRemoteAccountBinding, readRemoteAccountBinding, accountBindingAdmissionError } from '../diagnostics/remote-account-binding.mjs';
@@ -129,11 +130,13 @@ function executeHistoryTarget(options, deps, session, initialTarget, prepared = 
     const selected = roots.length ? (deps.fetchMessageDetails || adapter.fetchMessageDetails)(roots[0], {
       retries: 0, retryDelayMs: 0, detailMaxPages: 2, detailMaxItems: 100, detailBudgetMs: 30_000,
     }) : ordinary[0];
+    const acquiredAt = new Date().toISOString();
     if (Buffer.byteLength(JSON.stringify(selected)) > 1024 * 1024) throw new Error('size_limit');
     records = prepareChatWindowRecords([selected], scope.id, null, startMs, endMs, self.open_id, { self }, config);
     normalizeBoundedReplayRecords(records, 'lark.im');
     if (records.some(record => record.external_id !== row.external_id)) throw new Error('identity');
     if (records.length !== 1 || records[0].occurred_at_ms !== row.occurred_at_ms || records[0].container_id !== row.container_id) throw new Error('identity');
+    records = bindAcquiredMessageAccounts(records, self, { acquiredAt });
     records = records.map(record => ({ ...record, expected_external_version: row.external_version }));
     session.assertReady();
   } catch (cause) {
@@ -232,6 +235,7 @@ function executeHistoryGroup(options, deps, session, initialTarget, capacity) {
     // The original route acquires its own evidence and alone may rotate a row.
     return {...legacy(),bulkUnavailable:true};
   }
+  const acquiredAt = new Date().toISOString();
   // An unexpected merge root requires a separate original acquisition. Never
   // give a partial bulk item a body or claim that its missing details vanished.
   if(fetched.detailRoots?.length) return legacy();
@@ -250,6 +254,7 @@ function executeHistoryGroup(options, deps, session, initialTarget, capacity) {
     normalizeBoundedReplayRecords(records,'lark.im');
     if(records.length!==1 || records[0].external_id!==row.external_id || records[0].occurred_at_ms!==row.occurred_at_ms || records[0].container_id!==row.container_id)
       throw new Error('history fetched identity mismatch');
+    records=bindAcquiredMessageAccounts(records,self,{acquiredAt});
     records=records.map(record=>({...record,expected_external_version:row.external_version}));
     preparedRecords.set(row.id,records);
   }

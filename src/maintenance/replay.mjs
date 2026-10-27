@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 import { createLarkImAdapter } from "../adapters/lark-im/adapter.mjs";
 import { chatId, chatScopeId, messageId } from "../adapters/lark-im/core.mjs";
 import { prepareChatWindowRecords } from "../adapters/lark-im/sync-runner.mjs";
+import { bindAcquiredMessageAccounts } from "../adapters/lark-im/message-account-evidence.mjs";
 import { readOnlySqliteJson } from "../storage/sqlite/readonly-query.mjs";
 import { readRemoteAccountBinding, accountBindingAdmissionError } from "../diagnostics/remote-account-binding.mjs";
 import { captureLarkWriteAdmission } from "../diagnostics/lark-write-admission.mjs";
@@ -149,6 +150,7 @@ function executeLarkImReplay(opts, deps = {}) {
       // The adapter returns only after every page is valid and complete.
       // Deliberately do not use normal sync's cursor window or bisection.
       const fetched = (deps.fetchChatMessages || adapter.fetchChatMessages)(scope.config.chat_id, opts.startMs, opts.endMs, fetchOpts);
+      const acquiredAt = new Date().toISOString();
       if (!Array.isArray(fetched.messages) || !Number.isSafeInteger(fetched.pages) || fetched.pages < 1 ||
           fetched.pages > fetchOpts.maxPages || fetched.messages.length > 10_000 || /** @type {JsonObject} */ (fetched).has_more === true) {
         throw new ReplayInputError("replay fetch was incomplete or exceeded the bounded limit");
@@ -159,9 +161,9 @@ function executeLarkImReplay(opts, deps = {}) {
       if (targets.size && [...targets.keys()].some((id) => fetched.messages.filter((message) => messageId(message) === id).length !== 1)) {
         throw new ReplayInputError("exact replay targets were missing or repeated in the remote window");
       }
-      const prepared = prepareChatWindowRecords(fetched.messages, scope.id, null, opts.startMs, opts.endMs,
+      const prepared = bindAcquiredMessageAccounts(prepareChatWindowRecords(fetched.messages, scope.id, null, opts.startMs, opts.endMs,
         self.open_id, { self }, scope.config)
-        .filter((record) => record.occurred_at_ms >= opts.startMs && record.occurred_at_ms <= opts.endMs);
+        .filter((record) => record.occurred_at_ms >= opts.startMs && record.occurred_at_ms <= opts.endMs), self, { acquiredAt });
       // Validate the entire fetched page before filtering: an unselected invalid
       // message or another chat must not disappear behind the target allowlist.
       normalizeBoundedReplayRecords(/** @type {any} */ (prepared), "lark.im");

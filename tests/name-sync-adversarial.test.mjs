@@ -21,7 +21,8 @@ function fixture(t, count = 1, options = {}) {
   for (let id = 1; id <= count; id++) {
     const type = options.mode?.(id) || 'group';
     const raw = { message_id: `om_adversarial_synthetic_${id}`, chat_id: options.chat?.(id) || CHAT, chat_type: type,
-      sender: { id: SELF, id_type: 'open_id', sender_type: 'user' } };
+      // Sender identity is already named; each case below varies chat evidence.
+      sender: { id: SELF, id_type: 'open_id', sender_type: 'user', name: 'Synthetic author' } };
     const canonical = { message_id: raw.message_id, chat_id: raw.chat_id, chat_type: type,
       sender_id: SELF, sender_id_type: 'open_id', sender_name: 'Synthetic author', chat_name: null };
     options.alter?.(id, canonical, raw);

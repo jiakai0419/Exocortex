@@ -61,6 +61,13 @@ for (const storageRoute of ["legacy", "normalize_record_store"]) {
       const before = snapshot(fixture);
       const [json] = messages(fixture, "json");
       const text = messages(fixture, "text");
+      assert.equal(json.source_id, 'lark.im');
+      assert.deepEqual(json.readiness, { version: 1, state: 'ready', reasons: [], next_action: 'none', requirements: [
+        { field: 'sender', state: 'satisfied', reason: null, evidence: 'message_sender' },
+        { field: 'recipient', state: 'not_applicable', reason: null, evidence: 'chat_destination' },
+        { field: 'conversation', state: 'satisfied', reason: null, evidence: 'canonical' },
+        { field: 'content', state: 'satisfied', reason: null, evidence: 'content_projection' },
+      ] });
       assert.equal(JSON.stringify(original.raw), nativeBefore);
       assert.deepEqual(json.raw, original.raw);
       assert.equal(json.raw_json, nativeBefore);

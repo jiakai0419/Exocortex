@@ -35,7 +35,8 @@ function controls() {
 function source(name, card, attachment, mentions = []) {
   return {
     message_id: `om_invented_attachment_${name}`, msg_type: "interactive",
-    chat_id: "oc_invented_attachment_workshop", create_time: String(INSTANT), update_time: String(INSTANT + 817),
+    chat_id: "oc_invented_attachment_workshop", chat_type: "group", chat_name: "Invented workshop",
+    create_time: String(INSTANT), update_time: String(INSTANT + 817),
     sender: { id: "ou_invented_attachment_author", id_type: "open_id", sender_type: "user", name: "Invented Author" },
     mentions,
     body: { content: JSON.stringify({ json_card: JSON.stringify(card), json_attachment: attachment }) },
@@ -95,12 +96,14 @@ function legacyRecord(native, wrapRawApi = false) {
   return {
     source_id: "lark.im", first_seen_scope_id: SCOPE, external_id: native.message_id,
     external_version: String(native.update_time), record_type: "lark.im.message",
-    occurred_at: new Date(INSTANT).toISOString(), occurred_at_ms: INSTANT,
+    occurred_at: new Date(Number(native.create_time)).toISOString(), occurred_at_ms: Number(native.create_time),
     actor_id: native.sender.id, container_id: native.chat_id, direction: "sent", title: null,
     body: `LEGACY_STORED_BODY_${native.message_id}`,
     content_hash: sha256(JSON.stringify(raw)), raw_json: JSON.stringify(raw),
-    canonical_json: JSON.stringify({ msg_type: "interactive", sender_id: native.sender.id,
-      sender_name: "Stored invented author", sender_type: "user", chat_type: "group", chat_name: "Invented workshop",
+    canonical_json: JSON.stringify({ message_id: native.message_id, chat_id: native.chat_id,
+      msg_type: "interactive", sender_id: native.sender.id, sender_id_type: native.sender.id_type,
+      sender_name: native.sender.name, sender_name_source: "message_sender", sender_type: "user",
+      chat_type: native.chat_type, chat_name: native.chat_name,
       content: "LEGACY_CANONICAL_CONTENT", content_rendering: { version: 2, status: "partial", reason: "unresolved_card_mention" } }),
   };
 }
@@ -148,10 +151,47 @@ function messages(fixture, format) {
 }
 
 function assertUnchangedDisplay(displayed, record) {
-  for (const key of ["body", "raw_json", "canonical_json"]) assert.equal(displayed[key], record[key], key);
+  for (const key of ["source_id", "record_type", "external_id", "actor_id", "container_id", "direction",
+    "occurred_at", "occurred_at_ms", "body", "raw_json", "canonical_json"]) assert.equal(displayed[key], record[key], key);
   assert.deepEqual(displayed.raw, JSON.parse(record.raw_json));
   assert.deepEqual(displayed.canonical, JSON.parse(record.canonical_json));
   assert.equal(displayed.display.body, record.body);
+}
+
+function withReadiness(record) {
+  return enrichRow(record, undefined, true, undefined, undefined, null, true);
+}
+
+function assertReady(displayed) {
+  assert.equal(displayed.readiness.state, "ready");
+  assert.deepEqual(displayed.readiness.reasons, []);
+}
+
+function assertPageOrder(json, records) {
+  const expected = [...records].sort((a, b) => b.occurred_at_ms - a.occurred_at_ms
+    || (a.external_id < b.external_id ? 1 : a.external_id > b.external_id ? -1 : 0));
+  assert.deepEqual(json.map((row) => row.external_id), expected.map((row) => row.external_id));
+  for (const row of json) assertUnchangedDisplay(row, expected.find((record) => record.external_id === row.external_id));
+  return expected;
+}
+
+function atOffset(native, minutes) {
+  return { ...native, create_time: String(INSTANT + minutes * 60_000), update_time: String(INSTANT + minutes * 60_000 + 817) };
+}
+
+function assertExceptionPage(json, text, records, state, reason) {
+  const expected = assertPageOrder(json, records);
+  const blocks = text.split(/(?=^SENT )/m).slice(1);
+  assert.equal(blocks.length, expected.length, "every selected record retains its text position");
+  for (const [index, record] of expected.entries()) {
+    const row = json[index];
+    assert.equal(row.readiness.state, state);
+    assert.deepEqual(row.readiness.reasons, [reason]);
+    assert.ok(blocks[index].startsWith(`SENT ${new Date(record.occurred_at).toLocaleString()} `));
+    assert.match(blocks[index], state === "blocked" ? /状态\s+准备受阻/ : /状态\s+等待完整信息/);
+    assert.match(blocks[index], /messages --format json/);
+    assert.doesNotMatch(blocks[index], /^\s+(发送人|群|类型|消息)\s/m);
+  }
 }
 
 for (const attachmentForm of ["object", "string"]) {
@@ -160,7 +200,8 @@ for (const attachmentForm of ["object", "string"]) {
     const original = JSON.stringify(native);
     const normalized = normalizeApiMessage(native);
     const record = recordFromMessage(normalized, SCOPE, "sent");
-    const displayed = enrichRow(record);
+    const displayed = withReadiness(record);
+    assertReady(displayed);
     assertReadableProjection(displayed.display.card);
     assert.equal(normalized.content, displayed.display.card.text);
     const { text: _text, ...rendering } = displayed.display.card;
@@ -184,9 +225,12 @@ test("old attachment cards use the shared projection while JSON and every stored
   const loaded = loadMessages(fixture.db, { db: fixture.db, direction: "all", limit: 30, search: "" });
   const json = messages(fixture, "json");
   const text = messages(fixture, "text");
+  assertPageOrder(json, records);
+  assertPageOrder(loaded, records);
   for (const record of records) {
-    for (const displayed of [enrichRow(record), loaded.find((row) => row.external_id === record.external_id),
+    for (const displayed of [withReadiness(record), loaded.find((row) => row.external_id === record.external_id),
       json.find((row) => row.external_id === record.external_id)]) {
+      assertReady(displayed);
       assertUnchangedDisplay(displayed, record);
       assertReadableProjection(displayed.display.card);
       const native = displayed.raw.raw_api ?? displayed.raw;
@@ -218,10 +262,11 @@ test("attachment-only names, prefix keys and conflicting identities remain unkno
       { key: "@_user_5", name: sameName ? "DO_NOT_GUESS_COLLISION_NAME" : "DO_NOT_GUESS_OTHER_NAME", id: "ou_invented_identity_two", id_type: "open_id" },
     ])),
   ];
-  const records = cases.map((native) => legacyRecord(native));
+  const records = cases.map((native, index) => legacyRecord(atOffset(native, index)));
   const fixture = database(t, records);
   const before = snapshot(fixture);
   const json = messages(fixture, "json");
+  assertExceptionPage(json, messages(fixture, "text"), records, "enriching", "content_partial");
   for (const record of records) {
     const displayed = json.find((row) => row.external_id === record.external_id);
     assertUnchangedDisplay(displayed, record);
@@ -246,10 +291,11 @@ test("unknown body widgets and a declared missing body stay visibly incomplete b
     source("missing_body", { header: { title: plain("Known missing-body heading") },
       body: { unrecognized_elements: [{ text: "DO_NOT_DUMP_MISSING_BODY" }] } }, {}, []),
   ];
-  const records = cases.map((native) => legacyRecord(native));
+  const records = cases.map((native, index) => legacyRecord(atOffset(native, index)));
   const fixture = database(t, records);
   const before = snapshot(fixture);
   const json = messages(fixture, "json");
+  assertExceptionPage(json, messages(fixture, "text"), records, "blocked", "content_unsupported");
   for (const record of records) {
     const displayed = json.find((row) => row.external_id === record.external_id);
     assertUnchangedDisplay(displayed, record);
@@ -268,6 +314,12 @@ test("pure callback cards have a neutral folded display and their complete actio
   const fixture = database(t, records);
   const before = snapshot(fixture);
   const json = messages(fixture, "json");
+  assertPageOrder(json, records);
+  for (const row of json) assertReady(row);
+  const text = messages(fixture, "text");
+  assert.match(text, /卡片仅含交互操作，文本视图已收起/);
+  assert.match(text, /同意\/拒绝是本条合成正文中的普通词语。/);
+  assert.doesNotMatch(text, /等待完整信息|准备受阻/);
   const folded = json.find((row) => row.external_id === onlyControls.message_id);
   assert.equal(folded.display.card.text, "[卡片仅含交互操作，文本视图已收起]");
   assert.equal(folded.display.card.status, "rendered");
@@ -301,7 +353,8 @@ test("same-source-version attachment projection improves once without changing s
   assert.equal(stored.external_version, old.external_version);
   assert.equal(stored.body, normalized.content);
   assert.equal(JSON.parse(stored.canonical_json).content_rendering.version, 3);
-  assertReadableProjection(enrichRow(stored).display.card);
+  assertReadableProjection(withReadiness(stored).display.card);
+  assertReady(withReadiness(stored));
 });
 
 // Review regressions are synthetic structure combinations, including native
@@ -326,10 +379,13 @@ test("empty navigation slots and field tails share one projection across native 
   const before = snapshot(fixture);
   const json = messages(fixture, "json");
   const text = messages(fixture, "text");
+  assertPageOrder(json, records);
   for (const [index, native] of natives.entries()) {
     const normalized = normalizeApiMessage(native);
     const current = recordFromMessage(normalized, SCOPE, "sent");
     const old = json.find((row) => row.external_id === native.message_id);
+    assertReady(old);
+    assertReady(withReadiness(current));
     assertUnchangedDisplay(old, records[index]);
     const projections = [enrichRow(current).display.card, old.display.card];
     for (const card of projections) {
@@ -361,7 +417,9 @@ test("nonempty invalid primary navigation stays incomplete beside a fallback and
   const record = legacyRecord(native);
   const fixture = database(t, [record]);
   const before = snapshot(fixture);
-  const old = messages(fixture, "json")[0];
+  const json = messages(fixture, "json");
+  const old = json[0];
+  assertExceptionPage(json, messages(fixture, "text"), [record], "blocked", "content_unsupported");
   const normalized = normalizeApiMessage(native);
   assertUnchangedDisplay(old, record);
   assert.equal(old.display.card.status, "partial");
@@ -396,4 +454,5 @@ test("same-version slot projection correction writes once and then becomes a dup
   assert.match(stored.body, /Invented field\nInvented tail/);
   assert.match(stored.body, /Invented link.*https:\/\/example\.invalid\/version/);
   assert.equal(JSON.parse(stored.canonical_json).content_rendering.version, 3);
+  assertReady(withReadiness(stored));
 });

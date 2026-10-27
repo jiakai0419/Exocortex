@@ -34,7 +34,8 @@ const query=(f,sql)=>sqliteQuery(f.db,sql,'inspect synthetic round two fixture')
 function add(f,first,last,{unknown=false,bytes=0}={}) {
   const sql=[];
   for(let id=first;id<=last;id++) {
-    const raw={message_id:`om_independent_round_two_${id}`,chat_id:CHAT,chat_type:'group',sender:{id:ACTOR,id_type:'open_id',sender_type:'user'}};
+    // Known senders in these chat-projection fixtures have exact native authority.
+    const raw={message_id:`om_independent_round_two_${id}`,chat_id:CHAT,chat_type:'group',sender:{id:ACTOR,id_type:'open_id',sender_type:'user',...(!unknown?{name:'Known Synthetic Actor'}:{})}};
     const canonical={message_id:raw.message_id,chat_id:CHAT,chat_type:'group',sender_id:ACTOR,sender_id_type:'open_id',sender_name:unknown?null:'Known Synthetic Actor',chat_name:null};
     sql.push(`INSERT INTO records(id,source_id,first_seen_scope_id,external_id,external_version,record_type,actor_id,container_id,direction,body,canonical_json,raw_json)
       VALUES(${id},'lark.im',${quoteSql(chatScopeId(CHAT))},${quoteSql(raw.message_id)},'synthetic-version','lark.im.message',${quoteSql(ACTOR)},${quoteSql(CHAT)},'received',

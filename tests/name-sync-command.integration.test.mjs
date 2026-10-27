@@ -194,7 +194,7 @@ if (process.argv[2] === '--synthetic-remote') {
     return result.stdout;
   }
 
-  test('real sync CLI heals an old received sender after permission recovery, empty cycles and process restarts', t => {
+  test('real sync CLI heals quarantined historical sender after a bounded recovery probe and process restarts', t => {
     const f = fixture(t);
     const first = f.cycle(1, 0), firstRun = success(first);
     assert.equal(firstRun.inserted, 1);
@@ -205,6 +205,8 @@ if (process.argv[2] === '--synthetic-remote') {
     assert.equal(account.state, 'verified', 'the real command establishes account admission before the name tail');
     const failedTask = sqliteQuery(f.db, "SELECT * FROM lark_im_name_tasks WHERE kind='sender';")[0];
     assert(failedTask, 'the failed historical sender must have a durable task');
+    assert.equal(failedTask.blocked_reason,'permission_denied');
+    assert.equal(failedTask.retry_at_ms-failedTask.last_attempt_at_ms,86400000,'only a bounded daily recovery probe may recheck denied routes');
     assert.equal(failedTask.attempt_token, null); assert(failedTask.retry_at_ms > failedTask.last_attempt_at_ms);
     // Unknown fields are authored locally in this synthetic fixture to make
     // unintended JSON reserialization observable in the subsequent real pass.
@@ -217,10 +219,10 @@ if (process.argv[2] === '--synthetic-remote') {
     assert(second.calls.filter(call => call.route === 'messages').every(call => call.startMs > Number(OLD.create_time)));
     assert.equal(JSON.parse(f.old().canonical_json).sender_name, null, 'no new old-actor message can conceal the historical gap');
     preserveContent(before, f.old());
-    const third = f.cycle(3, 6), thirdRun = success(third);
+    const third = f.cycle(3, 1441), thirdRun = success(third);
     assert.equal(thirdRun.records, 0, 'a successful empty content cycle still invokes persisted name work');
     preserveContent(before, f.old());
-    const fourth = f.cycle(4, 7), fourthRun = success(fourth);
+    const fourth = f.cycle(4, 1442), fourthRun = success(fourth);
     assert.equal(fourthRun.records, 0);
     const after = f.old(), canonical = JSON.parse(after.canonical_json);
     assert.equal(canonical.sender_name, RECOVERED, JSON.stringify({ reports: [first, second, third, fourth].map(value => value.nameReport) }));

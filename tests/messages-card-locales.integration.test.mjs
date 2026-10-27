@@ -4,7 +4,8 @@ import test from "node:test";
 import { normalizeApiMessage } from "../src/adapters/lark-im/raw-message.mjs";
 import { recordFromMessage } from "../src/adapters/lark-im/message-record.mjs";
 import { enrichRow } from "../src/diagnostics/messages-report.mjs";
-import { createLegacyCardFixture, snapshot, messages, assertOriginalContract } from "./helpers/card-projection-fixture.mjs";
+import { createLegacyCardFixture, snapshot, messages, assertOriginalContract,
+  assertCardReadiness, assertPageContract, renderedCardText } from "./helpers/card-projection-fixture.mjs";
 
 // Fresh, short examples written for this contract; no captured or redacted cards.
 const START = Date.UTC(2047, 6, 12, 9, 4, 0);
@@ -38,6 +39,7 @@ function exercise(t, cases) {
   const json = messages(fixture, "json");
   const text = messages(fixture, "text");
   assert.equal(json.length, originals.length);
+  assertPageContract(json, text, originals);
   for (const [index, original] of originals.entries()) {
     const sourceBefore = JSON.stringify(original.raw);
     const historical = json.find((item) => item.external_id === original.raw.message_id);
@@ -55,7 +57,10 @@ function exercise(t, cases) {
     assert.deepEqual(normalized.raw_api, original.raw);
     assert.equal(JSON.parse(current.canonical_json).content_rendering.version, 3);
     const readableText = cases[index].readableText ?? projected.text;
-    for (const line of readableText.split("\n").filter(Boolean)) assert.ok(text.includes(line), `${original.name}: real text CLI lost a readable source line`);
+    const incomplete = cases[index].incomplete === true;
+    assertCardReadiness(historical, incomplete ? "blocked" : "ready", incomplete ? "content_unsupported" : null);
+    const output = incomplete ? renderedCardText(original) : text;
+    for (const line of readableText.split("\n").filter(Boolean)) assert.ok(output.includes(line), `${original.name}: source projection lost a readable line`);
     cases[index].check(projected, text, historical);
   }
   // Includes DB bytes, timestamps/mode, every stored field (hash/version too),
@@ -112,7 +117,7 @@ test("an explicitly chosen empty string or array does not borrow lower languages
 test("malformed outer maps and unknown languages stay partial without hiding their evidence behind fallback", (t) => {
   exercise(t, [null, "", [], { zz_invented: "UNKNOWN_LANGUAGE_MUST_STAY_HIDDEN" }, { zh_cn: {} }].map((value, index) => ({
     name: `malformed_${index}`, card: { header: { title: plain("Readable anchor") }, elements: [plain("DEFAULT_MUST_STAY_HIDDEN", { i18nContent: value })] },
-    readableText: "Readable anchor",
+    readableText: "Readable anchor", incomplete: true,
     check(card, text) {
       assert.equal(card.status, "partial");
       assert.equal(card.reason, "unsupported_card_structure");
@@ -126,7 +131,7 @@ test("malformed outer maps and unknown languages stay partial without hiding the
 test("a malformed preferred language may expose a valid alternative but remains partial", (t) => {
   exercise(t, [{ name: "invalid_then_readable", card: { elements: [plain("DEFAULT_MUST_STAY_HIDDEN", {
     i18nContent: { zh_cn: 42, en_us: "Readable alternative", ja_jp: "LOWER_LANGUAGE_MUST_STAY_HIDDEN" },
-  })] }, readableText: "Readable alternative", check(card, text) {
+  })] }, readableText: "Readable alternative", incomplete: true, check(card, text) {
     assert.equal(card.status, "partial");
     assert.equal(card.reason, "unsupported_card_structure");
     assert.match(card.text, /^Readable alternative\n/);

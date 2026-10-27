@@ -28,7 +28,8 @@ function raw(id, kind = 'app', offset = 1) {
 function record(id, kind = 'app', source = null, offset = 1) {
   const result = recordFromMessage(normalizeApiMessage(raw(id, kind, offset)), SCOPE, 'received', {}, { chat_id: CHAT });
   if (source) result.canonical_json = JSON.stringify({ ...canonical(result), sender_name: NAME,
-    sender_name_source: source, sender_name_confidence: 'high' });
+    sender_name_source: source, sender_name_confidence: 'high',
+    sender_name_account_key: createHash('sha256').update(`lark.im\0${SELF.open_id}`).digest('hex') });
   return result;
 }
 function fixture(t) {

@@ -114,8 +114,9 @@ globalThis.fetch=reject;Socket.prototype.connect=reject;\n`);
       const statements = [];
       for (let id = first; id <= last; id++) {
         const message = `om_synthetic_scheduler_${id}`, at = AT - id * 1000;
+        // Title recovery is the only debt; the native sender already names its exact ID.
         const raw = { message_id: message, chat_id: CHAT, chat_type: 'group', msg_type: 'text',
-          sender: { id: ACTOR, id_type: 'open_id', sender_type: 'user' }, opaque: { literal: '  preserved  ' } };
+          sender: { id: ACTOR, id_type: 'open_id', sender_type: 'user', name: AUTHOR }, opaque: { literal: '  preserved  ' } };
         const canonical = { message_id: message, chat_id: CHAT, chat_type: 'group', chat_name: null,
           msg_type: 'text', sender_id: ACTOR, sender_id_type: 'open_id', sender_name: AUTHOR };
         const text = '{\n "opaque_large":9007199254740993, "opaque_nested":{"x":9007199254740997,"spaces":"  keep  "},\n ' + JSON.stringify(canonical).slice(1);

@@ -256,7 +256,7 @@ test('migrations after 011 preserve every existing table value and initialize bo
   assert.equal(before.get('schema_migrations').rows.at(-1).version, '011');
   assert.deepEqual(store.ensureInitialized(f.db).applied,
     ['012_pending_detail_observation.sql', '013_lark_history_debt.sql', '014_lark_recipient_retry.sql',
-      '015_lark_name_convergence.sql']);
+      '015_lark_name_convergence.sql', '016_lark_name_scheduling.sql', '017_message_readiness_observations.sql']);
   for (const [name, saved] of before) {
     const current = store.sqliteQuery(f.db, `SELECT ${saved.columns.map(identifiers).join(',')} FROM ${identifiers(name)};`);
     assert.deepEqual(name === 'schema_migrations' ? current.filter(row => row.version <= '011') : current,

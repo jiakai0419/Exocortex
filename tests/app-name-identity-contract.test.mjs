@@ -116,7 +116,7 @@ test('legacy guessed names remain visible and retryable after failure; fresh exa
 test('legacy review retains clear, exact source and explicit account boundaries',t=>{
   const f=fixture(t);legacy(f);const original=canonical(f);
   for(const extra of [{sender_name_state:'cleared'},{sender_name_account_key:'f'.repeat(64)},
-    {chat_name_account_key:'f'.repeat(64)},{sender_name_source:'application_api',sender_name_confidence:'high'}]) {
+    {chat_name_account_key:'f'.repeat(64)},{sender_name_source:'application_api',sender_name_confidence:'high',sender_name_account_key:ACCOUNT}]) {
     f.setCanonical({...original,...extra});const before=f.row();
     const result=f.work(exact('Must Not Replace'));assert.equal(result.updates.length,0);assert.deepEqual(f.row(),before);
   }

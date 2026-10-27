@@ -26,6 +26,7 @@ import { displayNameFromUser, personName, senderAliasesByOpenId, senderIdentity,
  * @property {boolean=} forceRefresh Bypass name caches for an explicit probe.
  * @property {number=} memberPageLimit Optional tighter bound for an exact verification.
  * @property {number=} nameLookupDeadlineMs Shared absolute deadline for optional detail enrichment.
+ * @property {(target:{operation:string,actor_id:string,namespace:string,chat_id:string})=>boolean=} nameRouteAdmission
  *
  * @typedef {object} SelfProfile
  * @property {string} open_id
@@ -132,6 +133,15 @@ const failureReason = error => error instanceof NameLookupBudgetExceeded ? 'budg
  * @returns {NameResolver}
  */
 function createNameResolver({ run, now = Date.now, onLookup }) {
+  /** Admission never records a lookup observation; the caller's optional hook
+   * cannot clear or suppress an already accepted positive cache entry.
+   * @param {AdapterOptions} opts @param {string} operation @param {string} id
+   * @param {string} namespace @param {string} [chat] */
+  function routeAllowed(opts, operation, id, namespace, chat = '') {
+    if (opts.nameRouteAdmission === undefined) return true;
+    try { return opts.nameRouteAdmission({ operation, actor_id: id, namespace, chat_id: chat }) === true; }
+    catch { return false; }
+  }
   /** @param {string[]} args @param {AdapterRunOptions} options @param {AdapterOptions} opts */
   function lookup(args, options, opts) {
     if (opts.nameLookupDeadlineMs === undefined) return run(args, options);
@@ -218,7 +228,7 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
       const name = personName(cachedName(`user:${id}`), [id, ...(aliases.get(id) || [])]);
       if (name) names.set(id, name);
       else nameCache.delete(`user:${id}`);
-      return !name;
+      return !name && routeAllowed(opts, 'contact_search', id, 'open_id');
     });
     // lark-cli +search-user returns at most 30 users per page. Keep each ID
     // batch within that page and request it explicitly rather than default 20.
@@ -299,6 +309,9 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
         names.set(id, name);
         targetIds.delete(id);
       } else nameCache.delete(key);
+    }
+    for (const id of targetIds) {
+      if (!routeAllowed(opts, 'chat_members', id, 'open_id', chatIdValue)) targetIds.delete(id);
     }
 
     let pageToken = "";
@@ -416,6 +429,7 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
         reportLookup({ kind: "application", app_id: appId, status: "resolved", name: cached, cached: true });
         continue;
       }
+      if (!routeAllowed(opts, 'application_info', appId, 'app_id')) continue;
       try {
         const json = lookup(
           [
@@ -474,7 +488,8 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
     const names = new Map();
     for (const [chatIdValue, ids] of appIdsByChat.entries()) {
       const pendingIds = uniqueAppIds([...ids]).filter((id) => !personName(officialApps.get(id), [id])
-        && observations.get(`app:${id}`)?.status !== 'conflict');
+        && observations.get(`app:${id}`)?.status !== 'conflict'
+        && routeAllowed(opts, 'chat_bots', id, 'app_id', chatIdValue));
       if (pendingIds.length === 0) continue;
       try {
         const json = lookup(

@@ -12,6 +12,8 @@ import { ensureInitialized, quoteSql, sqliteExec } from '../dist/storage/sqlite/
 import { plain } from '../dist/terminal/index.js';
 import { normalizeApiMessage } from '../src/adapters/lark-im/raw-message.mjs';
 import { recordFromMessage } from '../src/adapters/lark-im/message-record.mjs';
+import { recipientAccountKey } from '../src/adapters/lark-im/p2p-recipient.mjs';
+import { renderMessagesText } from '../src/terminal/messages-view.mjs';
 import { textWidth } from '../src/terminal/text-layout.mjs';
 
 // Invented inputs only. The native system message intentionally has no title
@@ -111,6 +113,11 @@ function assertCurrentContext(row, type = 'group') {
   assert.match(row.body, /\[未知参数：group_name\]/, 'stored historical missing-parameter evidence remains');
   assert.equal(Object.hasOwn(row.raw, 'chat_name'), false);
   assert.equal(Object.hasOwn(row.raw, 'chat_type'), false);
+  assert.equal(row.display.scene, type === 'topic' ? '话题群' : '群聊');
+  assert.equal(row.readiness.state, 'enriching');
+  assert.deepEqual(row.readiness.reasons, ['content_partial']);
+  assert.deepEqual(row.readiness.requirements.find(item => item.field === 'content'),
+    { field: 'content', state: 'missing', reason: 'content_partial', evidence: null });
 }
 
 test('offline messages labels current group/topic titles for the native to_chatters template without repairing history', t => {
@@ -125,17 +132,30 @@ test('offline messages labels current group/topic titles for the native to_chatt
   assertCurrentContext(byId.get('om_synthetic_current_topic'), 'topic');
   assertCurrentContext(byId.get('om_synthetic_current_topic_mode'), 'topic');
   const text = f.run('text');
-  assert.equal((text.match(/当前本地标题来源\s+会话配置；观察时间未知/g) || []).length, 3);
-  assert.match(text, /current local\s+title: Synthetic Cedar Workshop/);
+  const blocks = text.trimEnd().split('\n\n');
+  assert.equal(blocks.length, 4);
+  assert.equal(blocks[0], 'Messages (3)\n完整 0 · 待补全 3 · 受阻 0');
+  for (const [index, row] of json.entries()) {
+    assert.equal(blocks[index + 1], `RECEIVED ${new Date(row.occurred_at).toLocaleString('en-US', { timeZone: 'UTC' })}  om_synth...  ${row.display.scene}\n  状态    等待完整信息\n  原因    消息内容未完整解析\n  查看    messages --format json 可检查已保存内容与原因`,
+      'a current local title does not turn missing historical event parameters into a complete message');
+  }
+  assert.doesNotMatch(text, /当前本地标题来源|current local title:/);
   assert.doesNotMatch(text, /2058-06-13|2058-06-14/, 'scope bookkeeping timestamps are not title observation evidence');
   assert.deepEqual(f.run('json'), json, 'text projection does not change a later JSON read');
 });
 
-test('real messages CLI stacks current-title provenance at 20 columns and below the width clamp', async t => {
-  const f = fixture(t, [{ key: 'narrow_columns' }]);
+test('real messages CLI retains partial provenance in JSON and wraps its exception beside a complete neighbour at narrow widths', async t => {
+  const f = fixture(t, [{ key: 'narrow_columns' }, { key: 'ready_neighbour',
+    parameters: { ...PARAMETERS, group_name: 'Synthetic Historical Studio' },
+    native: { create_time: String(AT + 1000), update_time: String(AT + 1000) } }]);
   const messages = f.run('json');
   const before = JSON.stringify(messages);
-  assertCurrentContext(messages[0]);
+  assert.equal(messages[0].external_id, 'om_synthetic_current_ready_neighbour');
+  assert.equal(messages[0].readiness.state, 'ready');
+  assert.equal(messages[0].display.system.status, 'rendered');
+  assert.deepEqual(messages[0].display.system.missing_parameters, []);
+  assert.equal(messages[0].display.system.current_group_context, null);
+  assertCurrentContext(messages[1]);
   function writer(columns) {
     let output = '';
     const stream = new Writable({ write(chunk, _encoding, done) { output += chunk.toString(); done(); } });
@@ -164,21 +184,48 @@ test('real messages CLI stacks current-title provenance at 20 columns and below 
       const text = await run(columns, 'text');
       assert.equal(text.code, 0, text.stderr);
       assert.equal(text.stderr, '');
-      assert.match(text.stdout, /Messages \(1\)/);
+      assert.match(text.stdout, /Messages \(2\)/);
       const lines = text.stdout.split('\n');
       for (const line of lines) {
         assert.ok(textWidth(line) <= Math.max(20, columns), `${textWidth(line)} cells at ${columns} columns: ${line}`);
       }
-      const source = lines.indexOf('  当前本地标题来源');
-      assert.ok(source >= 0, 'the long provenance label occupies its own line');
-      const nextField = lines.findIndex((line, index) => index > source && line.startsWith('  类型 '));
-      assert.ok(nextField > source + 1, 'the provenance value follows below its label');
-      const values = lines.slice(source + 1, nextField);
-      assert.ok(values.every(line => line.startsWith('    ')), 'stacked values retain their hanging indentation');
-      assert.equal(values.map(line => line.slice(4)).join(''), '会话配置；观察时间未知');
+      const blocks = text.stdout.trimEnd().split('\n\n');
+      assert.equal(blocks.length, 3, 'ready neighbour and partial exception retain separate selected positions');
+      const readyLines = blocks[1].split('\n');
+      const bodyIndex = readyLines.findIndex(line => line.startsWith('  消息    '));
+      assert.ok(bodyIndex >= 0, 'the complete historical message keeps its ordinary body field');
+      const bodyLines = readyLines.slice(bodyIndex);
+      assert.equal(bodyLines.map((line, index) => line.slice(index ? 10 : 8)).join(''), messages[0].display.body,
+        'normal narrow wrapping preserves the whole source body and its spaces');
+      const exception = blocks[2].replace(/\s/gu, '');
+      assert.ok(exception.includes('状态等待完整信息'));
+      assert.ok(exception.includes('原因消息内容未完整解析'));
+      assert.doesNotMatch(blocks[2], /\n  消息|当前本地标题来源/);
     });
   }
   assert.deepEqual(f.run('json'), messages, 'all narrow text reads preserve database bytes and a later JSON read');
+});
+
+test('low-level renderer still stacks a long current-title provenance label without asserting message readiness', () => {
+  // A fictional presentation model isolates the retained formatter contract.
+  // This is not a ready message or a normal CLI publication of partial content.
+  const presentation = { direction: 'received', occurred_at: new Date(AT).toISOString(), raw: {}, display: {
+    external_id: 'om_synth...', scene: '群聊', sender: '系统', sender_type: 'system', message_type: '系统',
+    recipient: null, chat: TITLE, body: EXPECTED,
+    system: { current_group_context: { chat_id: CHAT, name: TITLE, source: 'scope_config', observed_at: null } },
+  } };
+  assert.equal(Object.hasOwn(presentation, 'readiness'), false);
+  for (const columns of [20, 19, 1, 21]) {
+    const lines = plain(renderMessagesText([presentation], { columns })).split('\n');
+    for (const line of lines) assert.ok(textWidth(line) <= Math.max(20, columns));
+    const source = lines.indexOf('  当前本地标题来源');
+    assert.ok(source >= 0, 'the long provenance label occupies its own line');
+    const nextField = lines.findIndex((line, index) => index > source && line.startsWith('  类型 '));
+    assert.ok(nextField > source + 1, 'the provenance value follows below its label');
+    const values = lines.slice(source + 1, nextField);
+    assert.ok(values.every(line => line.startsWith('    ')), 'stacked values retain their hanging indentation');
+    assert.equal(values.map(line => line.slice(4)).join(''), '会话配置；观察时间未知');
+  }
 });
 
 test('explicit historical group names and existing adopted sender names retain precedence', t => {
@@ -186,7 +233,12 @@ test('explicit historical group names and existing adopted sender names retain p
     { key: 'explicit', parameters: { ...PARAMETERS, group_name: 'Synthetic Historical Studio' } },
     { key: 'adopted_sender', native: {
       sender: { id: 'ou_synthetic_current_actor', id_type: 'open_id', sender_type: 'user', name: 'Synthetic API Name' },
-    }, canonical: { sender_name: 'Synthetic Adopted Name', sender_name_source: 'chat_member', sender_name_confidence: 'high' } },
+    }, canonical: { sender_name: 'Synthetic Adopted Name', sender_name_source: 'chat_member', sender_name_confidence: 'high',
+      sender_name_account_key: recipientAccountKey('ou_synthetic_current_owner') } },
+    { key: 'adopted_complete', parameters: { ...PARAMETERS, group_name: 'Synthetic Historical Studio' }, native: {
+      sender: { id: 'ou_synthetic_current_actor', id_type: 'open_id', sender_type: 'user', name: 'Synthetic API Name' },
+    }, canonical: { sender_name: 'Synthetic Adopted Name', sender_name_source: 'chat_member', sender_name_confidence: 'high',
+      sender_name_account_key: recipientAccountKey('ou_synthetic_current_owner') } },
   ]);
   const json = f.run('json');
   const explicit = json.find(row => row.external_id === 'om_synthetic_current_explicit');
@@ -196,16 +248,23 @@ test('explicit historical group names and existing adopted sender names retain p
   assert.deepEqual(explicit.display.system.context_parameters, []);
   assert.equal(explicit.display.system.context_status, 'not_applied');
   assert.equal(explicit.display.system.current_group_context, null);
+  assert.equal(explicit.readiness.state, 'ready');
   const adopted = json.find(row => row.external_id === 'om_synthetic_current_adopted_sender');
   assertCurrentContext(adopted);
   // Current-title display cannot resolve a separate API/client name dispute
   // or replace an already adopted canonical name with a raw sender value.
   assert.equal(adopted.display.sender, 'Synthetic Adopted Name');
   assert.equal(adopted.raw.sender.name, 'Synthetic API Name');
+  const complete = json.find(row => row.external_id === 'om_synthetic_current_adopted_complete');
+  assert.equal(complete.readiness.state, 'ready');
+  assert.equal(complete.display.sender, 'Synthetic Adopted Name');
+  assert.equal(complete.raw.sender.name, 'Synthetic API Name');
   const text = f.run('text');
-  assert.equal((text.match(/当前本地标题来源\s+会话配置；观察时间未知/g) || []).length, 1);
+  assert.doesNotMatch(text, /当前本地标题来源/);
   assert.match(text, /Synthetic Historical Studio/);
   assert.match(text, /Synthetic Adopted Name/);
+  assert.equal((text.match(/  状态    等待完整信息/g) || []).length, 1, 'the partial adopted-name record remains an exception');
+  assert.deepEqual(f.run('json'), json);
 });
 
 test('current group labels require the exact template and consistent native/canonical/scope identity and time', t => {

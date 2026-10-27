@@ -13,5 +13,8 @@ declare function larkSenderNamespaceSql(canonical: string, raw: string, actor: s
  * Keep name provenance together, and never carry it across different identities.
  * Ingestion evaluates this inside its write transaction; enrichment evaluates
  * a snapshot and commits only if that exact snapshot still matches. */
-declare function mergeLarkNameProjectionSql(existingJson: string, incomingJson: string, existingActor: string, incomingActor: string, existingContainer: string, incomingContainer: string, existingRaw?: string, incomingRaw?: string): string;
+declare function mergeLarkNameProjectionSql(existingJson: string, incomingJson: string, existingActor: string, incomingActor: string, existingContainer: string, incomingContainer: string, existingRaw?: string, incomingRaw?: string, accountRetention?: {
+    existingAlias: string;
+    incomingAlias: string;
+}): string;
 export { larkSenderNameIsUnknownSql, larkSenderNamespaceSql, mergeLarkNameProjectionSql };

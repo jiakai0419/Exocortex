@@ -20,7 +20,8 @@ function fixture(t, count=1, options={}) {
   if(options.scope) statements.push(`INSERT INTO sync_scopes(id,source_id,name,enabled,config_json)
     VALUES(${quoteSql(chatScopeId(CHAT))},'lark.im','authored group',0,${quoteSql(JSON.stringify({chat_id:CHAT,chat_type:'group',chat_name:'Legacy scope title'}))});`);
   for(let id=1;id<=count;id++) {
-    const raw={message_id:`om_synthetic_name_${id}`,chat_id:CHAT,chat_type:'group',sender:{id:SELF,id_type:'open_id',sender_type:'user'}};
+    // These title/recipient scheduling cases start with an exact native sender name.
+    const raw={message_id:`om_synthetic_name_${id}`,chat_id:CHAT,chat_type:'group',sender:{id:SELF,id_type:'open_id',sender_type:'user',name:'Synthetic Owner'}};
     const canonical={message_id:raw.message_id,chat_id:CHAT,chat_type:'group',sender_id:SELF,sender_id_type:'open_id',sender_name:'Synthetic Owner',chat_name:'Legacy message title',...options.canonical};
     statements.push(`INSERT INTO records(id,source_id,first_seen_scope_id,external_id,external_version,record_type,actor_id,container_id,direction,body,canonical_json,raw_json)
       VALUES(${id},'lark.im','lark.im.sent_by_me',${quoteSql(raw.message_id)},'opaque-name-version','lark.im.message',${quoteSql(SELF)},${quoteSql(CHAT)},'sent',

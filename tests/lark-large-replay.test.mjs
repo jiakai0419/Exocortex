@@ -64,7 +64,15 @@ function restart(f) {
         has_more: !params.page_token, page_token: params.page_token ? '' : 'synthetic_page_2' } };
     } else assert.fail(`Unexpected fixture route ${path}`);
     return { ok: true, data: { items, has_more: false, page_token: '' } };
-  } }), buildPeopleContext: () => ({ self: SELF }), reuseKnownSenderNames: (_db, records) => f.project(records) });
+  } }), buildPeopleContext: () => ({ self: SELF }),
+    // Arbitrary future canonical fields belong at the storage boundary. The
+    // local-name interface intentionally admits only verified name projection.
+    commitLarkListRun: (db, scope, runId, records, ...rest) =>
+      store.commitLarkListRun(db, scope, runId, f.project(records), ...rest),
+    finishLarkDetailRun: (db, scope, runId, outcomes, ...rest) =>
+      store.finishLarkDetailRun(db, scope, runId, outcomes.map(outcome => outcome.record
+        ? { ...outcome, record: f.project([outcome.record])[0] } : outcome), ...rest),
+  });
 }
 const admitted = (f, extra = {}) => ({ ...options, ...extra, writeAdmission: captureLarkWriteAdmission(f.db, { selfOpenId: SELF.open_id }) });
 const sent = f => f.runner.syncSent(f.db, admitted(f), SELF);

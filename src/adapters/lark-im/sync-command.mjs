@@ -60,7 +60,7 @@ import { captureLarkWriteAdmission } from "../../diagnostics/lark-write-admissio
  * @property {(dbPath: string) => void=} ensureInitialized
  * @property {(dbPath: string, sourceId: string, candidateStartMs: number, options?: {explicit?: boolean, endMs?: number}) => number=} ensureSourceInitialSyncStart
  * @property {(opts: SyncOptions) => SelfProfile=} getSelfProfile
- * @property {Partial<Pick<import("./sync-runner.mjs").SyncRunner, "syncSent" | "syncDiscovery" | "syncReceived" | "retryDetails" | "syncRecipients" | "syncNames">>=} syncRunner
+ * @property {Partial<Pick<import("./sync-runner.mjs").SyncRunner, "syncSent" | "syncDiscovery" | "syncReceived" | "retryDetails" | "syncRecipients" | "syncNames" | "syncReadiness">>=} syncRunner
  * @property {Partial<import("./sync-runner.mjs").SyncRunnerDeps>=} syncRunnerDeps
  * @property {(dbPath: string) => string=} resolvePath
  * @property {() => JsonObject=} getTransportStats
@@ -249,6 +249,10 @@ function executeLarkImSync(opts, deps = {}) {
       }
     }
     catch { /* Its durable claim remains retryable; committed messages stand. */ }
+    // Observe the actual readable projection independently of name recovery.
+    // A failed name tail cannot hide previously committed incomplete messages.
+    try { runner.syncReadiness?.(dbPath, selfProfile); }
+    catch { /* Optional historical observation never rolls back collection. */ }
   }
   return summary;
 }

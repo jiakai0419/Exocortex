@@ -20,10 +20,10 @@ const NAME = "Synthetic Lantern Courier";
 const SOURCE = { kind: "user_screenshot", recorded_at: "2057-03-19T11:00:00.000Z", evidence_refs: ["synthetic-lantern-proof-1"] };
 const hash = (value) => createHash("sha256").update(value).digest("hex");
 
-function record(key, { chat = CHAT, app = APP, tenant = TENANT, name = null, clear = false, card = false } = {}) {
+function record(key, { chat = CHAT, app = APP, tenant = TENANT, name = null, sourceName = null, clear = false, card = false } = {}) {
   const native = { message_id: `om_synthetic_lantern_${key}`, chat_id: chat,
     msg_type: card ? "interactive" : "text", create_time: String(START),
-    sender: { id: app, id_type: "app_id", sender_type: "app", tenant_key: tenant },
+    sender: { id: app, id_type: "app_id", sender_type: "app", tenant_key: tenant, ...(sourceName ? { name: sourceName } : {}) },
     body: { content: JSON.stringify(card ? { elements: [{ tag: "markdown", elements: [
       { tag: "plain_text", content: "Invented audience " }, { tag: "at_all" },
       { tag: "plain_text", content: ": the paper lighthouse opens at noon." },
@@ -40,6 +40,9 @@ function insert(fixture, entries, offset = 0) {
   sqliteExec(fixture.dbPath, entries.map((entry, index) => {
     const scope = `synthetic.scope.${entry.key}`;
     const stamp = START + (offset + index) * 1000;
+    // Each invented event has one consistent source/record clock. Missing name
+    // cases must be isolated from unrelated timestamp conflicts.
+    entry.raw.create_time = entry.raw.raw_api.create_time = String(stamp);
     return `INSERT INTO sync_scopes(id,source_id,name,config_json) VALUES(
       ${quoteSql(scope)},'lark.im',${quoteSql(`Synthetic local name test ${entry.key}`)},${quoteSql(JSON.stringify({ chat_id: entry.chat, tenant_key: entry.tenant, chat_type: "group" }))});
       INSERT INTO records(source_id,first_seen_scope_id,external_id,external_version,record_type,
@@ -107,9 +110,11 @@ function messages(f, format = "json") {
 }
 
 test("CLI overlays one exact chat/app/tenant on a historical at_all card, preserving all other JSON and database bytes", (t) => {
+  const neighbour = record("ready_neighbour", { name: "Synthetic Proven Courier", sourceName: "Synthetic Proven Courier" });
+  neighbour.body = "Fictional lantern message ready_neighbour.";
   const rows = [record("exact", { card: true }), record("other_chat", { chat: "oc_synthetic_pond_room" }),
     record("other_app", { app: "cli_synthetic_pond_app" }), record("other_tenant", { tenant: "synthetic-tenant-pond" }),
-    record("known", { name: "Synthetic Native Courier" }), record("cleared", { clear: true })];
+    record("known", { name: "Synthetic Native Courier" }), record("cleared", { clear: true }), neighbour];
   const f = fixture(t, rows);
   const absentBefore = snapshot(f);
   const baseline = messages(f);
@@ -117,12 +122,22 @@ test("CLI overlays one exact chat/app/tenant on a historical at_all card, preser
   saveConfig(f);
   const before = snapshot(f);
   const actual = messages(f);
+  const ready = { version: 1, state: "ready", requirements: [
+    { field: "sender", state: "satisfied", reason: null, evidence: "local_chat_app_name" },
+    { field: "recipient", state: "not_applicable", reason: null, evidence: "chat_destination" },
+    { field: "conversation", state: "satisfied", reason: null, evidence: "canonical" },
+    { field: "content", state: "satisfied", reason: null, evidence: "content_projection" },
+  ], reasons: [], next_action: "none" };
+  const unresolved = structuredClone(ready);
+  unresolved.state = "enriching"; unresolved.reasons = ["sender_name_missing"]; unresolved.next_action = "resolve_sender";
+  unresolved.requirements[0] = { field: "sender", state: "missing", reason: "sender_name_missing", evidence: null };
+  assert.deepEqual(baseline.find(entry => entry.external_id === rows[0].raw.message_id).readiness, unresolved);
   const expected = baseline.map((entry) => entry.external_id === rows[0].raw.message_id ? {
     ...entry, display: { ...entry.display, sender: `应用：${NAME}`, sender_name_source: {
       kind: "local_chat_app_name", source_kind: "user_screenshot", recorded_at: SOURCE.recorded_at, evidence_refs: SOURCE.evidence_refs,
-    } },
+    } }, readiness: ready,
   } : entry);
-  assert.deepEqual(actual, expected, "only exact match display.sender and explicit display provenance may differ");
+  assert.deepEqual(actual, expected, "only exact match sender/provenance and its explicit readiness may differ; neighbouring rows remain exact");
   const exact = actual.find((entry) => entry.external_id === rows[0].raw.message_id);
   assert.equal(exact.display.card.text, "Invented audience @所有人: the paper lighthouse opens at noon.");
   assert.equal(exact.display.card.status, "rendered");
@@ -130,10 +145,19 @@ test("CLI overlays one exact chat/app/tenant on a historical at_all card, preser
   assert.deepEqual(exact.canonical, rows[0].canonical);
   assert.equal(exact.body, rows[0].body);
   const human = messages(f, "text");
+  assert.ok(actual.filter(entry => entry.readiness.state === "ready").length === 2);
+  assert.equal(actual.find(entry => entry.external_id === neighbour.raw.message_id).readiness.state, "ready");
+  assert.equal(actual.find(entry => entry.external_id === rows[4].raw.message_id).readiness.state, "enriching", "an unproven existing name remains inspectable without becoming trusted");
+  assert.equal(actual.find(entry => entry.external_id === rows[5].raw.message_id).readiness.state, "blocked", "mapping cannot undo an explicit clear");
+  assert.match(human, /Messages \(7\)\n完整 2 · 待补全 4 · 受阻 1/);
   assert.match(human, /发送人\s+应用：Synthetic Lantern Courier/);
   assert.match(human, /Invented audience @所有人: the paper lighthouse opens at noon\./);
   assert.doesNotMatch(human, /user_screenshot|local_chat_app_name|synthetic-lantern-proof|2057-03-19T11:00/,
     "provenance is machine readable and must not add human display lines");
+  const neighbourTime = new Date(START + 6000).toLocaleString();
+  assert.ok(human.includes(`RECEIVED ${neighbourTime}  om_synth...  群聊\n  发送人  应用：Synthetic Proven Courier\n  群      Synthetic Lantern Room\n  类型    app / 文本\n  消息    ${neighbour.body}\n`),
+    "a complete neighbour preserves its actual name, body, timestamp and field layout");
+  assert.ok(human.indexOf(neighbour.body) < human.indexOf("Invented audience @所有人"), "the mapped historical card keeps its order after its newer neighbour");
   assert.deepEqual(messages(f), actual, "text reading cannot mutate subsequent JSON");
   assert.deepEqual(snapshot(f), before, "DB bytes/schema/all rows/raw/hash/version/config and directory contents remain unchanged");
 });

@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { normalizeApiMessage } from "../src/adapters/lark-im/raw-message.mjs";
-import { createLegacyCardFixture, snapshot, messages, assertOriginalContract }
+import { createLegacyCardFixture, snapshot, messages, assertOriginalContract,
+  assertCardReadiness, assertPageContract, renderedCardText }
   from "./helpers/card-projection-fixture.mjs";
 
 // Freshly invented records represent persisted legacy projections.
@@ -25,6 +26,7 @@ test("old native card records render title, long multiline body, fields and butt
   const before = snapshot(fixture);
   const [json] = messages(fixture, "json");
   assertOriginalContract(json, original);
+  assertCardReadiness(json);
   assert.equal(json.display.card.version, 3);
   assert.equal(json.display.card.status, "rendered");
   assert.equal(json.display.card.reason, null);
@@ -34,6 +36,7 @@ test("old native card records render title, long multiline body, fields and butt
   assert.deepEqual(normalized.content_rendering, { status: "rendered", reason: null, version: 3 });
   assert.deepEqual(normalized.raw_api, original.raw, "projection preserves native source evidence");
   const text = messages(fixture, "text");
+  assertPageContract([json], text, [original]);
   const unwrapped = text.replace(/\n {4}/g, "");
   for (const visible of ["Synthetic release review", ...paragraphs, "Owner: Synthetic Team", "Status: Review pending",
     "Open synthetic review", "https://example.invalid/synthetic-review"]) assert.ok(unwrapped.includes(visible), visible);
@@ -76,10 +79,12 @@ test("nested json_card and schema-2 body envelopes remain readable from persiste
   for (const original of [legacy, nativeV2, propertyCard]) {
     const displayed = json.find((record) => record.external_id === original.raw.message_id);
     assertOriginalContract(displayed, original);
+    assertCardReadiness(displayed);
     assert.equal(displayed.display.card.status, "rendered");
     assert.equal(displayed.display.card.version, 3);
   }
   const text = messages(fixture, "text");
+  assertPageContract(json, text, fixture.rows);
   for (const visible of ["Nested synthetic title", "Nested synthetic body", "Synthetic v2 title",
     "Synthetic v2 body", "Synthetic v2 action", "Synthetic property title", "Synthetic property body",
     "Synthetic Property Person", "Synthetic property field", "Synthetic property button"]) assert.ok(text.includes(visible), visible);
@@ -100,13 +105,16 @@ test("unknown and invalid card nodes expose explicit incompleteness without dump
   for (const original of fixture.rows) {
     const displayed = json.find((record) => record.external_id === original.raw.message_id);
     assertOriginalContract(displayed, original);
+    assertCardReadiness(displayed, original === malformed ? "enriching" : "blocked",
+      original === malformed ? "content_partial" : "content_unsupported");
     assert.equal(displayed.display.card.status, original === partial ? "partial" : "structured_fallback");
     assert.ok(displayed.display.card.reason);
     assert.ok(displayed.display.card.text.trim(), "failed or empty projections need a visible placeholder");
   }
   const text = messages(fixture, "text");
-  assert.match(text, /Known synthetic title/);
-  assert.match(text, /Known synthetic paragraph/);
+  assertPageContract(json, text, fixture.rows);
+  assert.match(renderedCardText(partial), /Known synthetic title/);
+  assert.match(renderedCardText(partial), /Known synthetic paragraph/);
   assert.doesNotMatch(text, /SYNTHETIC_UNKNOWN_RAW_SENTINEL|SYNTHETIC_ALL_UNKNOWN_SENTINEL|SYNTHETIC_MALFORMED_RAW_SENTINEL|synthetic_unknown_widget|hidden_internal/);
   assert.doesNotMatch(text, /OLD_STORED_BODY|LEGACY_DERIVED_CONTENT/);
   assert.deepEqual(snapshot(fixture), before);
@@ -129,7 +137,9 @@ test("card mentions resolve only exact provided evidence and do not guess the se
   assert.doesNotMatch(displayed.display.card.text, /Exact Synthetic Person0|UNRELATED_SENDER_NAME/);
   assert.ok(displayed.display.card.text.includes("@_user_10") || /未知|unknown/i.test(displayed.display.card.text));
   const text = messages(fixture, "text");
-  assert.match(text, /Exact Synthetic Person/);
+  assertCardReadiness(displayed, "enriching", "content_partial");
+  assertPageContract([displayed], text, [original]);
+  assert.match(renderedCardText(original), /Exact Synthetic Person/);
   assert.deepEqual(snapshot(fixture), before);
 });
 
@@ -144,8 +154,10 @@ test("card display removes terminal controls and unsafe URL secrets while preser
   const before = snapshot(fixture);
   const [json] = messages(fixture, "json");
   assertOriginalContract(json, original);
+  assertCardReadiness(json);
   assert.ok(JSON.stringify(json.raw).includes("SYNTHETIC_PASSWORD"));
   const text = messages(fixture, "text");
+  assertPageContract([json], text, [original]);
   assert.match(text, /safe-red-end/);
   assert.match(text, /First line/);
   assert.match(text, /Last line/);
@@ -159,12 +171,19 @@ test("non-card messages preserve their existing body and display JSON without re
   original.raw.msg_type = "text";
   original.canonical.msg_type = "text";
   original.body = "Unchanged synthetic ordinary message";
+  original.raw.body.content = JSON.stringify({ text: original.body });
+  original.raw.content = original.body;
+  original.canonical.content = original.body;
+  delete original.raw.content_rendering;
+  delete original.canonical.content_rendering;
   const fixture = database(t, [original]);
   const before = snapshot(fixture);
   const [json] = messages(fixture, "json");
   assertOriginalContract(json, original);
+  assertCardReadiness(json);
   assert.equal(Object.hasOwn(json.display, "card"), false);
   const text = messages(fixture, "text");
+  assertPageContract([json], text, [original]);
   assert.match(text, /Unchanged synthetic ordinary message/);
   assert.doesNotMatch(text, /DO_NOT_RENDER_AS_CARD/);
   assert.deepEqual(snapshot(fixture), before);

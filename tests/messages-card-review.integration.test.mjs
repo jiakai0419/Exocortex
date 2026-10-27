@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { normalizeApiMessage } from "../src/adapters/lark-im/raw-message.mjs";
-import { createLegacyCardFixture, snapshot, messages, assertOriginalContract }
+import { createLegacyCardFixture, snapshot, messages, assertOriginalContract,
+  assertCardReadiness, assertPageContract, renderedCardText }
   from "./helpers/card-projection-fixture.mjs";
 
 // Freshly invented records represent persisted legacy projections.
@@ -11,14 +12,16 @@ const { row, database } = createLegacyCardFixture({ start: START, scope: SCOPE,
   chatId: "oc_synthetic_card_review", tempPrefix: "exocortex-card-review-" });
 
 
-function verifyReadOnlyProjection(t, originals, verify) {
+function verifyReadOnlyProjection(t, originals, verify, { incomplete = false } = {}) {
   const fixture = database(t, originals);
   const before = snapshot(fixture);
   const json = messages(fixture, "json");
   const text = messages(fixture, "text");
+  assertPageContract(json, text, originals);
   for (const original of originals) {
     const displayed = json.find((record) => record.external_id === original.raw.message_id);
     assertOriginalContract(displayed, original);
+    assertCardReadiness(displayed, incomplete ? "blocked" : "ready", incomplete ? "content_unsupported" : null);
     const normalized = normalizeApiMessage(original.raw);
     assert.equal(normalized.content, displayed.display.card.text);
     assert.deepEqual(normalized.content_rendering, {
@@ -108,10 +111,11 @@ test("unsupported subtitle, extra and multi_url shapes cannot silently claim a c
       assert.equal(displayed.display.card.reason, "unsupported_card_structure");
       assert.match(displayed.display.card.text, /卡片.*未展开/);
     }
-    for (const visible of ["Visible unsupported subtitle title", "Visible unsupported extra body"]) assert.ok(text.includes(visible));
+    const rendered = originals.map(renderedCardText).join("\n");
+    for (const visible of ["Visible unsupported subtitle title", "Visible unsupported extra body"]) assert.ok(rendered.includes(visible));
     assert.doesNotMatch(text, /Visible unsupported platform button|Visible malformed platform button/);
     assert.doesNotMatch(text, /NEVER_RENDER_|synthetic_future_|synthetic_console_url|"hidden"/);
-  });
+  }, { incomplete: true });
 });
 
 for (const [name, url, safeOrigin] of [

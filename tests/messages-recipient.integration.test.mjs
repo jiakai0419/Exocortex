@@ -175,15 +175,36 @@ for (const origin of ['sent', 'chat']) test(`real read-only messages restores ev
   for (let index = 0; index < 5; index++) {
     const id = index ? `${ID}_${index}` : ID, chat = index > 1 ? `${CHAT}_${index}` : CHAT;
     const actor = index === 1 ? PEER : SELF, direction = index === 1 ? 'received' : 'sent';
-    const ca = { ...s.canonical, sender_id: actor, message_id: id, chat_id: chat, ...(index > 1 ? { chat_type: 'group' } : {}) };
-    const raw = { ...s.raw, sender: { ...s.raw.sender, id: actor }, message_id: id, chat_id: chat };
     const body = `合成正文 ${index}。`;
+    const at = Date.parse(AT) - index, chatType = index > 1 ? 'group' : 'p2p';
+    // These are ordinary complete neighbours: source names, exact source clocks,
+    // explicit modes/titles and received-account proof are authored fixture facts.
+    // Only the target's private recipient is intentionally missing initially.
+    const ca = { ...s.canonical, sender_id: actor, message_id: id, chat_id: chat, chat_type: chatType,
+      sender_name_source: 'message_sender', sender_name_account_key: recipientAccountKey(SELF),
+      ...(index > 1 ? { chat_name: `合成邻居群 ${index}` } : {}) };
+    const raw = { ...s.raw, sender: { ...s.raw.sender, id: actor, name: '合成发送人' },
+      message_id: id, chat_id: chat, chat_type: chatType, create_time: String(at),
+      body: { content: JSON.stringify({ text: body }) } };
     sqliteExec(db, `INSERT INTO records(source_id,first_seen_scope_id,external_id,record_type,occurred_at,occurred_at_ms,actor_id,container_id,direction,body,content_hash,canonical_json,raw_json)
-      VALUES('lark.im',${q(origin === 'chat' && index < 2 ? scopeId : SENT_SCOPE_ID)},${q(id)},'lark.im.message',${q(AT)},${Date.parse(AT) - index},${q(actor)},${q(chat)},${q(direction)},${q(body)},${q(hash(body))},${q(JSON.stringify(ca))},${q(JSON.stringify(raw))});`);
+      VALUES('lark.im',${q(origin === 'chat' && index < 2 ? scopeId : SENT_SCOPE_ID)},${q(id)},'lark.im.message',${q(new Date(at).toISOString())},${at},${q(actor)},${q(chat)},${q(direction)},${q(body)},${q(hash(body))},${q(JSON.stringify(ca))},${q(JSON.stringify(raw))});`);
   }
   const records = sqliteJson(db, 'SELECT * FROM records ORDER BY id;', 'synthetic originals');
   const baseline = loadMessages(db, options);
   assert.equal(baseline[0].display.recipient, '未知');
+  const ready = index => ({ version: 1, state: 'ready', requirements: [
+    { field: 'sender', state: 'satisfied', reason: null, evidence: 'message_sender' },
+    { field: 'recipient', state: index > 1 ? 'not_applicable' : 'satisfied', reason: null,
+      evidence: index > 1 ? 'chat_destination' : index === 1 ? 'admitted_account' : 'contact' },
+    { field: 'conversation', state: 'satisfied', reason: null, evidence: index > 1 ? 'canonical' : 'exact_conversation' },
+    { field: 'content', state: 'satisfied', reason: null, evidence: 'content_projection' },
+  ], reasons: [], next_action: 'none' });
+  const targetBefore = ready(0);
+  targetBefore.state = 'enriching'; targetBefore.reasons = ['recipient_identity_unknown'];
+  targetBefore.next_action = 'resolve_recipient';
+  targetBefore.requirements[1] = { field: 'recipient', state: 'missing', reason: 'recipient_identity_unknown', evidence: null };
+  assert.deepEqual(baseline[0].readiness, targetBefore);
+  baseline.slice(1).forEach((row, index) => assert.deepEqual(row.readiness, ready(index + 1)));
   function setEvidence(value) {
     sqliteExec(db, `UPDATE sync_scopes SET config_json=${q(patchTopLevelJsonMemberText(configText, 'p2p_recipient', value ? JSON.stringify(value) : undefined))} WHERE id=${q(scopeId)};`);
     sqliteExec(db, 'PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;');
@@ -192,12 +213,23 @@ for (const origin of ['sent', 'chat']) test(`real read-only messages restores ev
   const bytesBefore = hash(readFileSync(db));
   const after = loadMessages(db, options);
   const expected = clone(baseline); expected[0].display.recipient = NAME;
-  assert.deepEqual(after, expected, 'the target changes only display.recipient; four neighbour JSON rows stay exact');
-  assert.equal(plain(renderMessagesText(after)), plain(renderMessagesText(baseline)).replace('接收人  未知', `接收人  ${NAME}`));
+  expected[0].readiness = ready(0);
+  assert.deepEqual(after, expected, 'only the target recipient and its explicit readiness change; all stored fields and four neighbour JSON rows stay exact');
+  const headers = records.map((record, index) => `${record.direction.toUpperCase()} ${new Date(record.occurred_at).toLocaleString()}  om_synth...  ${index > 1 ? '群聊' : '私聊'}`);
+  const blocks = records.map((record, index) => `${headers[index]}\n  发送人  合成发送人\n${index > 1
+    ? `  群      合成邻居群 ${index}` : `  接收人  ${index === 1 ? '我' : NAME}`}\n  类型    user / 文本\n  消息    ${record.body}`);
+  const afterText = `Messages (5)\n\n${blocks.join('\n\n')}\n`;
+  const beforeText = `Messages (5)\n完整 4 · 待补全 1 · 受阻 0\n\n${headers[0]}\n  状态    等待完整信息\n  原因    接收人身份待核验\n  查看    messages --format json 可检查已保存内容与原因\n\n${blocks.slice(1).join('\n\n')}\n`;
+  assert.equal(plain(renderMessagesText(after)), afterText, 'every complete row retains its exact names, body, event time, field order and spacing');
+  assert.equal(plain(renderMessagesText(baseline)), beforeText, 'the incomplete target keeps its position and the four complete neighbours retain their exact layout');
   const result = spawnSync(process.execPath, ['bin/exocortex.mjs', 'messages', '--db', db, '--limit', '5', '--format', 'json'],
     { encoding: 'utf8', env: { ...process.env, LARK_CLI: join(dir, 'does-not-exist') }, timeout: 5000 });
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(JSON.parse(result.stdout), after);
+  const textResult = spawnSync(process.execPath, ['bin/exocortex.mjs', 'messages', '--db', db, '--limit', '5', '--format', 'text'],
+    { encoding: 'utf8', env: { ...process.env, LARK_CLI: join(dir, 'does-not-exist') }, timeout: 5000 });
+  assert.equal(textResult.status, 0, textResult.stderr);
+  assert.equal(plain(textResult.stdout), afterText);
   assert.equal(hash(readFileSync(db)), bytesBefore, 'public reads do not mutate any database byte');
   assert.deepEqual(sqliteJson(db, 'SELECT * FROM records ORDER BY id;', 'synthetic originals'), records);
   setEvidence(null); assert.deepEqual(loadMessages(db, options), baseline);
