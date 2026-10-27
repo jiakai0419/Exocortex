@@ -12,6 +12,7 @@ import { activityDatabaseKey } from '../src/diagnostics/lark-im-activity-evidenc
 import { digest, sampleScopeHash } from '../src/diagnostics/remote-sample-core.mjs';
 import { writeRemoteSampleState, remoteSamplePaths } from '../src/runtime/worker/remote-sample-scheduler.mjs';
 import { executeLarkImHistory } from '../src/maintenance/history.mjs';
+import { readMessageAccountEvidence } from '../src/adapters/lark-im/message-account-evidence.mjs';
 import { loadHistoryDebtHints, mergeHistoryDebtHints, readHistoryDebtSchedule, readHistoryFairRound } from '../src/maintenance/history-debt.mjs';
 
 const SELF = { open_id: 'ou_synthetic_debt_observer', name: 'Synthetic observer' };
@@ -206,11 +207,27 @@ test('continuous new debt cannot jump ahead of unattempted old debt or consume e
 });
 
 test('same record generation cannot create repeated fast verification tickets after sampler leaves debt unresolved',t=>{
-  const f=fixture(t);f.state([10]);f.run({maxRecords:1,maxCliAttempts:4});
-  const first=f.query('SELECT * FROM lark_im_history_debt')[0];assert.equal(first.verification_generation,0);assert.ok(first.verification_requested_at_ms>0);
-  f.state([10]);f.run({maxRecords:1,maxCliAttempts:4});
+  const f=fixture(t),before=f.query('SELECT * FROM records ORDER BY id');
+  const generations=()=>f.query('SELECT record_id,generation FROM record_observation_state ORDER BY record_id');
+  const beforeGenerations=generations();f.state([10]);
+  const firstResult=f.run({maxRecords:1,maxCliAttempts:4});assert.equal(firstResult.updated,1);assert.equal(firstResult.duplicate,0);
+  const first=f.query('SELECT * FROM lark_im_history_debt')[0],after=f.query('SELECT * FROM records ORDER BY id');
+  const previous=before.find(row=>row.id===first.record_id),acquired=after.find(row=>row.id===first.record_id);
+  const canonical=JSON.parse(acquired.canonical_json),proof=readMessageAccountEvidence(acquired,canonical,JSON.parse(acquired.raw_json));
+  assert.ok(proof);assert.equal(proof.account_key,f.binding.account_key);delete canonical.message_account_evidence;
+  assert.deepEqual(canonical,JSON.parse(previous.canonical_json));
+  assert.ok(Date.parse(acquired.updated_at)>=Date.parse(previous.updated_at));
+  assert.deepEqual(after.map(row=>row.id===first.record_id?{...row,canonical_json:previous.canonical_json,updated_at:previous.updated_at}:row),before,
+    'first acquisition adds only the target proof and update clock, preserving all source fields and neighbors');
+  const firstGenerations=generations();
+  assert.deepEqual(firstGenerations,beforeGenerations.map(row=>row.record_id===first.record_id?{...row,generation:row.generation+1}:row));
+  assert.equal(first.verification_generation,firstGenerations.find(row=>row.record_id===first.record_id).generation);
+  assert.ok(first.verification_requested_at_ms>0);
+  f.state([10]);const secondResult=f.run({maxRecords:1,maxCliAttempts:4});assert.equal(secondResult.updated,0);assert.equal(secondResult.duplicate,1);
   const second=f.query('SELECT * FROM lark_im_history_debt')[0];assert.equal(second.generation,2);
   assert.equal(second.verification_requested_at_ms,first.verification_requested_at_ms);assert.equal(second.verification_generation,first.verification_generation);
+  assert.deepEqual(f.query('SELECT * FROM records ORDER BY id'),after,'same-source acquisition does not refresh proof or change neighbors');
+  assert.deepEqual(generations(),firstGenerations,'record generations stay fixed even though queue attempt generation advances');
 });
 
 test('a same-version conflict creates no fast verification ticket before independent acceptance',t=>{

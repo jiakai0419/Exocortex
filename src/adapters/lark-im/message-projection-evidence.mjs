@@ -5,6 +5,8 @@ import { sentRecipientAccount, recipientAccountKey, resolveP2pRecipient } from '
 import { titleMessageMatches } from './chat-title.mjs';
 import { validateJsonObjectText } from '../../../dist/core/json-text-patch.js';
 import { readMessageAccountEvidence } from './message-account-evidence.mjs';
+import { sanitizeSenderNameObservation } from './sender-name-observation.mjs';
+import { messageContentEvidence } from './message-content-evidence.mjs';
 
 /** @typedef {Record<string,any>} JsonObject */
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -108,6 +110,34 @@ function senderProjection(row, canonical, raw, saved) {
   return { ...base, name: known, source: known ? source : null };
 }
 
+/** Explain only a precisely bound application route failure. A failed contact
+ * route cannot establish that its independent member fallback is unavailable.
+ * @param {JsonObject} row @param {JsonObject} canonical @param {JsonObject} raw
+ * @param {JsonObject} accountEvidence */
+function applicationPermissionBlockers(row, canonical, raw, accountEvidence) {
+  const observation = canonical.sender_name_verification;
+  const allowed = new Set(['observed_at','cached','account_key','status','reason','source','failure','name']);
+  const identity = senderIdentity(raw);
+  const proof = readMessageAccountEvidence(row, canonical, raw);
+  if (!proof || accountEvidence.state !== 'verified' || proof.account_key !== accountEvidence.account_key
+    || !identity.verified || identity.conflict || identity.type !== 'app_id'
+    || identity.id !== row.actor_id || canonical.sender_id !== identity.id
+    || canonical.sender_id_type !== identity.type || !object(observation)
+    || Object.keys(observation).some(field => !allowed.has(field))
+    || observation.status !== 'failed' || observation.reason !== 'request_failed'
+    || observation.source !== 'application_api' || observation.cached !== false
+    || observation.account_key !== proof.account_key || observation.name != null) return [];
+  const clean = sanitizeSenderNameObservation(observation), failure = clean?.failure;
+  const at = Date.parse(observation.observed_at);
+  if (!Number.isSafeInteger(at) || at < 0 || at > Date.now()
+    || new Date(at).toISOString() !== observation.observed_at
+    || failure?.kind !== 'permission_denied' || failure.code !== 210508
+    || failure.operation !== 'application_info' || failure.stage !== 'response_error') return [];
+  return [{field:'sender',source_id:row.source_id,chat_id:row.container_id,
+    account_key:proof.account_key,id:identity.id,id_type:identity.type,
+    authority:'application_api',reason:'permission_denied',code:failure.code}];
+}
+
 /** Pure normalized evidence for the shared completeness evaluator.
  * @param {JsonObject} row @param {JsonObject} canonical @param {JsonObject} raw
  * @param {JsonObject} display @param {JsonObject} options */
@@ -117,23 +147,7 @@ function messageProjectionEvidence(row, canonical, raw, display, options) {
   catch { sourceIntegrity='invalid'; }
   const accountEvidence = projectionAccount(row, canonical, raw);
   const recipient = resolveP2pRecipient(row, canonical, raw, options.recipientConfig);
-  const native = object(raw.raw_api) ? raw.raw_api : raw;
-  const rendering = display.card || display.system || canonical.content_rendering;
-  const deleted = canonical.deleted === true || raw.deleted === true || native.deleted === true;
-  let contentState = deleted ? 'recalled' : rendering?.status === 'partial' ? 'partial'
-    : rendering?.status === 'structured_fallback' ? 'unsupported'
-    : rendering?.status === 'rendered' ? 'complete' : 'pending';
-  // Legacy plain text does not need an unrelated rendering clock. Native text
-  // and the stored readable body still must exist; empty media is not guessed.
-  if (!rendering && (canonical.msg_type || native.message_type || native.msg_type) === 'text'
-    && typeof row.body === 'string' && row.body.length > 0 && native.body?.content != null) contentState = 'complete';
-  // Legacy source text can be a direct string or an explicit text object.
-  // A stored arbitrary fallback string is not by itself a complete projection.
-  if (!rendering && (canonical.msg_type || native.message_type || native.msg_type) === 'text') {
-    const legacyText=typeof native.content==='string' ? native.content
-      : object(native.content) && typeof native.content.text==='string' ? native.content.text : null;
-    if (legacyText!==null && row.body===legacyText) contentState='complete';
-  }
+  const content = messageContentEvidence(row, canonical, raw, display);
   return {
     prepared: true,
     source_integrity: sourceIntegrity,
@@ -142,9 +156,8 @@ function messageProjectionEvidence(row, canonical, raw, display, options) {
       title: options.chatName ? { value: options.chatName, source: options.titleSource || 'canonical' } : null },
     sender: senderProjection(row, canonical, raw, options.senderEvidence),
     recipient: recipient.evidence ? { ...recipient.evidence, reason: recipient.reason } : { reason: recipient.reason },
-    content: { state: contentState, source: deleted ? 'native_tombstone' : 'message_renderer',
-      reason: rendering?.reason || null },
-    blockers: [],
+    content,
+    blockers: sourceIntegrity === 'valid' ? applicationPermissionBlockers(row, canonical, raw, accountEvidence) : [],
   };
 }
 

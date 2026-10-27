@@ -7,6 +7,8 @@ import { activityDatabaseKey } from '../diagnostics/lark-im-activity-evidence.mj
 import { captureRemoteAccountBinding, readRemoteAccountBinding, readRemoteAccountBindingSidecar } from '../diagnostics/remote-account-binding.mjs';
 import { readOnlySqliteJson } from '../storage/sqlite/readonly-query.mjs';
 import { renderCardContent } from '../adapters/lark-im/card-content.mjs';
+import { readMessageAccountEvidence } from '../adapters/lark-im/message-account-evidence.mjs';
+import { patchTopLevelJsonMemberText } from '../../dist/core/json-text-patch.js';
 import { quoteSql, REVIEW_RECORD_COLUMNS, REVIEW_EFFECTIVE_COLUMNS } from '../../dist/storage/sqlite/ingestion-store.js';
 
 import { recordProof, compareObservation, OBSERVATION_POLICY } from '../../dist/core/lark-observation.js';
@@ -233,6 +235,29 @@ function recordSnapshot(row) {
   return pick(row, REVIEW_RECORD_COLUMNS);
 }
 function effectiveRecord(row) { return pick(row, REVIEW_EFFECTIVE_COLUMNS); }
+
+/** Only approval comparison receives this dependency projection. Exact/opaque
+ * digests and committed records retain the actual acquisition bytes and clock.
+ * The complete source proof still binds the source_hash dependency; the strict
+ * reader verifies its exact bytes, version, identity and admitted account first.
+ * An older adopted proof is not a new acquisition and remains fully bound. */
+function acquisitionReviewProof(record, accountKey, acquiredAfter, observedNow) {
+  const exact = recordProof(record);
+  try {
+    const canonical = JSON.parse(record.canonical_json), raw = JSON.parse(record.raw_json);
+    const evidence = readMessageAccountEvidence(record, canonical, raw, observedNow);
+    if (!evidence || evidence.account_key !== accountKey || Date.parse(evidence.acquired_at) < acquiredAfter) return exact;
+    const dependency = { ...evidence, source_hash: 'bound_to_complete_source_proof', acquired_at: 'validated_current_acquisition' };
+    // Preserve all unrelated JSON tokens, including unknown unsafe numbers.
+    const projected = recordProof({ ...record, canonical_json:
+      patchTopLevelJsonMemberText(record.canonical_json, 'message_account_evidence', JSON.stringify(dependency)) });
+    // Domain-separate validated dependencies from ordinary canonical text: an
+    // invalid proof spelling these marker strings must never impersonate one.
+    return { ...projected, exact: exact.exact,
+      structural: projected.structural === null ? null : sha(`validated_acquisition_review/v1:structural\0${projected.structural}`),
+      references: projected.references === null ? null : sha(`validated_acquisition_review/v1:references\0${projected.references}`) };
+  } catch { return exact; }
+}
 function constraints(options, mode) {
   return { targets: [...(mode === 'names' ? options.recordIds : options.messageIds)].sort((a,b) => String(a).localeCompare(String(b))),
     scope_ids: mode === 'replay' ? [...options.scopeIds] : [], start_ms: mode === 'replay' ? options.startMs : null,
@@ -267,10 +292,42 @@ function beginMaintenanceReview(options, { db, mode, rows, scopes = [], now = Da
     if (snapshots.some(row => old.get(row.id)?.before_sha256 !== digest(row)) || old.size !== snapshots.length) fail('snapshot_changed');
   }
   let self = null;
+  let acquisitionCreatedAt = null;
   function verifySelf(value) {
     if (mode !== 'replay' || !hashValue(value)) fail('binding_unavailable');
     if (approval && approval.binding.verified_self_sha256 !== value) fail('binding_changed');
     self = value;
+  }
+  /** Called only after a real admitted replay response has been normalized and
+   * freshly bound. Legacy approvals may retain their previously observed proof,
+   * but only when the entire reconstructed observed record is byte exact. A
+   * pre-acquisition legacy approval can authorize only its original unbound
+   * proposal. Neither path invents a new observation at an old timestamp. */
+  function prepareReplayAcquisition(original, acquired, acquiredAt) {
+    if (mode !== 'replay' || !self) fail('binding_unavailable');
+    const at = Date.parse(acquiredAt);
+    if (!finite(at) || new Date(at).toISOString() !== acquiredAt || at > Date.now()) fail('invalid_file');
+    if (!approval) {
+      acquisitionCreatedAt = at;
+      return acquired;
+    }
+    if (observationReview) return acquired;
+    return acquired.map((record, index) => {
+      const approved = approval.records.find(entry => entry.external_id === record.external_id);
+      if (!approved) return record;
+      try {
+        const evidence = readMessageAccountEvidence(record, JSON.parse(record.canonical_json), JSON.parse(record.raw_json));
+        if (evidence?.account_key === control.binding.local_account_key) {
+          const retained = { ...record, canonical_json: patchTopLevelJsonMemberText(record.canonical_json,
+            'message_account_evidence', JSON.stringify({ ...evidence, acquired_at: new Date(approval.created_at_ms).toISOString() })) };
+          if (readMessageAccountEvidence(retained, JSON.parse(retained.canonical_json), JSON.parse(retained.raw_json))
+            && digest(effectiveRecord(retained)) === approved.observed_sha256) return retained;
+        }
+        const priorContract = original[index];
+        if (priorContract?.external_id === record.external_id && digest(effectiveRecord(priorContract)) === approved.observed_sha256) return priorContract;
+      } catch { /* Full legacy proposal comparison below remains authoritative. */ }
+      return record;
+    });
   }
   /** @param {any[]} decisions @param {(() => void)=} beforePublish */
   function finishChecked(decisions, beforePublish) {
@@ -280,6 +337,8 @@ function beginMaintenanceReview(options, { db, mode, rows, scopes = [], now = Da
     if (!equal(current, snapshots)) fail('snapshot_changed');
     const fresh = captureBinding(db, scopes, scopeReview);
     if (!equal(fresh.binding, control.binding)) fail('binding_changed');
+    const created = approval?.created_at_ms ?? acquisitionCreatedAt ?? now();
+    const observedNow = Date.now();
     let total = 0;
     const entries = decisions.map(({ before, after, observed = after, outcome, exclusion = null }) => {
       const original = recordSnapshot(before), effective = effectiveRecord(after);
@@ -319,7 +378,9 @@ function beginMaintenanceReview(options, { db, mode, rows, scopes = [], now = Da
         return [key, { sha256: sha(text), bytes: bytes(text) }];
       }));
       return { id: original.id, external_id: original.external_id, outcome, exclusion,
-        ...(observationReview ? { proof: { policy: OBSERVATION_POLICY, observed: recordProof(effectiveRecord(observed)), proposal: recordProof(effective) } } : {}),
+        ...(observationReview ? { proof: { policy: OBSERVATION_POLICY,
+          observed: acquisitionReviewProof(effectiveRecord(observed), control.binding.local_account_key, created, observedNow),
+          proposal: acquisitionReviewProof(effective, control.binding.local_account_key, created, observedNow) } } : {}),
         before_sha256: digest(original), proposal_sha256: digest(effective), observed_sha256: digest(effectiveRecord(observed)),
         changed_fields: REVIEW_EFFECTIVE_COLUMNS.filter(key => !equal(original[key] ?? null, effective[key])),
         display: { before: display(original), after: display(effective) }, opaque: { before: opaque(original), after: opaque(effective),
@@ -329,7 +390,6 @@ function beginMaintenanceReview(options, { db, mode, rows, scopes = [], now = Da
     const textReview = schema !== REVIEW_SCHEMA;
     if (textReview) for (const entry of entries) for (const side of ['before', 'after']) entry.display[side].non_card ??= null;
     const binding = { ...control.binding, verified_self_sha256: self };
-    const created = approval?.created_at_ms ?? now();
     const artifact = { schema, mode, created_at_ms: created, expires_at_ms: created + REVIEW_AGE_MS,
       disclosure: textReview ? TEXT_REVIEW_DISCLOSURE : REVIEW_DISCLOSURE,
       binding, constraints: selection, records: entries };
@@ -386,7 +446,7 @@ function beginMaintenanceReview(options, { db, mode, rows, scopes = [], now = Da
       throw error;
     }
   }
-  return { finish, verifySelf, legacyStrict: !observationReview };
+  return { finish, verifySelf, prepareReplayAcquisition, legacyStrict: !observationReview };
 
 }
 

@@ -3,6 +3,7 @@
 import { createHash } from "node:crypto";
 import { renderSystemContent } from "./system-content.mjs";
 import { personName, senderIdentity, senderLookupNamespace, senderNameFromSource } from "./sender-identity.mjs";
+import { sanitizeSenderNameObservation } from './sender-name-observation.mjs';
 
 /**
  * @typedef {"sent" | "received"} MessageDirection
@@ -360,7 +361,7 @@ function recordFromMessage(message, scopeId, direction, context = {}, scopeConfi
   // Source names and supplied self profiles have no independent lookup time.
   // Do not invent one from normalization time or the message timestamp.
   const nameObservation = !senderDirectName && Boolean(lookupNamespace)
-    ? context.sender_name_observations?.get(JSON.stringify([containerId, actorId, identity.type])) : null;
+    ? sanitizeSenderNameObservation(context.sender_name_observations?.get(JSON.stringify([containerId, actorId, identity.type]))) : null;
   const canonical = {
     message_id: externalId,
     msg_type: message?.msg_type || message?.message_type || null,

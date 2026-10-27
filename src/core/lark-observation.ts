@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { CARD_ID_NAMESPACES, resolveCardMention } from "./lark-card-reference.js";
-import { mergeJsonObjectText } from "./json-text-patch.js";
+import { mergeJsonObjectText, patchTopLevelJsonMemberText } from "./json-text-patch.js";
 
 /** A comparison of saved parsed-CLI evidence, never a client-state assertion. */
 const OBSERVATION_POLICY = "lark_raw_observation/v1";
@@ -242,7 +242,14 @@ function retainSourceRepresentation<T extends ObservationRecord & { content_hash
   // Keep the general-purpose JSON editor strict, including for empty patches.
   if (canonical !== incoming.canonical_json) {
     try {
-      canonical = mergeJsonObjectText(before.canonical_json, incoming.canonical_json, {
+      // Acquisition evidence binds exact raw bytes, not their equivalent
+      // representation. When retaining the old raw, retain only its existing
+      // member (including absence or an invalid legacy value); never transplant
+      // a new proof for bytes that will not be stored. Byte-identical source
+      // responses may still add freshly acquired evidence through normal merge.
+      const projection = before.raw_json === incoming.raw_json ? incoming.canonical_json
+        : patchTopLevelJsonMemberText(incoming.canonical_json, "message_account_evidence");
+      canonical = mergeJsonObjectText(before.canonical_json, projection, {
         retain: ["mentions", "create_time", "update_time"], deleteMissing: DERIVED_CANONICAL_FIELDS,
       });
     } catch (error) {

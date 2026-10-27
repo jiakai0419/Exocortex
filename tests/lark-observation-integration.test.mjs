@@ -12,6 +12,8 @@ import { normalizeApiMessage } from '../src/adapters/lark-im/raw-message.mjs';
 import { prepareChatWindowRecords } from '../src/adapters/lark-im/sync-runner.mjs';
 import { executeLarkImHistory, selectHistoryTarget } from '../src/maintenance/history.mjs';
 import { executeLarkImReplay, validateReplayOptions } from '../src/maintenance/replay.mjs';
+import { bindAcquiredMessageAccounts, readMessageAccountEvidence } from '../src/adapters/lark-im/message-account-evidence.mjs';
+import { beginMaintenanceReview, REVIEW_AGE_MS } from '../src/maintenance/review-artifact.mjs';
 
 // Only authored synthetic data; every request boundary is injected.
 const SELF = { open_id: 'ou_invented_observer', name: 'Invented Observer' };
@@ -185,6 +187,7 @@ test('v4 accepts a proven representation-only fresh response while legacy approv
     }
     const bytes=readFileSync(opts.reviewOut), before=rows(f), drift={...changed,body:{content:' {"future":{"b":2,"a":1},"text":"Invented approved"} '}};
     assert.equal(sourceRelation(JSON.stringify(changed),JSON.stringify(drift)),'json_representation');
+    const applyStarted=Date.now();
     const result=replay(f,[drift],input);
     assert.equal(result.ok,schema==='v4',JSON.stringify(result));
     assert.deepEqual(readFileSync(opts.reviewOut),bytes);
@@ -192,6 +195,11 @@ test('v4 accepts a proven representation-only fresh response while legacy approv
       assert.deepEqual(rows(f),before);const receipt=result.scopes[0].failure_evidence;assert.ok(receipt);
       const path=join(f.dir,receipt.file);assert.equal(statSync(path).mode&0o777,0o600);assert.equal(hash(readFileSync(path)),receipt.sha256);
       const saved=JSON.parse(readFileSync(path));assert.equal(saved.decisions[0].observed.raw_json,JSON.stringify(drift));
+    } else {
+      const after=rows(f)[0], proof=readMessageAccountEvidence(after,JSON.parse(after.canonical_json),JSON.parse(after.raw_json));
+      assert.ok(proof,'the committed representation keeps exact fresh acquisition evidence');
+      assert.equal(proof.source_hash,hash(after.raw_json));
+      assert.ok(Date.parse(proof.acquired_at)>=applyStarted,'comparison normalization cannot substitute the older preview clock');
     }
   }
 });
@@ -228,6 +236,133 @@ test('v4 whole reference proof accepts coordinated aliases and rejects same-name
     if(rebinding){assert.match(JSON.stringify(result),/proposal_changed/);assert.equal(rows(f)[0].body,'Invented initial 0');}
     else assert.equal(rows(f)[0].body,'@Invented A\n@Invented B');
   }
+});
+
+test('v4 acquisition equivalence keeps actual fresh proof bytes and rejects every unproved dependency drift',t=>{
+  const f=fixture(t), before=rows(f), opts=replayOptions(f);
+  const changed=native(f,0,{update_time:String(f.start+9000),body:{content:'{"text":"Invented attested replacement"}'}});
+  const original=records(f,[changed]), previewAt=new Date(Date.now()-1000).toISOString();
+  const acquired=bindAcquiredMessageAccounts(original,SELF,{acquiredAt:previewAt});
+  const context={db:f.db,mode:'replay',rows:before,scopes:[store.readScope(f.db,SCOPE)].map(({id,source_id,enabled,config_json})=>({id,source_id,enabled,config_json}))};
+  const view=beginMaintenanceReview(opts,context);view.verifySelf(hash(SELF.open_id));
+  const staged=view.prepareReplayAcquisition(original,acquired,previewAt);
+  const preview=view.finish([{before:before[0],after:{...before[0],...staged[0]},observed:staged[0],outcome:'update'}]);
+  const artifact=JSON.parse(readFileSync(opts.reviewOut));
+  assert.equal(artifact.created_at_ms,Date.parse(previewAt),'the artifact clock names the actual preview acquisition');
+  const freshAt=new Date().toISOString(), fresh=bindAcquiredMessageAccounts(original,SELF,{acquiredAt:freshAt});
+  const exactBefore=JSON.stringify(fresh);
+  const accepted=beginMaintenanceReview(approved(opts,{review:preview.summary}),context);accepted.verifySelf(hash(SELF.open_id));
+  const retained=accepted.prepareReplayAcquisition(original,fresh,freshAt);
+  assert.equal(retained[0].canonical_json,fresh[0].canonical_json);
+  accepted.finish([{before:before[0],after:{...before[0],...retained[0]},observed:retained[0],outcome:'update'}]);
+  assert.equal(JSON.stringify(fresh),exactBefore,'proof dependency normalization never edits actual candidate bytes');
+  const changeProof=change=>record=>{
+    const canonical=JSON.parse(record.canonical_json);change(canonical.message_account_evidence);
+    record.canonical_json=JSON.stringify(canonical);
+  };
+  const changes=[
+    ['schema',changeProof(proof=>{proof.schema='invented_wrong_schema';})],
+    ['extra proof key',changeProof(proof=>{proof.future='invented';})],
+    ['wrong source hash',changeProof(proof=>{proof.source_hash='b'.repeat(64);})],
+    ['cross account',changeProof(proof=>{proof.account_key='c'.repeat(64);})],
+    ['wrong message',changeProof(proof=>{proof.external_id='om_invented_wrong';})],
+    ['wrong chat',changeProof(proof=>{proof.container_id='oc_invented_wrong';})],
+    ['wrong version',changeProof(proof=>{proof.source_version='1';})],
+    ['future clock',changeProof(proof=>{proof.acquired_at=new Date(Date.now()+86400000).toISOString();})],
+    ['invalid clock',changeProof(proof=>{proof.acquired_at='invented-invalid';})],
+    ['normalization marker collision',changeProof(proof=>{proof.source_hash='bound_to_complete_source_proof';proof.acquired_at='validated_current_acquisition';})],
+    ['earlier than preview',changeProof(proof=>{proof.acquired_at=new Date(Date.parse(previewAt)-1).toISOString();})],
+    ['duplicate proof key',record=>{record.canonical_json=record.canonical_json.replace('"schema":"lark_message_acquisition/v1"',
+      '"schema":"lark_message_acquisition/v1","schema":"lark_message_acquisition/v1"');}],
+    ['missing proof',record=>{const c=JSON.parse(record.canonical_json);delete c.message_account_evidence;record.canonical_json=JSON.stringify(c);}],
+    ['unknown canonical',record=>{record.canonical_json=record.canonical_json.replace(/}$/,',"unknown_future_policy":true}');}],
+    ['unknown unsafe number',record=>{record.canonical_json=record.canonical_json.replace(/}$/,',"unknown_counter":9007199254740993}');}],
+    ['actor',record=>{record.actor_id='ou_invented_wrong';}],
+    ['container',record=>{record.container_id='oc_invented_wrong';}],
+    ['source version',record=>{record.external_version=String(f.start+10000);}],
+    ['unknown source field',record=>{record.raw_json=record.raw_json.replace(/}$/,',"unknown_future_source":true}');record.content_hash=hash(record.raw_json);}],
+  ];
+  for(const [label,change] of changes) {
+    const dir=mkdtempSync(join(f.dir,'case-')), path=join(dir,'approval.json');chmodSync(dir,0o700);
+    writeFileSync(path,readFileSync(opts.reviewOut),{mode:0o600});
+    const review=beginMaintenanceReview({...approved(opts,{review:preview.summary}),reviewIn:path},context);review.verifySelf(hash(SELF.open_id));
+    const altered={...fresh[0]};change(altered);
+    assert.throws(()=>review.finish([{before:before[0],after:{...before[0],...altered},observed:altered,outcome:'update'}]),
+      /proposal_changed|invalid_file/,label);
+  }
+  assert.deepEqual(rows(f),before);
+});
+
+test('reviewed replay still rejects expired and cross-account approval before any message fetch',t=>{
+  const f=fixture(t), opts=replayOptions(f), changed=native(f,0,{update_time:String(f.start+9000)});
+  const preview=replay(f,[changed],opts), input=approved(opts,preview), before=rows(f);
+  const artifact=JSON.parse(readFileSync(opts.reviewOut));
+  const expired={...artifact,created_at_ms:Date.now()-REVIEW_AGE_MS-1000,expires_at_ms:Date.now()-1000};
+  expired.expires_at_ms=expired.created_at_ms+REVIEW_AGE_MS;
+  const path=join(f.dir,'expired.json');writeFileSync(path,JSON.stringify(expired),{mode:0o600});
+  let fetched=0;
+  assert.throws(()=>executeLarkImReplay({...input,reviewIn:path,reviewSha256:hash(readFileSync(path))},{
+    getSelfProfile:()=>SELF,fetchChatMessages:()=>{fetched++;return {messages:[changed],pages:1};}}),/expired/);
+  assert.throws(()=>executeLarkImReplay(input,{getSelfProfile:()=>({open_id:'ou_invented_cross_account'}),
+    fetchChatMessages:()=>{fetched++;return {messages:[changed],pages:1};}}),/account|binding/);
+  assert.equal(fetched,0);assert.deepEqual(rows(f),before);
+});
+
+test('acquisition dependency projection cannot erase unknown canonical numeric token differences',t=>{
+  const f=fixture(t), before=rows(f), original=records(f,[native(f,0,{update_time:String(f.start+9000)})]);
+  const context={db:f.db,mode:'replay',rows:before,scopes:[store.readScope(f.db,SCOPE)].map(({id,source_id,enabled,config_json})=>({id,source_id,enabled,config_json}))};
+  for(const [oldToken,newToken] of [['9007199254740992','9007199254740993'],['0','-0'],['1','1.00000000000000001']]) {
+    const dir=mkdtempSync(join(f.dir,'numbers-'));chmodSync(dir,0o700);
+    const opts=replayOptions(f,{reviewOut:join(dir,'review.json')}), at=new Date().toISOString();
+    const authored=[{...original[0],canonical_json:original[0].canonical_json.replace(/}$/,`,"unknown_numeric":${oldToken}}`)}];
+    const bound=bindAcquiredMessageAccounts(authored,SELF,{acquiredAt:at});
+    const view=beginMaintenanceReview(opts,context);view.verifySelf(hash(SELF.open_id));view.prepareReplayAcquisition(authored,bound,at);
+    const preview=view.finish([{before:before[0],after:{...before[0],...bound[0]},observed:bound[0],outcome:'update'}]);
+    const changed={...bound[0],canonical_json:bound[0].canonical_json.replace(`"unknown_numeric":${oldToken}`,`"unknown_numeric":${newToken}`)};
+    const apply=beginMaintenanceReview(approved(opts,{review:preview.summary}),context);apply.verifySelf(hash(SELF.open_id));
+    assert.throws(()=>apply.finish([{before:before[0],after:{...before[0],...changed},observed:changed,outcome:'update'}]),/proposal_changed/);
+  }
+  assert.deepEqual(rows(f),before);
+});
+
+test('equivalent raw retention never installs acquisition evidence for bytes that were not retained',t=>{
+  for(const previouslyAttested of [false,true]) {
+    const f=fixture(t);
+    if(previouslyAttested) {
+      const bound=bindAcquiredMessageAccounts(records(f,f.messages),SELF,{acquiredAt:new Date(Date.now()-1000).toISOString()});
+      normal(f,bound[0]);
+    }
+    const before=rows(f)[0], oldProof=JSON.parse(before.canonical_json).message_account_evidence;
+    if(previouslyAttested)assert.ok(readMessageAccountEvidence(before,JSON.parse(before.canonical_json),JSON.parse(before.raw_json)));
+    const drift={...f.messages[0],body:{content:` ${f.messages[0].body.content} `}};
+    assert.equal(sourceRelation(before.raw_json,JSON.stringify(drift)),'json_representation');
+    const result=replay(f,[drift],replayOptions(f,{reviewOut:undefined,apply:true}));
+    assert.equal(result.ok,true,JSON.stringify(result));
+    const after=rows(f)[0], canonical=JSON.parse(after.canonical_json);
+    assert.equal(after.raw_json,before.raw_json);assert.equal(after.content_hash,before.content_hash);
+    assert.deepEqual(canonical.message_account_evidence,oldProof,
+      'retain the exact earlier proof when present; never mint proof for an unreturned byte representation');
+    if(previouslyAttested)assert.ok(readMessageAccountEvidence(after,canonical,JSON.parse(after.raw_json)));
+  }
+});
+
+test('a genuine pre-acquisition legacy approval remains byte exact and cannot authorize a new proof member',t=>{
+  const f=fixture(t), before=rows(f), opts=replayOptions(f), changed=native(f,0,{update_time:String(f.start+9000)});
+  const candidate=records(f,[changed])[0];
+  const context={db:f.db,mode:'replay',rows:before,scopes:[store.readScope(f.db,SCOPE)].map(({id,source_id,enabled,config_json})=>({id,source_id,enabled,config_json}))};
+  const view=beginMaintenanceReview(opts,context);view.verifySelf(hash(SELF.open_id));
+  view.finish([{before:before[0],after:{...before[0],...candidate},observed:candidate,outcome:'update'}]);
+  const artifact=JSON.parse(readFileSync(opts.reviewOut));artifact.schema='exocortex_private_maintenance_review/v3';
+  for(const record of artifact.records)delete record.proof;
+  writeFileSync(opts.reviewOut,JSON.stringify(artifact));
+  const {reviewOut,...options}=opts;
+  const applied=replay(f,[changed],{...options,apply:true,reviewIn:reviewOut,reviewSha256:hash(readFileSync(reviewOut))});
+  assert.equal(applied.ok,true,JSON.stringify(applied));
+  assert.equal(JSON.parse(rows(f)[0].canonical_json).message_account_evidence,undefined);
+  const newAcquisition=replay(f,[changed],{...options,apply:true});
+  assert.equal(newAcquisition.ok,true,JSON.stringify(newAcquisition));
+  const after=rows(f)[0];assert.ok(readMessageAccountEvidence(after,JSON.parse(after.canonical_json),JSON.parse(after.raw_json)),
+    'an independently requested replay remains an explicit acquisition-proof repair route');
 });
 
 test('detail queue, list ingestion and replay use one conservative equal-version selection rule',t=>{
@@ -301,7 +436,21 @@ for(const mode of ['complete','cli_budget','deadline','rate_limit'])test(`histor
   assert.equal(calls.length,2,'self and history list remain the only API attempts');
   assert.deepEqual(leases.map(lease=>lease.spawns),[1,1,0],'two API leases followed by one local commit lease');
   assert.equal(releases,3);assert.ok(leases.every(lease=>lease.released));assert.equal(held,false);
-  assert.equal(result.request_budget.cli_attempts,2);assert.deepEqual(rows(f),before);
+  assert.equal(result.request_budget.cli_attempts,2);
+  let acquiredRows;
+  if(mode==='complete') {
+    const after=rows(f), previous=JSON.parse(before[0].canonical_json), canonical=JSON.parse(after[0].canonical_json);
+    const evidence=readMessageAccountEvidence(after[0],canonical,JSON.parse(after[0].raw_json));
+    assert.ok(evidence, 'the first admitted source response supplies exact acquisition evidence');
+    assert.equal(evidence.account_key,hash(`lark.im\0${SELF.open_id}`));
+    delete canonical.message_account_evidence;
+    assert.deepEqual(canonical,previous);
+    assert.equal(after[0].canonical_json.replace(/,"message_account_evidence":\{[^}]*\}(?=\}$)/,''),before[0].canonical_json,
+      'all original canonical tokens are unchanged');
+    for(const key of Object.keys(before[0]).filter(key=>!['canonical_json','updated_at'].includes(key)))
+      assert.equal(after[0][key],before[0][key],key);
+    acquiredRows=after;
+  } else assert.deepEqual(rows(f),before);
   const expectedStop=mode==='complete'?null:{cli_budget:'cli_budget',deadline:'time_budget',rate_limit:'rate_limited'}[mode];
   assert.equal(result.request_budget.stop_reason,expectedStop);
   const progress=store.sqliteQuery(f.db,'SELECT after_id,completed_sweeps,last_result_json FROM lark_im_history_progress;')[0];
@@ -316,6 +465,10 @@ for(const mode of ['complete','cli_budget','deadline','rate_limit'])test(`histor
   }
   assert.equal(cooldownWrites,mode==='rate_limit'?1:0);
   assert.doesNotMatch(JSON.stringify(result),/secret|oc_invented|om_invented/);
+  if(mode==='complete') {
+    assert.equal(history(f).ok,true);
+    assert.deepEqual(rows(f),acquiredRows,'a second real response retains the earlier proof and all row bytes');
+  }
 });
 
 test('migration preserves legacy nineteen-column rows, and status exposes unresolved evidence without migrating on read',async t=>{

@@ -196,6 +196,8 @@ function contentRequirement(canonical, raw, native, display, evidence) {
   if (content.state === 'recalled' && [canonical, raw, native].some(value => value.deleted === true)) {
     return satisfied('content', 'source_tombstone');
   }
+  if (['partial', 'unsupported'].includes(content.state) && UNSUPPORTED_CONTENT.has(content.reason))
+    return requirement('content', 'blocked', 'content_unsupported', 'renderer');
   // Read-time renderers use the current raw snapshot. A successfully rebuilt
   // card/system projection supersedes an older stored renderer diagnosis.
   const renderings = [display.card || display.system || canonical.content_rendering || raw.content_rendering].filter(object);

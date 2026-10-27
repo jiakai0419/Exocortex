@@ -295,6 +295,62 @@ function mergeLarkNameProjectionSql(
   // compatibility branch to manufacture or borrow account evidence.
   const diagnosticAccountsAbsent = ['old', incomingJson].flatMap(json => diagnosticAccountPaths.map(path =>
     `json_type(${json}, '${path}') IS NULL`)).join(' AND ');
+  // A failed inline lookup has no adopted sender account to retain. Its safe
+  // diagnostic can nevertheless survive a no-query replay of the exact source
+  // version when an independent, already stored account anchor agrees. This
+  // branch copies only the latest diagnostic, never an adoption/ownership key.
+  const failureAccount = `json_extract(old, '$.sender_name_verification.account_key')`;
+  const failurePath = '$.sender_name_verification.failure';
+  const failureKinds = ['network_timeout','network_error','rate_limited','service_unavailable','internal_error',
+    'restricted_mode','bot_user_out_of_chat','permission_denied','command_unavailable','spawn_error','unknown','budget_exhausted'];
+  const failedDiagnosticAccounts = ['old', incomingJson].map(json => `(
+    ${[...diagnosticAccountPaths,'$.message_account_evidence.account_key'].map(path =>
+      `(json_type(${json}, '${path}') IS NULL OR json_type(${json}, '${path}')='text'
+        AND json_extract(${json}, '${path}') IS ${failureAccount})`).join(' AND ')}
+    AND (json_type(${json}, '$.message_account_evidence') IS NULL
+      OR json_type(${json}, '$.message_account_evidence')='object'
+        AND json_extract(${json}, '$.message_account_evidence.account_key') IS ${failureAccount})
+    AND NOT EXISTS (SELECT parent,key FROM json_tree(${json}) WHERE key IS NOT NULL
+      GROUP BY parent,key HAVING COUNT(*)>1))`).join(' AND ');
+  const failedDiagnosticRetention = accountRetention ? `(
+    ${['source_id','record_type','external_id','external_version','actor_id','container_id','direction',
+      'occurred_at','occurred_at_ms','raw_json','content_hash'].map(column =>
+      `${accountRetention.existingAlias}.${column} IS ${accountRetention.incomingAlias}.${column}`).join(' AND ')}
+    AND json_type(old, '$.sender_name_account_key') IS NULL AND json_type(next, '$.sender_name_account_key') IS NULL
+    AND json_type(old, '$.sender_name_verification.account_key')='text'
+    AND length(${failureAccount})=64 AND ${failureAccount} NOT GLOB '*[^0-9a-f]*'
+    AND (json_extract(old, '$.chat_name_account_key') IS ${failureAccount}
+      OR json_extract(old, '$.message_account_evidence.account_key') IS ${failureAccount})
+    AND (${failedDiagnosticAccounts})
+    AND json_extract(old, '$.sender_name_verification.status')='failed'
+    AND json_extract(old, '$.sender_name_verification.reason') IN ('request_failed','budget_exhausted')
+    AND json_type(old, '$.sender_name_verification.cached')='false'
+    AND json_type(old, '$.sender_name_verification.observed_at')='text'
+    AND NOT EXISTS (SELECT 1 FROM json_each(old, '$.sender_name_verification')
+      WHERE key NOT IN ('status','reason','source','observed_at','cached','account_key','failure','pages_observed'))
+    AND (json_extract(old, '$.sender_id_type')='open_id'
+        AND json_extract(old, '$.sender_name_verification.source') IN ('contact','chat_member')
+      OR json_extract(old, '$.sender_id_type')='app_id'
+        AND json_extract(old, '$.sender_name_verification.source') IN ('application_api','chat_bot_app_id'))
+    AND json_type(old, '${failurePath}')='object'
+    AND (SELECT COUNT(*) FROM json_each(old, '${failurePath}'))=5
+    AND NOT EXISTS (SELECT 1 FROM json_each(old, '${failurePath}')
+      WHERE key NOT IN ('version','operation','kind','code','stage'))
+    AND json_type(old, '${failurePath}.version')='integer' AND json_extract(old, '${failurePath}.version')=1
+    AND json_extract(old, '${failurePath}.operation')=CASE json_extract(old, '$.sender_name_verification.source')
+      WHEN 'contact' THEN 'contact_search' WHEN 'chat_member' THEN 'chat_members'
+      WHEN 'application_api' THEN 'application_info' WHEN 'chat_bot_app_id' THEN 'chat_bots' END
+    AND json_extract(old, '${failurePath}.kind') IN (${failureKinds.map(kind => `'${kind}'`).join(',')})
+    AND json_extract(old, '${failurePath}.stage') IN ('not_requested','response_error','request_error','unknown')
+    AND (json_type(old, '${failurePath}.code')='null' AND json_extract(old, '${failurePath}.stage')<>'response_error'
+      OR json_type(old, '${failurePath}.code')='integer' AND json_extract(old, '${failurePath}.code') BETWEEN 0 AND 9007199254740991
+        AND json_extract(old, '${failurePath}.stage')='response_error')
+    AND (json_extract(old, '${failurePath}.kind')='budget_exhausted'
+        AND json_extract(old, '${failurePath}.stage')='not_requested'
+        AND json_extract(old, '$.sender_name_verification.reason')='budget_exhausted'
+      OR json_extract(old, '${failurePath}.kind')<>'budget_exhausted'
+        AND json_extract(old, '$.sender_name_verification.reason')='request_failed')
+  )` : '0';
   const diagnosticKeysUnique = ['old', incomingJson].map(json => `NOT EXISTS (
     SELECT key FROM json_each(${json})
     WHERE key IN ('message_id','sender_id','sender_id_type','chat_id','sender_name','sender_name_source',
@@ -343,7 +399,8 @@ function mergeLarkNameProjectionSql(
         AND json_extract(old, '$.sender_name_verification.account_key') IS ${adoptedAccount}
         AND json_extract(next, '$.sender_name_account_key') IS ${adoptedAccount}
         AND (${diagnosticAccountsMatch}))
-        OR ((${diagnosticAccountsAbsent}) AND json_type(next, '$.sender_name_account_key') IS NULL))
+        OR ((${diagnosticAccountsAbsent}) AND json_type(next, '$.sender_name_account_key') IS NULL)
+        OR ${failedDiagnosticRetention})
       AND (${diagnosticKeysUnique}) AND (${diagnosticSourceMatches})
     THEN json_set(next, '$.sender_name_verification', json_extract(old, '$.sender_name_verification'))
     ELSE next END AS next FROM ${previous})`);

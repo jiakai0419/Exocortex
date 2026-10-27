@@ -12,6 +12,7 @@ import { activityDatabaseKey } from '../src/diagnostics/lark-im-activity-evidenc
 import { digest, sampleScopeHash } from '../src/diagnostics/remote-sample-core.mjs';
 import { writeRemoteSampleState, remoteSamplePaths } from '../src/runtime/worker/remote-sample-scheduler.mjs';
 import { executeLarkImHistory } from '../src/maintenance/history.mjs';
+import { readMessageAccountEvidence } from '../src/adapters/lark-im/message-account-evidence.mjs';
 
 const SELF={open_id:'ou_synthetic_ticket_self',name:'Synthetic ticket observer'};
 const CHAT='oc_synthetic_ticket',SCOPE=chatScopeId(CHAT),q=store.quoteSql;
@@ -65,10 +66,21 @@ function fixture(t) {
 }
 
 test('first equivalent acquisition receives one ticket; unchanged-generation duplicates do not renew it',t=>{
-  const f=fixture(t);f.run();const first=f.debt();
-  assert.equal(first.verification_generation,0);assert.ok(first.verification_requested_at_ms>0);
-  f.publish();f.run();const second=f.debt();
-  assert.equal(second.verification_generation,0);assert.equal(second.verification_requested_at_ms,first.verification_requested_at_ms);
+  const f=fixture(t),before=f.record(),beforeGeneration=f.generation();
+  const acquired=f.run();assert.equal(acquired.updated,1);assert.equal(acquired.duplicate,0);
+  const first=f.debt(),after=f.record(),canonical=JSON.parse(after.canonical_json);
+  const proof=readMessageAccountEvidence(after,canonical,JSON.parse(after.raw_json));
+  assert.ok(proof);assert.equal(proof.account_key,f.binding.account_key);delete canonical.message_account_evidence;
+  assert.deepEqual(canonical,JSON.parse(before.canonical_json));
+  assert.ok(Date.parse(after.updated_at)>=Date.parse(before.updated_at));
+  assert.deepEqual({...after,canonical_json:before.canonical_json,updated_at:before.updated_at},before,
+    'first equivalent acquisition adds only current account proof and the update clock');
+  assert.equal(f.generation(),beforeGeneration+1);assert.equal(first.verification_generation,f.generation());
+  assert.ok(first.verification_requested_at_ms>0);
+  f.publish();const duplicate=f.run();assert.equal(duplicate.updated,0);assert.equal(duplicate.duplicate,1);
+  const second=f.debt();
+  assert.equal(second.verification_generation,first.verification_generation);assert.equal(second.verification_requested_at_ms,first.verification_requested_at_ms);
+  assert.equal(f.generation(),first.verification_generation);assert.deepEqual(f.record(),after,'same source does not refresh its account proof');
   assert.ok(second.generation>first.generation);
 });
 
@@ -148,8 +160,9 @@ test('a new debt fingerprint renews once; repeated samples of that same debt do 
 test('lost-acknowledgement attempt replay cannot reissue a ticket or advance the queue generation',t=>{
   const f=fixture(t);let captured,effects;
   f.run({commit:(db,options)=>{captured=options;effects=store.commitBoundedReplayRecords(db,options);return effects;}});
-  const before=f.debt();assert.deepEqual(store.commitBoundedReplayRecords(f.db,captured),effects);
+  const before=f.debt(),record=f.record(),generation=f.generation();assert.deepEqual(store.commitBoundedReplayRecords(f.db,captured),effects);
   assert.deepEqual(f.debt(),before);
+  assert.deepEqual(f.record(),record);assert.equal(f.generation(),generation);
 });
 
 test('legacy direct history callers without commitReadyAtMs still receive a SQL-time ticket',t=>{

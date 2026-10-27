@@ -122,6 +122,49 @@ test('representation and newer-source decisions preserve the established record 
   assert.equal(newer.action, 'accept'); assert.equal(newer.reason, 'newer_observed_timestamp');
 });
 
+test('retained raw keeps only its own acquisition member without altering unknown JSON tokens', () => {
+  const equivalent = row(Object.fromEntries(Object.entries(raw()).reverse()));
+  const incomingProof = '{"source_hash":"incoming-raw-hash","acquired_at":"new-source-clock"}';
+  const candidate = { ...equivalent, canonical_json: equivalent.canonical_json.slice(0, -1)
+    + `,"message_account_evidence":${incomingProof},"new_unknown":9007199254740995}` };
+  for (const oldProof of [undefined, 'null', '"invalid legacy proof"',
+    '{ "source_hash" : "old-raw-hash", "unknown" : 9007199254740993, "clock":"\\u0041" }']) {
+    const retainedMember = oldProof === undefined ? '' : `,"message_account_\\u0065vidence" : ${oldProof}`;
+    const predecessor = { ...before, canonical_json: before.canonical_json.slice(0, -1)
+      + `${retainedMember},"old_unknown":9007199254740997,"old_escape":"\\u0042"}` };
+    const frozenBefore = Object.freeze(predecessor), frozenNext = Object.freeze(candidate);
+    const result = evaluateObservation(frozenBefore, frozenNext, state(), acquisition());
+    assert.equal(result.action, 'equivalent');
+    assert.equal(result.record.raw_json, predecessor.raw_json);
+    assert.equal(result.record.content_hash, predecessor.content_hash);
+    const canonical = result.record.canonical_json, parsed = JSON.parse(canonical);
+    assert.equal(Object.hasOwn(parsed, 'message_account_evidence'), oldProof !== undefined);
+    if (oldProof !== undefined) assert.ok(canonical.includes(`"message_account_\\u0065vidence" : ${oldProof}`));
+    assert.doesNotMatch(canonical, /incoming-raw-hash|new-source-clock/);
+    for (const token of ['"new_unknown":9007199254740995', '"old_unknown":9007199254740997', '"old_escape":"\\u0042"']) {
+      assert.ok(canonical.includes(token), token);
+    }
+    assert.equal(frozenBefore.canonical_json, predecessor.canonical_json);
+    assert.equal(frozenNext.canonical_json, candidate.canonical_json);
+  }
+});
+
+test('an exact source response can still add new evidence and an accepted source change keeps its fresh proof', () => {
+  const proof = { source_hash: 'authored-exact-source-hash', acquired_at: 'authored-acquisition-clock' };
+  const attach = record => ({ ...record, canonical_json: record.canonical_json.slice(0, -1)
+    + `,"message_account_evidence":${JSON.stringify(proof)}}` });
+  const exact = attach(before);
+  const refreshed = evaluate({ incoming: exact });
+  assert.equal(refreshed.action, 'equivalent');
+  assert.deepEqual(JSON.parse(refreshed.record.canonical_json).message_account_evidence, proof);
+  assert.equal(refreshed.record.raw_json, before.raw_json);
+  const newer = attach(row({ ...raw('Synthetic accepted new source'), update_time: '1800000002000' }));
+  const accepted = evaluate({ incoming: newer });
+  assert.equal(accepted.action, 'accept');
+  assert.equal(accepted.record.raw_json, newer.raw_json);
+  assert.equal(accepted.record.canonical_json, newer.canonical_json);
+});
+
 test('a descriptor predecessor still requires equality of the complete candidate subtree', () => {
   const root = { ...raw(), msg_type: 'merge_forward', body: { content: '{"snapshot":1}' } };
   const changed = { ...root, body: { content: '{"snapshot":2}' } };

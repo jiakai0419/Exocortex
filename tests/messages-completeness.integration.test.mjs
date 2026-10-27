@@ -500,3 +500,59 @@ test('real CLI preserves a real application name that itself begins with the wor
   assert.equal(actual.display.sender, `应用：${name}`, JSON.stringify({ display: actual.display, text }));
   assert.equal(text, `Messages (1)\n\n${readyBlock(row, `应用：${name}`)}\n`);
 });
+
+function deniedApplicationRow(id=501,{name=null}={}) {
+  let row=message(id,{name});
+  editJson(row,'canonical_json',value=>{
+    delete value.sender_name_account_key;
+    value.sender_name_verification={status:'failed',reason:'request_failed',source:'application_api',
+      account_key:ACCOUNT,observed_at:OBSERVED,cached:false,
+      failure:{version:1,operation:'application_info',kind:'permission_denied',code:210508,stage:'response_error'}};
+  });
+  [row]=bindAcquiredMessageAccounts([row],{open_id:'ou_synthetic_completeness_owner'},{acquiredAt:OBSERVED});
+  assert(JSON.parse(row.canonical_json).message_account_evidence);
+  return row;
+}
+
+test('actual CLI explains only an exact application permission response and preserves its ready neighbor',t=>{
+  const denied=deniedApplicationRow(),neighbor=message(502,{actor:HUMAN,namespace:'open_id',name:HUMAN_NAME,offset:100});
+  const f=fixture(t,[denied,neighbor],[]),before=snapshot(f);
+  const rows=messages(f,'json'),text=messages(f,'text');
+  assert.deepEqual(rows.map(row=>row.id),[neighbor.id,denied.id]);
+  for (const row of rows) assertPreserved(row,row.id===denied.id?denied:neighbor);
+  assert.equal(rows[0].readiness.state,'ready');
+  assert.equal(rows[1].readiness.state,'blocked');
+  assert.deepEqual(rows[1].readiness.reasons,['permission_denied']);
+  assert.equal(rows[1].readiness.next_action,'review_permissions');
+  assert.ok(text.includes(readyBlock(neighbor,HUMAN_NAME)));
+  assert.ok(text.includes('来源权限不足'));assert.equal(text.includes(denied.body),false);
+  assert.deepEqual(snapshot(f),before);
+});
+
+test('actual CLI never generalizes a route failure or downgrades an already authoritative name',async t=>{
+  const variants=[
+    ['generic failure',v=>{delete v.sender_name_verification.failure;}],
+    ['different code',v=>{v.sender_name_verification.failure.code=10014;}],
+    ['unknown class',v=>{v.sender_name_verification.failure.kind='unknown';}],
+    ['not requested',v=>{v.sender_name_verification.failure.stage='not_requested';}],
+    ['different operation',v=>{v.sender_name_verification.failure.operation='chat_bots';}],
+    ['untrusted diagnostic field',v=>{v.sender_name_verification.failure.private_error='invented private text';}],
+    ['cached failure',v=>{v.sender_name_verification.cached=true;}],
+    ['future observation',v=>{v.sender_name_verification.observed_at='2999-01-01T00:00:00.000Z';}],
+    ['missing acquisition proof',v=>{delete v.message_account_evidence;}],
+    ['foreign account',v=>{v.sender_name_verification.account_key=OTHER_ACCOUNT;}],
+    ['wrong current source proof',v=>{v.message_account_evidence.source_hash='0'.repeat(64);}],
+  ];
+  for(const [label,mutate] of variants)await t.test(label,t=>{
+    const row=deniedApplicationRow();editJson(row,'canonical_json',mutate);
+    const f=fixture(t,[row],[]),before=snapshot(f),[actual]=messages(f,'json'),text=messages(f,'text');
+    assertPreserved(actual,row);assert.equal(actual.readiness.reasons.includes('permission_denied'),false);
+    assert.doesNotMatch(text,/来源权限不足/);assert.deepEqual(snapshot(f),before);
+  });
+  await t.test('an exact native name supersedes the failed lookup',t=>{
+    const row=deniedApplicationRow(501,{name:APP_NAME});
+    const f=fixture(t,[row],[]),before=snapshot(f),[actual]=messages(f,'json'),text=messages(f,'text');
+    assertPreserved(actual,row);assert.equal(actual.readiness.state,'ready');
+    assert.ok(text.includes(readyBlock(row,`应用：${APP_NAME}`)));assert.deepEqual(snapshot(f),before);
+  });
+});

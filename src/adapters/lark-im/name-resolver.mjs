@@ -7,6 +7,7 @@ import {
   senderName,
 } from "./core.mjs";
 import { displayNameFromUser, personName, senderAliasesByOpenId, senderIdentity, senderLookupNamespace, senderOpenId } from "./sender-identity.mjs";
+import { nameLookupFailure } from './sender-name-observation.mjs';
 
 /**
  * @typedef {Record<string, any>} JsonObject
@@ -283,7 +284,8 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
           cacheName(`user:${openId}`, name);
         }
       } catch (error) {
-        for (const id of ids) observe(`user:${id}`, { status: 'failed', reason: failureReason(error), source: 'contact' });
+        for (const id of ids) observe(`user:${id}`, { status: 'failed', reason: failureReason(error), source: 'contact',
+          failure: nameLookupFailure(error,'contact_search',error instanceof NameLookupBudgetExceeded) });
         // Name enrichment is best-effort; message sync correctness must not depend on it.
       }
     }
@@ -407,7 +409,8 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
         for (const id of targetIds) {
           const key = `member:${JSON.stringify([chatIdValue, id])}`;
           if (observations.get(key)?.status !== 'conflict') observe(key, { status: 'failed', reason: failureReason(error),
-            pages_observed: pagesObserved, source: 'chat_member' });
+            pages_observed: pagesObserved, source: 'chat_member',
+            failure: nameLookupFailure(error,'chat_members',error instanceof NameLookupBudgetExceeded) });
         }
         break;
       }
@@ -471,7 +474,8 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
           reportLookup({ kind: "application", app_id: appId, status: "missing_name", cached: false });
         }
       } catch (error) {
-        observe(`app:${appId}`, { status: 'failed', reason: failureReason(error), source: 'application_api' });
+        observe(`app:${appId}`, { status: 'failed', reason: failureReason(error), source: 'application_api',
+          failure: nameLookupFailure(error,'application_info',error instanceof NameLookupBudgetExceeded) });
         reportLookup({ kind: "application", app_id: appId, status: "failed", error, cached: false });
         // App-name enrichment is best-effort. If permission is missing, leave it unresolved.
       }
@@ -547,7 +551,8 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
           pending_app_ids: remainingIds.length, bot_candidates: remainingBots.length });
       } catch (error) {
         for (const id of pendingIds) observe(`bot:${JSON.stringify([chatIdValue, id])}`, {
-          status: 'failed', reason: failureReason(error), source: 'chat_bot_app_id' });
+          status: 'failed', reason: failureReason(error), source: 'chat_bot_app_id',
+          failure: nameLookupFailure(error,'chat_bots',error instanceof NameLookupBudgetExceeded) });
         reportLookup({ kind: "chat_bots", chat_id: chatIdValue, status: "failed", error });
         // Fallback display-name enrichment must never block message sync.
       }

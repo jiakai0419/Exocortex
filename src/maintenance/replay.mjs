@@ -161,9 +161,11 @@ function executeLarkImReplay(opts, deps = {}) {
       if (targets.size && [...targets.keys()].some((id) => fetched.messages.filter((message) => messageId(message) === id).length !== 1)) {
         throw new ReplayInputError("exact replay targets were missing or repeated in the remote window");
       }
-      const prepared = bindAcquiredMessageAccounts(prepareChatWindowRecords(fetched.messages, scope.id, null, opts.startMs, opts.endMs,
+      const original = prepareChatWindowRecords(fetched.messages, scope.id, null, opts.startMs, opts.endMs,
         self.open_id, { self }, scope.config)
-        .filter((record) => record.occurred_at_ms >= opts.startMs && record.occurred_at_ms <= opts.endMs), self, { acquiredAt });
+        .filter((record) => record.occurred_at_ms >= opts.startMs && record.occurred_at_ms <= opts.endMs);
+      const acquired = bindAcquiredMessageAccounts(original, self, { acquiredAt });
+      const prepared = review ? review.prepareReplayAcquisition(original, acquired, acquiredAt) : acquired;
       // Validate the entire fetched page before filtering: an unselected invalid
       // message or another chat must not disappear behind the target allowlist.
       normalizeBoundedReplayRecords(/** @type {any} */ (prepared), "lark.im");

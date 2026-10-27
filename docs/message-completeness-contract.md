@@ -1,6 +1,6 @@
 # Message completeness and identity consistency
 
-Design v0.3 — integrated local candidate, base 5631504dade6c0ce2092bdfa6f5811f0314f376a. Integration and final validation are pending. Production, services, permissions and API budgets remain unchanged. No push/deploy is authorized. All test inputs must be authored from scratch; never commit real or redacted business data.
+Design v0.4 — integrated local candidate, base 5631504dade6c0ce2092bdfa6f5811f0314f376a. Final full-tree validation and independent acceptance remain pending. Production, services, permissions and API budgets remain unchanged. No push/deploy is authorized. All test inputs must be authored from scratch; never commit real or redacted business data.
 
 ## Goal
 
@@ -123,6 +123,19 @@ An otherwise identical record with two valid matching acquisition envelopes that
 
 This recovery path matters for legacy received private messages with an exact native sender name but no stored own-account evidence. Such a row correctly needs no sender-name request. Its missing ownership must instead be repaired by the normal authorized source reacquisition path; requiring a redundant sender lookup would mix two different contracts. Outside current collection overlap, existing historical traversal determines the opportunity. No claim of a fixed historical recovery deadline is made without a measured traversal bound.
 
+If equivalent-source reconciliation retains earlier raw bytes, it also retains
+the earlier acquisition-proof member, including absence. It cannot transplant a
+new exact-byte proof from the discarded representation. Byte-identical actual
+source acquisition may add proof through the normal guarded merge.
+
+Explicit replay review keeps exact digests and committed proof bytes. Its v4
+structural comparison can normalize only validated current acquisition time and
+the exact-source hash dependency, within a separate validated-proof domain; the
+complete source/reference proof still applies. Invalid, foreign, duplicate or
+unknown canonical data is not normalized. Legacy approval remains byte exact:
+only an exactly approved prior proof, or an exactly approved proposal without
+new proof, can be retained. A replay never invents an earlier request time.
+
 ## Persisted completeness observations
 
 Migration 017 records historical results of the actual local `messages` pipeline. A successful sync tail, including an empty successful cycle, may observe at most 20 new and 20 historical records per admitted 60-second opportunity. The same account/maintenance fences protect short local commits. There are no remote calls or long transactions. Source CAS prevents attaching a reading to changed source bytes; a failed optional observer never rolls back acquired messages. Oversized or unreadable candidates are counted as deferred, and historical scanning continues fairly.
@@ -168,3 +181,31 @@ the number of stored or displayed messages. Existing persistent authority repair
 remains the recovery route; both its enrollment/application and ingestion's local
 reuse include nonempty unproven labels. The original private screenshot records
 are a required real-CLI regression check for this case.
+
+## Exact failure diagnostics and content verification
+
+Failed inline name lookups retain only a finite diagnostic descriptor: version,
+operation, kind, numeric code or null, and execution stage. Request admission,
+local budget exhaustion, transport failure and an actual API error are distinct;
+arbitrary exception text is never persisted. No-query replay can retain an
+exactly bound diagnostic without creating name adoption or account proof.
+
+An application-info permission response may explain a missing application name
+in the actual read projection only when its finite observation and current
+acquisition proof bind the same account, typed actor, source and message. A
+valid alternative name stays ready. This is evidence about that lookup route,
+not proof that every possible authority is permanently inaccessible. A failed
+contact lookup alone does not declare all member fallback routes blocked.
+
+For legacy records without renderer metadata, nonempty stored text is not proof
+of complete content. The read path must verify the source representation and
+the type-specific rendering, including unresolved references. Valid legacy
+content remains readable; malformed or contradictory content cannot count as
+ready merely because its stored body contains text. This adds no new content
+format support and never changes stored source bytes or body.
+
+This legacy check does not replace existing renderer metadata or expand support
+for content types. It reuses the bounded source renderer when such metadata is
+absent, keeps native encoded JSON distinct from direct-text legacy shapes, and
+requires the complete rendered text to match the stored body before accepting
+that fallback as complete. JSON and quality use this same decision.

@@ -12,6 +12,8 @@ import { runMaintenanceCommand } from '../src/cli/maintenance-command.mjs';
 import { parseRouteOptions } from '../src/cli/registry.mjs';
 import { createCommandContext } from '../src/cli/context.mjs';
 import { normalizeApiMessage } from '../src/adapters/lark-im/raw-message.mjs';
+import { readMessageAccountEvidence } from '../src/adapters/lark-im/message-account-evidence.mjs';
+import { patchTopLevelJsonMemberText } from '../dist/core/json-text-patch.js';
 import { createSyncRunner, prepareChatWindowRecords } from '../src/adapters/lark-im/sync-runner.mjs';
 import { chatScopeId } from '../src/adapters/lark-im/core.mjs';
 import { commitBoundedReplayRecords, ensureInitialized, INITIAL_ACCOUNT_KIND, quoteSql, sqliteExec, sqliteQuery, upsertRecordsSql } from '../dist/storage/sqlite/ingestion-store.js';
@@ -344,11 +346,18 @@ test('card review uses final SQL merge, refetches without extra API, binds opaqu
   }
   assert.equal(artifact.disclosure.card_text, 'rendered_api_projection_not_the_stored_body_column_or_business_approval');
   saveSyntheticExample('card', opts.reviewOut, preview);
+  const applyStarted=Date.now();
   const result = replay(f, undefined, approved(opts, preview)); publicReport(result);
   assert.equal(result.ok, true); assert.equal(result.scopes[0].updated, 2); assert.equal(f.calls.length, 4);
   for (const [i, row] of ro(f).entries()) {
     assert.equal(hash(row.raw_json), artifact.records[i].opaque.after.raw_json.sha256);
-    assert.equal(hash(row.canonical_json), artifact.records[i].opaque.after.canonical_json.sha256);
+    const proof=readMessageAccountEvidence(row,JSON.parse(row.canonical_json),JSON.parse(row.raw_json));
+    assert.ok(proof,'the new acquisition is exactly bound to the committed source bytes and identity');
+    assert.ok(Date.parse(proof.acquired_at)>=applyStarted);
+    const previewCanonical=patchTopLevelJsonMemberText(row.canonical_json,'message_account_evidence',
+      JSON.stringify({...proof,acquired_at:new Date(artifact.created_at_ms).toISOString()}));
+    assert.equal(hash(previewCanonical), artifact.records[i].opaque.after.canonical_json.sha256,
+      'only the verified acquisition clock can differ; every other canonical byte remains approved');
     assert.equal(row.id, before[i].id);
   }
 });
