@@ -82,6 +82,25 @@ function patchTopLevelJsonMemberText(text: string, key: string, value?: string):
   return result;
 }
 
+/** Replace one existing object-path value, retaining every byte outside its
+ * span, including ancestor whitespace, separators and escaped key spelling. */
+function patchExistingJsonValueText(text: string, path: readonly string[], value: string): string {
+  if (!Array.isArray(path) || !path.length || path.length > 64 || [...path].some(key => typeof key !== 'string')) {
+    throw new Error('json_patch_invalid_path');
+  }
+  let node = parseText(text);
+  for (const key of path) {
+    if (!node.members) throw new Error('json_patch_object_required');
+    const member = node.members.find(candidate => candidate.key === key);
+    if (!member) throw new Error('json_patch_path_missing');
+    node = member.value;
+  }
+  parseText(value);
+  const result = text.slice(0, node.start) + value + text.slice(node.end);
+  parseText(result);
+  return result;
+}
+
 /** A raw JSON value is supplied only for an owned path; omitted value deletes
  * that path. Missing intermediate objects are created for sets, not deletions.
  * Existing non-object intermediates are rejected instead of silently replaced.
@@ -158,5 +177,5 @@ function mergeJsonObjectText(before: string, incoming: string, options: {
   return patchJsonText(before, patches, patches.map(patch => patch.path));
 }
 
-export { patchJsonText, patchTopLevelJsonMemberText, mergeJsonObjectText, validateJsonObjectText };
+export { patchJsonText, patchTopLevelJsonMemberText, patchExistingJsonValueText, mergeJsonObjectText, validateJsonObjectText };
 export type { JsonTextPatch };

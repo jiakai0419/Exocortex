@@ -11,6 +11,11 @@ import { SENT_SCOPE_ID } from '../src/adapters/lark-im/core.mjs';
 import { nameTaskKey } from '../src/adapters/lark-im/name-evidence.mjs';
 import { recipientAccountKey } from '../src/adapters/lark-im/p2p-recipient.mjs';
 import { bindAcquiredMessageAccounts } from '../src/adapters/lark-im/message-account-evidence.mjs';
+import { senderNameRouteTargetKey } from '../src/adapters/lark-im/sender-name-observation.mjs';
+import { createNameResolver } from '../src/adapters/lark-im/name-resolver.mjs';
+import { normalizeApiMessage } from '../src/adapters/lark-im/raw-message.mjs';
+import { recordFromMessage } from '../src/adapters/lark-im/message-record.mjs';
+import { bindCurrentSenderNames } from '../src/adapters/lark-im/name-history.mjs';
 
 // Invented from scratch: no saved business records, account, screenshots or
 // production database. Exercise the real parser -> SQLite -> projection ->
@@ -507,14 +512,62 @@ function deniedApplicationRow(id=501,{name=null}={}) {
     delete value.sender_name_account_key;
     value.sender_name_verification={status:'failed',reason:'request_failed',source:'application_api',
       account_key:ACCOUNT,observed_at:OBSERVED,cached:false,
-      failure:{version:1,operation:'application_info',kind:'permission_denied',code:210508,stage:'response_error'}};
+      failure:{version:1,operation:'application_info',kind:'permission_denied',code:210508,stage:'response_error'},
+      route_failures:{version:1,attempt_key:hash('invented complete application route attempt'),
+        target_key:senderNameRouteTargetKey(ACCOUNT,row.actor_id,row.container_id),account_key:ACCOUNT,
+        routes:['application_info','chat_bots'].map(operation=>({operation,status:'failed',
+          failure:{version:1,operation,kind:'permission_denied',code:210508,stage:'response_error'}}))}};
   });
   [row]=bindAcquiredMessageAccounts([row],{open_id:'ou_synthetic_completeness_owner'},{acquiredAt:OBSERVED});
   assert(JSON.parse(row.canonical_json).message_account_evidence);
   return row;
 }
 
-test('actual CLI explains only an exact application permission response and preserves its ready neighbor',t=>{
+test('real resolver through storage and CLI blocks only two denied app routes, retaining all recoverable alternatives',t=>{
+  const modes=['both_denied','fallback_timeout','fallback_not_requested','fallback_empty',
+    'fallback_named','primary_unknown','human_member_timeout'];
+  const expected=['blocked','enriching','enriching','enriching','ready','enriching','enriching'];
+  const records=modes.map((mode,index)=>{
+    const human=mode==='human_member_timeout',id=600+index;
+    const original=message(id,{actor:human?HUMAN:`${APP}_${index}`,namespace:human?'open_id':'app_id',offset:index});
+    const raw=JSON.parse(original.raw_json),calls=[];
+    const resolver=createNameResolver({now:()=>Date.parse(OBSERVED),run(args){
+      const operation=args[0]==='contact'?'contact_search':args[0]==='api'?'application_info'
+        :args[2]==='get'?'chat_members':'chat_bots';
+      calls.push(operation);
+      if(['application_info','contact_search'].includes(operation))
+        throw Error(`lark-cli failed: kind=${mode==='primary_unknown'?'unknown code=10014':'permission_denied code=210508'} operation=${operation}`);
+      if(mode==='fallback_named')return {items:[{app_id:original.actor_id,name:APP_NAME}]};
+      if(mode==='fallback_empty')return {items:[]};
+      if(['both_denied','primary_unknown'].includes(mode))
+        throw Error(`lark-cli failed: kind=permission_denied code=210508 operation=${operation}`);
+      throw Error(`lark-cli failed: kind=network_timeout timeout_ms=5000 operation=${operation}`);
+    }});
+    const normalized=normalizeApiMessage(raw),self={open_id:'ou_synthetic_completeness_owner',name:'Invented Owner'};
+    const context=resolver.buildPeopleContext([normalized],mode==='fallback_not_requested'
+      ?{nameRouteAdmission:({operation})=>operation!=='chat_bots'}:{},self);
+    let row=recordFromMessage(normalized,SENT_SCOPE_ID,'received',context,{chat_id:CHAT,chat_type:'group',chat_name:TITLE});
+    [row]=bindAcquiredMessageAccounts(bindCurrentSenderNames([row],self),self,{acquiredAt:OBSERVED});
+    assert.equal(calls.length,mode==='fallback_not_requested'?1:2);
+    return {...row,id};
+  });
+  const f=fixture(t,records,[]),before=snapshot(f),actual=messages(f,'json'),text=messages(f,'text');
+  assert.equal(actual.length,modes.length);
+  for(const [index,row] of records.entries()){
+    const result=actual.find(value=>value.id===row.id);
+    assertPreserved(result,row);
+    assert.equal(result.readiness.state,expected[index],modes[index]);
+    assert.equal(result.readiness.reasons.includes('permission_denied'),modes[index]==='both_denied',modes[index]);
+    assert.equal(result.readiness.next_action,modes[index]==='both_denied'?'review_permissions'
+      :modes[index]==='fallback_named'?'none':'resolve_sender',modes[index]);
+  }
+  assert.equal(text.match(/来源权限不足/g)?.length,1);
+  assert.ok(text.includes(readyBlock(records[4],`应用：${APP_NAME}`)));
+  assert.deepEqual(actual.map(row=>row.id),ordered(records).map(row=>row.id));
+  assert.deepEqual(snapshot(f),before);
+});
+
+test('actual CLI explains exact permission responses from both application routes and preserves its ready neighbor',t=>{
   const denied=deniedApplicationRow(),neighbor=message(502,{actor:HUMAN,namespace:'open_id',name:HUMAN_NAME,offset:100});
   const f=fixture(t,[denied,neighbor],[]),before=snapshot(f);
   const rows=messages(f,'json'),text=messages(f,'text');
@@ -531,6 +584,16 @@ test('actual CLI explains only an exact application permission response and pres
 
 test('actual CLI never generalizes a route failure or downgrades an already authoritative name',async t=>{
   const variants=[
+    ['only primary failure',v=>{delete v.sender_name_verification.route_failures;}],
+    ['fallback not requested',v=>{Object.assign(v.sender_name_verification.route_failures.routes[1],{status:'not_requested',failure:null});}],
+    ['fallback empty successful collection',v=>{Object.assign(v.sender_name_verification.route_failures.routes[1],{status:'unresolved',failure:null});}],
+    ['fallback unknown',v=>{Object.assign(v.sender_name_verification.route_failures.routes[1],{status:'unknown',failure:null});}],
+    ['fallback timeout',v=>{Object.assign(v.sender_name_verification.route_failures.routes[1].failure,{kind:'network_timeout',code:null,stage:'request_error'});}],
+    ['foreign route target',v=>{v.sender_name_verification.route_failures.target_key=senderNameRouteTargetKey(ACCOUNT,APP,`${CHAT}_foreign`);}],
+    ['foreign route account',v=>{v.sender_name_verification.route_failures.account_key=OTHER_ACCOUNT;}],
+    ['duplicate route',v=>{v.sender_name_verification.route_failures.routes[1]=clone(v.sender_name_verification.route_failures.routes[0]);}],
+    ['reordered routes',v=>{v.sender_name_verification.route_failures.routes.reverse();}],
+    ['untrusted route field',v=>{v.sender_name_verification.route_failures.routes[1].private_error='invented private text';}],
     ['generic failure',v=>{delete v.sender_name_verification.failure;}],
     ['different code',v=>{v.sender_name_verification.failure.code=10014;}],
     ['unknown class',v=>{v.sender_name_verification.failure.kind='unknown';}],

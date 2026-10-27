@@ -8,7 +8,7 @@ import { captureRemoteAccountBinding, readRemoteAccountBinding, readRemoteAccoun
 import { readOnlySqliteJson } from '../storage/sqlite/readonly-query.mjs';
 import { renderCardContent } from '../adapters/lark-im/card-content.mjs';
 import { readMessageAccountEvidence } from '../adapters/lark-im/message-account-evidence.mjs';
-import { patchTopLevelJsonMemberText } from '../../dist/core/json-text-patch.js';
+import { patchExistingJsonValueText, patchTopLevelJsonMemberText } from '../../dist/core/json-text-patch.js';
 import { quoteSql, REVIEW_RECORD_COLUMNS, REVIEW_EFFECTIVE_COLUMNS } from '../../dist/storage/sqlite/ingestion-store.js';
 
 import { recordProof, compareObservation, OBSERVATION_POLICY } from '../../dist/core/lark-observation.js';
@@ -150,9 +150,11 @@ function validateArtifact(value, now) {
       || !Array.isArray(record.opaque.changed_fields) || record.opaque.changed_fields.some(field => !OPAQUE_FIELDS.includes(field))) fail('invalid_file');
     if (observationReview) {
       if (!exactKeys(record.proof, ['policy', 'observed', 'proposal']) || record.proof.policy !== OBSERVATION_POLICY) fail('invalid_file');
-      for (const p of [record.proof.observed, record.proof.proposal]) if (!exactKeys(p, ['policy', 'exact', 'structural', 'references'])
+      for (const p of [record.proof.observed, record.proof.proposal]) if (!exactKeys(p, ['policy', 'exact', 'structural', 'references',
+        ...(Object.hasOwn(p ?? {}, 'acquisition_exact') ? ['acquisition_exact'] : [])])
         || p.policy !== OBSERVATION_POLICY || !hashValue(p.exact)
-        || ![p.structural, p.references].every(v => v === null || hashValue(v))) fail('invalid_file');
+        || ![p.structural, p.references].every(v => v === null || hashValue(v))
+        || Object.hasOwn(p, 'acquisition_exact') && p.acquisition_exact !== null && !hashValue(p.acquisition_exact)) fail('invalid_file');
       if (record.proof.proposal.exact !== record.proposal_sha256 || record.proof.observed.exact !== record.observed_sha256) fail('invalid_file');
     }
     for (const side of ['before', 'after']) {
@@ -242,18 +244,24 @@ function effectiveRecord(row) { return pick(row, REVIEW_EFFECTIVE_COLUMNS); }
  * reader verifies its exact bytes, version, identity and admitted account first.
  * An older adopted proof is not a new acquisition and remains fully bound. */
 function acquisitionReviewProof(record, accountKey, acquiredAfter, observedNow) {
-  const exact = recordProof(record);
+  const exact = { ...recordProof(record), acquisition_exact: null };
   try {
     const canonical = JSON.parse(record.canonical_json), raw = JSON.parse(record.raw_json);
     const evidence = readMessageAccountEvidence(record, canonical, raw, observedNow);
     if (!evidence || evidence.account_key !== accountKey || Date.parse(evidence.acquired_at) < acquiredAfter) return exact;
+    // Exact-source fallback deliberately bypasses the conservative structural
+    // number parser. Only the existing clock value span changes: raw, hash,
+    // identity/version and every other canonical byte remain digest-bound.
+    const clockOnly = { ...record, canonical_json: patchExistingJsonValueText(record.canonical_json,
+      ['message_account_evidence', 'acquired_at'], JSON.stringify('validated_current_acquisition_clock')) };
+    const acquisitionExact = sha(`validated_acquisition_review/v1:exact_clock\0${stable(clockOnly)}`);
     const dependency = { ...evidence, source_hash: 'bound_to_complete_source_proof', acquired_at: 'validated_current_acquisition' };
     // Preserve all unrelated JSON tokens, including unknown unsafe numbers.
     const projected = recordProof({ ...record, canonical_json:
       patchTopLevelJsonMemberText(record.canonical_json, 'message_account_evidence', JSON.stringify(dependency)) });
     // Domain-separate validated dependencies from ordinary canonical text: an
     // invalid proof spelling these marker strings must never impersonate one.
-    return { ...projected, exact: exact.exact,
+    return { ...projected, exact: exact.exact, acquisition_exact: acquisitionExact,
       structural: projected.structural === null ? null : sha(`validated_acquisition_review/v1:structural\0${projected.structural}`),
       references: projected.references === null ? null : sha(`validated_acquisition_review/v1:references\0${projected.references}`) };
   } catch { return exact; }
@@ -274,6 +282,9 @@ function beginMaintenanceReview(options, { db, mode, rows, scopes = [], now = Da
   const approval = options.reviewIn ? readApproval(options, now()) : null;
   // Legacy approvals retain both their original schema and full-byte binding;
   // a digest is never silently reinterpreted as a v3 projected configuration.
+  // A pre-acquisition v4 proposal does not authorize adding the new ownership
+  // member. It needs a fresh preview; optional acquisition_exact is additional
+  // comparison evidence, never a reinterpretation of its original exact digest.
   const schema = approval?.schema ?? (mode === 'replay' ? OBSERVATION_REVIEW_SCHEMA : SCOPE_REVIEW_SCHEMA);
   const observationReview = schema === OBSERVATION_REVIEW_SCHEMA;
   const scopeReview = schema === SCOPE_REVIEW_SCHEMA || observationReview;
@@ -455,6 +466,7 @@ function equivalentApproval(approved, fresh) {
   const top = value => ({ ...value, records: null });
   if (!equal(top(approved), top(fresh)) || approved.records.length !== fresh.records.length) return false;
   const sameProof = (a, b) => a.policy === b.policy && (a.exact === b.exact
+    || hashValue(a.acquisition_exact) && a.acquisition_exact === b.acquisition_exact
     || a.structural !== null && a.structural === b.structural || a.references !== null && a.references === b.references);
   const spine = entry => {
     const { proof, proposal_sha256, observed_sha256, opaque, ...rest } = entry;

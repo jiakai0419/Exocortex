@@ -33,14 +33,23 @@ export function messageContentEvidence(row, canonical, raw, display) {
   if (rendering) return fromRendering(rendering);
   const type = canonical.msg_type || native.msg_type || native.message_type;
   let item = native;
+  // Old unwrapped text/post rows can retain their sole explicit type only in
+  // canonical metadata. Supply that type to the renderer without changing raw.
+  // A native API marker, wrapper, or declared source type is not this legacy
+  // shape, even when a declared value is null/empty rather than supported.
+  if (native === raw && !Object.hasOwn(raw, 'raw_api')
+    && !Object.hasOwn(raw, 'source_api') && !Object.hasOwn(canonical, 'source_api')
+    && !Object.hasOwn(native, 'msg_type') && !Object.hasOwn(native, 'message_type')
+    && ['text', 'post'].includes(canonical.msg_type)) item = { ...native, msg_type: canonical.msg_type };
   if (!Object.hasOwn(native, 'body')) {
     // The old direct-text representation is distinct from a native API item or
     // its derived wrapper. A wrapper cannot rescue missing/malformed raw_api.
-    if (type !== 'text' || native !== raw || raw.source_api != null) return evidence('pending');
+    if (type !== 'text' || native !== raw || raw.source_api != null
+      || (item.msg_type || item.message_type) !== 'text') return evidence('pending');
     const text = typeof native.content === 'string' ? native.content
       : object(native.content) && typeof native.content.text === 'string' ? native.content.text : null;
     if (text === null) return evidence('pending');
-    item = { ...native, msg_type: 'text', body: { content: { text } } };
+    item = { ...item, body: { content: { text } } };
   }
   try {
     validateNativeContent(item);

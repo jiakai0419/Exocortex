@@ -5,6 +5,10 @@ import { MESSAGE_READINESS_OBSERVATION_FIELDS, selectMessageReadinessObservation
 import { larkSenderNameIsUnknownSql } from '../../dist/storage/sqlite/lark-name-projection.js';
 
 const NAME_TABLE = 'lark_im_name_tasks', RECIPIENT_TABLE = 'lark_im_recipient_state', OBSERVATION_TABLE = 'lark_im_message_readiness';
+const ROUTE_TABLE = 'lark_im_name_routes', ROUTE_INDEX = 'sqlite_autoindex_lark_im_name_routes_1';
+const ROUTE_COLUMNS = ['source_id','account_key','route_key','operation','failure_kind','failure_code',
+  'failures','last_attempt_at_ms','retry_at_ms','blocked','generation'];
+const ROUTE_ACCOUNTS = 32, ROUTE_PER_ACCOUNT = 1024, ROUTE_ROWS = 2048;
 const ROW_COLUMNS = ['id', 'source_id', 'direction', 'record_type', 'occurred_at', 'occurred_at_ms',
   'actor_id', 'container_id', 'external_id', 'external_version', 'content_hash', 'body', 'canonical_json', 'raw_json',
   'scope_config_json', 'type_scope_id', 'type_scope_source_id'];
@@ -43,6 +47,8 @@ const rowQuery = (kind, columns, query, order) => `SELECT ${quote(kind)} AS kind
   NULL AS total,NULL AS evaluated,NULL AS not_evaluated,NULL AS source_max_record_id,
   NULL AS read_at,NULL AS schema_consistent FROM (${query}) item`;
 const existsTable = table => `EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=${quote(table)})`;
+const routeIndexColumns = `(SELECT group_concat(name,',') FROM pragma_index_info(${quote(ROUTE_INDEX)}))='source_id,account_key,route_key'`;
+const existsRouteIndex = `EXISTS(SELECT 1 FROM sqlite_schema WHERE type='index' AND name=${quote(ROUTE_INDEX)} AND ${routeIndexColumns})`;
 const invalid = () => new SqliteReadError('invalid_response', 'read message snapshot returned invalid data');
 
 /**
@@ -64,11 +70,14 @@ function readMessageSnapshot(db, options = {}, deps = {}) {
     || options.recordIds.some(id=>!Number.isSafeInteger(id) || id<1)
     || new Set(options.recordIds).size!==options.recordIds.length)) throw new TypeError('invalid internal message selection');
   const query = deps.sqliteJson || readOnlySqliteJson;
-  const optionalTables = [NAME_TABLE, RECIPIENT_TABLE, OBSERVATION_TABLE];
+  const optionalTables = [NAME_TABLE, RECIPIENT_TABLE, OBSERVATION_TABLE, ROUTE_TABLE];
   const schema = query(db, `SELECT name FROM sqlite_schema WHERE (type='table'
-    AND name IN (${optionalTables.map(quote).join(',')})) OR (type='index' AND name=${quote(DONOR_INDEX)}) ORDER BY name;`, 'read message snapshot schema');
-  if (!Array.isArray(schema) || schema.some(row => ![...optionalTables,DONOR_INDEX].includes(row.name))) throw invalid();
+    AND name IN (${optionalTables.map(quote).join(',')})) OR (type='index' AND (name=${quote(DONOR_INDEX)}
+      OR name=${quote(ROUTE_INDEX)} AND ${routeIndexColumns})) ORDER BY name;`, 'read message snapshot schema');
+  if (!Array.isArray(schema) || schema.some(row => ![...optionalTables,DONOR_INDEX,ROUTE_INDEX].includes(row.name))) throw invalid();
   const donorIndex = schema.some(row => row.name === DONOR_INDEX);
+  const routeTable = schema.some(row => row.name === ROUTE_TABLE), routeIndex = schema.some(row => row.name === ROUTE_INDEX);
+  const routesAvailable = routeTable && routeIndex;
   const available = { names: schema.some(row => row.name === NAME_TABLE), recipients: schema.some(row => row.name === RECIPIENT_TABLE),
     observations: schema.some(row => row.name === OBSERVATION_TABLE) };
   const filters = ["r.source_id='lark.im'", "r.record_type='lark.im.message'"];
@@ -145,11 +154,46 @@ function readMessageSnapshot(db, options = {}, deps = {}) {
       JOIN donor_groups g ON g.actor_id=b.actor_id WHERE g.complete=1`, 'actor_id,id') : null;
   const donorGroups = donorIndex ? rowQuery('senderDonorGroup', ['actor_id','complete'],
     'SELECT * FROM donor_groups','actor_id') : null;
+  // Hashes cannot be guessed in SQL or fetched in a later data snapshot. Read
+  // bounded PK prefixes for selected acquisition-account candidates; consumers
+  // revalidate proof and recompute exact keys. Prefixes include successes and
+  // transient/unrelated routes so recovery is never hidden by denial filtering.
+  const routeCtes = routesAvailable ? `route_account_candidates AS MATERIALIZED (
+      SELECT id,CASE WHEN json_valid(canonical_json) THEN
+        json_extract(canonical_json,'$.message_account_evidence.account_key') END AS account_key FROM selected
+    ), route_accounts AS MATERIALIZED (
+      SELECT account_key,MIN(id) AS selected_id FROM route_account_candidates
+      WHERE typeof(account_key)='text' AND length(account_key)=64 AND account_key NOT GLOB '*[^a-f0-9]*'
+      GROUP BY account_key ORDER BY selected_id DESC LIMIT ${ROUTE_ACCOUNTS}
+    ), route_prefixes AS MATERIALIZED (
+      SELECT account_key,(SELECT json_group_array(rowid) FROM (
+        SELECT rowid FROM ${ROUTE_TABLE} r INDEXED BY ${ROUTE_INDEX}
+        WHERE source_id='lark.im' AND r.account_key=a.account_key ORDER BY route_key LIMIT ${ROUTE_PER_ACCOUNT + 1}
+      )) AS ids FROM route_accounts a
+    ), route_ranked AS MATERIALIZED (
+      SELECT p.account_key,j.value AS row_id,json_array_length(p.ids) AS route_count,
+        ROW_NUMBER() OVER(ORDER BY p.account_key,j.key) AS payload_position FROM route_prefixes p,json_each(p.ids) j
+    ), route_bounded AS MATERIALIZED (
+      SELECT p.*,CASE WHEN typeof(r.route_key)='text' AND length(CAST(r.route_key AS BLOB))=64
+        AND typeof(r.operation)='text' AND length(CAST(r.operation AS BLOB))<=32
+        AND (r.failure_kind IS NULL OR typeof(r.failure_kind)='text' AND length(CAST(r.failure_kind AS BLOB))<=32)
+        AND (r.failure_code IS NULL OR typeof(r.failure_code)='integer' AND r.failure_code BETWEEN 0 AND 9007199254740991)
+        AND ${['failures','last_attempt_at_ms','retry_at_ms','blocked','generation'].map(key=>`typeof(r.${key})='integer' AND r.${key} BETWEEN 0 AND 9007199254740991`).join(' AND ')}
+        THEN 1 ELSE 0 END AS serializable FROM route_ranked p JOIN ${ROUTE_TABLE} r ON r.rowid=p.row_id
+    ), route_groups AS MATERIALIZED (
+      SELECT account_key,MIN(CASE WHEN route_count<=${ROUTE_PER_ACCOUNT} AND payload_position<=${ROUTE_ROWS}
+        AND serializable=1 THEN 1 ELSE 0 END) AS complete FROM route_bounded GROUP BY account_key
+    ),` : '';
+  const routeRows = routesAvailable ? rowQuery('nameRoute', ROUTE_COLUMNS,
+    `SELECT ${ROUTE_COLUMNS.map(key=>`r.${key}`).join(',')} FROM route_bounded p JOIN ${ROUTE_TABLE} r ON r.rowid=p.row_id
+      JOIN route_groups g ON g.account_key=p.account_key WHERE g.complete=1`, 'account_key,route_key') : null;
+  const routeGroups = routesAvailable ? rowQuery('nameRouteGroup', ['account_key','complete'],
+    'SELECT * FROM route_groups','account_key') : null;
   const dataBranches = [rowQuery('row', ROW_COLUMNS, 'SELECT * FROM selected', ordering),
     rowQuery('scope', SCOPE_COLUMNS, `SELECT s.id,s.source_id,s.config_json FROM sync_scopes s
       WHERE s.source_id='lark.im' AND CASE WHEN json_valid(s.config_json)
         THEN json_extract(s.config_json,'$.chat_id') END IN (SELECT container_id FROM containers)`, 'id'),
-    names, recipients, observations, donorRows, donorGroups].filter(Boolean).join('\nUNION ALL\n');
+    names, recipients, observations, donorRows, donorGroups, routeRows, routeGroups].filter(Boolean).join('\nUNION ALL\n');
   const result = query(db, `WITH
     matched AS MATERIALIZED (
       SELECT r.id,r.occurred_at_ms,r.external_id FROM records r WHERE ${filters.join(' AND ')}
@@ -163,7 +207,7 @@ function readMessageSnapshot(db, options = {}, deps = {}) {
       LEFT JOIN sync_scopes s ON s.id=r.first_seen_scope_id
     ), containers AS MATERIALIZED (
       SELECT DISTINCT container_id FROM selected WHERE typeof(container_id)='text' AND container_id<>''
-    ), ${donorCtes} population AS MATERIALIZED (
+    ), ${donorCtes} ${routeCtes} population AS MATERIALIZED (
       SELECT COUNT(*) AS total,(SELECT COUNT(*) FROM selected_ids) AS evaluated FROM matched
     ) SELECT 'metadata' AS kind,0 AS position,NULL AS payload,
       total,evaluated,total-evaluated AS not_evaluated,
@@ -172,6 +216,7 @@ function readMessageSnapshot(db, options = {}, deps = {}) {
       (${existsTable(NAME_TABLE)}=${Number(available.names)}
         AND ${existsTable(RECIPIENT_TABLE)}=${Number(available.recipients)}
         AND ${existsTable(OBSERVATION_TABLE)}=${Number(available.observations)}
+        AND ${existsTable(ROUTE_TABLE)}=${Number(routeTable)} AND ${existsRouteIndex}=${Number(routeIndex)}
         AND EXISTS(SELECT 1 FROM sqlite_schema WHERE type='index' AND name=${quote(DONOR_INDEX)})=${Number(donorIndex)}) AS schema_consistent
     FROM population
     UNION ALL
@@ -183,7 +228,8 @@ function readMessageSnapshot(db, options = {}, deps = {}) {
   const value = metadata[0];
   if (value.schema_consistent !== 1) throw invalid();
   /** @type {Record<string, Record<string,any>[]>} */
-  const groups = { row: [], scope: [], nameTask: [], recipient: [], observation: [], senderDonor: [], senderDonorGroup: [] };
+  const groups = { row: [], scope: [], nameTask: [], recipient: [], observation: [], senderDonor: [], senderDonorGroup: [],
+    nameRoute: [], nameRouteGroup: [] };
   for (const item of result) {
     if (item.kind === 'metadata') continue;
     try {
@@ -201,7 +247,10 @@ function readMessageSnapshot(db, options = {}, deps = {}) {
     || typeof value.read_at !== 'string' || !Number.isFinite(Date.parse(value.read_at))) throw invalid();
   const senderDonors = groups.senderDonorGroup.map(group => ({actor_id:group.actor_id,complete:group.complete===1,
     rows:groups.senderDonor.filter(row=>row.actor_id===group.actor_id)}));
-  return { rows, scopes, nameTasks, recipients: savedRecipients, available, senderDonors,
+  const nameRoutes = { available: routesAvailable, accounts: groups.nameRouteGroup.map(group => ({
+    account_key: group.account_key, complete: group.complete === 1,
+    rows: groups.nameRoute.filter(row => row.account_key === group.account_key) })) };
+  return { rows, scopes, nameTasks, recipients: savedRecipients, available, senderDonors, nameRoutes,
     observations: selectMessageReadinessObservations(rows, history, Date.parse(value.read_at)),
     population: { total: value.total, evaluated: value.evaluated, not_evaluated: value.not_evaluated },
     as_of: { read_at: value.read_at, source_max_record_id: value.source_max_record_id } };

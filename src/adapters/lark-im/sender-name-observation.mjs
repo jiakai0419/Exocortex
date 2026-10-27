@@ -1,4 +1,5 @@
 // @ts-check
+import { createHash } from 'node:crypto';
 import { classifyNameRouteFailure } from './name-route-state.mjs';
 
 const OPERATIONS = {contact:'contact_search',chat_member:'chat_members',
@@ -7,6 +8,10 @@ const KINDS = new Set(['network_timeout','network_error','rate_limited','service
   'restricted_mode','bot_user_out_of_chat','permission_denied','command_unavailable','spawn_error','unknown','budget_exhausted']);
 const STAGES = new Set(['not_requested','response_error','request_error','unknown']);
 const FIELDS = ['version','operation','kind','code','stage'];
+const HASH = /^[0-9a-f]{64}$/;
+const ROUTE_FIELDS = ['version','attempt_key','target_key','account_key','routes'];
+const ROUTE_ITEM_FIELDS = ['operation','status','failure'];
+const APP_OPERATIONS = ['application_info','chat_bots'];
 /** @param {unknown} value @returns {value is Record<string,any>} */
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 
@@ -27,23 +32,74 @@ function nameLookupFailure(error, operation, notRequested = false) {
           'bot_user_out_of_chat','permission_denied','spawn_error'].includes(classified.kind) ? 'request_error' : 'unknown'};
 }
 
-/** The new optional diagnostic has an exact whitelist; it grants no name or
- * account authority. Existing observation envelopes and successful-task schemas
- * retain their established fields and compatibility.
- * @param {Record<string,any>|null|undefined} observation */
-function sanitizeSenderNameObservation(observation) {
-  if (!object(observation)) return null;
-  if (!Object.hasOwn(observation,'failure')) return observation;
-  const {failure,...base}=observation;
-  if (observation.status !== 'failed' || !object(failure) || Object.keys(failure).length !== FIELDS.length
-    || FIELDS.some(key=>!Object.hasOwn(failure,key)) || failure.version !== 1
-    || !Object.hasOwn(OPERATIONS,observation.source) || failure.operation !== OPERATIONS[observation.source]
-    || !KINDS.has(failure.kind) || !STAGES.has(failure.stage)
-    || failure.code !== null && (!Number.isSafeInteger(failure.code) || failure.code < 0)
-    || (failure.stage==='response_error') !== (failure.code!==null)
-    || failure.kind==='budget_exhausted' && (observation.reason!=='budget_exhausted' || failure.stage!=='not_requested')
-    || failure.kind!=='budget_exhausted' && observation.reason!=='request_failed') return base;
-  return {...base,failure:Object.fromEntries(FIELDS.map(key=>[key,failure[key]]))};
+/** @param {unknown} failure @param {string} operation */
+function validFailure(failure, operation) {
+  return object(failure) && Object.keys(failure).length === FIELDS.length
+    && FIELDS.every(key=>Object.hasOwn(failure,key)) && failure.version === 1 && failure.operation === operation
+    && KINDS.has(failure.kind) && STAGES.has(failure.stage)
+    && (failure.code === null || Number.isSafeInteger(failure.code) && failure.code >= 0)
+    && (failure.stage === 'response_error') === (failure.code !== null)
+    && (failure.kind !== 'budget_exhausted' || failure.stage === 'not_requested');
 }
 
-export { nameLookupFailure, sanitizeSenderNameObservation };
+/** Opaque binding to the exact account, explicit app namespace, actor and chat.
+ * This digest is not account evidence and cannot supply a name or authority.
+ * @param {string} accountKey @param {string} actorId @param {string} chatId */
+function senderNameRouteTargetKey(accountKey, actorId, chatId) {
+  if (typeof accountKey !== 'string' || !HASH.test(accountKey)
+    || typeof actorId !== 'string' || !actorId || actorId.includes('\0')
+    || typeof chatId !== 'string' || !chatId || chatId.includes('\0')) return null;
+  return createHash('sha256').update(JSON.stringify(['lark.im',accountKey,'app_id',actorId,chatId])).digest('hex');
+}
+
+/** Only two current-attempt route outcomes are supported. Missing/empty routes
+ * never imply denial; arbitrary private error fields are rejected as a whole.
+ * Binding is mandatory at the projection/record boundary, optional for callers
+ * that only sanitize the finite shape before checking their own identity proof.
+ * @param {Record<string,any>|null|undefined} observation
+ * @param {{account_key:string,actor_id:string,namespace:string,chat_id:string}} [binding] */
+function readSenderNameRouteFailures(observation, binding) {
+  if (!object(observation) || observation.status !== 'failed' || observation.cached !== false
+    || !['application_api','chat_bot_app_id'].includes(observation.source)
+    || typeof observation.account_key !== 'string' || !HASH.test(observation.account_key)
+    || !validFailure(observation.failure, OPERATIONS[observation.source])) return null;
+  const value = observation.route_failures;
+  if (!object(value) || Object.keys(value).length !== ROUTE_FIELDS.length
+    || ROUTE_FIELDS.some(key=>!Object.hasOwn(value,key)) || value.version !== 1
+    || typeof value.attempt_key !== 'string' || !HASH.test(value.attempt_key)
+    || typeof value.target_key !== 'string' || !HASH.test(value.target_key)
+    || value.account_key !== observation.account_key || !Array.isArray(value.routes) || value.routes.length !== 2
+    || binding && (binding.namespace !== 'app_id' || binding.account_key !== value.account_key
+      || senderNameRouteTargetKey(binding.account_key,binding.actor_id,binding.chat_id) !== value.target_key)) return null;
+  for (const [index,route] of value.routes.entries()) {
+    if (!object(route) || Object.keys(route).length !== ROUTE_ITEM_FIELDS.length
+      || ROUTE_ITEM_FIELDS.some(key=>!Object.hasOwn(route,key)) || route.operation !== APP_OPERATIONS[index]
+      || !['failed','unresolved','not_requested','unknown'].includes(route.status)
+      || (route.failure !== null && (route.status !== 'failed' || !validFailure(route.failure,route.operation)))) return null;
+  }
+  const selected = value.routes.find(route=>route.operation === observation.failure.operation);
+  if (!selected || selected.status !== 'failed' || !selected.failure
+    || FIELDS.some(key=>selected.failure[key] !== observation.failure[key])) return null;
+  return {version:1,attempt_key:value.attempt_key,target_key:value.target_key,account_key:value.account_key,
+    routes:value.routes.map(route=>({operation:route.operation,status:route.status,
+      failure:route.failure === null ? null : Object.fromEntries(FIELDS.map(key=>[key,route.failure[key]]))}))};
+}
+
+/** The optional diagnostic grants no name/account authority. Successful-task
+ * schemas keep their established shape. An invalid companion envelope is
+ * removed without erasing the independently valid primary-route failure.
+ * @param {Record<string,any>|null|undefined} observation
+ * @param {{account_key:string,actor_id:string,namespace:string,chat_id:string}} [binding] */
+function sanitizeSenderNameObservation(observation, binding) {
+  if (!object(observation)) return null;
+  if (!Object.hasOwn(observation,'failure') && !Object.hasOwn(observation,'route_failures')) return observation;
+  const {failure,route_failures,...base}=observation;
+  if (observation.status !== 'failed' || !Object.hasOwn(OPERATIONS,observation.source)
+    || !validFailure(failure,OPERATIONS[observation.source])
+    || failure.kind==='budget_exhausted' && observation.reason!=='budget_exhausted'
+    || failure.kind!=='budget_exhausted' && observation.reason!=='request_failed') return base;
+  const routes = readSenderNameRouteFailures(observation,binding);
+  return {...base,failure:Object.fromEntries(FIELDS.map(key=>[key,failure[key]])),...(routes ? {route_failures:routes} : {})};
+}
+
+export { nameLookupFailure, sanitizeSenderNameObservation, senderNameRouteTargetKey, readSenderNameRouteFailures };

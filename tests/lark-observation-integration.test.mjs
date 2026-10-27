@@ -6,14 +6,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as store from '../dist/storage/sqlite/ingestion-store.js';
 import { prepareObservationRecords } from '../dist/storage/sqlite/observation-store.js';
-import { sourceRelation } from '../dist/core/lark-observation.js';
+import { sourceRelation, stable } from '../dist/core/lark-observation.js';
 import { chatScopeId } from '../src/adapters/lark-im/core.mjs';
 import { normalizeApiMessage } from '../src/adapters/lark-im/raw-message.mjs';
 import { prepareChatWindowRecords } from '../src/adapters/lark-im/sync-runner.mjs';
 import { executeLarkImHistory, selectHistoryTarget } from '../src/maintenance/history.mjs';
 import { executeLarkImReplay, validateReplayOptions } from '../src/maintenance/replay.mjs';
 import { bindAcquiredMessageAccounts, readMessageAccountEvidence } from '../src/adapters/lark-im/message-account-evidence.mjs';
-import { beginMaintenanceReview, REVIEW_AGE_MS } from '../src/maintenance/review-artifact.mjs';
+import { beginMaintenanceReview, effectiveRecord, REVIEW_AGE_MS } from '../src/maintenance/review-artifact.mjs';
 
 // Only authored synthetic data; every request boundary is injected.
 const SELF = { open_id: 'ou_invented_observer', name: 'Invented Observer' };
@@ -217,6 +217,81 @@ test('v4 rejects unknown source drift and saves the exact fresh candidate withou
   assert.equal(readdirSync(f.dir).filter(name=>name.startsWith('.replay-rejected')).length,1);
 });
 
+test('exact-source review with unknown fractional data permits only a verified acquisition clock change',t=>{
+  const f=fixture(t), opts=replayOptions(f);
+  const changed=native(f,0,{update_time:String(f.start+9000),future_metric:0.5,
+    body:{content:'{"text":"Invented exact decimal source"}'}});
+  const preview=replay(f,[changed],opts), approvalBytes=readFileSync(opts.reviewOut), artifact=JSON.parse(approvalBytes);
+  assert.equal(preview.ok,true);assert.equal(preview.review.changes,1);
+  assert.equal(artifact.records[0].proof.observed.structural,null);
+  assert.equal(artifact.records[0].proof.observed.references,null);
+  const applied=replay(f,[changed],approved(opts,preview));
+  assert.equal(applied.ok,true,JSON.stringify(applied));
+  const row=rows(f)[0], canonical=JSON.parse(row.canonical_json), proof=readMessageAccountEvidence(row,canonical,JSON.parse(row.raw_json));
+  assert.ok(proof);assert.ok(Date.parse(proof.acquired_at)>artifact.created_at_ms);
+  assert.equal(row.raw_json,JSON.stringify(changed));assert.equal(row.content_hash,hash(row.raw_json));
+  const previewCanonical=row.canonical_json.replace(`"acquired_at":${JSON.stringify(proof.acquired_at)}`,
+    `"acquired_at":${JSON.stringify(new Date(artifact.created_at_ms).toISOString())}`);
+  assert.equal(hash(previewCanonical),artifact.records[0].opaque.after.canonical_json.sha256,
+    'the original preview binds every non-clock canonical byte');
+  assert.deepEqual(readFileSync(opts.reviewOut),approvalBytes);
+  assert.match(artifact.records[0].proof.observed.acquisition_exact,/^[a-f0-9]{64}$/);
+});
+
+test('exact acquisition fallback rejects byte drift even when the changed record has a valid re-bound proof',t=>{
+  const f=fixture(t), before=rows(f), opts=replayOptions(f);
+  const original=records(f,[native(f,0,{update_time:String(f.start+9000),future_metric:0.5})]);
+  const context={db:f.db,mode:'replay',rows:before,scopes:[store.readScope(f.db,SCOPE)].map(({id,source_id,enabled,config_json})=>({id,source_id,enabled,config_json}))};
+  const previewAt=new Date(Date.now()-1000).toISOString(), bound=bindAcquiredMessageAccounts(original,SELF,{acquiredAt:previewAt});
+  const view=beginMaintenanceReview(opts,context);view.verifySelf(hash(SELF.open_id));view.prepareReplayAcquisition(original,bound,previewAt);
+  const preview=view.finish([{before:before[0],after:{...before[0],...bound[0]},observed:bound[0],outcome:'update'}]);
+  const artifact=JSON.parse(readFileSync(opts.reviewOut));
+  assert.equal(artifact.records[0].proof.observed.structural,null);assert.equal(artifact.records[0].proof.observed.references,null);
+  assert.equal(artifact.records[0].proof.observed.exact,hash(stable(effectiveRecord(bound[0]))));
+  assert.equal(artifact.records[0].observed_sha256,artifact.records[0].proof.observed.exact,'the original exact digest is never replaced');
+  const changes=[
+    ['same decimal with different raw token',record=>{record.raw_json=record.raw_json.replace('"future_metric":0.5','"future_metric":0.50');}],
+    ['changed raw decimal',record=>{record.raw_json=record.raw_json.replace('"future_metric":0.5','"future_metric":0.6');}],
+    ['raw whitespace',record=>{record.raw_json=` ${record.raw_json}`;}],
+    ['canonical parent whitespace',record=>{record.canonical_json=record.canonical_json.replace('{','{ ');}],
+    ['canonical escaped key',record=>{record.canonical_json=record.canonical_json.replace('"msg_type":','"msg_\\u0074ype":');}],
+    ['non-clock proof key spelling',record=>{record.canonical_json=record.canonical_json.replace('"source_hash":','"source_\\u0068ash":');}],
+    ['non-clock proof whitespace',record=>{record.canonical_json=record.canonical_json.replace('"source_hash":','"source_hash" : ');}],
+  ];
+  for(const [label,change] of changes) {
+    const dir=mkdtempSync(join(f.dir,'exact-case-')), path=join(dir,'approval.json');chmodSync(dir,0o700);
+    writeFileSync(path,readFileSync(opts.reviewOut),{mode:0o600});
+    const changed={...original[0]};
+    if(label.startsWith('non-clock proof')) {
+      Object.assign(changed,bindAcquiredMessageAccounts([changed],SELF,{acquiredAt:new Date().toISOString()})[0]);
+      change(changed);
+    } else {
+      change(changed);changed.content_hash=hash(changed.raw_json);
+      Object.assign(changed,bindAcquiredMessageAccounts([changed],SELF,{acquiredAt:new Date().toISOString()})[0]);
+    }
+    assert.ok(readMessageAccountEvidence(changed,JSON.parse(changed.canonical_json),JSON.parse(changed.raw_json)),label);
+    const review=beginMaintenanceReview({...approved(opts,{review:preview.summary}),reviewIn:path},context);review.verifySelf(hash(SELF.open_id));
+    assert.throws(()=>review.finish([{before:before[0],after:{...before[0],...changed},observed:changed,outcome:'update'}]),/proposal_changed/,label);
+  }
+  assert.deepEqual(rows(f),before);
+});
+
+test('v4 accepts its original four-key proof shape but rejects malformed optional exact-acquisition fields',t=>{
+  const f=fixture(t), opts=replayOptions(f), changed=native(f,0,{update_time:String(f.start+9000)});
+  const preview=replay(f,[changed],opts), artifact=JSON.parse(readFileSync(opts.reviewOut)), before=rows(f);
+  for(const mutate of [proof=>{proof.acquisition_exact=[];},proof=>{proof.acquisition_unknown='invented';}]) {
+    const invalid=structuredClone(artifact);mutate(invalid.records[0].proof.observed);
+    const path=join(f.dir,`invalid-${readdirSync(f.dir).length}.json`);writeFileSync(path,JSON.stringify(invalid),{mode:0o600});
+    const beforeCalls=f.calls;
+    assert.throws(()=>replay(f,[changed],{...approved(opts,preview),reviewIn:path,reviewSha256:hash(readFileSync(path))}),/invalid_file/);
+    assert.equal(f.calls,beforeCalls,'invalid proof protocol is rejected before any API');
+  }
+  for(const record of artifact.records)for(const proof of [record.proof.observed,record.proof.proposal])delete proof.acquisition_exact;
+  writeFileSync(opts.reviewOut,JSON.stringify(artifact));
+  const result=replay(f,[changed],{...approved(opts,preview),reviewSha256:hash(readFileSync(opts.reviewOut))});
+  assert.equal(result.ok,true,JSON.stringify(result));assert.notDeepEqual(rows(f),before);
+});
+
 function cardAliases(f, swapped=false, sameNames=false) {
   const ids=swapped?['b','a']:['a','b'], names=sameNames?['Same invented name','Same invented name']:['Invented A','Invented B'];
   return native(f,0,{msg_type:'interactive',update_time:String(f.start+9000),body:{content:JSON.stringify({
@@ -271,6 +346,7 @@ test('v4 acquisition equivalence keeps actual fresh proof bytes and rejects ever
     ['future clock',changeProof(proof=>{proof.acquired_at=new Date(Date.now()+86400000).toISOString();})],
     ['invalid clock',changeProof(proof=>{proof.acquired_at='invented-invalid';})],
     ['normalization marker collision',changeProof(proof=>{proof.source_hash='bound_to_complete_source_proof';proof.acquired_at='validated_current_acquisition';})],
+    ['exact clock marker collision',changeProof(proof=>{proof.acquired_at='validated_current_acquisition_clock';})],
     ['earlier than preview',changeProof(proof=>{proof.acquired_at=new Date(Date.parse(previewAt)-1).toISOString();})],
     ['duplicate proof key',record=>{record.canonical_json=record.canonical_json.replace('"schema":"lark_message_acquisition/v1"',
       '"schema":"lark_message_acquisition/v1","schema":"lark_message_acquisition/v1"');}],
@@ -311,7 +387,8 @@ test('reviewed replay still rejects expired and cross-account approval before an
 test('acquisition dependency projection cannot erase unknown canonical numeric token differences',t=>{
   const f=fixture(t), before=rows(f), original=records(f,[native(f,0,{update_time:String(f.start+9000)})]);
   const context={db:f.db,mode:'replay',rows:before,scopes:[store.readScope(f.db,SCOPE)].map(({id,source_id,enabled,config_json})=>({id,source_id,enabled,config_json}))};
-  for(const [oldToken,newToken] of [['9007199254740992','9007199254740993'],['0','-0'],['1','1.00000000000000001']]) {
+  for(const [oldToken,newToken] of [['9007199254740992','9007199254740993'],['0','-0'],['1','1.00000000000000001'],
+    ['0.5','0.50'],['1e-1','0.1']]) {
     const dir=mkdtempSync(join(f.dir,'numbers-'));chmodSync(dir,0o700);
     const opts=replayOptions(f,{reviewOut:join(dir,'review.json')}), at=new Date().toISOString();
     const authored=[{...original[0],canonical_json:original[0].canonical_json.replace(/}$/,`,"unknown_numeric":${oldToken}}`)}];
@@ -346,12 +423,15 @@ test('equivalent raw retention never installs acquisition evidence for bytes tha
   }
 });
 
-test('a genuine pre-acquisition legacy approval remains byte exact and cannot authorize a new proof member',t=>{
+test('pre-acquisition v4 needs a fresh preview while genuine legacy approval remains byte exact',t=>{
   const f=fixture(t), before=rows(f), opts=replayOptions(f), changed=native(f,0,{update_time:String(f.start+9000)});
   const candidate=records(f,[changed])[0];
   const context={db:f.db,mode:'replay',rows:before,scopes:[store.readScope(f.db,SCOPE)].map(({id,source_id,enabled,config_json})=>({id,source_id,enabled,config_json}))};
   const view=beginMaintenanceReview(opts,context);view.verifySelf(hash(SELF.open_id));
-  view.finish([{before:before[0],after:{...before[0],...candidate},observed:candidate,outcome:'update'}]);
+  const oldPreview=view.finish([{before:before[0],after:{...before[0],...candidate},observed:candidate,outcome:'update'}]);
+  const oldBytes=readFileSync(opts.reviewOut), oldV4=replay(f,[changed],approved(opts,{review:oldPreview.summary}));
+  assert.equal(oldV4.ok,false);assert.match(JSON.stringify(oldV4),/proposal_changed/);
+  assert.deepEqual(rows(f),before);assert.deepEqual(readFileSync(opts.reviewOut),oldBytes);
   const artifact=JSON.parse(readFileSync(opts.reviewOut));artifact.schema='exocortex_private_maintenance_review/v3';
   for(const record of artifact.records)delete record.proof;
   writeFileSync(opts.reviewOut,JSON.stringify(artifact));

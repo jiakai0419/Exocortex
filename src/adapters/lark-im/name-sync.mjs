@@ -120,13 +120,6 @@ function syncNames(db, self, deps = {}) {
     };
     let scan = query(`SELECT * FROM lark_im_name_scan WHERE account_key=${quoteSql(accountKey)};`,'read name scan cursor')[0];
     if(Number(scan?.next_attempt_at_ms||0)>nowMs) return {...report,reason:'cadence'};
-    // A worker cycle contains several separate sync processes. Persist the
-    // admission before scanning so their optional budgets cannot accumulate.
-    commit([nameEffects(`${nameFence(scan?`EXISTS(SELECT 1 FROM lark_im_name_scan WHERE account_key=${quoteSql(accountKey)} AND generation=${scan.generation}
-      AND next_attempt_at_ms<=${nowMs})`:`NOT EXISTS(SELECT 1 FROM lark_im_name_scan WHERE account_key=${quoteSql(accountKey)})`)}
-      INSERT INTO lark_im_name_scan(account_key,next_attempt_at_ms,generation) VALUES(${quoteSql(accountKey)},${nowMs+INTERVAL_MS},1)
-      ON CONFLICT(account_key) DO UPDATE SET next_attempt_at_ms=excluded.next_attempt_at_ms,generation=generation+1`)],'name-work-cadence');
-    scan=query(`SELECT * FROM lark_im_name_scan WHERE account_key=${quoteSql(accountKey)};`,'read admitted name scan')[0];
     const top = query("SELECT MAX(id) AS id FROM records INDEXED BY records_name_scan WHERE source_id='lark.im' AND record_type='lark.im.message';",'read name scan horizon')[0]?.id || 0;
     let horizon = Number(scan?.horizon_record_id || top), after = Number(scan?.after_record_id || 0);
     if (after >= horizon) { after = 0; horizon = top; }
@@ -178,7 +171,7 @@ function syncNames(db, self, deps = {}) {
       ON CONFLICT(account_key) DO UPDATE SET after_record_id=excluded.after_record_id,horizon_record_id=excluded.horizon_record_id,generation=excluded.generation`)];
     for (const {kind,actor,namespace,key,row,urgent} of enrollment.values()) updates.push(nameEffects(`${nameFence(nameRecordFence(row))}
       INSERT INTO lark_im_name_tasks(source_id,account_key,task_key,kind,chat_id,actor_id,namespace,latest_record_id,retry_at_ms,enqueued_at_ms,enqueued_sequence,last_served_sequence,fresh_required_record_id)
-      VALUES('lark.im',${quoteSql(accountKey)},${quoteSql(key)},${quoteSql(kind)},${quoteSql(row.container_id)},${quoteSql(actor)},${quoteSql(namespace)},${row.id},${nowMs},${nowMs},${Number(scan.schedule_sequence)},${Number(scan.schedule_sequence)},${urgent?row.id:0})
+      VALUES('lark.im',${quoteSql(accountKey)},${quoteSql(key)},${quoteSql(kind)},${quoteSql(row.container_id)},${quoteSql(actor)},${quoteSql(namespace)},${row.id},${nowMs},${nowMs},${Number(scan?.schedule_sequence||0)},${Number(scan?.schedule_sequence||0)},${urgent?row.id:0})
       ON CONFLICT(source_id,account_key,task_key) DO UPDATE SET latest_record_id=MAX(latest_record_id,excluded.latest_record_id),
         fresh_required_record_id=MAX(fresh_required_record_id,excluded.fresh_required_record_id),
         outcome=CASE WHEN kind='chat' AND evidence_json IS NOT NULL AND latest_record_id<excluded.latest_record_id AND attempt_token IS NULL THEN 'applying' ELSE outcome END,
@@ -208,21 +201,26 @@ function syncNames(db, self, deps = {}) {
     });
     const recipientDue=recipientFresh||query(`SELECT 1 AS due FROM lark_im_recipient_state WHERE source_id='lark.im' AND account_key=${quoteSql(accountKey)}
       AND (retry_at_ms<=${nowMs} OR attempt_evidence_json IS NOT evidence_json) LIMIT 1;`,'read recipient due indicator').length>0;
-    const state=/** @type {import('./name-work-policy.mjs').SelectionState} */ ({schema:'name_work_selection/v1',sequence:Number(scan.schedule_sequence),slot:Number(scan.schedule_slot)});
+    const state=/** @type {import('./name-work-policy.mjs').SelectionState} */ ({schema:'name_work_selection/v1',sequence:Number(scan?.schedule_sequence||0),slot:Number(scan?.schedule_slot||0)});
     const candidates=/** @type {import('./name-work-policy.mjs').WorkCandidate[]} */ (due.map(task=>({key:task.task_key,
       tier:task.blocked_reason?'history':task.fresh_required_record_id>task.serviced_record_id?'fresh':['pending','applying','page_limit'].includes(task.outcome)?'continuation':'history',
       operation:task.kind==='chat'?'other':task.namespace==='app_id'?'application_info':'contact_search',
       enqueuedSequence:task.enqueued_sequence,lastServedSequence:task.last_served_sequence,dueAtMs:task.retry_at_ms,
       claimedUntilMs:task.attempt_token?task.retry_at_ms:0,blocked:false,freshOrder:task.fresh_required_record_id})));
     if(recipientDue)candidates.push({key:'recipient',tier:recipientFresh?'fresh':'history',operation:'other',
-      enqueuedSequence:0,lastServedSequence:Number(scan.recipient_last_served_sequence),dueAtMs:0,claimedUntilMs:0,blocked:false});
+      enqueuedSequence:0,lastServedSequence:Number(scan?.recipient_last_served_sequence||0),dueAtMs:0,claimedUntilMs:0,blocked:false});
     const choice=selectNameWork(candidates,state,{nowMs,resource:'remote'});
     if(!choice)return report;
+    // Reserve the shared opportunity only when there is selected work. An idle
+    // discovery must not block a later fresh message, while a real claim and
+    // its cadence remain one CAS so separate commands cannot add budgets.
     const rotate=`${nameFence(`EXISTS(SELECT 1 FROM lark_im_name_scan WHERE account_key=${quoteSql(accountKey)}
-      AND generation=${Number(scan.generation)+1} AND schedule_sequence=${state.sequence} AND schedule_slot=${state.slot})`)}
+      AND generation=${Number(scan?.generation||0)+1} AND schedule_sequence=${state.sequence} AND schedule_slot=${state.slot}
+      AND next_attempt_at_ms<=${nowMs})`)}
       UPDATE lark_im_name_scan SET schedule_sequence=${choice.nextState.sequence},schedule_slot=${choice.nextState.slot},
-      recipient_last_served_sequence=${choice.candidate.key==='recipient'?choice.nextState.sequence:Number(scan.recipient_last_served_sequence)},
-      generation=generation+1 WHERE account_key=${quoteSql(accountKey)} AND generation=${Number(scan.generation)+1};`;
+      recipient_last_served_sequence=${choice.candidate.key==='recipient'?choice.nextState.sequence:Number(scan?.recipient_last_served_sequence||0)},
+      next_attempt_at_ms=${nowMs+INTERVAL_MS},generation=generation+1
+      WHERE account_key=${quoteSql(accountKey)} AND generation=${Number(scan?.generation||0)+1} AND next_attempt_at_ms<=${nowMs};`;
     if(choice.candidate.key==='recipient') {
       commit([nameEffects(rotate)],'name-work-recipient-turn');
       const recipient=(deps.syncRecipients||syncRecipients)(db,self,{runLark:boundedRun,now,monotonicNow:monotonic,budgetMs:remaining()});

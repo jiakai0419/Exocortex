@@ -11,6 +11,7 @@ import { displayP2pRecipient, readRecipientEvidence, recipientAccountKey, sentRe
 import { patchTopLevelJsonMemberText, validateJsonObjectText } from "../../dist/core/json-text-patch.js";
 import { projectionAccount, readSenderProjectionEvidence, senderProjection, messageProjectionEvidence } from "../adapters/lark-im/message-projection-evidence.mjs";
 import { readMessageSnapshot } from "./message-read-snapshot.mjs";
+import { readSavedSenderRouteEvidence } from "../adapters/lark-im/saved-sender-route-failures.mjs";
 import { evaluateMessageCompleteness } from "../adapters/lark-im/message-completeness.mjs";
 import { readLocalSenderProjectionEvidence } from "../adapters/lark-im/name-history.mjs";
 
@@ -147,7 +148,8 @@ function loadMessages(dbPath, opts, deps = {}) {
     return enrichRow(row,chats.get(row.container_id),type_scope_source_id==='lark.im'
       && typeof row.container_id==='string' && type_scope_id===chatScopeId(row.container_id),
       account?recipients.get(`${recipientAccountKey(account)}:${row.container_id}`):undefined,
-      nameAccount?titles.get(`${nameAccount}:${row.container_id}`):undefined,saved,true);
+      nameAccount?titles.get(`${nameAccount}:${row.container_id}`):undefined,saved,true,
+      readSavedSenderRouteEvidence(row,canonical,raw,owner,snapshot.nameRoutes));
   });
   messageReadMetadata.set(messages,{population:snapshot.population,as_of:snapshot.as_of,
     observations:snapshot.observations,
@@ -374,9 +376,12 @@ function conversationType(row, canonical, raw, config, currentChat, recipientCon
  * @param {boolean} [scopeSourceMatches]
  * @param {Row} [recipientConfig]
  * @param {Row | null} [currentName]
+ * @param {Row | null} [savedSender]
+ * @param {boolean} [includeReadiness]
+ * @param {{blockers:Row[],supersedes_inline:boolean}} [routeEvidence]
  * @returns {EnrichedMessage}
  */
-function enrichRow(row, currentChat, scopeSourceMatches = true, recipientConfig, currentName, savedSender = null, includeReadiness = false) {
+function enrichRow(row, currentChat, scopeSourceMatches = true, recipientConfig, currentName, savedSender = null, includeReadiness = false, routeEvidence = {blockers:[],supersedes_inline:false}) {
   const canonical = parseMaybeJson(row.canonical_json) || {};
   const raw = parseMaybeJson(row.raw_json) || {};
   const config = parseMaybeJson(row.scope_config_json) || {};
@@ -420,7 +425,7 @@ function enrichRow(row, currentChat, scopeSourceMatches = true, recipientConfig,
     const evidence=messageProjectionEvidence(row,canonical,raw,result.display,{
       chatType,chatName,titleSource:currentName?.name===chatName?'im.chats.get'
         :canonical.chat_name===chatName?'canonical':'scope_config',
-      recipientConfig:recipientConfig??currentChat,senderEvidence:savedSender });
+      recipientConfig:recipientConfig??currentChat,senderEvidence:savedSender,routeEvidence });
     result.readiness=evaluateMessageCompleteness({row,canonical,raw,display:result.display,evidence});
     projectionEvidence.set(result,evidence);
   }

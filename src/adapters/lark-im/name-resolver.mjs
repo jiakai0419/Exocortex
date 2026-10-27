@@ -1,13 +1,13 @@
 // @ts-check
 
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   chatId,
   senderId,
   senderName,
 } from "./core.mjs";
 import { displayNameFromUser, personName, senderAliasesByOpenId, senderIdentity, senderLookupNamespace, senderOpenId } from "./sender-identity.mjs";
-import { nameLookupFailure } from './sender-name-observation.mjs';
+import { nameLookupFailure, sanitizeSenderNameObservation, senderNameRouteTargetKey } from './sender-name-observation.mjs';
 
 /**
  * @typedef {Record<string, any>} JsonObject
@@ -140,8 +140,14 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
    * @param {string} namespace @param {string} [chat] */
   function routeAllowed(opts, operation, id, namespace, chat = '') {
     if (opts.nameRouteAdmission === undefined) return true;
-    try { return opts.nameRouteAdmission({ operation, actor_id: id, namespace, chat_id: chat }) === true; }
-    catch { return false; }
+    let allowed = false;
+    try { allowed = opts.nameRouteAdmission({ operation, actor_id: id, namespace, chat_id: chat }) === true; }
+    catch { /* An unavailable admission hook cannot authorize a request. */ }
+    if (!allowed && activeAttempt && namespace === 'app_id' && skippedRoutes.size < cacheMaxEntries) {
+      const key = operation === 'application_info' ? `app:${id}` : `bot:${JSON.stringify([chat,id])}`;
+      skippedRoutes.set(key, activeAttempt);
+    }
+    return allowed;
   }
   /** @param {string[]} args @param {AdapterRunOptions} options @param {AdapterOptions} opts */
   function lookup(args, options, opts) {
@@ -167,11 +173,22 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
   // reuse carries the original observation time and is never a fresh check.
   /** @type {Map<string, JsonObject>} */
   const observations = new Map();
+  // Ephemeral markers cannot be serialized or confused with an earlier attempt.
+  const observationAttempts = new WeakMap();
+  const skippedRoutes = new Map();
+  let activeAttempt = '';
+  /** @template T @param {() => T} action @returns {T} */
+  function withAttempt(action) {
+    activeAttempt = randomBytes(32).toString('hex'); skippedRoutes.clear();
+    try { return action(); } finally { activeAttempt = ''; skippedRoutes.clear(); }
+  }
   /** @param {string} key @param {JsonObject} value */
   function observe(key, value) {
     observations.delete(key);
-    observations.set(key, { observed_at: new Date(now()).toISOString(), cached: false,
-      ...(contextAccount ? { account_key: createHash('sha256').update(`lark.im\0${contextAccount}`).digest('hex') } : {}), ...value });
+    const observed = { observed_at: new Date(now()).toISOString(), cached: false,
+      ...(contextAccount ? { account_key: createHash('sha256').update(`lark.im\0${contextAccount}`).digest('hex') } : {}), ...value };
+    observations.set(key, observed);
+    observationAttempts.set(observed, activeAttempt);
     if (observations.size > cacheMaxEntries) { const oldest = observations.keys().next().value; if (oldest !== undefined) observations.delete(oldest); }
   }
   // Lookup evidence is bound to the explicitly selected route. Identifier
@@ -187,7 +204,24 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
     const selected = values.find(value => value?.status === 'conflict')
       || values.find(value => value?.status === 'resolved')
       || values.find(value => value?.status === 'failed') || values.at(-1);
-    return selected ? { ...selected } : null;
+    if (!selected) return null;
+    const result = { ...selected };
+    const targetKey = namespace === 'app_id' && selected.account_key
+      ? senderNameRouteTargetKey(selected.account_key,id,chat) : null;
+    if (activeAttempt && targetKey && selected.status === 'failed' && selected.cached === false
+      && selected.failure && observationAttempts.get(selected) === activeAttempt) {
+      const routes = keys.map((key,index) => {
+        const value = observations.get(key);
+        const current = value && observationAttempts.get(value) === activeAttempt
+          && value.account_key === selected.account_key && value.cached === false ? value : null;
+        return {operation:index === 0 ? 'application_info' : 'chat_bots',
+          status:current && ['failed','unresolved'].includes(current.status) ? current.status
+            : skippedRoutes.get(key) === activeAttempt ? 'not_requested' : 'unknown',
+          failure:current?.status === 'failed' ? current.failure || null : null};
+      });
+      result.route_failures = {version:1,attempt_key:activeAttempt,target_key:targetKey,account_key:selected.account_key,routes};
+    }
+    return sanitizeSenderNameObservation(result);
   }
 
   /** @param {string} key */
@@ -567,6 +601,11 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
    * @param {JsonObject} [scopeConfig]
    */
   function buildPeopleContext(messages, opts, selfProfile, scopeConfig = {}) {
+    return withAttempt(() => buildPeopleContextAttempt(messages,opts,selfProfile,scopeConfig));
+  }
+
+  /** @param {any[]} messages @param {AdapterOptions} opts @param {SelfProfile|null} selfProfile @param {JsonObject} scopeConfig */
+  function buildPeopleContextAttempt(messages, opts, selfProfile, scopeConfig) {
     // A resolver may be reused in one process; never attribute another account's
     // cached authority to the current sync account when persisting provenance.
     observations.clear();
@@ -651,6 +690,11 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
    * persistence, no inferred identity and no unbound/unique bot inference.
    * @param {JsonObject} message @param {unknown} adoptedName @param {SelfProfile} selfProfile @param {AdapterOptions} [opts] */
   function verifySenderName(message, adoptedName, selfProfile, opts = {}) {
+    return withAttempt(() => verifySenderNameAttempt(message,adoptedName,selfProfile,opts));
+  }
+
+  /** @param {JsonObject} message @param {unknown} adoptedName @param {SelfProfile} selfProfile @param {AdapterOptions} opts */
+  function verifySenderNameAttempt(message, adoptedName, selfProfile, opts) {
     const identity = senderIdentity(message);
     const native = message.raw_api && typeof message.raw_api === 'object' && !Array.isArray(message.raw_api) ? message.raw_api : message;
     const chat = chatId(native);

@@ -291,6 +291,8 @@ function mergeLarkNameProjectionSql(existingJson, incomingJson, existingActor, i
         AND json_extract(${json}, '$.message_account_evidence.account_key') IS ${failureAccount})
     AND NOT EXISTS (SELECT parent,key FROM json_tree(${json}) WHERE key IS NOT NULL
       GROUP BY parent,key HAVING COUNT(*)>1))`).join(' AND ');
+    const sameDiagnosticVersion = accountRetention ? ['source_id', 'record_type', 'external_id', 'external_version',
+        'actor_id', 'container_id', 'direction', 'occurred_at', 'occurred_at_ms', 'raw_json', 'content_hash'].map(column => `${accountRetention.existingAlias}.${column} IS ${accountRetention.incomingAlias}.${column}`).join(' AND ') : '0';
     const failedDiagnosticRetention = accountRetention ? `(
     ${['source_id', 'record_type', 'external_id', 'external_version', 'actor_id', 'container_id', 'direction',
         'occurred_at', 'occurred_at_ms', 'raw_json', 'content_hash'].map(column => `${accountRetention.existingAlias}.${column} IS ${accountRetention.incomingAlias}.${column}`).join(' AND ')}
@@ -305,7 +307,7 @@ function mergeLarkNameProjectionSql(existingJson, incomingJson, existingActor, i
     AND json_type(old, '$.sender_name_verification.cached')='false'
     AND json_type(old, '$.sender_name_verification.observed_at')='text'
     AND NOT EXISTS (SELECT 1 FROM json_each(old, '$.sender_name_verification')
-      WHERE key NOT IN ('status','reason','source','observed_at','cached','account_key','failure','pages_observed'))
+      WHERE key NOT IN ('status','reason','source','observed_at','cached','account_key','failure','pages_observed','route_failures'))
     AND (json_extract(old, '$.sender_id_type')='open_id'
         AND json_extract(old, '$.sender_name_verification.source') IN ('contact','chat_member')
       OR json_extract(old, '$.sender_id_type')='app_id'
@@ -360,6 +362,69 @@ function mergeLarkNameProjectionSql(existingJson, incomingJson, existingActor, i
         .concat(['$.chat_id', '$.chat.chat_id', '$.chat.id'].map(path => `(json_type(document, '${path}') IS NOT NULL
           AND (json_type(document, '${path}') <> 'text' OR json_extract(document, '${path}') IS NOT ${existingContainer}))`)).join(' OR ')}
       ))`).join(' AND ');
+    // Flat materialized stages keep strict route JSON validation below SQLite's
+    // parser-stack limit. Payloads are at most two finite route descriptors.
+    const beforeRouteValidation = `n${index}`;
+    stages.push(`nr_bundle AS MATERIALIZED (SELECT old,next,
+    CASE WHEN json_type(old, '$.sender_name_verification.route_failures')='object'
+      THEN json_extract(old, '$.sender_name_verification.route_failures') ELSE '{}' END AS bundle
+    FROM ${beforeRouteValidation})`);
+    stages.push(`nr_items AS MATERIALIZED (SELECT old, route.key AS position,route.type AS item_type,
+    CASE WHEN route.type='object' THEN route.value ELSE '{}' END AS item
+    FROM nr_bundle,json_each(bundle, '$.routes') AS route)`);
+    stages.push(`nr_failure AS MATERIALIZED (SELECT *,
+    CASE WHEN json_type(item, '$.failure')='object' THEN json_extract(item, '$.failure') ELSE '{}' END AS failure
+    FROM nr_items)`);
+    stages.push(`nr_valid AS MATERIALIZED (SELECT *,
+    json_type(item, '$.failure')='object' AND (SELECT COUNT(*) FROM json_each(failure))=5
+    AND NOT EXISTS (SELECT 1 FROM json_each(failure) WHERE key NOT IN ('version','operation','kind','code','stage'))
+    AND json_type(failure, '$.version')='integer' AND json_extract(failure, '$.version')=1
+    AND json_extract(failure, '$.operation') IS json_extract(item, '$.operation')
+    AND json_extract(failure, '$.kind') IN (${failureKinds.map(kind => `'${kind}'`).join(',')})
+    AND json_extract(failure, '$.stage') IN ('not_requested','response_error','request_error','unknown')
+    AND (json_type(failure, '$.code')='null' AND json_extract(failure, '$.stage')<>'response_error'
+      OR json_type(failure, '$.code')='integer' AND json_extract(failure, '$.code') BETWEEN 0 AND 9007199254740991
+        AND json_extract(failure, '$.stage')='response_error')
+    AND (json_extract(failure, '$.kind')<>'budget_exhausted' OR json_extract(failure, '$.stage')='not_requested') AS failure_valid
+    FROM nr_failure)`);
+    stages.push(`nr_routes AS MATERIALIZED (SELECT
+    item_type='object' AND (SELECT COUNT(*) FROM json_each(item))=3
+    AND NOT EXISTS (SELECT 1 FROM json_each(item) WHERE key NOT IN ('operation','status','failure'))
+    AND json_extract(item, '$.operation')=CASE position WHEN 0 THEN 'application_info' ELSE 'chat_bots' END
+    AND json_extract(item, '$.status') IN ('failed','unresolved','not_requested','unknown')
+    AND (json_type(item, '$.failure')='null' OR json_extract(item, '$.status')='failed' AND failure_valid)
+    AND (json_extract(item, '$.operation') IS NOT json_extract(old, '${failurePath}.operation')
+      OR json_extract(item, '$.status')='failed'
+        AND ${['version', 'operation', 'kind', 'code', 'stage'].map(key => `json_extract(failure, '$.${key}') IS json_extract(old, '${failurePath}.${key}')`).join(' AND ')}) AS valid
+    FROM nr_valid)`);
+    index += 1;
+    stages.push(`n${index} AS MATERIALIZED (SELECT old,next,
+    json_type(old, '$.sender_name_verification.route_failures') IS NULL OR (
+      (${sameDiagnosticVersion}) AND (${failedDiagnosticAccounts})
+      AND json_extract(old, '$.sender_id_type')='app_id'
+      AND json_extract(old, '$.sender_name_verification.status')='failed'
+      AND json_type(old, '$.sender_name_verification.cached')='false'
+      AND json_extract(old, '$.sender_name_verification.source') IN ('application_api','chat_bot_app_id')
+      AND json_type(old, '${failurePath}')='object'
+      AND (SELECT COUNT(*) FROM json_each(old, '${failurePath}'))=5
+      AND NOT EXISTS (SELECT 1 FROM json_each(old, '${failurePath}')
+        WHERE key NOT IN ('version','operation','kind','code','stage'))
+      AND json_extract(old, '${failurePath}.operation')=CASE json_extract(old, '$.sender_name_verification.source')
+        WHEN 'application_api' THEN 'application_info' ELSE 'chat_bots' END
+      AND (json_extract(old, '${failurePath}.kind')='budget_exhausted'
+        AND json_extract(old, '$.sender_name_verification.reason')='budget_exhausted'
+        OR json_extract(old, '${failurePath}.kind')<>'budget_exhausted'
+          AND json_extract(old, '$.sender_name_verification.reason')='request_failed')
+      AND json_type(old, '$.sender_name_verification.route_failures')='object'
+      AND (SELECT COUNT(*) FROM json_each(bundle))=5
+      AND NOT EXISTS (SELECT 1 FROM json_each(bundle) WHERE key NOT IN ('version','attempt_key','target_key','account_key','routes'))
+      AND json_type(bundle, '$.version')='integer' AND json_extract(bundle, '$.version')=1
+      AND ${['attempt_key', 'target_key', 'account_key'].map(key => `(json_type(bundle, '$.${key}')='text'
+        AND length(json_extract(bundle, '$.${key}'))=64 AND json_extract(bundle, '$.${key}') NOT GLOB '*[^0-9a-f]*')`).join(' AND ')}
+      AND json_extract(bundle, '$.account_key') IS ${failureAccount}
+      AND json_type(bundle, '$.routes')='array' AND json_array_length(bundle, '$.routes')=2
+      AND NOT EXISTS (SELECT 1 FROM nr_routes WHERE NOT COALESCE(valid,0))
+    ) AS route_diagnostic_valid FROM nr_bundle)`);
     const previous = `n${index}`;
     index += 1;
     stages.push(`n${index} AS MATERIALIZED (SELECT old, CASE
@@ -379,7 +444,7 @@ function mergeLarkNameProjectionSql(existingJson, incomingJson, existingActor, i
         AND (${diagnosticAccountsMatch}))
         OR ((${diagnosticAccountsAbsent}) AND json_type(next, '$.sender_name_account_key') IS NULL)
         OR ${failedDiagnosticRetention})
-      AND (${diagnosticKeysUnique}) AND (${diagnosticSourceMatches})
+      AND (${diagnosticKeysUnique}) AND (${diagnosticSourceMatches}) AND route_diagnostic_valid
     THEN json_set(next, '$.sender_name_verification', json_extract(old, '$.sender_name_verification'))
     ELSE next END AS next FROM ${previous})`);
     // This marker is written only by the fenced current-chat observation task.

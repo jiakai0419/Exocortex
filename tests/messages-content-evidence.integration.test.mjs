@@ -42,7 +42,8 @@ function fixtures() {
       container_id: CHAT, direction: 'received', occurred_at: new Date(AT + id * 1000).toISOString(),
       occurred_at_ms: AT + id * 1000, body, raw_json: rawJson, canonical_json: JSON.stringify(canonical), content_hash: hash(rawJson) };
     cases.push({ label, row, state: options.state || 'ready', reason: options.reason || null,
-      shown: own(options, 'shown') ? options.shown : body, freshProjection: options.freshProjection || false });
+      shown: own(options, 'shown') ? options.shown : body, freshProjection: options.freshProjection || false,
+      contentRequirement: options.contentRequirement });
   };
   const member = { key: '@_user_1', id: { open_id: 'ou_synthetic_content_mention' }, name: 'Invented Mention' };
   add('native exact plain text', 'text', { text: 'Invented exact text.' });
@@ -107,6 +108,39 @@ function fixtures() {
     state: 'enriching', reason: 'content_invalid' });
   add('unsupported media is not invented prose support', 'sticker', { file_key: 'synthetic_sticker_key' },
     { state: 'blocked', reason: 'content_unsupported' });
+  add('legacy canonical text supplies only the absent source type', 'text', { text: 'Invented legacy typed text.' },
+    { body: 'Invented legacy typed text.', mutate: raw => { delete raw.msg_type; } });
+  add('legacy canonical text still resolves exact mentions', 'text', { text: 'Hello @_user_1.' },
+    { body: 'Hello @Invented Mention.', mentions: [member], mutate: raw => { delete raw.msg_type; } });
+  add('legacy canonical post uses the existing post renderer', 'post',
+    { title: 'Invented legacy post', content: [[{ tag: 'text', text: 'Invented typed paragraph.' }]] },
+    { body: 'Invented legacy post\nInvented typed paragraph.', shown: 'Invented legacy post Invented typed paragraph.',
+      mutate: raw => { delete raw.msg_type; } });
+  add('legacy canonical direct text remains supported', 'text', null, { body: 'Invented old direct text.',
+    mutate: raw => { delete raw.msg_type; delete raw.body; raw.content = 'Invented old direct text.'; } });
+  add('canonical type cannot repair a malformed encoded body', 'text', null, { body: 'Invented readable fallback.',
+    mutate: raw => { delete raw.msg_type; raw.body.content = '{broken invented legacy'; }, state: 'enriching', reason: 'content_invalid' });
+  add('canonical type cannot repair body disagreement', 'text', { text: 'Invented authoritative legacy.' },
+    { body: 'Invented mismatched legacy.', mutate: raw => { delete raw.msg_type; }, state: 'enriching', reason: 'content_invalid' });
+  add('canonical type cannot resolve a missing mention name', 'text', { text: 'Hello @_user_1.' },
+    { body: 'Hello @_user_1.', mentions: [{ key: member.key, id: member.id }], mutate: raw => { delete raw.msg_type; },
+      state: 'enriching', reason: 'content_partial' });
+  for (const [label, mutate, canonical] of [
+    ['native API source marker', raw => { raw.source_api = 'im.v1.messages'; }, {}],
+    ['canonical API source marker', () => {}, { source_api: 'im.v1.messages' }],
+    ['native API wrapper', raw => { raw.raw_api = clone(raw); }, {}],
+    ['malformed native wrapper', raw => { raw.raw_api = null; }, {}],
+    ['explicit null source type', raw => { raw.msg_type = null; }, {}],
+    ['explicit empty source type', raw => { raw.msg_type = ''; }, {}],
+    ['explicit null source type alias', raw => { raw.message_type = null; }, {}],
+  ]) add(`canonical type cannot rescue ${label}`, 'text', { text: 'Invented marked source text.' },
+    { body: 'Invented marked source text.', mutate: raw => { delete raw.msg_type; mutate(raw); }, canonical,
+      state: 'blocked', reason: 'content_unsupported' });
+  add('canonical type cannot overwrite a contradictory source alias', 'text', { content: [[{ tag: 'text', text: 'Invented conflicting post.' }]] },
+    { body: 'Invented conflicting post.', mutate: raw => { delete raw.msg_type; raw.message_type = 'post'; },
+      state: 'blocked', reason: 'content_invalid', contentRequirement: 'conflict' });
+  add('unsupported canonical type is not added to renderer support', 'sticker', { file_key: 'synthetic_legacy_sticker_key' },
+    { body: 'Invented sticker fallback.', mutate: raw => { delete raw.msg_type; }, state: 'blocked', reason: 'content_unsupported' });
   add('ready adjacent neighbor', 'text', { text: 'Invented adjacent ready body.' });
   add('latest malformed must not be replaced at limit one', 'text', {}, { body: 'Invented latest fallback.',
     mutate: raw => { raw.body.content = 'not encoded JSON'; }, state: 'enriching', reason: 'content_invalid' });
@@ -161,7 +195,7 @@ test('real CLI and quality verify legacy content against its exact source withou
     assert.equal(row.readiness.state, expected.state, expected.label);
     assert.deepEqual(row.readiness.reasons, expected.reason ? [expected.reason] : [], expected.label);
     const content = row.readiness.requirements.find(value => value.field === 'content');
-    assert.equal(content.state, expected.state === 'ready' ? 'satisfied' : expected.state === 'blocked' ? 'blocked' : 'missing', expected.label);
+    assert.equal(content.state, expected.contentRequirement || (expected.state === 'ready' ? 'satisfied' : expected.state === 'blocked' ? 'blocked' : 'missing'), expected.label);
     const start = text.indexOf(header(stored)), end = index + 1 < ordered.length ? text.indexOf(header(ordered[index + 1].row)) : text.length;
     assert(start >= 0 && end > start, `${expected.label}: exact text header and unchanged position`);
     const block = text.slice(start, end).trimEnd();

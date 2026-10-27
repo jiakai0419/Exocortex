@@ -1,6 +1,6 @@
 # Message completeness and identity consistency
 
-Design v0.4 — integrated local candidate, base 5631504dade6c0ce2092bdfa6f5811f0314f376a. Final full-tree validation and independent acceptance remain pending. Production, services, permissions and API budgets remain unchanged. No push/deploy is authorized. All test inputs must be authored from scratch; never commit real or redacted business data.
+Design v0.5 — integrated local candidate, base 5631504dade6c0ce2092bdfa6f5811f0314f376a. Final full-tree validation and independent acceptance remain pending. Production, services, permissions and API budgets remain unchanged. No push/deploy is authorized. All test inputs must be authored from scratch; never commit real or redacted business data.
 
 ## Goal
 
@@ -10,7 +10,7 @@ Raw acquisition stays durable even if enrichment fails. Network requests run out
 
 ## Ownership and integration
 
-Main checkout: /tmp/exocortex-completeness-20261027-1SCjPK/repo, branch candidate/message-completeness. Main is the only integrator. Other routes work in separate checkouts and submit fixed commits/diffs; do not edit this checkout.
+Main checkout: /tmp/exocortex-completeness-20261027-1SCjPK/repo, branch candidate/message-completeness. Main is the only integrator. Other routes work in separate checkouts and submit fixed commits/diffs. Main may assign local agents exclusive file ownership for a narrow integration fix; shared files still have one writer.
 
 | Owner | Files and responsibilities |
 | --- | --- |
@@ -96,7 +96,7 @@ The read protocol and finite reason vocabulary below are implemented. Migration 
 
 `messages --format json` remains an array. Each selected row adds `source_id` and `readiness={version:1,state,requirements,reasons,next_action}`. Requirements always appear exactly once in sender, recipient, conversation, content order. A group destination has recipient=not_applicable. JSON retains raw/canonical/body and the inspectable candidate display even when readiness is not ready; only a ready row is presented as an ordinary complete text message. An exception keeps its actual selected header and position, followed by state, finite reasons and the JSON inspection hint. No older row replaces it. Ready-row layout is unchanged.
 
-Reduction priority is conflict/blocked -> blocked; otherwise unprepared -> captured; otherwise all satisfied/not_applicable -> ready; otherwise enriching. Current read projection always prepares its selected page, so captured is reserved for unavailable/invalid preparation and lifecycle producers. Invalid source/message identity maps to conversation conflict; invalid event time maps to content conflict; account disagreement maps to conversation conflict. Direction unknown remains missing. Exact error 210508 plus matching target, account and supported authority can block the affected component; generic failure cannot. A valid adopted value remains valid despite a newer failed check unless its identity/account/clear contract is contradicted.
+Reduction priority is conflict/blocked -> blocked; otherwise unprepared -> captured; otherwise all satisfied/not_applicable -> ready; otherwise enriching. Current read projection always prepares its selected page, so captured is reserved for unavailable/invalid preparation and lifecycle producers. Invalid source/message identity maps to conversation conflict; invalid event time maps to content conflict; account disagreement maps to conversation conflict. Direction unknown remains missing. For an unnamed application, exact error 210508 from both supported routes, with matching target and account, can block the sender component; one route or a generic failure cannot. A valid adopted value remains valid despite a newer failed check unless its identity/account/clear contract is contradicted.
 
 Reason vocabulary is MESSAGE_COMPLETENESS_REASONS in the pure evaluator. Actions are none, prepare, review_identity, review_permissions, review_explicit_clear, review_content, resolve_sender, resolve_recipient, resolve_conversation, resolve_content. Priority is ready/captured, identity conflict, verified permission, explicit clear, unsupported content, then first missing requirement. Unknown errors do not invent a permanent block.
 
@@ -136,6 +136,14 @@ unknown canonical data is not normalized. Legacy approval remains byte exact:
 only an exactly approved prior proof, or an exactly approved proposal without
 new proof, can be retained. A replay never invents an earlier request time.
 
+The optional v4 `acquisition_exact` digest additionally supports byte-identical
+source payloads containing legal numbers outside the conservative structural
+parser's domain. It replaces only the validated current acquired_at value span,
+binding every other canonical byte, raw byte and effective record field. The
+original exact digest remains unchanged and independently checked. Old v4
+proofs without this optional field remain readable; a pre-acquisition approval
+does not authorize adding ownership proof and must be previewed again.
+
 ## Persisted completeness observations
 
 Migration 017 records historical results of the actual local `messages` pipeline. A successful sync tail, including an empty successful cycle, may observe at most 20 new and 20 historical records per admitted 60-second opportunity. The same account/maintenance fences protect short local commits. There are no remote calls or long transactions. Source CAS prevents attaching a reading to changed source bytes; a failed optional observer never rolls back acquired messages. Oversized or unreadable candidates are counted as deferred, and historical scanning continues fairly.
@@ -147,6 +155,14 @@ The reader always evaluates current source and identity evidence again. Ledger s
 ## Latency boundary and acceptance envelope
 
 The fixed optional background name tail remains four CLI calls and ten seconds per 60-second account admission. Inline names consult the same exact persisted route failures after positive local/cache reuse and before issuing optional requests. Each list/detail preparation has one shared deadline of at most five seconds, including route reads; it does not reset the deadline per actor. Blocked probes remain the background coordinator's low-priority recovery work. Skipping a denied route is not a fresh request, failure, permission observation or successful recovery. Different typed actors and independent chat fallbacks retain their own admissibility.
+
+An idle discovery or empty successful sync may scan/enroll bounded old debt, but
+does not reserve the remote 60-second opportunity when no work is eligible.
+Only an actual selected task atomically reserves cadence together with its
+rotation and claim. A concurrent winner or stale task rolls back all three;
+new records never bypass an already consumed opportunity. This fixes the public
+discover-then-sent path without increasing API budgets or disabling historical
+empty-cycle recovery.
 
 The synthetic worker gate uses an external publisher and actual CLI JSON/text observations with 15 source versions: two fresh, one locally known donor, and twelve unresolved old applications. All remain in the denominator; the three accessible identities must have exact expected names and `ready`, and the twelve others must remain explicitly accounted for. Its one-group, two-fresh, available-upstream, normal-response envelope demonstrates a source-to-readable minute-scale example, not a measured production percentile. The separate twelve-denied-plus-one-fresh two-batch test proves already isolated identities cause no repeated inline requests. Arbitrary cold identity rates, unbounded member pagination, worker sleep or missing upstream visibility do not have a finite guarantee from those samples.
 
@@ -190,12 +206,31 @@ local budget exhaustion, transport failure and an actual API error are distinct;
 arbitrary exception text is never persisted. No-query replay can retain an
 exactly bound diagnostic without creating name adoption or account proof.
 
-An application-info permission response may explain a missing application name
-in the actual read projection only when its finite observation and current
-acquisition proof bind the same account, typed actor, source and message. A
-valid alternative name stays ready. This is evidence about that lookup route,
-not proof that every possible authority is permanently inaccessible. A failed
-contact lookup alone does not declare all member fallback routes blocked.
+An application-info permission response is evidence only about that route. The
+current-attempt observation may additionally retain a finite `route_failures`
+envelope with version, attempt digest, target digest, account key and exactly two
+ordered outcomes: application_info and chat_bots. Each distinguishes failed,
+unresolved, not_requested and unknown. The consumer recomputes the exact typed
+actor/account/chat target and validates current acquisition proof. Only two
+explicit permission_denied/210508 response errors yield review_permissions for
+the missing sender. Empty results, timeout, unknown errors or an unattempted
+fallback remain recoverable/unknown, not permission proof. No valid alternative
+name is demoted. A failed contact lookup alone likewise cannot declare all
+member fallback routes blocked.
+
+Legacy route-table evidence uses the same SQLite read snapshot, not a second
+lookup. Candidates are bounded to 32 proved account keys, 1024 rows per account
+and 2048 payloads per page. Overflow, ambiguous identity, invalid schema or an
+incomplete candidate group supplies no permission conclusion. The reader
+recomputes both opaque route keys and checks current blocked admission, precise
+code and timestamps. A newer exact producer observation with a recoverable or
+unattempted fallback prevents older stored denials from overriding it. This
+explains existing failures without fabricating a new observation, account proof
+or name; it does not prove permanent invisibility from every possible authority.
+Conversely, a strictly later validated route response showing success or a
+nonblocked failure withdraws the old inline paired-denial conclusion. A missing
+route, equal timestamp, generation change or recovery claim alone is not such a
+response. Freshness arbitration applies before component-state reduction.
 
 For legacy records without renderer metadata, nonempty stored text is not proof
 of complete content. The read path must verify the source representation and
@@ -203,6 +238,12 @@ the type-specific rendering, including unresolved references. Valid legacy
 content remains readable; malformed or contradictory content cannot count as
 ready merely because its stored body contains text. This adds no new content
 format support and never changes stored source bytes or body.
+
+For older non-native shapes, when raw msg_type and message_type keys are both
+absent and no source_api/raw_api provenance key exists, an explicit canonical
+text/post type may drive the same strict renderer. Its JSON, references and
+exact body comparison still apply. Explicit null/empty/conflicting raw types or
+a native provenance marker cannot be rescued by this compatibility rule.
 
 This legacy check does not replace existing renderer metadata or expand support
 for content types. It reuses the bounded source renderer when such metadata is

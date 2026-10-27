@@ -361,7 +361,9 @@ function recordFromMessage(message, scopeId, direction, context = {}, scopeConfi
   // Source names and supplied self profiles have no independent lookup time.
   // Do not invent one from normalization time or the message timestamp.
   const nameObservation = !senderDirectName && Boolean(lookupNamespace)
-    ? sanitizeSenderNameObservation(context.sender_name_observations?.get(JSON.stringify([containerId, actorId, identity.type]))) : null;
+    ? sanitizeSenderNameObservation(context.sender_name_observations?.get(JSON.stringify([containerId, actorId, identity.type])),
+      {account_key:context.self?.open_id ? createHash('sha256').update(`lark.im\0${context.self.open_id}`).digest('hex') : '',
+        actor_id:actorId,namespace:identity.type || '',chat_id:containerId}) : null;
   const canonical = {
     message_id: externalId,
     msg_type: message?.msg_type || message?.message_type || null,

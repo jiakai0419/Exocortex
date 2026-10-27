@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { patchJsonText, patchTopLevelJsonMemberText, mergeJsonObjectText, validateJsonObjectText } from '../dist/core/json-text-patch.js';
+import { patchJsonText, patchTopLevelJsonMemberText, patchExistingJsonValueText, mergeJsonObjectText, validateJsonObjectText } from '../dist/core/json-text-patch.js';
 import { retainSourceRepresentation } from '../dist/core/lark-observation.js';
 
 const tokenValues = ['9007199254740993', '18446744073709551617', '0.12345678901234567890123456789', '1e400', '-0'];
@@ -22,6 +22,49 @@ test('one owned root member preserves every original byte through append, refres
   }
   for (const invalid of ['[]', '{"a":1,"a":2}', '{bad}', '{"a":1}x']) assert.throws(() => patchTopLevelJsonMemberText(invalid, 'owned', '1'));
   assert.throws(() => patchTopLevelJsonMemberText('{}', 'owned', 'not-json'));
+});
+test('existing nested value replacement preserves all other bytes and decodes only path keys', () => {
+  const original = String.raw`
+{ "message\u005faccount_evidence" : {
+    "acquired\u005fat" : "old-clock", "unknown" : [1e400,-0,9007199254740993]
+  } , "a/b~c" : { "__proto__" : { "" : "escaped \" token" } },
+  "opaque" : 0.12345678901234567890123456789
+}	`;
+  const changed = patchExistingJsonValueText(original, ['message_account_evidence', 'acquired_at'], '"new-clock"');
+  assert.equal(changed, original.replace('"old-clock"', '"new-clock"'));
+  assert.equal(patchExistingJsonValueText(changed, ['message_account_evidence', 'acquired_at'], '"old-clock"'), original);
+  const nested = patchExistingJsonValueText(original, ['a/b~c', '__proto__', ''], 'null');
+  assert.equal(nested, original.replace(String.raw`"escaped \" token"`, 'null'));
+  for (const token of tokenValues) {
+    const input = ` \n{ "a" : { "value" : null , "unknown" : ${token} } }\t`;
+    assert.equal(patchExistingJsonValueText(input, ['a', 'value'], token), input.replace('null', token));
+  }
+});
+
+test('existing value replacement rejects missing, non-object and malformed paths without creating fields', () => {
+  for (const path of [[], ['a', 'missing'], ['missing'], ['a', 'value', 'child'], ['array', '0']]) {
+    assert.throws(() => patchExistingJsonValueText('{"a":{"value":null},"array":[0]}', path, '0'), /json_patch/);
+  }
+  for (const path of [undefined, null, 'a', [1], ['a', null], Array(1), Array(65).fill('a')]) {
+    assert.throws(() => patchExistingJsonValueText('{"a":0}', path, '0'), /invalid_path/);
+  }
+  for (const text of ['null', '[]', '{"a":1,"\\u0061":2}', '{"a":0,"other":{"b":1,"b":2}}', '{"a":0} trailing']) {
+    assert.throws(() => patchExistingJsonValueText(text, ['a'], '1'), /json_patch/);
+  }
+  for (const value of [undefined, '', 'NaN', '1 2', '{"a":1,"\\u0061":2}']) {
+    assert.throws(() => patchExistingJsonValueText('{"a":0}', ['a'], value), /json_patch/);
+  }
+});
+
+test('existing value replacement revalidates composed depth, node and byte limits', () => {
+  const atDepth64 = '{"a":'.repeat(64) + '0' + '}'.repeat(64);
+  const path = Array(64).fill('a');
+  assert.equal(patchExistingJsonValueText(atDepth64, path, '-0'), atDepth64.replace('0', '-0'));
+  assert.throws(() => patchExistingJsonValueText(atDepth64, path, '[0]'), /limit/);
+  assert.throws(() => patchExistingJsonValueText('{"a":0,"b":0}', ['a'], '[' + '0,'.repeat(19998) + '0]'), /limit/);
+  const boundedInput = '{"a":0,"other":"' + 'x'.repeat(524288) + '"}';
+  const boundedReplacement = '"' + 'x'.repeat(524288) + '"';
+  assert.throws(() => patchExistingJsonValueText(boundedInput, ['a'], boundedReplacement), /limit/);
 });
 for (const token of tokenValues) test(`owned field edit preserves unknown numeric token ${token}`, () => {
   const nested = `{ "arr" : [${token},null,{"inner":${token}}] }`;
