@@ -145,7 +145,7 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
     catch { /* An unavailable admission hook cannot authorize a request. */ }
     if (!allowed && activeAttempt && namespace === 'app_id' && skippedRoutes.size < cacheMaxEntries) {
       const key = operation === 'application_info' ? `app:${id}` : `bot:${JSON.stringify([chat,id])}`;
-      skippedRoutes.set(key, activeAttempt);
+      skippedRoutes.set(key, {attempt:activeAttempt,observed_at:new Date(now()).toISOString()});
     }
     return allowed;
   }
@@ -214,12 +214,14 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
         const value = observations.get(key);
         const current = value && observationAttempts.get(value) === activeAttempt
           && value.account_key === selected.account_key && value.cached === false ? value : null;
-        return {operation:index === 0 ? 'application_info' : 'chat_bots',
-          status:current && ['failed','unresolved'].includes(current.status) ? current.status
-            : skippedRoutes.get(key) === activeAttempt ? 'not_requested' : 'unknown',
+        const skipped = skippedRoutes.get(key);
+        const status = current && ['failed','unresolved'].includes(current.status) ? current.status
+          : skipped?.attempt === activeAttempt ? 'not_requested' : 'unknown';
+        return {operation:index === 0 ? 'application_info' : 'chat_bots',status,
+          observed_at:status === 'unknown' ? null : current?.observed_at ?? skipped?.observed_at,
           failure:current?.status === 'failed' ? current.failure || null : null};
       });
-      result.route_failures = {version:1,attempt_key:activeAttempt,target_key:targetKey,account_key:selected.account_key,routes};
+      result.route_failures = {version:2,attempt_key:activeAttempt,target_key:targetKey,account_key:selected.account_key,routes};
     }
     return sanitizeSenderNameObservation(result);
   }

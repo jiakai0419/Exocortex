@@ -369,7 +369,7 @@ function mergeLarkNameProjectionSql(existingJson, incomingJson, existingActor, i
     CASE WHEN json_type(old, '$.sender_name_verification.route_failures')='object'
       THEN json_extract(old, '$.sender_name_verification.route_failures') ELSE '{}' END AS bundle
     FROM ${beforeRouteValidation})`);
-    stages.push(`nr_items AS MATERIALIZED (SELECT old, route.key AS position,route.type AS item_type,
+    stages.push(`nr_items AS MATERIALIZED (SELECT old,json_extract(bundle, '$.version') AS route_version, route.key AS position,route.type AS item_type,
     CASE WHEN route.type='object' THEN route.value ELSE '{}' END AS item
     FROM nr_bundle,json_each(bundle, '$.routes') AS route)`);
     stages.push(`nr_failure AS MATERIALIZED (SELECT *,
@@ -388,13 +388,19 @@ function mergeLarkNameProjectionSql(existingJson, incomingJson, existingActor, i
     AND (json_extract(failure, '$.kind')<>'budget_exhausted' OR json_extract(failure, '$.stage')='not_requested') AS failure_valid
     FROM nr_failure)`);
     stages.push(`nr_routes AS MATERIALIZED (SELECT
-    item_type='object' AND (SELECT COUNT(*) FROM json_each(item))=3
-    AND NOT EXISTS (SELECT 1 FROM json_each(item) WHERE key NOT IN ('operation','status','failure'))
+    item_type='object' AND (SELECT COUNT(*) FROM json_each(item))=CASE route_version WHEN 2 THEN 4 ELSE 3 END
+    AND NOT EXISTS (SELECT 1 FROM json_each(item) WHERE key NOT IN ('operation','status','failure')
+      AND NOT (route_version=2 AND key='observed_at'))
+    AND (route_version=1 OR (json_extract(item, '$.status')='unknown' AND json_type(item, '$.observed_at')='null'
+      OR json_extract(item, '$.status')<>'unknown' AND json_type(item, '$.observed_at')='text'
+        AND strftime('%Y-%m-%dT%H:%M:%fZ', json_extract(item, '$.observed_at'), '+0 seconds')=json_extract(item, '$.observed_at')
+        AND julianday(json_extract(item, '$.observed_at')) BETWEEN 2440587.5 AND julianday('now')))
     AND json_extract(item, '$.operation')=CASE position WHEN 0 THEN 'application_info' ELSE 'chat_bots' END
     AND json_extract(item, '$.status') IN ('failed','unresolved','not_requested','unknown')
     AND (json_type(item, '$.failure')='null' OR json_extract(item, '$.status')='failed' AND failure_valid)
     AND (json_extract(item, '$.operation') IS NOT json_extract(old, '${failurePath}.operation')
       OR json_extract(item, '$.status')='failed'
+        AND (route_version=1 OR json_extract(item, '$.observed_at') IS json_extract(old, '$.sender_name_verification.observed_at'))
         AND ${['version', 'operation', 'kind', 'code', 'stage'].map(key => `json_extract(failure, '$.${key}') IS json_extract(old, '${failurePath}.${key}')`).join(' AND ')}) AS valid
     FROM nr_valid)`);
     index += 1;
@@ -418,7 +424,7 @@ function mergeLarkNameProjectionSql(existingJson, incomingJson, existingActor, i
       AND json_type(old, '$.sender_name_verification.route_failures')='object'
       AND (SELECT COUNT(*) FROM json_each(bundle))=5
       AND NOT EXISTS (SELECT 1 FROM json_each(bundle) WHERE key NOT IN ('version','attempt_key','target_key','account_key','routes'))
-      AND json_type(bundle, '$.version')='integer' AND json_extract(bundle, '$.version')=1
+      AND json_type(bundle, '$.version')='integer' AND json_extract(bundle, '$.version') IN (1,2)
       AND ${['attempt_key', 'target_key', 'account_key'].map(key => `(json_type(bundle, '$.${key}')='text'
         AND length(json_extract(bundle, '$.${key}'))=64 AND json_extract(bundle, '$.${key}') NOT GLOB '*[^0-9a-f]*')`).join(' AND ')}
       AND json_extract(bundle, '$.account_key') IS ${failureAccount}

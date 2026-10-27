@@ -378,10 +378,10 @@ function conversationType(row, canonical, raw, config, currentChat, recipientCon
  * @param {Row | null} [currentName]
  * @param {Row | null} [savedSender]
  * @param {boolean} [includeReadiness]
- * @param {{blockers:Row[],supersedes_inline:boolean}} [routeEvidence]
+ * @param {{blockers:Row[]}} [routeEvidence]
  * @returns {EnrichedMessage}
  */
-function enrichRow(row, currentChat, scopeSourceMatches = true, recipientConfig, currentName, savedSender = null, includeReadiness = false, routeEvidence = {blockers:[],supersedes_inline:false}) {
+function enrichRow(row, currentChat, scopeSourceMatches = true, recipientConfig, currentName, savedSender = null, includeReadiness = false, routeEvidence = undefined) {
   const canonical = parseMaybeJson(row.canonical_json) || {};
   const raw = parseMaybeJson(row.raw_json) || {};
   const config = parseMaybeJson(row.scope_config_json) || {};

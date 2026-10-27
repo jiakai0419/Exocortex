@@ -1,6 +1,6 @@
 # Message completeness and identity consistency
 
-Design v0.5 — integrated local candidate, base 5631504dade6c0ce2092bdfa6f5811f0314f376a. Final full-tree validation and independent acceptance remain pending. Production, services, permissions and API budgets remain unchanged. No push/deploy is authorized. All test inputs must be authored from scratch; never commit real or redacted business data.
+Design v0.6 — integrated local candidate, base 5631504dade6c0ce2092bdfa6f5811f0314f376a. Final full-tree validation and independent acceptance remain pending. Production, services, permissions and API budgets remain unchanged. No push/deploy is authorized. All test inputs must be authored from scratch; never commit real or redacted business data.
 
 ## Goal
 
@@ -210,7 +210,13 @@ An application-info permission response is evidence only about that route. The
 current-attempt observation may additionally retain a finite `route_failures`
 envelope with version, attempt digest, target digest, account key and exactly two
 ordered outcomes: application_info and chat_bots. Each distinguishes failed,
-unresolved, not_requested and unknown. The consumer recomputes the exact typed
+unresolved, not_requested and unknown. Version 2 records each route's own
+observed_at: the actual result time, the admission decision time for a skipped
+route, or null for an unknown route. It never borrows the primary's clock for a
+later fallback. The selected result time must match the top-level observation.
+Existing version 1 envelopes remain byte-preserved and use their recorded
+cohort clock for compatibility; that clock cannot attest precise per-route
+latency. The consumer recomputes the exact typed
 actor/account/chat target and validates current acquisition proof. Only two
 explicit permission_denied/210508 response errors yield review_permissions for
 the missing sender. Empty results, timeout, unknown errors or an unattempted
@@ -222,15 +228,27 @@ Legacy route-table evidence uses the same SQLite read snapshot, not a second
 lookup. Candidates are bounded to 32 proved account keys, 1024 rows per account
 and 2048 payloads per page. Overflow, ambiguous identity, invalid schema or an
 incomplete candidate group supplies no permission conclusion. The reader
-recomputes both opaque route keys and checks current blocked admission, precise
-code and timestamps. A newer exact producer observation with a recoverable or
-unattempted fallback prevents older stored denials from overriding it. This
-explains existing failures without fabricating a new observation, account proof
-or name; it does not prove permanent invisibility from every possible authority.
-Conversely, a strictly later validated route response showing success or a
-nonblocked failure withdraws the old inline paired-denial conclusion. A missing
-route, equal timestamp, generation change or recovery claim alone is not such a
-response. Freshness arbitration applies before component-state reduction.
+recomputes each opaque route key and validates timestamps. One reducer selects
+the latest applicable evidence independently for each operation, then emits a
+sender permission blocker only when both selected outcomes are precise denials.
+Neither route's timestamp controls the other route. At equal timestamps a
+precise denial takes precedence over uncertainty, timeout or empty success:
+these do not prove a later recovery. Strictly newer evidence may replace it.
+Admission decisions and absent observations (not_requested, unknown without a
+result, or failure.stage=not_requested) retain their diagnostic clocks but do
+not enter response ordering. In particular, a skip caused by an existing
+denial cannot erase that same denial. A failed command that was unavailable
+likewise does not prove a new remote attempt. Actual unclassified request
+failures and empty successful responses can still replace an older result.
+Missing/invalid/future clocks, generation changes and recovery claims alone
+provide no new event. Missing one stored route cannot discard a valid result
+for the other; the independent inline proof may supply the missing route.
+Malformed bound companion envelopes remain unknown rather than strengthening
+old permission evidence. This single reduction replaces both prior whole-pair
+checks; no older inline blockers are appended afterward. Valid names remain
+ready regardless of failed routes. No observation, account proof or name is
+manufactured, and the result does not prove permanent invisibility from every
+possible authority.
 
 For legacy records without renderer metadata, nonempty stored text is not proof
 of complete content. The read path must verify the source representation and

@@ -5,7 +5,7 @@ import { sentRecipientAccount, recipientAccountKey, resolveP2pRecipient } from '
 import { titleMessageMatches } from './chat-title.mjs';
 import { validateJsonObjectText } from '../../../dist/core/json-text-patch.js';
 import { readMessageAccountEvidence } from './message-account-evidence.mjs';
-import { readSenderNameRouteFailures } from './sender-name-observation.mjs';
+import { readSavedSenderRouteEvidence } from './saved-sender-route-failures.mjs';
 import { messageContentEvidence } from './message-content-evidence.mjs';
 
 /** @typedef {Record<string,any>} JsonObject */
@@ -110,37 +110,6 @@ function senderProjection(row, canonical, raw, saved) {
   return { ...base, name: known, source: known ? source : null };
 }
 
-/** Explain only a precisely bound pair of unavailable application routes. A
- * denied primary route says nothing about an unattempted/recoverable fallback.
- * @param {JsonObject} row @param {JsonObject} canonical @param {JsonObject} raw
- * @param {JsonObject} accountEvidence */
-function applicationPermissionBlockers(row, canonical, raw, accountEvidence) {
-  const observation = canonical.sender_name_verification;
-  const allowed = new Set(['observed_at','cached','account_key','status','reason','source','failure','name','route_failures']);
-  const identity = senderIdentity(raw);
-  const proof = readMessageAccountEvidence(row, canonical, raw);
-  if (!proof || accountEvidence.state !== 'verified' || proof.account_key !== accountEvidence.account_key
-    || !identity.verified || identity.conflict || identity.type !== 'app_id'
-    || identity.id !== row.actor_id || canonical.sender_id !== identity.id
-    || canonical.sender_id_type !== identity.type || !object(observation)
-    || Object.keys(observation).some(field => !allowed.has(field))
-    || observation.status !== 'failed' || observation.reason !== 'request_failed'
-    || !['application_api','chat_bot_app_id'].includes(observation.source) || observation.cached !== false
-    || observation.account_key !== proof.account_key || observation.name != null) return [];
-  const routes = readSenderNameRouteFailures(observation,{account_key:proof.account_key,
-    actor_id:identity.id,namespace:identity.type,chat_id:row.container_id});
-  const at = Date.parse(observation.observed_at);
-  if (!Number.isSafeInteger(at) || at < 0 || at > Date.now()
-    || new Date(at).toISOString() !== observation.observed_at
-    || !routes || !routes.routes.every(route=>route.status==='failed'
-      && route.failure?.kind==='permission_denied' && route.failure.code===210508
-      && route.failure.stage==='response_error')) return [];
-  return routes.routes.map(route=>({field:'sender',source_id:row.source_id,chat_id:row.container_id,
-    account_key:proof.account_key,id:identity.id,id_type:identity.type,
-    authority:route.operation==='application_info'?'application_api':'chat_bot_app_id',
-    reason:'permission_denied',code:210508}));
-}
-
 /** Pure normalized evidence for the shared completeness evaluator.
  * @param {JsonObject} row @param {JsonObject} canonical @param {JsonObject} raw
  * @param {JsonObject} display @param {JsonObject} options */
@@ -160,11 +129,8 @@ function messageProjectionEvidence(row, canonical, raw, display, options) {
     sender: senderProjection(row, canonical, raw, options.senderEvidence),
     recipient: recipient.evidence ? { ...recipient.evidence, reason: recipient.reason } : { reason: recipient.reason },
     content,
-    blockers: sourceIntegrity === 'valid' ? [
-      ...(options.routeEvidence?.supersedes_inline ? []
-        : applicationPermissionBlockers(row, canonical, raw, accountEvidence)),
-      ...(options.routeEvidence?.blockers || []),
-    ] : [],
+    blockers: sourceIntegrity === 'valid' ? (options.routeEvidence
+      || readSavedSenderRouteEvidence(row,canonical,raw,accountEvidence,undefined)).blockers : [],
   };
 }
 

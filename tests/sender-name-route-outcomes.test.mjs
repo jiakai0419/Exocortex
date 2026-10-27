@@ -49,7 +49,8 @@ for (const [mode,status,kind] of [['permission','failed','permission_denied'],['
     const result=producer(mode),envelope=readSenderNameRouteFailures(result.observation,binding);
     assert(envelope);assert.equal(envelope.account_key,ACCOUNT);assert.equal(envelope.target_key,senderNameRouteTargetKey(ACCOUNT,APP,CHAT));
     assert.match(envelope.attempt_key,/^[0-9a-f]{64}$/);assert.equal(result.observation.failure.code,210508);
-    assert.deepEqual(envelope.routes[0],{operation:'application_info',status:'failed',failure:result.observation.failure});
+    assert.equal(envelope.version,2);
+    assert.deepEqual(envelope.routes[0],{operation:'application_info',status:'failed',observed_at:new Date(AT).toISOString(),failure:result.observation.failure});
     assert.equal(envelope.routes[1].status,status);assert.equal(envelope.routes[1].failure?.kind??null,kind);
     assert.deepEqual(result.calls,mode==='skip'?['application_info']:['application_info','chat_bots']);
     assert.equal(envelope.routes.every(route=>route.status==='failed' && route.failure?.kind==='permission_denied'

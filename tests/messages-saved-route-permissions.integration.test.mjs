@@ -93,7 +93,9 @@ function data() {
     c.sender_name = 'Invented Adopted App'; c.sender_name_source = 'application_api'; c.sender_name_confidence = 'high'; c.sender_name_account_key = ACCOUNT;
   }); }, 'ready', null);
   add('explicit clear is not rewritten as permission', value => { edit(value.row, 'canonical_json', c => { c.sender_name_state = 'cleared'; }); }, 'blocked', 'name_explicitly_cleared');
-  add('newer unattempted fallback supersedes old denials', value => { edit(value.row, 'canonical_json', c => { c.sender_name_verification = observation(value.row); }); });
+  add('unattempted fallback cannot erase the stored denial that can cause its admission skip', value => {
+    edit(value.row, 'canonical_json', c => { c.sender_name_verification = observation(value.row); });
+  }, 'blocked', 'permission_denied');
   add('newer transient fallback supersedes old denials', value => { edit(value.row, 'canonical_json', c => { c.sender_name_verification = observation(value.row, 'transient'); }); });
   add('newer unresolved fallback supersedes old denials', value => { edit(value.row, 'canonical_json', c => { c.sender_name_verification = observation(value.row, 'unresolved'); }); });
   add('older unattempted fallback cannot erase current table denials', value => { edit(value.row, 'canonical_json', c => { c.sender_name_verification = observation(value.row, 'not_requested', ROUTE_AT - 1); }); }, 'blocked', 'permission_denied');
@@ -110,7 +112,8 @@ function data() {
     { nowMs: ROUTE_AT + 2000 }).row;
   });
   for (const result of ['recover_only', 'later_denial_then_recover', 'equal_success', 'older_success', 'missing_primary', 'foreign_fallback'])
-    add(`${result} cannot masquerade as a newer exact successful lookup`, value => {
+    add(result === 'missing_primary' ? 'valid inline primary combines with newer exact fallback despite absent table primary'
+      : `${result} cannot masquerade as a newer exact successful lookup`, value => {
       edit(value.row, 'canonical_json', c => { c.sender_name_verification = observation(value.row, 'permission', ROUTE_AT); });
       const descriptor = nameRouteDescriptor(task(value.row), 'chat_bots');
       if (result === 'recover_only') value.routes[1] = nextNameRouteState(descriptor, value.routes[1], { type: 'recover' }, { nowMs: ROUTE_AT + 1000 }).row;
@@ -125,7 +128,10 @@ function data() {
         null, { type: 'success' }, { nowMs: ROUTE_AT + 2000 }).row;
         if (result === 'missing_primary') value.routes.shift();
       }
-    }, 'blocked', 'permission_denied');
+    // The inline envelope already proves the primary. A missing table copy of
+    // that route cannot invalidate the fallback's independently exact result.
+    }, result === 'missing_primary' ? 'enriching' : 'blocked',
+      result === 'missing_primary' ? 'sender_name_missing' : 'permission_denied');
   add('latest exact denied stays selected at limit one', () => {}, 'blocked', 'permission_denied');
   return { entries, routes };
 }
