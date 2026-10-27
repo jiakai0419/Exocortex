@@ -1,6 +1,6 @@
 # Message completeness and identity consistency
 
-Design v0.8 — business-result and diagnostic-clock correction after the frozen 909951f execution-boundary review. Base 5631504dade6c0ce2092bdfa6f5811f0314f376a. New fixed-candidate full-tree validation and independent acceptance remain required. Production, services, permissions and API budgets remain unchanged. No push/deploy is authorized. All test inputs must be authored from scratch; never commit real or redacted business data.
+Design v0.9 — preserve root API codes with pure error metadata, independent transport kinds and existing retry headers after frozen 774026a full verification. Base 5631504dade6c0ce2092bdfa6f5811f0314f376a. New fixed-candidate full-tree validation and independent acceptance remain required. Production, services, permissions and API budgets remain unchanged. No push/deploy is authorized. All test inputs must be authored from scratch; never commit real or redacted business data.
 
 ## Goal
 
@@ -20,7 +20,7 @@ Main checkout: /tmp/exocortex-completeness-20261027-1SCjPK/repo, branch candidat
 
 Each route writes design before code and updates actual behavior/limits afterward. Shared interface changes go through this file first. Main-owned module changes must not be duplicated by another route.
 
-### Execution evidence correction (v0.8, integrated; final verification pending)
+### Execution evidence correction (v0.9, integrated; final verification pending)
 
 The actual command boundary must distinguish an invocation attempt, a child that
 actually executed, and a validated remote result. An incremented attempt counter
@@ -105,6 +105,14 @@ unchanged. A custom runner that reports an execution callback and
 then returns a business failure retains that receipt through the coordinator
 guard. Development probes separately preserve their captured first output and
 parse validity; a non-JSON version-output exception cannot waive an API failure.
+A numeric root API code may coexist with an error metadata object that has no
+own type/code or recognized transport tag. Explicit local/network claims or an
+untyped nested code remain outside this compatibility rule. Network/timeout/rate
+transport tags keep their own finite transport kind without borrowing a root API
+code or prose. The existing fixed retry-header line remains independent duration
+evidence across output streams, without changing classification, request budgets
+or retry policy. An untyped nested error is counted as a general failed lookup,
+not proved permission denial; this conservative boundary is retained in tests.
 
 For a version 2 failure, top-level/route observed_at records the local diagnostic
 observation time. The separate execution.result_at_ms retains the earlier actual

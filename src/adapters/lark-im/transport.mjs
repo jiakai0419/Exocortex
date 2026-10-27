@@ -325,13 +325,26 @@ function businessResultFailure(envelope, original) {
   if (!failed) return {failed:false,remote:false,failure:original};
   const error = envelope?.error;
   const typedApi = error && typeof error === 'object' && !Array.isArray(error) && error.type === 'api';
-  const numeric = value => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
-  const code = typedApi ? numeric(error.code) : error == null && envelope?.code !== 0 ? numeric(envelope?.code) : null;
-  const remote = Boolean(typedApi || error == null && code !== null);
   const typedTransport = error && typeof error === 'object' && !Array.isArray(error)
-    && (error.type === 'network' || error.subtype === 'rate_limit');
+    && !typedApi && (error.type === 'network' || error.subtype === 'rate_limit');
+  const numeric = value => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
+  // A root API code may accompany purely additional error metadata (for
+  // example rate_limit_reset). Such metadata has no competing type/code claim.
+  // Explicit type or nested code, including malformed values, stays outside
+  // this compatibility branch and cannot borrow authority from the root.
+  const rootCodeAllowed = error == null || typeof error === 'object' && !Array.isArray(error)
+    && !typedTransport && !Object.hasOwn(error,'type') && !Object.hasOwn(error,'code');
+  const code = typedApi ? numeric(error.code) : rootCodeAllowed && envelope?.code !== 0 ? numeric(envelope?.code) : null;
+  const remote = Boolean(typedApi || rootCodeAllowed && code !== null);
   const unknown = {...original,kind:/** @type {LarkFailureKind} */('unknown'),code:null,transient:false,message:'unknown'};
-  if (!remote) return {failed:true,remote:false,failure:typedTransport ? {...original,code:null} : unknown};
+  if (!remote) {
+    // Explicit transport tags describe this local/transport result itself.
+    // Root API codes and contradictory prose cannot turn them into permission.
+    const transportKind = typedTransport ? error.subtype === 'rate_limit' ? 'rate_limited'
+      : error.subtype === 'timeout' ? 'network_timeout' : 'network_error' : null;
+    return {failed:true,remote:false,failure:transportKind ? {...original,
+      kind:/** @type {LarkFailureKind} */(transportKind),code:null,transient:true,message:transportKind.replaceAll('_',' ')} : unknown};
+  }
   if (code === null) return {failed:true,remote:true,failure:unknown};
   const knownDenial = code === 210508 ? 'permission_denied' : code === 231203 ? 'restricted_mode'
     : code === 230002 ? 'bot_user_out_of_chat' : null;
@@ -488,6 +501,9 @@ function createLarkCliRunner({
       const envelope = declaresBusinessFailure(stderrEnvelope) ? stderrEnvelope
         : declaresBusinessFailure(stdoutEnvelope) ? stdoutEnvelope : null;
       const originalFailure = classifyLarkFailure(envelope ? JSON.stringify(envelope) : spawnFailureText(result));
+      // Retry duration also has an existing independent fixed-header channel.
+      // Preserve it without letting the other stream change kind/code.
+      if (envelope) originalFailure.retry_after_ms = extractRetryAfterMs(envelope,spawnFailureText(result));
       const business = businessResultFailure(envelope,originalFailure);
       const failure = business.failure;
       lastFailure = business.failed ? failure : null;

@@ -1177,7 +1177,7 @@ for (const [label, bots, expectedSource] of [
 
 test("shared transport preserves permission and ambiguity counts with opt-in app diagnostics", (t) => {
   const fixture = enrichmentFixture(t, {
-    applicationError: JSON.stringify({ error: { code: 210508, message: "Permission denied invented private diagnostic" } }),
+    applicationError: JSON.stringify({ error: { type: "api", code: 210508, message: "Permission denied invented private diagnostic" } }),
     botResponse: { items: [{ bot_name: "Synthetic First Bot" }, { bot_name: "Synthetic Second Bot" }] },
     record: { sender: { id: LAB.app.id, sender_type: "app" },
       canonical: { chat_name: LAB.room.name, sender_name: LAB.app.name,
@@ -1193,6 +1193,32 @@ test("shared transport preserves permission and ambiguity counts with opt-in app
   assert.equal(summary.app_probe.results[0].app_id, LAB.app.id);
   assert.equal(summary.app_probe.results[0].code, 210508);
   assert.equal(summary.app_probe.results[0].status, "permission_denied");
+  assert.equal(summary.unsafe_details.app_fallback_errors[0].pending_app_ids, 1);
+  assert.equal(summary.unsafe_details.app_fallback_errors[0].bot_candidates, 2);
+  assert.doesNotMatch(result.stdout, /invented private diagnostic/);
+  assert.deepEqual(readRecords(fixture.dbPath), before);
+});
+
+test("an untyped application error remains a general failure without permission authority", (t) => {
+  const fixture = enrichmentFixture(t, {
+    applicationError: JSON.stringify({ error: { code: 210508, message: "Permission denied invented private diagnostic" } }),
+    botResponse: { items: [{ bot_name: "Synthetic First Bot" }, { bot_name: "Synthetic Second Bot" }] },
+    record: { sender: { id: LAB.app.id, sender_type: "app" },
+      canonical: { chat_name: LAB.room.name, sender_name: LAB.app.name,
+        sender_name_source: "application_api", sender_name_confidence: "high" } },
+  });
+  const before = readRecords(fixture.dbPath);
+  const result = runEnrichment(fixture, ["--probe-apps", "--unsafe-details"]);
+  assert.equal(result.status, 0, result.stderr);
+  const summary = JSON.parse(result.stdout);
+  assert.equal(summary.app_lookup_failures, 1);
+  assert.equal(summary.app_lookup_permission_denied, 0);
+  assert.equal(summary.app_lookup_other_failures, 1);
+  assert.equal(summary.app_fallback_ambiguous, 1);
+  assert.equal(summary.app_fallback_failures, 0);
+  assert.equal(summary.app_probe.results[0].app_id, LAB.app.id);
+  assert.equal(summary.app_probe.results[0].code, null);
+  assert.equal(summary.app_probe.results[0].status, "failed");
   assert.equal(summary.unsafe_details.app_fallback_errors[0].pending_app_ids, 1);
   assert.equal(summary.unsafe_details.app_fallback_errors[0].bot_candidates, 2);
   assert.doesNotMatch(result.stdout, /invented private diagnostic/);

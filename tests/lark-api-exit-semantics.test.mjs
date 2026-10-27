@@ -145,3 +145,69 @@ for(const [code,kind]of [[210508,'permission_denied'],[231203,'restricted_mode']
   assert.equal(receipt.result_kind,kind);assert.equal(receipt.result_code,code);assert.equal(receipt.remote_result,true);
   assert.match(error.message,new RegExp(`kind=${kind} code=${code}(?: |$)`));
  });
+
+
+for(const status of [0,1])for(const metadata of [{rate_limit_reset:60},{}])
+ test(`root rate code retains same-root pure metadata at exit ${status}`,()=>{
+  let calls=0;const state=createTransportState();
+  const run=createLarkCliRunner({state,clock:()=>RESULT,monotonicClock:()=>0,writeSharedCooldown:()=>true,
+   spawn(){calls++;return {...output(status,{code:99991400,msg:'request rate limit',error:metadata}),stderr:'HTTP 429'};}});
+  const error=capture(()=>run(args,{retries:0}));const receipt=readLarkExecutionReceipt(error,'application_info').value;
+  assert.equal(calls,1);assert.equal(receipt.result_kind,'rate_limited');assert.equal(receipt.result_code,99991400);assert.equal(receipt.remote_result,true);
+  assert.equal(getTransportStats(state,RESULT).rate_limits,1);assert.match(error.message,/kind=rate_limited code=99991400/);
+ });
+
+for(const status of [0,1])for(const errorMetadata of [{type:'local'},{type:'network'},{type:null},{type:42},
+ {code:210508},{code:'210508'},{code:null},{code:-1},{code:Number.MAX_SAFE_INTEGER+1},[]])
+ test(`root code cannot supply API authority through explicit or invalid nested claims at exit ${status}: ${JSON.stringify(errorMetadata)}`,()=>{
+  const run=createLarkCliRunner({state:createTransportState(),clock:()=>RESULT,monotonicClock:()=>0,
+   spawn:()=>output(status,{code:210508,error:errorMetadata})});
+  const error=capture(()=>run(args));const receipt=readLarkExecutionReceipt(error,'application_info').value;
+  assert.equal(receipt.remote_result,false);assert.equal(receipt.result_code,null);
+ });
+
+for(const code of ['99991400',-1,Number.MAX_SAFE_INTEGER+1])test(`pure metadata cannot validate an invalid root code ${code}`,()=>{
+ const run=createLarkCliRunner({state:createTransportState(),clock:()=>RESULT,monotonicClock:()=>0,
+  spawn:()=>output(0,{code,error:{rate_limit_reset:60}})});
+ const error=capture(()=>run(args));const receipt=readLarkExecutionReceipt(error,'application_info').value;
+ assert.equal(receipt.result_kind,'unknown');assert.equal(receipt.result_code,null);assert.equal(receipt.remote_result,false);
+});
+
+
+for(const [tag,kind]of [[{type:'network'},'network_error'],[{type:'network',subtype:'timeout'},'network_timeout'],
+ [{subtype:'rate_limit'},'rate_limited']])for(const rootCode of [210508,231203,230002])for(const status of [0,1])
+ test(`typed ${kind} cannot borrow root denial ${rootCode} at exit ${status}`,()=>{
+  let calls=0;const state=createTransportState();
+  const run=createLarkCliRunner({state,clock:()=>RESULT,monotonicClock:()=>0,writeSharedCooldown:()=>true,
+   spawn(){calls++;return output(status,{code:rootCode,error:{...tag,message:'permission denied Restricted Mode'}});}});
+  const error=capture(()=>run(args,{retries:0}));const receipt=readLarkExecutionReceipt(error,'application_info').value;
+  assert.equal(calls,1);assert.equal(receipt.result_kind,kind);assert.equal(receipt.result_code,null);assert.equal(receipt.remote_result,false);
+  assert.match(error.message,new RegExp(`kind=${kind}(?: |$)`));assert.doesNotMatch(error.message,/(?:^| )code=(?:210508|231203|230002)(?: |$)/);
+ });
+
+for(const [tag,kind]of [[{type:'network'},'network_error'],[{type:'network',subtype:'timeout'},'network_timeout'],
+ [{subtype:'rate_limit'},'rate_limited']])test(`typed ${kind} still uses the established bounded retry path`,()=>{
+ let calls=0,wall=RESULT,elapsed=0;const state=createTransportState();
+ const run=createLarkCliRunner({state,clock:()=>wall,monotonicClock:()=>elapsed,
+  sleep(ms){wall+=ms;elapsed+=ms;},spawn(){calls++;return calls===1?output(0,{code:210508,error:{...tag,message:'permission denied'},
+   headers:{'x-ogw-ratelimit-reset':'0.001'}}):output(0,{code:0,app:{app_id:APP,app_name:'Invented Recovered App'}});}});
+ assert.equal(run(args,{retries:1,retryDelayMs:1,retryBudgetMs:20}).app.app_name,'Invented Recovered App');
+ assert.equal(calls,2);assert.equal(getTransportStats(state,wall).retries,1);
+});
+
+
+for(const status of [0,1])for(const [header,expected]of [
+ ['x-ogw-ratelimit-reset: 60',60000],['X-Ogw-Ratelimit-Reset: 60',60000],
+ ['prefix x-ogw-ratelimit-reset: 60',30000],['x-ogw-ratelimit-reset: NaN',30000],
+ ['x-ogw-ratelimit-reset: -1',30000],['x-ogw-ratelimit-reset: 60seconds',30000],
+])test(`rate ${status} preserves only fixed independent header ${header}`,()=>{
+ let calls=0;const state=createTransportState();
+ const run=createLarkCliRunner({state,clock:()=>RESULT,monotonicClock:()=>0,writeSharedCooldown:()=>true,
+  sleep:()=>assert.fail('cooldown exceeds finite retry budget'),spawn(){calls++;return {...output(status,{code:99991400,error:{rate_limit_reset:60}}),stderr:header};}});
+ const error=capture(()=>run(args,{retries:1,retryBudgetMs:1000}));
+ const receipt=readLarkExecutionReceipt(error,'application_info').value,stats=getTransportStats(state,RESULT);
+ assert.equal(calls,1);assert.equal(receipt.result_kind,'rate_limited');assert.equal(receipt.result_code,99991400);assert.equal(receipt.remote_result,true);
+ assert.equal(stats.cooldowns_by_operation.application_info,RESULT+expected);
+ assert.equal(stats.max_retry_after_ms,expected===60000?60000:0);
+ assert.match(error.message,new RegExp(expected===60000?'retry_after_ms=60000 retry_after_source=header':'retry_after_source=fallback'));
+});

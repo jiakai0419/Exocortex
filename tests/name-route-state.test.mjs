@@ -90,11 +90,16 @@ function transportError(stderr, args = ['contact', '+search-user'], spawnExtras 
 }
 
 test('actual transport producer formats are accepted without remote/private strings', () => {
-  const denied = transportError(JSON.stringify({ error: { code: 210508, message: 'synthetic private prose' } }),
+  const denied = transportError(JSON.stringify({ error: { type: 'api', code: 210508, message: 'synthetic private prose' } }),
     ['api', 'GET', '/open-apis/application/v6/applications/synthetic-app']);
   assert.equal(denied.attempts, 1);
   assert.deepEqual(classifyNameRouteFailure(denied.error, 'application_info'),
     { kind: 'permission_denied', code: 210508, retryAfterMs: null });
+  const untyped = transportError(JSON.stringify({ error: { code: 210508, message: 'synthetic private prose' } }),
+    ['api', 'GET', '/open-apis/application/v6/applications/synthetic-app']);
+  assert.equal(untyped.attempts, 1);
+  assert.deepEqual(classifyNameRouteFailure(untyped.error, 'application_info'),
+    { kind: 'unknown', code: null, retryAfterMs: null }, 'untyped nested code is not proof of an API refusal');
   const rate = transportError(JSON.stringify({ code: 99991400, headers: { 'x-ogw-ratelimit-reset': '7' } }));
   assert.deepEqual(classifyNameRouteFailure(rate.error, 'contact_search'),
     { kind: 'rate_limited', code: 99991400, retryAfterMs: 7000 });
