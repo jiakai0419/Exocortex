@@ -19,7 +19,7 @@ import { nameRecordFence, nameEffects, nameFence, nameStateKey, nameRowBytesSql,
 import { runLark, transportOperation } from './transport.mjs';
 import { selectNameWork } from './name-work-policy.mjs';
 import { nameRouteDescriptor, nextNameRouteState } from './name-route-state.mjs';
-import { readLarkExecutionReceipt, validateLarkExecutionReceipt } from './transport-execution.mjs';
+import { readLarkExecutionReceipt, validateLarkExecutionReceipt, formatLarkExecutionReceipt } from './transport-execution.mjs';
 
 const PAGE = 40, MAX_CALLS = 4, BUDGET_MS = 10_000, INTERVAL_MS = 60_000;
 class NameBudgetError extends Error {}
@@ -105,12 +105,13 @@ function syncNames(db, self, deps = {}) {
       const result = (deps.runLark || runLark)(args,{...options,retries:0,timeoutMs:Math.min(5000,left),retryBudgetMs:left,maxBufferBytes:2*1024*1024,
         onExecutionReceipt(value) {
           receiptSeen = true;
-          executionReceipt = validateLarkExecutionReceipt(value) ? value : null;
+          executionReceipt = validateLarkExecutionReceipt(value) ? { ...value } : null;
           try { options.onExecutionReceipt?.(value); } catch { /* Optional observation cannot affect transport. */ }
         }});
       if (result && (result.error != null || result.ok === false || result.success === false || result.code !== undefined && result.code !== 0)) {
         const code = Number.isSafeInteger(result.code) && result.code >= 0 ? ` code=${result.code}` : '';
-        throw new Error(`lark-cli failed: kind=unknown${code} operation=${transportOperation(args)}`);
+        const receipt = !receiptSeen ? '' : executionReceipt ? ` ${formatLarkExecutionReceipt(executionReceipt)}` : ' receipt_v=invalid';
+        throw new Error(`lark-cli failed: kind=unknown${code} operation=${transportOperation(args)}${receipt}`);
       }
       recordRoute(entry, { type: 'success', ...(receiptSeen ? { execution: executionReceipt } : {}) });
       return result;

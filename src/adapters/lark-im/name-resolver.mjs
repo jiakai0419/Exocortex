@@ -195,7 +195,9 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
   function observe(key, value) {
     observations.delete(key);
     const observedNow = now();
-    const actualAt = value.failure?.version === 2 ? value.failure.execution?.result_at_ms
+    // A v2 failure can describe a later local retry/cleanup error. Its local
+    // diagnostic clock is independent from execution.result_at_ms.
+    const actualAt = value.failure?.version === 2 ? null
       : latestExecution?.execution === 'started' ? latestExecution.result_at_ms : null;
     const actualClock = Number.isSafeInteger(actualAt) && actualAt >= 0 && actualAt <= observedNow;
     const observed = { observed_at: new Date(actualClock ? actualAt : observedNow).toISOString(), cached: false,

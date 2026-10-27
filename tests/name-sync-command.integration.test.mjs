@@ -93,7 +93,9 @@ if (process.argv[2] === '--synthetic-remote') {
   const db = join(dir, 'synthetic.sqlite'), directory = join(dir, 'api-state'), bin = join(dir, 'fake-lark');
   assert(inside(dir, db) && inside(dir, bin));
   const state = createTransportState();
-  const remote = createLarkCliRunner({ bin, state,
+  // The test advances coordinator wall time between process phases. Keep
+  // receipt/cooldown wall time on that same seam; process budgets remain real.
+  const remote = createLarkCliRunner({ bin, state, clock: () => nowMs,
     readSharedCooldown: opts => readSharedLarkCooldown(opts, { directory }),
     writeSharedCooldown: opts => writeSharedLarkCooldown(opts, { directory }),
   });

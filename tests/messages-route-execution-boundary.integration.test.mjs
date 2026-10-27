@@ -76,11 +76,24 @@ const stages = [
   ['after_timeout_shared_wait_intermediate_denial', 'blocked', 'started'],
 ].map(([mode, state, execution]) => ({ mode, state, execution, stage: true, path: 'inline', side: 'fallback',
   label: `independent execution stage: ${mode}`, denialAt: mode.includes('intermediate_denial') ? RESULT + 50 : OLD }));
+const envelopes = [
+  ...[[1, 1], [1, 0], [0, 1], [0, 0]].map(exitCodes => ({ response: 'permission', bothRoutes: true, exitCodes,
+    side: 'fallback', path: 'inline', prior: false, state: 'blocked', label: `same structured API denial at process exits ${exitCodes.join('/')}` })),
+  ...[0, 1].map(exit => ({ response: 'permission', exitCodes: [exit, exit], side: 'fallback', path: 'saved', state: 'blocked',
+    label: `saved API denial survives process exit ${exit}` })),
+  ...[0, 1].map(exit => ({ response: 'success', exitCodes: [exit, exit], side: 'primary', path: 'inline', prior: false,
+    state: exit === 0 ? 'ready' : 'enriching', expectedName: 'Invented Exact Envelope App', label: `exact named success with process exit ${exit}` })),
+  ...['nonzero_code', 'ok_false', 'success_false', 'error_without_code'].flatMap(response => [0, 1].map(exit => ({ response,
+    exitCodes: [exit, exit], side: 'primary', path: 'inline', prior: false, state: 'enriching',
+    label: `${response} with stale exact-name payload cannot be adopted at process exit ${exit}` }))),
+  ...['string_code', 'negative_code', 'unsafe_code'].map(response => ({ response, exitCodes: [0, 0], side: 'primary',
+    path: 'inline', prior: false, state: 'enriching', label: `${response} cannot manufacture numeric API authority or adopt a stale name` })),
+].map(spec => ({ ...spec, mode: 'response_envelope' }));
 
 function stageTransportProbe(spec) {
   const mode = spec.mode.replace('_intermediate_denial', ''), target = 'chat_bots', state = createTransportState();
   let active = '', wall = OLD + 100, elapsed = 0, monotonicCalls = 0, sharedCalls = 0, launches = 0;
-  const trace = [], errors = new Map(), receipts = new Map(), targetActive = () => active === target, after = () => launches > 0;
+  const trace = [], errors = new Map(), receipts = new Map(), catchClocks = new Map(), targetActive = () => active === target, after = () => launches > 0;
   const transport = createLarkCliRunner({ bin: 'invented-stage-cli', state, clock: () => wall,
     monotonicClock: () => {
       if (!targetActive()) return 0;
@@ -120,15 +133,16 @@ function stageTransportProbe(spec) {
     active = transportOperation(args); wall = targetActive() ? RESULT - 100 : OLD + 100;
     try { return transport(args, { ...options, retries: 1, retryBudgetMs: 1000, retryDelayMs: mode === 'after_timeout_sleep_throw' ? 10 : 0,
       onExecutionReceipt: value => { receipts.set(active, { status: 'valid', value }); options.onExecutionReceipt?.(value); } }); }
-    catch (error) { errors.set(active, error); receipts.set(active, readLarkExecutionReceipt(error, active)); throw error; }
+    catch (error) { errors.set(active, error); receipts.set(active, readLarkExecutionReceipt(error, active)); catchClocks.set(active, wall); throw error; }
   };
-  return { run, trace, errors, receipts, target, state, clock: () => wall };
+  return { run, trace, errors, receipts, catchClocks, target, state, clock: () => wall };
 }
 
 function transportProbe(spec, actor, chat) {
   const target = spec.side === 'primary' ? OPS[0] : OPS[1], state = createTransportState();
   let active = '', wall = RESULT, elapsed = 0, targetLaunches = 0, targetResults = 0, resultWallReads = 0;
-  const trace = [], errors = new Map(), receipts = new Map();
+  const trace = [], errors = new Map(), receipts = new Map(), catchClocks = new Map();
+  const observationClock = () => spec.response ? LOCAL : Number.isFinite(wall) ? wall : LOCAL;
   const targetActive = () => active === target;
   const afterResult = () => targetActive() && targetResults > 0;
   const localThrow = () => { wall = LOCAL; throw Error('Invented local boundary exception'); };
@@ -169,6 +183,19 @@ function transportProbe(spec, actor, chat) {
         return { pid: 0, status: null, error: { code: spec.mode === 'spawn_enoent' ? 'ENOENT' : spec.mode === 'spawn_eacces' ? 'EACCES' : 'SYNTHETIC_START_ERROR' }, stdout: '', stderr: '' };
       trace.push({ event: 'started', operation });
       if (targetActive()) targetResults++;
+      if (spec.response && (spec.bothRoutes || targetActive())) {
+        const app = { app_id: actor, app_name: 'Invented Exact Envelope App' };
+        const body = spec.response === 'permission' ? { error: { type: 'api', code: 210508 } }
+          : spec.response === 'success' ? { code: 0, app }
+            : spec.response === 'nonzero_code' ? { code: 123456, app }
+              : spec.response === 'string_code' ? { code: '210508', app }
+                : spec.response === 'negative_code' ? { code: -210508, app }
+                  : spec.response === 'unsafe_code' ? { code: Number.MAX_SAFE_INTEGER + 1, app }
+              : spec.response === 'ok_false' ? { ok: false, app }
+                : spec.response === 'success_false' ? { success: false, app }
+                  : { error: { message: 'Invented business failure without a numeric code' }, app };
+        return { pid: 4242, status: spec.exitCodes[OPS.indexOf(operation)], stdout: JSON.stringify(body), stderr: '' };
+      }
       if (targetActive() && ['timeout', 'timeout_no_pid', 'network_error'].includes(spec.mode)) return {
         ...(spec.mode === 'timeout_no_pid' ? {} : { pid: 4242 }), status: null,
         error: { code: spec.mode === 'network_error' ? 'ECONNRESET' : 'ETIMEDOUT' }, stdout: '', stderr: '' };
@@ -186,9 +213,9 @@ function transportProbe(spec, actor, chat) {
     active = transportOperation(args); wall = RESULT; elapsed = 0;
     try { return transport(args, { ...options, retries: targetActive() && spec.mode.startsWith('retry_') ? 1 : 0, retryBudgetMs: 1000, retryDelayMs: 1,
       onExecutionReceipt: value => { receipts.set(active, { status: 'valid', value }); options.onExecutionReceipt?.(value); } }); }
-    catch (error) { errors.set(active, error); receipts.set(active, readLarkExecutionReceipt(error, active)); throw error; }
+    catch (error) { errors.set(active, error); receipts.set(active, readLarkExecutionReceipt(error, active)); catchClocks.set(active, observationClock()); throw error; }
   };
-  return { run, trace, errors, receipts, target, state, clock: () => Number.isFinite(wall) ? wall : LOCAL,
+  return { run, trace, errors, receipts, catchClocks, target, state, clock: observationClock,
     targetLaunches: () => targetLaunches, targetResults: () => targetResults };
 }
 
@@ -276,7 +303,7 @@ async function acceptance(t, specs) {
   assert.deepEqual(rows.map(row => row.id), expectedRows.map(row => row.id));
   for (const [index, value] of ordered.entries()) await t.test(value.label, () => {
     const got = rows[index], p = value.probe, receipt = p.receipts.get(p.target);
-    if (!value.nativeName && value.mode !== 'empty_success') {
+    if (!value.response && !value.nativeName && value.mode !== 'empty_success') {
       assert.equal(receipt?.status, 'valid', `${value.label}: finite execution receipt`);
       assert.deepEqual(readLarkExecutionReceipt(p.errors.get(p.target).message, p.target), receipt, 'receipt survives the existing string boundary');
       const expectedStarted = value.execution ? value.execution === 'started' : value.state === 'enriching' && value.prior !== false || value.mode === 'api_denial';
@@ -301,6 +328,50 @@ async function acceptance(t, specs) {
         assert.deepEqual(failure.execution, receipt.value, 'local diagnostic persists the bounded actual-result receipt');
       }
     }
+    if (value.response) {
+      assert.equal(receipt?.status, 'valid'); assert.equal(receipt.value.execution, 'started');
+      assert.equal(receipt.value.result_at_ms, RESULT, 'JSON/exit interpretation does not retimestamp the result');
+      if (value.response === 'permission') {
+        assert.equal(receipt.value.result_kind, 'permission_denied'); assert.equal(receipt.value.result_code, 210508);
+        assert.equal(receipt.value.remote_result, true);
+        if (value.path === 'inline') {
+          const observation = JSON.parse(value.row.canonical_json).sender_name_verification;
+          assert.equal(observation.route_failures.routes.length, 2);
+          for (const route of observation.route_failures.routes) {
+            assert.equal(route.status, 'failed'); assert.equal(route.failure?.version, 2);
+            assert.equal(route.failure.kind, 'permission_denied'); assert.equal(route.failure.code, 210508);
+            assert.deepEqual(route.failure.execution, p.receipts.get(route.operation).value);
+          }
+        } else {
+          const saved = value.routes.find(route => route.operation === p.target);
+          assert.equal(saved.failure_kind, 'permission_denied'); assert.equal(saved.failure_code, 210508);
+          assert.equal(saved.last_attempt_at_ms, RESULT);
+        }
+      } else if (value.response === 'success' && value.exitCodes[0] === 0) {
+        assert.equal(receipt.value.result_kind, 'success'); assert.equal(p.errors.has(p.target), false);
+        assert.equal(got.canonical.sender_name, value.expectedName);
+      } else {
+        assert.notEqual(receipt.value.result_kind, 'success', 'business failure and failed process cannot masquerade as a successful name lookup');
+        assert.notEqual(got.canonical.sender_name, 'Invented Exact Envelope App');
+        assert.notEqual(receipt.value.result_kind, 'permission_denied', 'an unclassified business failure grants no permission-denial authority');
+        if (['string_code', 'negative_code', 'unsafe_code'].includes(value.response)) {
+          assert.equal(receipt.value.result_code, null); assert.equal(receipt.value.remote_result, false);
+        }
+      }
+    }
+    if (value.path === 'inline' && !value.nativeName) {
+      const observation = JSON.parse(value.row.canonical_json).sender_name_verification;
+      for (const route of observation?.route_failures?.routes || []) {
+        if (route.failure?.version !== 2 || !p.catchClocks.has(route.operation)) continue;
+        assert.equal(route.observed_at, new Date(p.catchClocks.get(route.operation)).toISOString(),
+          'each route retains its actual local diagnostic time independently of the execution-result time');
+        assert.deepEqual(route.failure.execution, p.receipts.get(route.operation).value);
+      }
+      if (observation?.failure?.version === 2 && p.catchClocks.has(observation.failure.operation)) {
+        assert.equal(observation.observed_at, new Date(p.catchClocks.get(observation.failure.operation)).toISOString(),
+          'selected diagnostic retains its catch clock while consumers sort by receipt.result_at_ms');
+      }
+    }
     if (value.mode === 'empty_success') {
       assert.equal(receipt?.status, 'valid', 'successful JSON carries execution evidence through the optional callback');
       assert.equal(receipt.value.result_kind, 'success'); assert.equal(receipt.value.result_at_ms, RESULT);
@@ -312,7 +383,7 @@ async function acceptance(t, specs) {
     assert.equal(got.readiness.next_action, value.state === 'blocked' ? 'review_permissions' : value.state === 'enriching' ? 'resolve_sender' : 'none');
     const start = text.indexOf(header(value.row)), end = text.indexOf(header(expectedRows[index + 1])); assert(start >= 0 && end > start);
     const block = text.slice(start, end).trimEnd();
-    if (value.state === 'ready') assert(block.includes(value.row.body) && block.includes('Invented Native Boundary App'));
+    if (value.state === 'ready') assert(block.includes(value.row.body) && block.includes(value.expectedName || 'Invented Native Boundary App'));
     else assert.equal(block, `${header(value.row)}\n  状态    ${value.state === 'blocked' ? '准备受阻' : '等待完整信息'}\n  原因    ${value.state === 'blocked' ? '来源权限不足' : '发送人名称待补全'}\n  查看    messages --format json 可检查已保存内容与原因`);
   });
   for (const [index, row] of f.neighbors.entries()) {
@@ -331,6 +402,7 @@ test('the independent twelve preexecution expectations hold through actual trans
 test('every local execution boundary preserves distinct diagnostics and actual results in CLI', t => acceptance(t, extended));
 test('local failures neither invent prior denial nor demote an already valid name', t => acceptance(t, controls));
 test('all twenty-five independent execution-stage and intermediate-denial expectations remain exact', t => acceptance(t, stages));
+test('structured API and business failures retain their meaning across zero and nonzero process exits', t => acceptance(t, envelopes));
 
 test('real name synchronization never publishes provisional recovery when the target command did not start', t => {
   const spec = { mode: 'api_denial', side: 'fallback', path: 'saved', state: 'blocked', label: 'persisted recovery witness' };
@@ -367,4 +439,53 @@ test('real name synchronization never publishes provisional recovery when the ta
   const readBefore = snapshot(f), got = JSON.parse(messages(f, 'json')).find(row => row.id === targetRow.id);
   assert.equal(got.readiness.state, 'blocked'); assert.equal(got.readiness.next_action, 'review_permissions');
   assert.deepEqual(snapshot(f), readBefore, 'displaying recovery debt remains read-only');
+});
+
+for (const invalidCallback of [false, true]) test(`real coordinator preserves callback provenance across a returned business failure (${invalidCallback ? 'invalid receipt' : 'copied valid receipt'})`, t => {
+  const f = fixture(t, [{ mode: 'shared_unavailable', side: 'fallback', path: 'inline', prior: false,
+    state: 'enriching', label: 'fresh synthetic coordinator witness' }]), target = f.entries[0].row;
+  const owner = recordFromMessage(normalizeApiMessage({ message_id: 'om_synthetic_envelope_self_binding',
+    chat_id: 'oc_synthetic_envelope_self_room', chat_type: 'group', chat_name: TITLE, msg_type: 'text',
+    create_time: String(AT - 4000), update_time: String(AT - 3999),
+    sender: { id: SELF.open_id, id_type: 'open_id', sender_type: 'user', name: SELF.name },
+    body: { content: JSON.stringify({ text: 'Invented complete envelope owner binding.' }) } }), 'lark.im.sent_by_me', 'sent');
+  sqliteExec(f.db, insert('records', { ...owner, id: 3000 }));
+  const before = readOnlySqliteJson(f.db, 'SELECT * FROM records ORDER BY id;', 'synthetic before returned failure');
+  const callbackOperations = [], started = [];
+  const transport = createLarkCliRunner({ state: createTransportState(), clock: () => RESULT, monotonicClock: () => 0,
+    spawn: (_bin, args) => { started.push(transportOperation(args)); return { pid: 4242, status: 0,
+      stdout: JSON.stringify({ error: { type: 'api', code: 210508 } }), stderr: '' }; } });
+  const result = syncNames(f.db, SELF, { now: () => LOCAL + 1000, monotonicNow: () => 0,
+    syncRecipients: () => ({ reason: 'idle' }), runLark: (args, options) => {
+      const operation = transportOperation(args); if (operation === 'self_profile') return SELF;
+      try {
+        transport(args, { ...options, retries: 0, onExecutionReceipt: receipt => {
+          const forwarded = invalidCallback ? { ...receipt, unexpected: true } : receipt;
+          callbackOperations.push(operation); options.onExecutionReceipt?.(forwarded);
+          // Mutation after the receiver runs cannot rewrite what it observed.
+          forwarded.result_kind = 'success'; forwarded.result_code = null; forwarded.remote_result = false;
+        } });
+      } catch { /* This authored adapter returns the same business failure. */ }
+      return { code: 210508, app: { app_id: target.actor_id, app_name: 'Invented stale business name' } };
+    } });
+  assert.equal(result.attempted, 1, JSON.stringify(result)); assert.deepEqual(started, OPS); assert.deepEqual(callbackOperations, OPS);
+  const routes = readOnlySqliteJson(f.db, 'SELECT * FROM lark_im_name_routes ORDER BY operation;', 'synthetic returned failure routes');
+  if (invalidCallback) assert.equal(routes.length, 0, 'invalid callback cannot fall through to fabricated legacy route evidence');
+  else {
+    assert.equal(routes.length, 2);
+    for (const route of routes) {
+      assert.equal(route.failure_kind, 'permission_denied'); assert.equal(route.failure_code, 210508);
+      assert.equal(route.last_attempt_at_ms, RESULT, 'guard reconstruction preserves the original actual-result clock');
+      assert.equal(route.blocked, 1);
+    }
+  }
+  assert.deepEqual(readOnlySqliteJson(f.db, 'SELECT * FROM records ORDER BY id;', 'synthetic after returned failure'), before);
+  const readBefore = snapshot(f), rows = JSON.parse(messages(f, 'json')), got = rows.find(row => row.id === target.id);
+  assert.equal(got.readiness.state, invalidCallback ? 'enriching' : 'blocked');
+  assert.equal(got.body, target.body); assert.equal(got.raw_json, target.raw_json);
+  const text = messages(f, 'text'); assert(text.includes(header(target)));
+  assert(text.includes(invalidCallback ? '发送人名称待补全' : '来源权限不足'));
+  const quality = JSON.parse(run(f, ['--input-type=module', '-e', `import {collectQualityReport} from ${JSON.stringify(pathToFileURL(join(ROOT, 'src/diagnostics/lark-im-quality-report.mjs')).href)};process.stdout.write(JSON.stringify(collectQualityReport(process.argv[1])));`, f.db]));
+  const counts = { captured: 0, enriching: 0, ready: 0, blocked: 0 }; for (const row of rows) counts[row.readiness.state]++;
+  assert.deepEqual(quality.completeness.counts, counts); assert.deepEqual(snapshot(f), readBefore);
 });

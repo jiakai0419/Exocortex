@@ -1,6 +1,6 @@
 # Message completeness and identity consistency
 
-Design v0.7 — execution-evidence correction in progress after frozen 4970258 passed 5260 tests but failed five independent preexecution cases. Base 5631504dade6c0ce2092bdfa6f5811f0314f376a. New fixed-candidate full-tree validation and independent acceptance remain required. Production, services, permissions and API budgets remain unchanged. No push/deploy is authorized. All test inputs must be authored from scratch; never commit real or redacted business data.
+Design v0.8 — business-result and diagnostic-clock correction after the frozen 909951f execution-boundary review. Base 5631504dade6c0ce2092bdfa6f5811f0314f376a. New fixed-candidate full-tree validation and independent acceptance remain required. Production, services, permissions and API budgets remain unchanged. No push/deploy is authorized. All test inputs must be authored from scratch; never commit real or redacted business data.
 
 ## Goal
 
@@ -20,7 +20,7 @@ Main checkout: /tmp/exocortex-completeness-20261027-1SCjPK/repo, branch candidat
 
 Each route writes design before code and updates actual behavior/limits afterward. Shared interface changes go through this file first. Main-owned module changes must not be duplicated by another route.
 
-### Execution evidence correction (v0.7, integrated; final verification pending)
+### Execution evidence correction (v0.8, integrated; final verification pending)
 
 The actual command boundary must distinguish an invocation attempt, a child that
 actually executed, and a validated remote result. An incremented attempt counter
@@ -87,6 +87,30 @@ prior member cursor/evidence; this change does not add a persistent detailed
 local-error log or a new task-evidence schema. The live safe failure descriptor
 is inspectable, but must not be described as a new durable per-task diagnostic.
 Actual route outcomes remain durable in the existing route table.
+
+Process exit and business result are distinct. The existing supported JSON failure
+contracts (typed API error, nonzero safe integer root code, explicit failed
+boolean/error envelope) enter one finite transport failure path even at exit 0.
+Only a structurally valid numeric API code supplies response-code evidence;
+strings/prose cannot. Data/name fields inside a declared failure are not adopted.
+Valid successful JSON retains its existing return shape, including arrays and
+scalars: a nested item is never promoted to a root business result. Standard
+output and standard error are evaluated independently for explicit failure; a
+successful or empty output cannot hide an explicit structured error from the
+other stream. Classification and response-code evidence use the selected
+envelope, with an explicit error on standard error taking precedence. The
+existing three definite denial codes take precedence over contradictory prose;
+this does not add codes or infer permission from free text. Retry budgets stay
+unchanged. A custom runner that reports an execution callback and
+then returns a business failure retains that receipt through the coordinator
+guard. Development probes separately preserve their captured first output and
+parse validity; a non-JSON version-output exception cannot waive an API failure.
+
+For a version 2 failure, top-level/route observed_at records the local diagnostic
+observation time. The separate execution.result_at_ms retains the earlier actual
+result time, and only that result time participates in route chronology. Success
+and legacy observations retain their existing semantics. This needs no new
+persisted field: both clocks already have distinct places in the finite object.
 
 For this narrow correction, main owns name-route-state.mjs, name-sync.mjs,
 saved-sender-route-failures.mjs, SQLite projection TS/generated code and this

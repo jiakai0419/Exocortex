@@ -296,12 +296,61 @@ function spawnFailureText(result) {
   return [String(result.stderr || ""), String(result.stdout || ""), spawnError?.code || "", spawnError?.message || ""].filter(Boolean).join("\n");
 }
 
-/** Safe descriptors contain only enums and validated numbers, never remote payloads. @param {SpawnResult | null} result @param {number} timeoutMs */
-function publicFailureDescriptor(result, timeoutMs) {
+/** A valid JSON array/scalar is a successful payload shape, not a container
+ * from which an inner object can be extracted as a business response envelope.
+ * Non-JSON CLI warning prefixes retain the existing structured-error reader.
+ * @param {unknown} input @returns {JsonObject|null} */
+function businessRootEnvelope(input) {
+  const text = String(input || '').trim();
+  if (!text) return null;
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch { return parseLarkEnvelope(text); }
+}
+
+/** @param {JsonObject|null} envelope */
+function declaresBusinessFailure(envelope) {
+  return Boolean(envelope && (envelope.error != null || envelope.ok === false || envelope.success === false
+    || envelope.code !== undefined && envelope.code !== 0));
+}
+
+/** The already-supported business result contract is independent of CLI exit
+ * status. Only a typed API error or an unambiguous numeric top-level API code
+ * supplies response-code evidence. Generic declared failure cannot expose a
+ * name embedded beside it or acquire permission semantics from prose.
+ * @param {JsonObject|null} envelope @param {LarkFailureClassification} original */
+function businessResultFailure(envelope, original) {
+  const failed = declaresBusinessFailure(envelope);
+  if (!failed) return {failed:false,remote:false,failure:original};
+  const error = envelope?.error;
+  const typedApi = error && typeof error === 'object' && !Array.isArray(error) && error.type === 'api';
+  const numeric = value => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
+  const code = typedApi ? numeric(error.code) : error == null && envelope?.code !== 0 ? numeric(envelope?.code) : null;
+  const remote = Boolean(typedApi || error == null && code !== null);
+  const typedTransport = error && typeof error === 'object' && !Array.isArray(error)
+    && (error.type === 'network' || error.subtype === 'rate_limit');
+  const unknown = {...original,kind:/** @type {LarkFailureKind} */('unknown'),code:null,transient:false,message:'unknown'};
+  if (!remote) return {failed:true,remote:false,failure:typedTransport ? {...original,code:null} : unknown};
+  if (code === null) return {failed:true,remote:true,failure:unknown};
+  const knownDenial = code === 210508 ? 'permission_denied' : code === 231203 ? 'restricted_mode'
+    : code === 230002 ? 'bot_user_out_of_chat' : null;
+  if (knownDenial) return {failed:true,remote:true,failure:{...original,
+    kind:/** @type {LarkFailureKind} */(knownDenial),code,transient:false,message:knownDenial.replaceAll('_',' ')}};
+  // Keep the established transient/retry policy; permission-like codes require
+  // their exact numeric contract rather than a phrase in a remote explanation.
+  const unsupportedDenial = original.kind === 'permission_denied' && code !== 210508
+    || original.kind === 'restricted_mode' && code !== 231203
+    || original.kind === 'bot_user_out_of_chat' && code !== 230002;
+  return {failed:true,remote:true,failure:unsupportedDenial ? {...unknown,code} : {...original,code}};
+}
+
+/** Safe descriptors contain only enums and validated numbers, never remote payloads. @param {SpawnResult | null} result @param {number} timeoutMs @param {LarkFailureClassification|null} [override] */
+function publicFailureDescriptor(result, timeoutMs, override) {
   const spawnError = /** @type {NodeJS.ErrnoException | undefined} */ (result?.error);
   if (spawnError?.code === "ENOENT") return "kind=command_unavailable spawn_code=ENOENT";
   if (spawnError?.code === "ETIMEDOUT") return `kind=network_timeout timeout_ms=${timeoutMs}`;
-  const classification = classifyLarkFailure(spawnFailureText(result));
+  const classification = override || classifyLarkFailure(spawnFailureText(result));
   const parts = [`kind=${classification.kind}`];
   if (classification.code !== null) parts.push(`code=${classification.code}`);
   if (classification.retry_after_ms !== null) parts.push(`retry_after_ms=${classification.retry_after_ms} retry_after_source=header`);
@@ -377,12 +426,14 @@ function createLarkCliRunner({
     const deadline = started + budgetMs;
     /** @type {SpawnResult | null} */
     let lastResult = null;
+    /** @type {LarkFailureClassification|null} */
+    let lastFailure = null;
     let lastTimeoutMs = requestedTimeoutMs;
     let nextAttemptAt = started;
     /** @param {boolean} budgetExhausted @returns {never} */
     const fail = budgetExhausted => {
       if (budgetExhausted) counters.exhausted += 1;
-      const descriptor = lastResult ? publicFailureDescriptor(lastResult, lastTimeoutMs) : "kind=rate_limited retry_after_source=shared";
+      const descriptor = lastResult ? publicFailureDescriptor(lastResult, lastTimeoutMs, lastFailure) : "kind=rate_limited retry_after_source=shared";
       throw new Error(`lark-cli failed: ${descriptor} operation=${operation}${budgetExhausted ? " retry_exhausted=1" : ""} ${receipt()}`);
     };
     for (let attempt = 0; attempt <= retries; attempt += 1) {
@@ -429,17 +480,23 @@ function createLarkCliRunner({
       if (result?.status === 0) {
         try { parsed = parseJson(result.stdout || ''); } catch { parseFailed = true; }
       }
-      const failure = classifyLarkFailure(spawnFailureText(result));
+      const stdoutEnvelope = businessRootEnvelope(result.stdout || '');
+      const stderrEnvelope = businessRootEnvelope(result.stderr || '');
+      // Independent streams can each declare failure. A successful stdout root
+      // cannot hide stderr failure; two explicit failures use stderr, and code
+      // classification always comes from that same chosen envelope.
+      const envelope = declaresBusinessFailure(stderrEnvelope) ? stderrEnvelope
+        : declaresBusinessFailure(stdoutEnvelope) ? stdoutEnvelope : null;
+      const originalFailure = classifyLarkFailure(envelope ? JSON.stringify(envelope) : spawnFailureText(result));
+      const business = businessResultFailure(envelope,originalFailure);
+      const failure = business.failure;
+      lastFailure = business.failed ? failure : null;
       if (didStart) {
-        const envelope = parseLarkEnvelope(result.stderr || '') || parseLarkEnvelope(result.stdout || '');
-        const remoteError = envelope?.error;
-        const remote = Boolean(remoteError && typeof remoteError === 'object' && !Array.isArray(remoteError)
-          && remoteError.type === 'api');
-        const resultKind = result.status === 0 ? parseFailed ? 'unknown' : remote ? failure.kind : 'success'
+        const resultKind = result.status === 0 ? business.failed ? failure.kind : parseFailed ? 'unknown' : 'success'
           : spawnError?.code === 'ETIMEDOUT' ? 'network_timeout' : failure.kind;
         execution = {version:1,launch_attempted:true,execution:'started',result_at_ms:null,
-          result_kind:resultKind,result_code:remote ? numericCode(remoteError?.code) : null,
-          remote_result:remote};
+          result_kind:resultKind,result_code:business.remote ? failure.code : null,
+          remote_result:business.remote};
         // Record the execution outcome before any local cooldown, wait, parse
         // diagnostic or retry bookkeeping can fail. Missing clocks stay missing.
         try { execution.result_at_ms = wallNow(); } catch (error) { publish(); throw error; }
@@ -447,7 +504,9 @@ function createLarkCliRunner({
       } else if (execution.execution !== 'started') {
         execution.execution = ['ENOENT','EACCES','E2BIG','ENOEXEC'].includes(spawnError?.code || '') ? 'not_started' : 'unknown';
       }
-      if (result?.status === 0) {
+      // A successful CLI process can still return a structured API failure.
+      // Keep it on the same failure/retry path as a nonzero process result.
+      if (result?.status === 0 && !business.failed) {
         if (parseFailed) return localFailure('kind=unknown reason=invalid_json');
         state.rateStreaks.delete(operation);
         if ((state.cooldowns.get(operation) || 0) <= wallNow()) state.cooldowns.delete(operation);
