@@ -36,9 +36,23 @@ function inlineEvents(canonical, task, nowMs) {
     return { ...empty(), invalid: true };
   const events = new Map();
   for (const route of envelope.routes) {
+    const failure = /** @type {Row|null} */ (route.failure);
+    if (failure?.version === 2) {
+      const execution = failure.execution;
+      // The finite failure validator has checked this receipt. The local
+      // diagnostic may be later than (or follow) an actual retry result.
+      if (execution.execution === 'started' && execution.result_at_ms !== null
+        && execution.result_at_ms <= nowMs) events.set(route.operation, {
+          at: execution.result_at_ms,
+          denied: execution.remote_result === true && execution.result_kind === 'permission_denied'
+            && execution.result_code === 210508,
+        });
+      continue;
+    }
     // Admission and lack of an observation are diagnostics, not new request
     // outcomes. A skip caused by a stored denial cannot erase that same denial.
-    if (['not_requested','unknown'].includes(route.status) || route.failure?.stage === 'not_requested') continue;
+    if (['not_requested','unknown'].includes(route.status)
+      || ['not_requested','execution_unknown'].includes(failure?.stage)) continue;
     const routeAt = envelope.version === 1 ? at : observationTime(route.observed_at, nowMs);
     if (routeAt !== null) events.set(route.operation, { at: routeAt, denied: denied(route) });
   }

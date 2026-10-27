@@ -7,6 +7,7 @@ import {
   senderName,
 } from "./core.mjs";
 import { displayNameFromUser, personName, senderAliasesByOpenId, senderIdentity, senderLookupNamespace, senderOpenId } from "./sender-identity.mjs";
+import { validateLarkExecutionReceipt } from './transport-execution.mjs';
 import { nameLookupFailure, sanitizeSenderNameObservation, senderNameRouteTargetKey } from './sender-name-observation.mjs';
 
 /**
@@ -18,6 +19,7 @@ import { nameLookupFailure, sanitizeSenderNameObservation, senderNameRouteTarget
  * @property {number=} retryDelayMs
  * @property {number=} retryBudgetMs
  * @property {number=} timeoutMs
+ * @property {(receipt:Record<string,any>)=>void=} onExecutionReceipt
  *
  * @typedef {(args: string[], options?: AdapterRunOptions) => JsonObject | null} LarkRunner
  *
@@ -149,13 +151,20 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
     }
     return allowed;
   }
+  /** @type {Record<string,any>|null} */
+  let latestExecution = null;
   /** @param {string[]} args @param {AdapterRunOptions} options @param {AdapterOptions} opts */
   function lookup(args, options, opts) {
-    if (opts.nameLookupDeadlineMs === undefined) return run(args, options);
+    latestExecution = null;
+    const executionOptions = {...options,onExecutionReceipt: receipt => {
+      if (validateLarkExecutionReceipt(receipt)) latestExecution = {...receipt};
+      try { options.onExecutionReceipt?.(receipt); } catch { /* optional observer */ }
+    }};
+    if (opts.nameLookupDeadlineMs === undefined) return run(args, executionOptions);
     const remaining = Math.floor(opts.nameLookupDeadlineMs - Date.now());
     if (!Number.isFinite(remaining) || remaining <= 0) throw new NameLookupBudgetExceeded('optional name lookup budget exhausted');
     const budget = Math.min(NAME_LOOKUP_RETRY_BUDGET_MS, remaining);
-    return run(args, { ...options, timeoutMs: budget, retryBudgetMs: budget });
+    return run(args, { ...executionOptions, timeoutMs: budget, retryBudgetMs: budget });
   }
   // An explicit observer receives private lookup evidence for its own report.
   // Nothing is logged here; observer failures cannot affect name resolution.
@@ -185,7 +194,11 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
   /** @param {string} key @param {JsonObject} value */
   function observe(key, value) {
     observations.delete(key);
-    const observed = { observed_at: new Date(now()).toISOString(), cached: false,
+    const observedNow = now();
+    const actualAt = value.failure?.version === 2 ? value.failure.execution?.result_at_ms
+      : latestExecution?.execution === 'started' ? latestExecution.result_at_ms : null;
+    const actualClock = Number.isSafeInteger(actualAt) && actualAt >= 0 && actualAt <= observedNow;
+    const observed = { observed_at: new Date(actualClock ? actualAt : observedNow).toISOString(), cached: false,
       ...(contextAccount ? { account_key: createHash('sha256').update(`lark.im\0${contextAccount}`).digest('hex') } : {}), ...value };
     observations.set(key, observed);
     observationAttempts.set(observed, activeAttempt);
@@ -258,6 +271,7 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
    * @param {Map<string, string[]>} [aliases]
    */
   function resolveContactNames(openIds, opts, seed = new Map(), aliases = new Map()) {
+    latestExecution = null;
     const names = new Map([...seed].filter(([id, name]) => personName(name, [id, ...(aliases.get(id) || [])])));
     const unresolved = uniqueOpenIds(openIds).filter((id) => {
       if (names.has(id)) return false;
@@ -335,6 +349,7 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
    * @param {Map<string, string[]>} [aliases]
    */
   function resolveChatMemberNames(chatIdValue, openIds, opts, aliases = new Map()) {
+    latestExecution = null;
     const targetIds = new Set(uniqueOpenIds(openIds).filter(id => observations.get(`user:${id}`)?.status !== 'conflict'));
     const names = new Map();
     if (!chatIdValue || targetIds.size === 0) return names;
@@ -459,6 +474,7 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
    * @param {AdapterOptions} opts
    */
   function resolveApplicationNames(appIds, opts) {
+    latestExecution = null;
     const names = new Map();
     for (const appId of uniqueAppIds(appIds)) {
       if (opts.forceRefresh) nameCache.delete(`app:${appId}`);
@@ -525,6 +541,7 @@ function createNameResolver({ run, now = Date.now, onLookup }) {
    * @param {AdapterOptions} opts
    */
   function resolveChatBotAppFallbackNames(appIdsByChat, officialApps, opts) {
+    latestExecution = null;
     const names = new Map();
     for (const [chatIdValue, ids] of appIdsByChat.entries()) {
       const pendingIds = uniqueAppIds([...ids]).filter((id) => !personName(officialApps.get(id), [id])

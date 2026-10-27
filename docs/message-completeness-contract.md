@@ -1,6 +1,6 @@
 # Message completeness and identity consistency
 
-Design v0.6 — integrated local candidate, base 5631504dade6c0ce2092bdfa6f5811f0314f376a. Final full-tree validation and independent acceptance remain pending. Production, services, permissions and API budgets remain unchanged. No push/deploy is authorized. All test inputs must be authored from scratch; never commit real or redacted business data.
+Design v0.7 — execution-evidence correction in progress after frozen 4970258 passed 5260 tests but failed five independent preexecution cases. Base 5631504dade6c0ce2092bdfa6f5811f0314f376a. New fixed-candidate full-tree validation and independent acceptance remain required. Production, services, permissions and API budgets remain unchanged. No push/deploy is authorized. All test inputs must be authored from scratch; never commit real or redacted business data.
 
 ## Goal
 
@@ -19,6 +19,82 @@ Main checkout: /tmp/exocortex-completeness-20261027-1SCjPK/repo, branch candidat
 | Independent route 01a1498c-530b-717e-9b7e-a0c307d9a0c9 | Independent synthetic real-CLI matrix, counterexamples, fixed-candidate review; no product edits in main checkout |
 
 Each route writes design before code and updates actual behavior/limits afterward. Shared interface changes go through this file first. Main-owned module changes must not be duplicated by another route.
+
+### Execution evidence correction (v0.7, integrated; final verification pending)
+
+The actual command boundary must distinguish an invocation attempt, a child that
+actually executed, and a validated remote result. An incremented attempt counter
+or a caught exception proves neither execution nor a remote result. Public
+failure evidence contains only validated finite fields and numbers; raw errors,
+arguments, credentials and response bodies must never be serialized. The safe
+representation must survive the existing error-message/string boundary as well
+as an Error object. A malformed or absent receipt cannot manufacture execution
+evidence. Existing persisted v1/v2 observations retain their documented legacy
+meaning; missing historical detail must not be invented.
+
+A local error before execution is diagnostic information, not a new route
+outcome: it cannot clear or timestamp-refresh earlier denial, successful lookup,
+or recovery evidence. The coordinator must not publish a provisional recovery
+claim when no execution follows. Local diagnostics and the last actual execution
+result must remain distinguishable, including when a local cooldown/clock/wait
+error occurs after an earlier result during retry handling. The time of that
+local error must not masquerade as the earlier result's observation time.
+
+An actually executed command that times out is a new execution failure with no
+remote response proof. It can make the current permission conclusion uncertain
+(`enriching`), but does not prove successful lookup, authorization recovery or an
+HTTP response. This preserves the original 18 chronology and 12 preexecution
+oracles. Only an explicit, correctly bound API denial supplies remote permission
+evidence. An empty successful lookup likewise supplies no name.
+
+The correction covers initial and retry paths uniformly: clock/shared-cooldown
+admission, waiting and budget exhaustion, lease/argument preparation, process
+creation, returned process errors, parsing, and local bookkeeping after a result.
+It does not add request budget, change permissions, or change message display.
+The final gate uses the actual transport with an invented process boundary,
+resolver, storage, JSON/text messages and quality counts; both inline and saved
+routes must preserve body, identity, order and read-only database state.
+
+The agreed finite interface is `readLarkExecutionReceipt(error,
+expectedOperation?)`, exported by the transport or its finite evidence helper.
+It returns `{ status: 'absent' | 'invalid' | 'valid', value? }`. A valid value is
+`{ version: 1, launch_attempted: boolean, execution: 'not_started' | 'started' |
+'unknown', result_at_ms: number | null, result_kind: enum | null, result_code:
+number | null, remote_result: boolean }`. The public descriptor serializes its
+complete receipt with `receipt_v`, `launch_attempted`, `execution`,
+`result_at_ms`, `result_kind`, `result_code`, and `remote_result` tokens. Boolean
+tokens use 0/1; nullable tokens use `none`. Partial, duplicate, contradictory or
+wrong-operation receipts are invalid, not legacy evidence. A version 2 finite
+lookup failure can preserve this receipt under `execution`; its local diagnostic
+still has its own kind/code/stage. Existing version 1 failures remain readable.
+An actual result uses `result_at_ms` for chronology, never a later local catch
+time. The existing route table stores only actual execution outcomes; a local
+failure with no such outcome is deferred without overwriting its previous row.
+No table migration is needed.
+
+The producer exports this interface from
+`src/adapters/lark-im/transport-execution.mjs`. Successful calls may deliver the
+same finite value through optional `onExecutionReceipt`, without changing the
+returned API JSON. The coordinator composes that callback with the resolver's
+callback. A present invalid receipt yields only a finite local
+`unknown`/`execution_unknown` diagnostic; it does not claim either execution or
+nonexecution. Only verified structured API output may set `remote_result` or
+persist its numeric response code as `response_error`.
+
+Inline local diagnostics are retained independently inside the finite stored
+failure. The existing background task still records its outcome and retains its
+prior member cursor/evidence; this change does not add a persistent detailed
+local-error log or a new task-evidence schema. The live safe failure descriptor
+is inspectable, but must not be described as a new durable per-task diagnostic.
+Actual route outcomes remain durable in the existing route table.
+
+For this narrow correction, main owns name-route-state.mjs, name-sync.mjs,
+saved-sender-route-failures.mjs, SQLite projection TS/generated code and this
+document. Source-trace owns transport.mjs, sender-name-observation.mjs,
+name-resolver.mjs, a narrowly necessary finite helper and producer tests.
+Sender-audit owns only the new
+tests/messages-route-execution-boundary.integration.test.mjs matrix. No edits
+to the frozen 4970258 result are presented as part of its completed verification.
 
 ## Existing contracts to preserve
 

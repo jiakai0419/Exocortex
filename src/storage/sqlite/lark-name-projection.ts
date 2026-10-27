@@ -303,6 +303,45 @@ function mergeLarkNameProjectionSql(
   const failurePath = '$.sender_name_verification.failure';
   const failureKinds = ['network_timeout','network_error','rate_limited','service_unavailable','internal_error',
     'restricted_mode','bot_user_out_of_chat','permission_denied','command_unavailable','spawn_error','unknown','budget_exhausted'];
+  // The lookup diagnostic and its last execution result are separate finite
+  // values. Validate both on exact-source/no-query retention; never turn an old
+  // v1 failure into newly witnessed execution evidence.
+  const failureShapeSql = (json: string, path: string, observedAt: string) => {
+    const get = (key: string) => `json_extract(${json}, '${path}.${key}')`;
+    const type = (key: string) => `json_type(${json}, '${path}.${key}')`;
+    const resultKinds = failureKinds.filter(kind => kind !== 'budget_exhausted').concat('success');
+    const validExecution = `(
+      ${type('execution')}='object' AND (SELECT COUNT(*) FROM json_each(${json}, '${path}.execution'))=7
+      AND NOT EXISTS (SELECT 1 FROM json_each(${json}, '${path}.execution')
+        WHERE key NOT IN ('version','launch_attempted','execution','result_at_ms','result_kind','result_code','remote_result'))
+      AND ${type('execution.version')}='integer' AND ${get('execution.version')}=1
+      AND ${type('execution.launch_attempted')} IN ('true','false')
+      AND ${type('execution.remote_result')} IN ('true','false')
+      AND ${get('execution.execution')} IN ('not_started','started','unknown')
+      AND (${type('execution.result_at_ms')}='null' OR ${type('execution.result_at_ms')}='integer'
+        AND ${get('execution.result_at_ms')} BETWEEN 0 AND 9007199254740991
+        AND ${get('execution.result_at_ms')} <= CAST(strftime('%s',${observedAt}) AS INTEGER)*1000
+          + CAST(substr(${observedAt},21,3) AS INTEGER))
+      AND (${type('execution.result_kind')}='null' OR ${get('execution.result_kind')} IN (${resultKinds.map(kind=>`'${kind}'`).join(',')}))
+      AND (${type('execution.result_code')}='null' OR ${type('execution.result_code')}='integer'
+        AND ${get('execution.result_code')} BETWEEN 0 AND 9007199254740991)
+      AND (${get('execution.execution')}='started' AND ${type('execution.launch_attempted')}='true'
+        AND ${type('execution.result_kind')}='text'
+        AND (${type('execution.result_code')}='null' OR ${type('execution.remote_result')}='true')
+        AND (${get('execution.result_kind')}<>'success' OR ${type('execution.result_code')}='null' OR ${get('execution.result_code')}=0)
+        OR ${get('execution.execution')} IN ('not_started','unknown')
+          AND (${get('execution.execution')}<>'unknown' OR ${type('execution.launch_attempted')}='true')
+          AND ${type('execution.result_at_ms')}='null' AND ${type('execution.result_kind')}='null'
+          AND ${type('execution.result_code')}='null' AND ${type('execution.remote_result')}='false'))`;
+    return `(json_type(${json}, '${path}')='object'
+      AND ${type('version')}='integer' AND ${get('version')} IN (1,2)
+      AND (SELECT COUNT(*) FROM json_each(${json}, '${path}'))=CASE ${get('version')} WHEN 1 THEN 5 ELSE 6 END
+      AND NOT EXISTS (SELECT 1 FROM json_each(${json}, '${path}')
+        WHERE key NOT IN ('version','operation','kind','code','stage') AND NOT (${get('version')}=2 AND key='execution'))
+      AND (${get('stage')}<>'execution_unknown' OR ${get('version')}=1
+        AND ${get('kind')}='unknown' AND ${type('code')}='null')
+      AND (${get('version')}=1 OR ${validExecution}))`;
+  };
   const failedDiagnosticAccounts = ['old', incomingJson].map(json => `(
     ${[...diagnosticAccountPaths,'$.message_account_evidence.account_key'].map(path =>
       `(json_type(${json}, '${path}') IS NULL OR json_type(${json}, '${path}')='text'
@@ -335,16 +374,12 @@ function mergeLarkNameProjectionSql(
         AND json_extract(old, '$.sender_name_verification.source') IN ('contact','chat_member')
       OR json_extract(old, '$.sender_id_type')='app_id'
         AND json_extract(old, '$.sender_name_verification.source') IN ('application_api','chat_bot_app_id'))
-    AND json_type(old, '${failurePath}')='object'
-    AND (SELECT COUNT(*) FROM json_each(old, '${failurePath}'))=5
-    AND NOT EXISTS (SELECT 1 FROM json_each(old, '${failurePath}')
-      WHERE key NOT IN ('version','operation','kind','code','stage'))
-    AND json_type(old, '${failurePath}.version')='integer' AND json_extract(old, '${failurePath}.version')=1
+    AND ${failureShapeSql('old', failurePath, "json_extract(old, '$.sender_name_verification.observed_at')")}
     AND json_extract(old, '${failurePath}.operation')=CASE json_extract(old, '$.sender_name_verification.source')
       WHEN 'contact' THEN 'contact_search' WHEN 'chat_member' THEN 'chat_members'
       WHEN 'application_api' THEN 'application_info' WHEN 'chat_bot_app_id' THEN 'chat_bots' END
     AND json_extract(old, '${failurePath}.kind') IN (${failureKinds.map(kind => `'${kind}'`).join(',')})
-    AND json_extract(old, '${failurePath}.stage') IN ('not_requested','response_error','request_error','unknown')
+    AND json_extract(old, '${failurePath}.stage') IN ('not_requested','response_error','request_error','unknown','execution_unknown')
     AND (json_type(old, '${failurePath}.code')='null' AND json_extract(old, '${failurePath}.stage')<>'response_error'
       OR json_type(old, '${failurePath}.code')='integer' AND json_extract(old, '${failurePath}.code') BETWEEN 0 AND 9007199254740991
         AND json_extract(old, '${failurePath}.stage')='response_error')
@@ -399,12 +434,10 @@ function mergeLarkNameProjectionSql(
     CASE WHEN json_type(item, '$.failure')='object' THEN json_extract(item, '$.failure') ELSE '{}' END AS failure
     FROM nr_items)`);
   stages.push(`nr_valid AS MATERIALIZED (SELECT *,
-    json_type(item, '$.failure')='object' AND (SELECT COUNT(*) FROM json_each(failure))=5
-    AND NOT EXISTS (SELECT 1 FROM json_each(failure) WHERE key NOT IN ('version','operation','kind','code','stage'))
-    AND json_type(failure, '$.version')='integer' AND json_extract(failure, '$.version')=1
+    ${failureShapeSql('item', '$.failure', "CASE WHEN route_version=2 THEN json_extract(item, '$.observed_at') ELSE json_extract(old, '$.sender_name_verification.observed_at') END")}
     AND json_extract(failure, '$.operation') IS json_extract(item, '$.operation')
     AND json_extract(failure, '$.kind') IN (${failureKinds.map(kind => `'${kind}'`).join(',')})
-    AND json_extract(failure, '$.stage') IN ('not_requested','response_error','request_error','unknown')
+    AND json_extract(failure, '$.stage') IN ('not_requested','response_error','request_error','unknown','execution_unknown')
     AND (json_type(failure, '$.code')='null' AND json_extract(failure, '$.stage')<>'response_error'
       OR json_type(failure, '$.code')='integer' AND json_extract(failure, '$.code') BETWEEN 0 AND 9007199254740991
         AND json_extract(failure, '$.stage')='response_error')
@@ -424,7 +457,7 @@ function mergeLarkNameProjectionSql(
     AND (json_extract(item, '$.operation') IS NOT json_extract(old, '${failurePath}.operation')
       OR json_extract(item, '$.status')='failed'
         AND (route_version=1 OR json_extract(item, '$.observed_at') IS json_extract(old, '$.sender_name_verification.observed_at'))
-        AND ${['version','operation','kind','code','stage'].map(key =>
+        AND ${['version','operation','kind','code','stage','execution'].map(key =>
           `json_extract(failure, '$.${key}') IS json_extract(old, '${failurePath}.${key}')`).join(' AND ')}) AS valid
     FROM nr_valid)`);
   index += 1;
@@ -435,10 +468,7 @@ function mergeLarkNameProjectionSql(
       AND json_extract(old, '$.sender_name_verification.status')='failed'
       AND json_type(old, '$.sender_name_verification.cached')='false'
       AND json_extract(old, '$.sender_name_verification.source') IN ('application_api','chat_bot_app_id')
-      AND json_type(old, '${failurePath}')='object'
-      AND (SELECT COUNT(*) FROM json_each(old, '${failurePath}'))=5
-      AND NOT EXISTS (SELECT 1 FROM json_each(old, '${failurePath}')
-        WHERE key NOT IN ('version','operation','kind','code','stage'))
+      AND ${failureShapeSql('old', failurePath, "json_extract(old, '$.sender_name_verification.observed_at')")}
       AND json_extract(old, '${failurePath}.operation')=CASE json_extract(old, '$.sender_name_verification.source')
         WHEN 'application_api' THEN 'application_info' ELSE 'chat_bots' END
       AND (json_extract(old, '${failurePath}.kind')='budget_exhausted'

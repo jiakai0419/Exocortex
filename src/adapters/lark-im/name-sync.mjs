@@ -19,6 +19,7 @@ import { nameRecordFence, nameEffects, nameFence, nameStateKey, nameRowBytesSql,
 import { runLark, transportOperation } from './transport.mjs';
 import { selectNameWork } from './name-work-policy.mjs';
 import { nameRouteDescriptor, nextNameRouteState } from './name-route-state.mjs';
+import { readLarkExecutionReceipt, validateLarkExecutionReceipt } from './transport-execution.mjs';
 
 const PAGE = 40, MAX_CALLS = 4, BUDGET_MS = 10_000, INTERVAL_MS = 60_000;
 class NameBudgetError extends Error {}
@@ -79,7 +80,10 @@ function syncNames(db, self, deps = {}) {
   };
   const recordRoute = (entry, event) => {
     if (!entry) return;
-    const next = nextNameRouteState(entry.route, entry.row, event, { nowMs });
+    const observedNow = now();
+    if (!Number.isSafeInteger(observedNow) || observedNow < nowMs) { routeDeferred = true; return; }
+    const next = nextNameRouteState(entry.route, entry.row, event, { nowMs: observedNow });
+    if (next.state === 'deferred') routeDeferred = true;
     if (next.changed) {
       const row=next.row;
       if(row&&(row.blocked||row.failures>=3)) row.retry_at_ms=nowMs+(row.blocked?NAME_REFRESH_MS:NAME_RETRY_MS);
@@ -96,17 +100,26 @@ function syncNames(db, self, deps = {}) {
     if (calls >= MAX_CALLS - reserve) throw new NameBudgetError('name request limit reached');
     const left = remaining(); // Route reads consume the same monotonic budget.
     calls += 1;
+    let receiptSeen = false, executionReceipt = null;
     try {
-      const result = (deps.runLark || runLark)(args,{...options,retries:0,timeoutMs:Math.min(5000,left),retryBudgetMs:left,maxBufferBytes:2*1024*1024});
+      const result = (deps.runLark || runLark)(args,{...options,retries:0,timeoutMs:Math.min(5000,left),retryBudgetMs:left,maxBufferBytes:2*1024*1024,
+        onExecutionReceipt(value) {
+          receiptSeen = true;
+          executionReceipt = validateLarkExecutionReceipt(value) ? value : null;
+          try { options.onExecutionReceipt?.(value); } catch { /* Optional observation cannot affect transport. */ }
+        }});
       if (result && (result.error != null || result.ok === false || result.success === false || result.code !== undefined && result.code !== 0)) {
         const code = Number.isSafeInteger(result.code) && result.code >= 0 ? ` code=${result.code}` : '';
         throw new Error(`lark-cli failed: kind=unknown${code} operation=${transportOperation(args)}`);
       }
-      recordRoute(entry, { type: 'success' });
+      recordRoute(entry, { type: 'success', ...(receiptSeen ? { execution: executionReceipt } : {}) });
       return result;
     } catch (error) {
       const safe = error instanceof Error ? error.message : '';
-      if (/^lark-cli failed: /.test(safe) && /(?:retry_after_source=shared|reason=sync_busy|reason=shared_cooldown_unavailable)(?:\s|$)/.test(safe)) routeDeferred = true;
+      const execution = readLarkExecutionReceipt(error, transportOperation(args));
+      if (execution.status === 'invalid' || execution.status === 'valid' && execution.value?.execution !== 'started') routeDeferred = true;
+      else if (execution.status === 'absent' && /^lark-cli failed: /.test(safe)
+        && /(?:retry_after_source=shared|reason=sync_busy|reason=shared_cooldown_unavailable)(?:\s|$)/.test(safe)) routeDeferred = true;
       else recordRoute(entry, { type: 'failure', error });
       throw error;
     }

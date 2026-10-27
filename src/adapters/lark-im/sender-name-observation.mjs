@@ -1,12 +1,13 @@
 // @ts-check
 import { createHash } from 'node:crypto';
 import { classifyNameRouteFailure } from './name-route-state.mjs';
+import { readLarkExecutionReceipt, validateLarkExecutionReceipt } from './transport-execution.mjs';
 
 const OPERATIONS = {contact:'contact_search',chat_member:'chat_members',
   application_api:'application_info',chat_bot_app_id:'chat_bots'};
 const KINDS = new Set(['network_timeout','network_error','rate_limited','service_unavailable','internal_error',
   'restricted_mode','bot_user_out_of_chat','permission_denied','command_unavailable','spawn_error','unknown','budget_exhausted']);
-const STAGES = new Set(['not_requested','response_error','request_error','unknown']);
+const STAGES = new Set(['not_requested','execution_unknown','response_error','request_error','unknown']);
 const FIELDS = ['version','operation','kind','code','stage'];
 const HASH = /^[0-9a-f]{64}$/;
 const ROUTE_FIELDS = ['version','attempt_key','target_key','account_key','routes'];
@@ -23,25 +24,40 @@ const object = value => value !== null && typeof value === 'object' && !Array.is
  * @param {unknown} error @param {string} operation @param {boolean} [notRequested] */
 function nameLookupFailure(error, operation, notRequested = false) {
   if (notRequested) return {version:1,operation,kind:'budget_exhausted',code:null,stage:'not_requested'};
+  const execution = readLarkExecutionReceipt(error, operation);
+  // Explicitly invalid receipts cannot fall through to legacy execution guesses.
+  if (execution.status === 'invalid') return {version:1,operation,kind:'unknown',code:null,stage:'execution_unknown'};
   const classified = classifyNameRouteFailure(error, operation);
+  const code = execution.status === 'valid' && !execution.value?.remote_result ? null : classified.code;
   const descriptor = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
   const sharedBeforeRequest = classified.kind === 'rate_limited' && classified.code === null
     && /(?:^| )retry_after_source=shared(?: |$)/.test(descriptor);
-  return {version:1,operation,kind:classified.kind,code:classified.code,
-    stage:classified.code !== null ? 'response_error'
+  return {version:execution.status === 'valid' ? 2 : 1,operation,kind:classified.kind,code,
+    ...(execution.status === 'valid' ? {execution:execution.value} : {}),stage:code !== null ? 'response_error'
       : sharedBeforeRequest || classified.kind === 'command_unavailable' ? 'not_requested'
         : ['network_timeout','network_error','service_unavailable','internal_error','restricted_mode',
           'bot_user_out_of_chat','permission_denied','spawn_error'].includes(classified.kind) ? 'request_error' : 'unknown'};
 }
 
 /** @param {unknown} failure @param {string} operation */
-function validFailure(failure, operation) {
-  return object(failure) && Object.keys(failure).length === FIELDS.length
-    && FIELDS.every(key=>Object.hasOwn(failure,key)) && failure.version === 1 && failure.operation === operation
+function validFailure(failure, operation, observedAt, nowMs) {
+  const fields = object(failure) && failure.version === 2 ? [...FIELDS,'execution'] : FIELDS;
+  return object(failure) && Object.keys(failure).length === fields.length
+    && fields.every(key=>Object.hasOwn(failure,key)) && [1,2].includes(failure.version) && failure.operation === operation
     && KINDS.has(failure.kind) && STAGES.has(failure.stage)
     && (failure.code === null || Number.isSafeInteger(failure.code) && failure.code >= 0)
     && (failure.stage === 'response_error') === (failure.code !== null)
-    && (failure.kind !== 'budget_exhausted' || failure.stage === 'not_requested');
+    && (failure.stage !== 'execution_unknown' || failure.version === 1 && failure.kind === 'unknown' && failure.code === null)
+    && (failure.kind !== 'budget_exhausted' || failure.stage === 'not_requested')
+    && (failure.version === 1 || validateLarkExecutionReceipt(failure.execution)
+      && (failure.execution.result_at_ms === null || routeTime(observedAt,nowMs)
+        && failure.execution.result_at_ms <= Date.parse(observedAt)));
+}
+
+/** @param {Record<string,any>} failure */
+function copyFailure(failure) {
+  return {...Object.fromEntries(FIELDS.map(key=>[key,failure[key]])),
+    ...(failure.version === 2 ? {execution:{...failure.execution}} : {})};
 }
 
 /** Opaque binding to the exact account, explicit app namespace, actor and chat.
@@ -68,7 +84,7 @@ function readSenderNameRouteFailures(observation, binding, nowMs = Date.now()) {
   if (!Number.isSafeInteger(nowMs) || nowMs < 0 || !object(observation) || observation.status !== 'failed' || observation.cached !== false
     || !['application_api','chat_bot_app_id'].includes(observation.source)
     || typeof observation.account_key !== 'string' || !HASH.test(observation.account_key)
-    || !validFailure(observation.failure, OPERATIONS[observation.source])) return null;
+    || !validFailure(observation.failure, OPERATIONS[observation.source],observation.observed_at,nowMs)) return null;
   const value = observation.route_failures;
   if (!object(value) || Object.keys(value).length !== ROUTE_FIELDS.length
     || ROUTE_FIELDS.some(key=>!Object.hasOwn(value,key)) || ![1,2].includes(value.version)
@@ -82,16 +98,16 @@ function readSenderNameRouteFailures(observation, binding, nowMs = Date.now()) {
     if (!object(route) || Object.keys(route).length !== routeFields.length
       || routeFields.some(key=>!Object.hasOwn(route,key)) || route.operation !== APP_OPERATIONS[index]
       || !['failed','unresolved','not_requested','unknown'].includes(route.status)
-      || (route.failure !== null && (route.status !== 'failed' || !validFailure(route.failure,route.operation)))
+      || (route.failure !== null && (route.status !== 'failed' || !validFailure(route.failure,route.operation,value.version === 2 ? route.observed_at : observation.observed_at,nowMs)))
       || value.version === 2 && (route.status === 'unknown' ? route.observed_at !== null : !routeTime(route.observed_at,nowMs))) return null;
   }
   const selected = value.routes.find(route=>route.operation === observation.failure.operation);
   if (!selected || selected.status !== 'failed' || !selected.failure
-    || FIELDS.some(key=>selected.failure[key] !== observation.failure[key])
+    || JSON.stringify(copyFailure(selected.failure)) !== JSON.stringify(copyFailure(observation.failure))
     || value.version === 2 && selected.observed_at !== observation.observed_at) return null;
   return {version:value.version,attempt_key:value.attempt_key,target_key:value.target_key,account_key:value.account_key,
     routes:value.routes.map(route=>({operation:route.operation,status:route.status,
-      ...(value.version === 2 ? {observed_at:route.observed_at} : {}),failure:route.failure === null ? null : Object.fromEntries(FIELDS.map(key=>[key,route.failure[key]]))}))};
+      ...(value.version === 2 ? {observed_at:route.observed_at} : {}),failure:route.failure === null ? null : copyFailure(route.failure)}))};
 }
 
 /** The optional diagnostic grants no name/account authority. Successful-task
@@ -105,11 +121,11 @@ function sanitizeSenderNameObservation(observation, binding, nowMs = Date.now())
   if (!Object.hasOwn(observation,'failure') && !Object.hasOwn(observation,'route_failures')) return observation;
   const {failure,route_failures,...base}=observation;
   if (observation.status !== 'failed' || !Object.hasOwn(OPERATIONS,observation.source)
-    || !validFailure(failure,OPERATIONS[observation.source])
+    || !validFailure(failure,OPERATIONS[observation.source],observation.observed_at,nowMs)
     || failure.kind==='budget_exhausted' && observation.reason!=='budget_exhausted'
     || failure.kind!=='budget_exhausted' && observation.reason!=='request_failed') return base;
   const routes = readSenderNameRouteFailures(observation,binding,nowMs);
-  return {...base,failure:Object.fromEntries(FIELDS.map(key=>[key,failure[key]])),...(routes ? {route_failures:routes} : {})};
+  return {...base,failure:copyFailure(failure),...(routes ? {route_failures:routes} : {})};
 }
 
 export { nameLookupFailure, sanitizeSenderNameObservation, senderNameRouteTargetKey, readSenderNameRouteFailures };

@@ -9,6 +9,8 @@ import {
   redactCommand, transportOperation,
 } from "../src/adapters/lark-im/transport.mjs";
 
+import { readLarkExecutionReceipt } from "../src/adapters/lark-im/transport-execution.mjs";
+
 const EPOCH = 1_800_000_000_000;
 const HISTORY = ["im", "+chat-messages-list", "--chat-id", "oc_private"];
 const SEARCH = ["im", "+messages-search", "--sender", "ou_private"];
@@ -44,7 +46,8 @@ function harness(results, { initial = EPOCH, state = createTransportState(), ...
 function throwsSafe(fn, expected) {
   assert.throws(fn, (error) => {
     assert.match(error.message, expected);
-    assert.doesNotMatch(error.message, /private|secret|Bearer|\/home\/|ou_|oc_|pt_/);
+    assert.doesNotMatch(error.message, /private|secret|Bearer|\/home\/|ou_|oc_|\bpt_/);
+    if (error.message.startsWith("lark-cli failed:")) assert.equal(readLarkExecutionReceipt(error).status,"valid");
     return true;
   });
 }
@@ -398,7 +401,7 @@ test("a throwing spawn or malformed success response cannot expose secrets", () 
   const h = harness([], { spawn() { throw new Error("private Bearer secret /home/private/bin"); } });
   throwsSafe(() => h.run(HISTORY), /kind=spawn_error operation=message_history_bundle/);
   const malformed = harness([ok("private Bearer secret")]);
-  throwsSafe(() => malformed.run(HISTORY), /non-JSON output$/);
+  throwsSafe(() => malformed.run(HISTORY), /kind=unknown reason=invalid_json .*execution=started .*result_kind=unknown .*remote_result=0$/);
 });
 
 test("CLI errors on stdout are classified, and malformed reset values use fallback", () => {

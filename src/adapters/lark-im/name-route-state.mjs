@@ -1,6 +1,7 @@
 // @ts-check
 import { createHash } from 'node:crypto';
 import { classifyLarkFailure, TRANSPORT_OPERATIONS } from './transport.mjs';
+import { readLarkExecutionReceipt, validateLarkExecutionReceipt } from './transport-execution.mjs';
 
 /** @typedef {Record<string, any>} Row */
 const KINDS = new Set(['network_timeout', 'network_error', 'rate_limited', 'service_unavailable',
@@ -18,6 +19,8 @@ const object = value => value !== null && typeof value === 'object' && !Array.is
 const only = (value, fields) => object(value) && Object.keys(value).every(key => fields.includes(key));
 const check = condition => { if (!condition) throw new Error('invalid_name_route_state'); };
 const unknown = () => ({ kind: 'unknown', code: null, retryAfterMs: null });
+const RECEIPT_FIELDS = new Set(['receipt_v','launch_attempted','execution','result_at_ms',
+  'result_kind','result_code','remote_result']);
 const addTime = (now, delay) => delay > Number.MAX_SAFE_INTEGER - now ? Number.MAX_SAFE_INTEGER : now + delay;
 
 /** The task's typed identity has already been validated by its coordinator.
@@ -49,24 +52,31 @@ function classifyNameRouteFailure(error, expectedOperation) {
   if (typeof message !== 'string' || message.length > 1024
     || !/^lark-cli failed: kind=[a-z_]+(?: [a-z_]+=[A-Za-z0-9_]+)*$/.test(message)
     || expectedOperation !== undefined && !OPERATIONS.has(expectedOperation)) return unknown();
+  const execution = readLarkExecutionReceipt(error, expectedOperation);
+  if (execution.status === 'invalid') return unknown();
   /** @type {Record<string,string>} */
   const fields = {};
   for (const token of message.slice('lark-cli failed: '.length).split(' ')) {
     const [key, value] = token.split('=');
     if (Object.hasOwn(fields, key)) return unknown();
     fields[key] = value;
-    if (['code', 'retry_after_ms', 'timeout_ms', 'retries'].includes(key)) {
+    if (RECEIPT_FIELDS.has(key)) {
+      if (execution.status !== 'valid') return unknown();
+    } else if (['code', 'retry_after_ms', 'timeout_ms', 'retries'].includes(key)) {
       if (!/^\d+$/.test(value) || !integer(Number(value))) return unknown();
     } else if (key === 'kind') { if (!KINDS.has(value)) return unknown(); }
     else if (key === 'operation') { if (!TRANSPORT_OPERATIONS.includes(/** @type {any} */ (value))) return unknown(); }
     else if (key === 'retry_after_source') { if (!['header', 'fallback', 'shared'].includes(value)) return unknown(); }
     else if (key === 'spawn_code') { if (value !== 'ENOENT') return unknown(); }
     else if (key === 'retry_exhausted' || key === 'exhausted') { if (!['0', '1'].includes(value)) return unknown(); }
-    else if (key === 'reason') { if (!['clock_unavailable', 'shared_cooldown_unavailable'].includes(value)) return unknown(); }
+    else if (key === 'reason') { if (!['clock_unavailable', 'shared_cooldown_unavailable',
+      'retry_wait_unavailable', 'lease_unavailable', 'invalid_json'].includes(value)) return unknown(); }
     else return unknown();
   }
   if (expectedOperation !== undefined && fields.operation !== undefined && fields.operation !== expectedOperation) return unknown();
-  const failure = classifyLarkFailure(message);
+  const localDescriptor = 'lark-cli failed: ' + Object.entries(fields)
+    .filter(([key]) => !RECEIPT_FIELDS.has(key)).map(([key,value]) => `${key}=${value}`).join(' ');
+  const failure = classifyLarkFailure(localDescriptor);
   if (!KINDS.has(failure.kind) || failure.code !== null && !integer(failure.code)
     || failure.retry_after_ms !== null && !integer(failure.retry_after_ms)) return unknown();
   return { kind: failure.kind, code: failure.code, retryAfterMs: failure.retry_after_ms };
@@ -104,25 +114,39 @@ function nameRouteAdmission(route, row, nowMs) {
 /** A state transition receipt is not request admission or response validation.
  * The caller alone performs generation CAS and actual request accounting.
  * @param {Row} route @param {Row|null} previous
- * @param {{type:'success'|'failure'|'deferred'|'recover',error?:unknown}} event
+ * @param {{type:'success'|'failure'|'deferred'|'recover',error?:unknown,execution?:unknown}} event
  * @param {{nowMs:number,cooldownUntilMs?:number}} options */
 function nextNameRouteState(route, previous, event, { nowMs, cooldownUntilMs = 0 }) {
   check(validRoute(route) && (previous === null || validRow(previous, route))
-    && only(event, ['type', 'error']) && ['success', 'failure', 'deferred', 'recover'].includes(event.type)
+    && only(event, ['type', 'error', 'execution']) && ['success', 'failure', 'deferred', 'recover'].includes(event.type)
     && integer(nowMs) && integer(cooldownUntilMs)
     && (previous === null || nowMs >= previous.last_attempt_at_ms));
   const priorTerminal = terminal(previous);
   if (event.type !== 'recover' && priorTerminal) return { changed: false, ...priorTerminal, row: previous };
   if (event.type === 'deferred') return { changed: false, state: 'deferred', reason: 'admission_deferred', row: previous };
   if (event.type === 'recover' && previous === null) return { changed: false, state: 'ready', reason: 'recovered', row: null };
+  // A final local diagnostic is not a newer remote outcome. The producer's
+  // finite receipt survives Error.message/string boundaries and retains the
+  // last actual result when retry bookkeeping fails after it.
+  const execution = event.type === 'failure' ? readLarkExecutionReceipt(event.error, route.operation)
+    : event.execution !== undefined ? validateLarkExecutionReceipt(event.execution)
+      ? { status: 'valid', value: event.execution } : { status: 'invalid' } : { status: 'absent' };
+  const receipt = execution.status === 'valid' ? execution.value : null;
+  if (execution.status === 'invalid' || receipt && (receipt.execution !== 'started'
+    || receipt.result_at_ms === null || receipt.result_at_ms > nowMs
+    || previous && receipt.result_at_ms < previous.last_attempt_at_ms))
+    return { changed: false, state: 'deferred', reason: 'no_execution_result', row: previous };
+  const resultAt = receipt?.result_at_ms ?? nowMs;
   check((previous?.generation || 0) < Number.MAX_SAFE_INTEGER);
   const row = { ...route, failure_kind: null, failure_code: null, failures: 0,
-    last_attempt_at_ms: event.type === 'recover' ? previous?.last_attempt_at_ms ?? 0 : nowMs,
+    last_attempt_at_ms: event.type === 'recover' ? previous?.last_attempt_at_ms ?? 0 : resultAt,
     retry_at_ms: event.type === 'recover' ? Math.max(nowMs, cooldownUntilMs) : 0,
     blocked: 0, generation: (previous?.generation || 0) + 1 };
-  if (event.type === 'success' || event.type === 'recover')
+  if (event.type === 'success' || event.type === 'recover' || receipt?.result_kind === 'success')
     return { changed: true, state: 'ready', reason: event.type === 'success' ? 'successful_lookup' : 'recovered', row };
-  const failure = classifyNameRouteFailure(event.error, route.operation);
+  const localFailure = classifyNameRouteFailure(event.error, route.operation);
+  const failure = receipt ? { kind: receipt.result_kind, code: receipt.result_code,
+    retryAfterMs: receipt.result_kind === localFailure.kind ? localFailure.retryAfterMs : null } : localFailure;
   const failures = Math.min(3, (previous?.failures || 0) + 1);
   const blocked = TERMINAL.has(failure.kind) ? 1 : 0;
   const next = { ...row, failure_kind: failure.kind, failure_code: failure.code, failures, blocked,

@@ -1,6 +1,7 @@
 // @ts-check
 
 import { spawnSync } from "node:child_process";
+import { formatLarkExecutionReceipt } from "./transport-execution.mjs";
 import { getLarkApiLeaseStdio, readSharedLarkCooldown, writeSharedLarkCooldown } from "../../runtime/lark-api-lease.mjs";
 
 /**
@@ -17,6 +18,7 @@ import { getLarkApiLeaseStdio, readSharedLarkCooldown, writeSharedLarkCooldown }
  * @property {number=} timeoutMs
  * @property {number=} retryBudgetMs Total time for attempts and waits, including an inherited cooldown.
  * @property {number=} maxBufferBytes Optional smaller subprocess output limit; cannot exceed the default.
+ * @property {(receipt:Record<string,any>)=>void=} onExecutionReceipt Finite actual command result; observer errors are isolated.
  * @typedef {import("node:child_process").SpawnSyncReturns<string>} SpawnResult
  * @typedef {object} TransportDeps
  * @property {string=} bin
@@ -28,6 +30,7 @@ import { getLarkApiLeaseStdio, readSharedLarkCooldown, writeSharedLarkCooldown }
  * @property {TransportState=} state
  * @property {typeof readSharedLarkCooldown=} readSharedCooldown
  * @property {typeof writeSharedLarkCooldown=} writeSharedCooldown
+ * @property {typeof getLarkApiLeaseStdio=} getLeaseStdio
  * @typedef {(args: string[], options?: AdapterRunOptions) => JsonObject | null} LarkRunner
  */
 
@@ -337,73 +340,119 @@ function createLarkCliRunner({
   state = defaultTransportState, timeoutMs: defaultTimeoutMs = DEFAULT_LARK_CLI_TIMEOUT_MS,
   readSharedCooldown = spawn === spawnSync ? readSharedLarkCooldown : undefined,
   writeSharedCooldown = spawn === spawnSync ? writeSharedLarkCooldown : undefined,
+  getLeaseStdio = spawn === spawnSync ? getLarkApiLeaseStdio : undefined,
 } = {}) {
   return function runLark(args, options = {}) {
     const operation = transportOperation(args);
     const counters = state.stats.get(operation) || emptyCounters();
     state.stats.set(operation, counters);
     counters.calls += 1;
+    /** The last actual result survives later local retry/cleanup errors. Merely
+     * entering spawn or incrementing attempts cannot create such a result.
+     * @type {Record<string,any>} */
+    let execution = {version:1,launch_attempted:false,execution:'not_started',result_at_ms:null,
+      result_kind:null,result_code:null,remote_result:false};
+    const receipt = () => formatLarkExecutionReceipt(execution);
+    /** @param {string} descriptor @returns {never} */
+    const localFailure = descriptor => { throw new Error(`lark-cli failed: ${descriptor} operation=${operation} ${receipt()}`); };
+    const wallNow = () => {
+      let value;
+      try { value = clock(); } catch { return localFailure('kind=unknown reason=clock_unavailable'); }
+      if (!Number.isSafeInteger(value) || value < 0) return localFailure('kind=unknown reason=clock_unavailable');
+      return value;
+    };
+    const now = () => {
+      let value;
+      try { value = monotonicClock(); } catch { return localFailure('kind=unknown reason=clock_unavailable'); }
+      if (!Number.isFinite(value)) return localFailure('kind=unknown reason=clock_unavailable');
+      return value;
+    };
+    const publish = () => { try { options.onExecutionReceipt?.({...execution}); } catch { /* Optional diagnostics cannot change execution. */ } };
     const retries = Number.isFinite(options.retries) ? Math.min(MAX_LARK_RETRIES, Math.max(0, Math.floor(Number(options.retries)))) : 0;
     const retryDelayMs = Number.isFinite(options.retryDelayMs) && Number(options.retryDelayMs) >= 0 ? Number(options.retryDelayMs) : 1000;
     const requestedTimeoutMs = positiveInteger(options.timeoutMs, positiveInteger(defaultTimeoutMs, DEFAULT_LARK_CLI_TIMEOUT_MS));
     const budgetMs = positiveInteger(options.retryBudgetMs, DEFAULT_LARK_RETRY_BUDGET_MS);
     const maxBuffer = Math.min(MAX_LARK_BUFFER_BYTES, positiveInteger(options.maxBufferBytes, MAX_LARK_BUFFER_BYTES));
-    const wallNow = () => { const value = clock(); return Number.isFinite(value) ? value : Date.now(); };
-    const now = () => {
-      const value = monotonicClock();
-      if (!Number.isFinite(value)) throw new Error(`lark-cli failed: kind=unknown reason=clock_unavailable operation=${operation}`);
-      return value;
-    };
-    // Epoch cooldowns may cross processes; elapsed deadlines must not follow
-    // wall-clock corrections or treat a requested sleep as proof time passed.
     const started = now();
     const deadline = started + budgetMs;
     /** @type {SpawnResult | null} */
     let lastResult = null;
     let lastTimeoutMs = requestedTimeoutMs;
     let nextAttemptAt = started;
-    /** @param {boolean} budgetExhausted */
-    const fail = (budgetExhausted) => {
+    /** @param {boolean} budgetExhausted @returns {never} */
+    const fail = budgetExhausted => {
       if (budgetExhausted) counters.exhausted += 1;
       const descriptor = lastResult ? publicFailureDescriptor(lastResult, lastTimeoutMs) : "kind=rate_limited retry_after_source=shared";
-      throw new Error(`lark-cli failed: ${descriptor} operation=${operation}${budgetExhausted ? " retry_exhausted=1" : ""}`);
+      throw new Error(`lark-cli failed: ${descriptor} operation=${operation}${budgetExhausted ? " retry_exhausted=1" : ""} ${receipt()}`);
     };
     for (let attempt = 0; attempt <= retries; attempt += 1) {
-      // A best-effort caller may swallow an earlier error. Cooling this operation
-      // remains mandatory, while unrelated operations can proceed immediately.
       while (true) {
-        const shared = readSharedCooldown?.({ operation, nowMs: wallNow() });
-        if (shared?.state === "unavailable") throw new Error(`lark-cli failed: kind=unknown reason=shared_cooldown_unavailable operation=${operation}`);
+        const sharedAt = wallNow();
+        let shared;
+        try { shared = readSharedCooldown?.({ operation, nowMs: sharedAt }); }
+        catch { return localFailure('kind=unknown reason=shared_cooldown_unavailable'); }
+        if (shared?.state === "unavailable") return localFailure('kind=unknown reason=shared_cooldown_unavailable');
         if (shared?.state === "cooldown") state.cooldowns.set(operation, Math.max(state.cooldowns.get(operation) || 0, Number(shared.untilMs)));
         const current = now();
         const waitMs = Math.max(0, nextAttemptAt - current, (state.cooldowns.get(operation) || 0) - wallNow());
         if (current >= deadline || waitMs >= deadline - current) return fail(true);
         if (waitMs <= 0) break;
-        sleep(waitMs);
+        try { sleep(waitMs); } catch { return localFailure('kind=unknown reason=retry_wait_unavailable'); }
         counters.wait_ms += waitMs;
-        // Re-read after waiting: another process may have lengthened the
-        // operation cooldown. Never launch from a stale ready decision.
       }
       const remaining = Math.floor(deadline - now());
       if (remaining <= 0) return fail(true);
       lastTimeoutMs = Math.min(requestedTimeoutMs, remaining);
+      let stdio;
+      try { stdio = getLeaseStdio?.(); } catch { return localFailure('kind=unknown reason=lease_unavailable'); }
       counters.attempts += 1;
       if (attempt > 0) counters.retries += 1;
+      execution.launch_attempted = true;
       let result;
       try {
         result = spawn(bin, args, { encoding: "utf8", maxBuffer, timeout: lastTimeoutMs, killSignal: "SIGKILL",
-          ...(spawn === spawnSync ? { stdio: getLarkApiLeaseStdio() } : {}) });
+          ...(getLeaseStdio ? {stdio} : {}) });
       } catch {
-        // Do not leak paths, arguments or payloads from an executor exception.
-        throw new Error(`lark-cli failed: kind=spawn_error operation=${operation}`);
+        if (execution.execution !== 'started') execution.execution = 'unknown';
+        return localFailure('kind=spawn_error');
       }
       lastResult = result;
-      if (result.status === 0) {
-        state.rateStreaks.delete(operation);
-        if ((state.cooldowns.get(operation) || 0) <= wallNow()) state.cooldowns.delete(operation);
-        return parseJson(result.stdout || "");
+      const spawnError = /** @type {NodeJS.ErrnoException|undefined} */ (result?.error);
+      // ENOENT/EACCES are failed exec boundaries, even if an injected result is
+      // contradictory. Missing pid in a SpawnSync ETIMEDOUT result is compatible
+      // with older adapters; an explicit pid=0 remains unproved execution.
+      const didStart = !['ENOENT','EACCES','E2BIG','ENOEXEC'].includes(spawnError?.code || '')
+        && (Number.isInteger(result?.status) && Number(result?.status) >= 0
+          || Number.isInteger(result?.pid) && Number(result?.pid) > 0
+          || spawnError?.code === 'ETIMEDOUT' && !Object.hasOwn(result, 'pid'));
+      let parsed = null, parseFailed = false;
+      if (result?.status === 0) {
+        try { parsed = parseJson(result.stdout || ''); } catch { parseFailed = true; }
       }
       const failure = classifyLarkFailure(spawnFailureText(result));
+      if (didStart) {
+        const envelope = parseLarkEnvelope(result.stderr || '') || parseLarkEnvelope(result.stdout || '');
+        const remoteError = envelope?.error;
+        const remote = Boolean(remoteError && typeof remoteError === 'object' && !Array.isArray(remoteError)
+          && remoteError.type === 'api');
+        const resultKind = result.status === 0 ? parseFailed ? 'unknown' : remote ? failure.kind : 'success'
+          : spawnError?.code === 'ETIMEDOUT' ? 'network_timeout' : failure.kind;
+        execution = {version:1,launch_attempted:true,execution:'started',result_at_ms:null,
+          result_kind:resultKind,result_code:remote ? numericCode(remoteError?.code) : null,
+          remote_result:remote};
+        // Record the execution outcome before any local cooldown, wait, parse
+        // diagnostic or retry bookkeeping can fail. Missing clocks stay missing.
+        try { execution.result_at_ms = wallNow(); } catch (error) { publish(); throw error; }
+        publish();
+      } else if (execution.execution !== 'started') {
+        execution.execution = ['ENOENT','EACCES','E2BIG','ENOEXEC'].includes(spawnError?.code || '') ? 'not_started' : 'unknown';
+      }
+      if (result?.status === 0) {
+        if (parseFailed) return localFailure('kind=unknown reason=invalid_json');
+        state.rateStreaks.delete(operation);
+        if ((state.cooldowns.get(operation) || 0) <= wallNow()) state.cooldowns.delete(operation);
+        return parsed;
+      }
       if (failure.kind === "network_timeout") counters.timeouts += 1;
       if (failure.kind === "rate_limited") {
         counters.rate_limits += 1;
@@ -415,8 +464,11 @@ function createLarkCliRunner({
         const wall = wallNow();
         const until = Math.min(Number.MAX_SAFE_INTEGER, wall + delay);
         state.cooldowns.set(operation, Math.max(state.cooldowns.get(operation) || 0, until));
-        if (writeSharedCooldown && until > wall && !writeSharedCooldown({ operation, untilMs: until, nowMs: wall })) {
-          throw new Error(`lark-cli failed: kind=rate_limited reason=shared_cooldown_unavailable operation=${operation}`);
+        if (writeSharedCooldown && until > wall) {
+          let written;
+          try { written = writeSharedCooldown({ operation, untilMs: until, nowMs: wall }); }
+          catch { return localFailure('kind=rate_limited reason=shared_cooldown_unavailable'); }
+          if (!written) return localFailure('kind=rate_limited reason=shared_cooldown_unavailable');
         }
       }
       if (!failure.transient) return fail(false);
