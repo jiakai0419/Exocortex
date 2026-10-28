@@ -181,7 +181,7 @@ function removeChatAccountTextSql(text: string) {
  * Keep name provenance together, and never carry it across different identities.
  * Ingestion evaluates this inside its write transaction; enrichment evaluates
  * a snapshot and commits only if that exact snapshot still matches. */
-function mergeLarkNameProjectionSql(
+function larkNameProjectionStages(
   existingJson: string,
   incomingJson: string,
   existingActor: string,
@@ -564,25 +564,52 @@ function mergeLarkNameProjectionSql(
       || CASE WHEN EXISTS(SELECT 1 FROM json_each(without_chat_account)) THEN ',' ELSE '' END
       || '"chat_name_account_key":' || json_quote(${chatAccount}) || substr(without_chat_account,${lastBrace})
     ELSE without_chat_account END AS next FROM ${editedChatAccount})`);
-  // Restoring a previously absent field may move its JSON property position.
-  // Compare paths and typed scalar values, so equivalent projections keep the
-  // stored bytes and updated_at instead of recording a formatting-only update.
-  // Numbers must use -> (JSON text), never atom/json_extract's numeric scalar:
-  // distinct values outside int64 or decimal precision can otherwise compare
-  // equal and cause a legitimate incoming unknown value to be discarded.
+  return { stages, resultStage: `n${index}` };
+}
+
+/** Keep the original lossless final comparison after every projection phase.
+ * Numeric JSON tokens use ->, never SQLite's rounded numeric scalar. */
+function equivalentCanonicalSelection(resultStage: string) {
   const comparable = (json: string) => `SELECT fullkey, type,
     CASE WHEN type IN ('integer', 'real') THEN ${json} -> fullkey ELSE atom END
     FROM json_tree(${json})`;
-  let resultStage = `n${index}`;
-  if (accountRetention) {
-    const retention = messageAccountRetentionStages(accountRetention.existingAlias, accountRetention.incomingAlias, resultStage);
-    stages.push(...retention.stages);
-    resultStage = retention.resultStage;
-  }
-  return `(WITH RECURSIVE ${stages.join(',\n')} SELECT CASE WHEN
+  return `SELECT CASE WHEN
     NOT EXISTS (${comparable('next')} EXCEPT ${comparable('old')})
     AND NOT EXISTS (${comparable('old')} EXCEPT ${comparable('next')})
-    THEN old ELSE next END FROM ${resultStage})`;
+    THEN old ELSE next END FROM ${resultStage}`;
 }
 
-export { larkSenderNameIsUnknownSql, larkSenderNamespaceSql, mergeLarkNameProjectionSql };
+/** Compatibility expression; standalone consumers keep the original ordering. */
+function mergeLarkNameProjectionSql(...args: Parameters<typeof larkNameProjectionStages>) {
+  const projection = larkNameProjectionStages(...args);
+  const accountRetention = args[8];
+  if (accountRetention) {
+    const retention = messageAccountRetentionStages(accountRetention.existingAlias,
+      accountRetention.incomingAlias, projection.resultStage);
+    projection.stages.push(...retention.stages);
+    projection.resultStage = retention.resultStage;
+  }
+  return `(WITH RECURSIVE ${projection.stages.join(',\n')} ${equivalentCanonicalSelection(projection.resultStage)})`;
+}
+
+/** First phase for the record store. Account aliases still authorize failure
+ * diagnostic retention; only acquisition retention and final equality wait.
+ * Its result must become a materialized TEXT column before the second phase. */
+function projectLarkNamesSql(...args: Parameters<typeof larkNameProjectionStages>) {
+  const { stages, resultStage } = larkNameProjectionStages(...args);
+  return `(WITH RECURSIVE ${stages.join(',\n')} SELECT next FROM ${resultStage})`;
+}
+
+/** Apply unchanged acquisition rules to one materialized row, then perform the
+ * original final comparison. original existing/incoming aliases are preserved;
+ * the projected column must never replace the incoming evidence document. */
+function finishLarkAccountProjectionSql(existingAlias: string, incomingAlias: string,
+  projectedCanonical: string) {
+  const seed = `acquisition_seed AS MATERIALIZED (SELECT ${existingAlias}.canonical_json AS old,
+    ${projectedCanonical} AS next)`;
+  const retention = messageAccountRetentionStages(existingAlias, incomingAlias, 'acquisition_seed');
+  return `(WITH RECURSIVE ${[seed, ...retention.stages].join(',\n')}
+    ${equivalentCanonicalSelection(retention.resultStage)})`;
+}
+
+export { larkSenderNameIsUnknownSql, larkSenderNamespaceSql, mergeLarkNameProjectionSql, projectLarkNamesSql, finishLarkAccountProjectionSql };

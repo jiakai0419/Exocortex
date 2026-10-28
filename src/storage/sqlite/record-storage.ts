@@ -1,6 +1,6 @@
 import type { StoredRecord } from "./ingestion-types.js";
 import { quoteSql } from "./sqlite-executor.js";
-import { mergeLarkNameProjectionSql } from "./lark-name-projection.js";
+import { projectLarkNamesSql, finishLarkAccountProjectionSql } from "./lark-name-projection.js";
 import { compareObservation, isNativeRecord } from "../../core/lark-observation.js";
 import { observationAllowsSql, observationEvidenceSql, observationGuardSql, prepareObservationRecords } from "./observation-store.js";
 
@@ -149,21 +149,48 @@ const MUTABLE_RECORD_COLUMNS = [
 ];
 const REVIEW_EFFECTIVE_COLUMNS = ["id", "source_id", "first_seen_scope_id", "external_id", ...MUTABLE_RECORD_COLUMNS];
 
-function mergedCanonicalSql(existingAlias: string, incomingAlias: string) {
+function nameProjectedCanonicalSql(existingAlias: string, incomingAlias: string) {
   const existing = existingAlias;
   const incoming = incomingAlias;
   return `(CASE WHEN ${existing}.source_id = 'lark.im' AND ${incoming}.source_id = 'lark.im'
     AND ${existing}.record_type = 'lark.im.message' AND ${incoming}.record_type = 'lark.im.message'
-    THEN ${mergeLarkNameProjectionSql(`${existing}.canonical_json`, `${incoming}.canonical_json`,
+    THEN ${projectLarkNamesSql(`${existing}.canonical_json`, `${incoming}.canonical_json`,
       `${existing}.actor_id`, `${incoming}.actor_id`, `${existing}.container_id`, `${incoming}.container_id`,
       `${existing}.raw_json`, `${incoming}.raw_json`, { existingAlias: existing, incomingAlias: incoming })}
     ELSE ${incoming}.canonical_json END)`;
 }
 
-function recordDiffSql(existingAlias: string, incomingAlias: string) {
+/** A top-level phase owns the name expression. The correlated account helper
+ * only reads its materialized column, not the entire upstream CTE graph.
+ * Each scalar account helper still receives exactly one existing/incoming pair. */
+function canonicalProjectionCtes(input: string, prefix: string, fence = '1', admission?: string) {
+  const names = `${prefix}_names`, final = `${prefix}_canonical`;
+  const admitted = admission ? 'a.accepted' : '1';
+  const joinAdmission = admission
+    ? `JOIN ${admission} a ON a.source_id=i.source_id AND a.external_id=i.external_id` : '';
+  return { names, final, sql: `${names} AS MATERIALIZED (
+      SELECT i.source_id,i.external_id,CASE WHEN r.id IS NULL THEN i.canonical_json
+        WHEN ${admitted} THEN ${nameProjectedCanonicalSql('r', 'i')}
+        ELSE r.canonical_json END AS canonical_json
+      FROM ${input} i LEFT JOIN records r ON r.source_id=i.source_id AND r.external_id=i.external_id
+      ${joinAdmission}
+      WHERE ${fence}
+    ), ${final} AS MATERIALIZED (
+      SELECT i.source_id,i.external_id,CASE WHEN ${admitted} AND r.source_id='lark.im' AND i.source_id='lark.im'
+        AND r.record_type='lark.im.message' AND i.record_type='lark.im.message'
+        THEN ${finishLarkAccountProjectionSql('r', 'i', 'n.canonical_json')}
+        ELSE n.canonical_json END AS canonical_json
+      FROM ${input} i JOIN ${names} n ON n.source_id=i.source_id AND n.external_id=i.external_id
+      LEFT JOIN records r ON r.source_id=i.source_id AND r.external_id=i.external_id
+      ${joinAdmission}
+    )` };
+}
+
+function recordDiffSql(existingAlias: string, incomingAlias: string,
+  canonical = `${incomingAlias}.canonical_json`) {
   return `(${MUTABLE_RECORD_COLUMNS.map(
     (column) => `${existingAlias}.${column} IS NOT ${column === "canonical_json"
-      ? mergedCanonicalSql(existingAlias, incomingAlias) : `${incomingAlias}.${column}`}`,
+      ? canonical : `${incomingAlias}.${column}`}`,
   ).join(" OR ")})`;
 }
 
@@ -209,15 +236,17 @@ function boundedReplayProjectionSql(records: StoredRecord[], options: { dbPath?:
   const incomingColumns = ["source_id", "external_id", ...MUTABLE_RECORD_COLUMNS];
   const sameFact = "r.external_version IS i.external_version AND r.content_hash IS i.content_hash AND r.raw_json IS i.raw_json";
   const allow = options.legacyStrict ? strictlyNewerVersionSql("r", "i") : sourceCanReplaceSql("r", "i", "NULL", true, "COALESCE(i.allow_update, (" + strictlyNewerVersionSql("r", "i") + " OR (r.external_version IS i.external_version AND r.raw_json IS i.raw_json)))");
+  const projected = canonicalProjectionCtes("i", "review");
   return `WITH i (${incomingColumns.join(",")},allow_update) AS (VALUES
       ${normalized.map((record) => `(${incomingColumns.map((column) => column === "occurred_at_ms"
         ? String(record.occurred_at_ms) : quoteSql(record[column as keyof StoredRecord])).join(",")},${observationAllowsSql(record) ?? "NULL"})`).join(",\n")}
-    ), projection AS MATERIALIZED (
-      SELECT r.*, CASE WHEN ${allow} AND ${recordDiffSql("r", "i")} THEN 1 ELSE 0 END AS should_update,
+    ), ${projected.sql}, projection AS MATERIALIZED (
+      SELECT r.*, CASE WHEN ${allow} AND ${recordDiffSql("r", "i", "p.canonical_json")} THEN 1 ELSE 0 END AS should_update,
         CASE WHEN ${sameFact} THEN 1 ELSE 0 END AS same_fact,
         ${MUTABLE_RECORD_COLUMNS.map((column) => `${column === "canonical_json"
-          ? mergedCanonicalSql("r", "i") : `i.${column}`} AS incoming_${column}`).join(",\n")}
+          ? "p.canonical_json" : `i.${column}`} AS incoming_${column}`).join(",\n")}
       FROM i JOIN records r ON r.source_id=i.source_id AND r.external_id=i.external_id
+      JOIN ${projected.final} p ON p.source_id=i.source_id AND p.external_id=i.external_id
     ) SELECT id, external_id,
       CASE WHEN should_update=1 THEN 'update' WHEN same_fact=1 THEN 'duplicate' ELSE 'conflict' END AS outcome,
       json_object(${REVIEW_EFFECTIVE_COLUMNS.flatMap((column) => [quoteSql(column),
@@ -226,8 +255,8 @@ function boundedReplayProjectionSql(records: StoredRecord[], options: { dbPath?:
 }
 
 function recordUpdateSetSql() {
-  return [...MUTABLE_RECORD_COLUMNS.map((column) => `${column} = ${column === "canonical_json"
-    ? mergedCanonicalSql("records", "excluded") : `excluded.${column}`}`), "updated_at = excluded.updated_at"].join(",\n  ");
+  return [...MUTABLE_RECORD_COLUMNS.map((column) => `${column} = excluded.${column}`),
+    "updated_at = excluded.updated_at"].join(",\n  ");
 }
 
 /** A failed explicit predecessor check aborts its surrounding transaction.
@@ -253,53 +282,29 @@ function recordIdentityGuardSql(records: StoredRecord[]) {
 function upsertRecordsSql(records: StoredRecord[], options: { strictVersionIncrease?: boolean; dbPath?: string; legacyApprovalGate?: boolean } = {}) {
   const initial = normalizeStoredRecords(records);
   const normalized = options.dbPath ? prepareObservationRecords(options.dbPath, initial) : initial;
-  return recordIdentityGuardSql(normalized) + observationEvidenceSql(normalized) + normalized
-    .map(
-      (record) => `
-INSERT INTO records (
-  source_id,
-  first_seen_scope_id,
-  external_id,
-  external_version,
-  record_type,
-  occurred_at,
-  occurred_at_ms,
-  actor_id,
-  container_id,
-  direction,
-  title,
-  body,
-  content_hash,
-  canonical_json,
-  raw_json,
-  updated_at
-)
-VALUES (
-  ${quoteSql(record.source_id)},
-  ${quoteSql(record.first_seen_scope_id)},
-  ${quoteSql(record.external_id)},
-  ${quoteSql(record.external_version)},
-  ${quoteSql(record.record_type)},
-  ${quoteSql(record.occurred_at)},
-  ${Number(record.occurred_at_ms)},
-  ${quoteSql(record.actor_id)},
-  ${quoteSql(record.container_id)},
-  ${quoteSql(record.direction)},
-  ${quoteSql(record.title)},
-  ${quoteSql(record.body)},
-  ${quoteSql(record.content_hash)},
-  ${quoteSql(record.canonical_json)},
-  ${quoteSql(record.raw_json)},
+  const columns = ['source_id', 'first_seen_scope_id', 'external_id', ...MUTABLE_RECORD_COLUMNS];
+  const projected = canonicalProjectionCtes('i', 'upsert', '1', 'admission');
+  // Retain one atomic record DML per normalized input and the historical final
+  // changes() contract. All projection stages stay inside that same statement.
+  return recordIdentityGuardSql(normalized) + observationEvidenceSql(normalized) + normalized.map(record => `
+WITH i (${columns.join(',')}) AS MATERIALIZED (VALUES (
+  ${columns.map(column => column === 'occurred_at_ms' ? String(Number(record.occurred_at_ms))
+    : quoteSql(record[column as keyof StoredRecord])).join(',')}
+)), admission AS MATERIALIZED (
+  SELECT i.source_id,i.external_id,r.id IS NULL OR (
+    ${sourceCanReplaceSql('r', 'i', quoteSql(record.expected_external_version), options.strictVersionIncrease, observationAllowsSql(record))}
+    AND ${options.legacyApprovalGate ? strictlyNewerVersionSql('r', 'i') : '1'}) AS accepted
+  FROM i LEFT JOIN records r ON r.source_id=i.source_id AND r.external_id=i.external_id
+), ${projected.sql}
+INSERT INTO records (${columns.join(',')},updated_at)
+SELECT ${columns.map(column => column === 'canonical_json' ? 'p.canonical_json' : `i.${column}`).join(',')},
   ${quoteSql(new Date().toISOString())}
-)
-ON CONFLICT(source_id, external_id) DO UPDATE SET
-  ${recordUpdateSetSql()}
-WHERE ${sourceCanReplaceSql("records", "excluded", quoteSql(record.expected_external_version), options.strictVersionIncrease, observationAllowsSql(record))}
-  AND ${options.legacyApprovalGate ? strictlyNewerVersionSql("records", "excluded") : "1"}
-  AND ${recordDiffSql("records", "excluded")};
-`,
-    )
-    .join("\n");
+FROM i JOIN ${projected.final} p ON p.source_id=i.source_id AND p.external_id=i.external_id
+WHERE 1
+ON CONFLICT(source_id, external_id) DO UPDATE SET ${recordUpdateSetSql()}
+WHERE (SELECT accepted FROM admission a WHERE a.source_id=excluded.source_id AND a.external_id=excluded.external_id)
+  AND ${recordDiffSql('records', 'excluded')};
+`).join('\n');
 }
 
 function incomingRecordsSql(records: StoredRecord[]) {
@@ -358,7 +363,9 @@ ${inserts}
 function recordWritesSql(normalizedRecords: StoredRecord[], now: string) {
   const canReplace = sourceCanReplaceSql("r", "i", "i.expected_external_version", false,
     `COALESCE(i.allow_update, (${strictlyNewerVersionSql("r", "i")} OR (r.external_version IS i.external_version AND r.raw_json IS i.raw_json)))`);
-  const differs = recordDiffSql("r", "i");
+  const differs = recordDiffSql("r", "i", "p.canonical_json");
+  const projected = canonicalProjectionCtes("__incoming_records", "batch",
+    "EXISTS (SELECT 1 FROM __run_fence_guard)", "__record_acceptance");
   return `
 ${recordIdentityGuardSql(normalizedRecords)}
 ${observationEvidenceSql(normalizedRecords, "EXISTS (SELECT 1 FROM __run_fence_guard)")}
@@ -369,6 +376,12 @@ ${incomingRecordsSql(normalizedRecords)}
       SELECT i.source_id, i.external_id, (r.id IS NULL OR ${canReplace}) AS accepted
       FROM __incoming_records i LEFT JOIN records r
         ON r.source_id=i.source_id AND r.external_id=i.external_id;
+    CREATE TEMP TABLE __record_projection (
+      source_id TEXT NOT NULL,external_id TEXT NOT NULL,canonical_json TEXT,
+      PRIMARY KEY(source_id,external_id)
+    );
+    WITH ${projected.sql}
+    INSERT INTO __record_projection SELECT source_id,external_id,canonical_json FROM ${projected.final};
     CREATE TEMP TABLE __write_effects (
       inserted INTEGER NOT NULL,
       updated INTEGER NOT NULL,
@@ -383,6 +396,7 @@ ${incomingRecordsSql(normalizedRecords)}
       COALESCE(SUM(CASE WHEN r.id IS NOT NULL AND i.allow_update=0 THEN 1 ELSE 0 END), 0)
     FROM __incoming_records i
     JOIN __record_acceptance a ON a.source_id=i.source_id AND a.external_id=i.external_id
+    JOIN __record_projection p ON p.source_id=i.source_id AND p.external_id=i.external_id
     LEFT JOIN records r
       ON r.source_id = i.source_id
      AND r.external_id = i.external_id
@@ -395,8 +409,9 @@ ${incomingRecordsSql(normalizedRecords)}
     SELECT
       i.source_id, i.first_seen_scope_id, i.external_id, i.external_version, i.record_type,
       i.occurred_at, i.occurred_at_ms, i.actor_id, i.container_id, i.direction, i.title, i.body,
-      i.content_hash, i.canonical_json, i.raw_json, ${quoteSql(now)}
+      i.content_hash, p.canonical_json, i.raw_json, ${quoteSql(now)}
     FROM __incoming_records i
+    JOIN __record_projection p ON p.source_id=i.source_id AND p.external_id=i.external_id
     WHERE EXISTS (SELECT 1 FROM __run_fence_guard)
     ON CONFLICT(source_id, external_id) DO UPDATE SET
       ${recordUpdateSetSql()}
