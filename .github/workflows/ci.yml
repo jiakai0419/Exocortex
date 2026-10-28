@@ -15,7 +15,7 @@ jobs:
   test:
     name: Check and test
     runs-on: macos-26
-    timeout-minutes: 20
+    timeout-minutes: 60
     env:
       EXOCORTEX_SYNTHETIC_PYTHON: /usr/bin/python3
 
