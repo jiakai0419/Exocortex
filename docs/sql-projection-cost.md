@@ -81,7 +81,8 @@ These are complete-program measurements, not just the final record INSERT.
 Five alternating post-warmup samples per baseline/repair case cover all three
 entrypoints, ordinary and native-observation inputs, and single-row
 fresh/update/no-op variants. The maximum paired median preparation CPU ratio
-was 1.574 versus 563; maximum instruction and summed statement-memory ratios
+was 1.584 versus 563, including the separate five-sample triplet comparison;
+maximum instruction and summed statement-memory ratios
 were 1.625 and 1.351. The run-commit path uses less compiled structure than 563
 because it reuses the final canonical for counts and the write. An absent replay
 target is measured only as a structural case, not as successful replay review.
