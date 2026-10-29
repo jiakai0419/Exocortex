@@ -8,7 +8,8 @@ import { projectionAccount } from '../adapters/lark-im/message-projection-eviden
 import { recipientAccountKey } from '../adapters/lark-im/p2p-recipient.mjs';
 import { renderMediaProjection } from '../adapters/lark-im/media-content.mjs';
 import { assessMediaImageBytes, makeMediaResourceBinding, MAX_MEDIA_RESOURCE_BYTES,
-  publishMediaResource, readMediaResource, resourceStorePath } from '../adapters/lark-im/media-resource-store.mjs';
+  publishMediaResource, readMediaResource, resourceStorePath, makeMediaPendingSourceFence,
+  readPendingMediaResource, retainPendingMediaResource, discardPendingMediaResource, reclaimPendingMediaResources } from '../adapters/lark-im/media-resource-store.mjs';
 import { classifyLarkFailure } from '../adapters/lark-im/transport.mjs';
 import { readMessageSnapshot } from '../diagnostics/message-read-snapshot.mjs';
 import { createMaintenanceRequestSession, MaintenanceRequestError } from './request-session.mjs';
@@ -22,7 +23,9 @@ const parse = value => { try {return JSON.parse(value);} catch {return {};} };
 const localFailure = reason => Object.assign(new Error(reason),{resourceReason:reason});
 const localReasons = new Set(['profile_unverified','account_mismatch','account_changed','source_changed',
   'download_response_invalid','download_file_invalid','download_image_invalid','resource_publish_failed',
-  'resource_format_unsupported','resource_decoder_unavailable']);
+  'resource_format_unsupported','resource_decoder_unavailable','resource_pending_invalid','resource_pending_busy']);
+const continuationCurrent=(evidence,time)=>Number.isSafeInteger(time)&&time>=evidence.read_observed_at_ms&&time>=evidence.created_at_ms&&time<evidence.expires_at_ms;
+const resumableStops = new Set(['sync_busy','cli_budget','self_budget','time_budget']);
 // Only these byte-content outcomes are independent of batch safety admission.
 const itemContentFailures = new Set(['download_image_invalid','resource_format_unsupported']);
 function failure(error) {
@@ -81,7 +84,9 @@ export function enrichResources(options,deps={}) {
     if(cached.status==='available')return {...entry,state:'available',reason:null};
     if(cached.status==='invalid')return {...entry,reason:cached.reason};
     const planned={...entry,state:'planned',reason:null};
-    candidates.push({row,account,media,binding,entry:planned});return planned;
+    const sourceFence=makeMediaPendingSourceFence(row);
+    if(!sourceFence)return {...entry,reason:'source_binding_invalid'};
+    candidates.push({row,account,media,binding,sourceFence,entry:planned});return planned;
   });
   /** @type {Row} */ const report={target:'resources',dry_run:options.apply!==true,
     selected:results.length,results,request_budget:null,partial:false};
@@ -99,6 +104,7 @@ export function enrichResources(options,deps={}) {
   let session;
   /** @type {Row|null} */ let activeCandidate=null;
   let activeAttempts=0;
+  let openingAtMs=null,originalClosingAtMs=null;
   try {
     const sessionDeps={env:deps.env,now:deps.now,...deps.requestSessionDeps};
     const executor=sessionDeps.spawnSync || spawnSync;
@@ -114,7 +120,20 @@ export function enrichResources(options,deps={}) {
       return recipientAccountKey(self.open_id);};
     const account=verifySelf();
     if(candidates.some(candidate=>candidate.account.account_key!==account))throw localFailure('account_mismatch');
+    openingAtMs=now();
+    const prepared=reclaimPendingMediaResources(cache,{nowMs:now()});
+    if(prepared.status!=='ready')throw localFailure(prepared.reason);
     for(const [index,candidate] of candidates.entries()) {
+      const pending=readPendingMediaResource(cache,candidate.binding,candidate.sourceFence,{nowMs:now()});
+      if(pending.status==='invalid')throw localFailure('resource_pending_invalid');
+      if(pending.status==='pending') {
+        candidate.bytes=pending.bytes;candidate.continuation=pending;
+        candidate.entry.state='verified_download';candidate.entry.pending_state='reused';continue;
+      }
+      // A previous download without its original closing account observation is
+      // quarantined, never promoted by today's self profile. A fresh operation
+      // must download again; success may remove that exact obsolete generation.
+      if(pending.status==='quarantined')candidate.quarantine=pending;
       session.assertReady();
       const filename=`resource-${index}.bin`;
       activeCandidate=candidate;activeAttempts=session.summary().cli_attempts;
@@ -133,21 +152,54 @@ export function enrichResources(options,deps={}) {
     const downloaded=candidates.filter(candidate=>candidate.entry.state==='verified_download');
     if(!downloaded.length)return finish();
     if(verifySelf()!==account)throw localFailure('account_changed');
+    originalClosingAtMs=now();
     session.withCommit(()=>{
       const current=snapshot(options.db,selection).rows;
       for(const candidate of downloaded) {
+        const publicationAtMs=now();
+        if(candidate.continuation && !continuationCurrent(candidate.continuation,publicationAtMs)) {
+          candidate.entry.state='blocked';candidate.entry.reason='resource_pending_expired';continue;
+        }
         const row=current.find(row=>row.id===candidate.row.id);
         if(!row||unchangedFields.some(key=>row[key]!==candidate.row[key])) {
           candidate.entry.state='blocked';candidate.entry.reason='source_changed';continue;
         }
-        const saved=publishMediaResource(cache,candidate.binding,candidate.bytes,{nowMs:now()});
+        const saved=publishMediaResource(cache,candidate.binding,candidate.bytes,{nowMs:publicationAtMs});
         candidate.entry.state=saved.status==='available'?'available':'blocked';
         candidate.entry.reason=saved.status==='available'?null:saved.reason;
         if(saved.status!=='available')throw localFailure('resource_publish_failed');
+        const receipt=candidate.continuation?.receipt??candidate.quarantine?.receipt;
+        if(receipt) {
+          const cleaned=discardPendingMediaResource(cache,receipt);
+          if(cleaned.status!=='removed')candidate.entry.pending_cleanup_reason=cleaned.reason;
+        }
       }
     });
   } catch(error) {
     const reason=failure(error);report.stop_reason=reason;
+    if(resumableStops.has(reason)&&openingAtMs!==null) {
+      // Local retention never publishes available evidence or obtains an API
+      // lease. Recheck the exact row before preserving this original operation.
+      try {
+        const current=snapshot(options.db,selection).rows;
+        for(const candidate of candidates.filter(item=>item.entry.state==='verified_download')) {
+          const retentionAtMs=now();
+          if(candidate.continuation && !continuationCurrent(candidate.continuation,retentionAtMs)) {
+            candidate.entry.pending_state='not_retained';candidate.entry.pending_reason='resource_pending_expired';continue;
+          }
+          const row=current.find(row=>row.id===candidate.row.id);
+          if(!row||makeMediaPendingSourceFence(row)!==candidate.sourceFence) {
+            candidate.entry.state='blocked';candidate.entry.reason='source_changed';continue;
+          }
+          const retained=retainPendingMediaResource(cache,candidate.binding,candidate.sourceFence,candidate.bytes,{nowMs:retentionAtMs,
+            openingAtMs:candidate.continuation?.opening_at_ms??openingAtMs,
+            originalClosingAtMs:candidate.continuation?.original_closing_at_ms??originalClosingAtMs,stopReason:reason,
+            freshDownload:!candidate.continuation});
+          candidate.entry.pending_state=retained.status==='pending'?'retained':retained.status==='quarantined'?'quarantined':'not_retained';
+          if(!['pending','quarantined'].includes(retained.status))candidate.entry.pending_reason=retained.reason;
+        }
+      }catch {report.pending_reason='resource_pending_invalid';}
+    }
     // A failed request is evidence about one resource, never its neighbors.
     // Pre-execution admission failures have no resource response to attribute.
     if(activeCandidate?.entry.state==='fetching' && (session?.summary().cli_attempts || 0)>activeAttempts) {

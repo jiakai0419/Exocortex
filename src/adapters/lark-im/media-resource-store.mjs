@@ -1,7 +1,8 @@
 // @ts-check
 import { createHash, randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { constants, closeSync, fstatSync, fsyncSync, linkSync, lstatSync, mkdirSync,
-  openSync, readSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs';
+  openSync, readSync, readdirSync, realpathSync, rmdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { inflateSync } from 'node:zlib';
 import { validateJsonObjectText } from '../../../dist/core/json-text-patch.js';
@@ -468,4 +469,207 @@ export function publishMediaResource(cacheDir,binding,bytes,options={},deps={}) 
     publishFile(dir,`${digest}.json`,Buffer.from(JSON.stringify(manifest)+'\n'));
     return readMediaResource(cacheDir,binding);
   }catch{return finite('invalid','resource_publish_failed');}
+}
+
+// Explicit maintenance continuation only. The normal reader above never opens
+// this namespace; pending evidence cannot supply an available manifest.
+export const MEDIA_PENDING_TTL_MS = 60 * 60 * 1000;
+export const MAX_PENDING_MEDIA_RESOURCES = 20;
+export const MEDIA_RESOURCE_SOURCE_FIELDS = Object.freeze(['id','source_id','record_type','external_id','external_version','content_hash',
+  'raw_json','canonical_json','actor_id','container_id','direction','occurred_at','occurred_at_ms','body']);
+const pendingKeys = ['schema','generation','binding','source_fence','sha256','size_bytes','mime_type',
+  'opening_at_ms','original_closing_at_ms','created_at_ms','expires_at_ms','stop_reason'];
+const claimKeys = ['schema','generation','created_at_ms'];
+const resumableStops = new Set(['sync_busy','cli_budget','self_budget','time_budget']);
+const validTime = n => Number.isSafeInteger(n) && n >= 0 && Number.isFinite(new Date(n).getTime());
+const validGeneration = value => typeof value === 'string' && /^[0-9a-f-]{36}$/.test(value);
+const slots = Array.from({length:MAX_PENDING_MEDIA_RESOURCES},(_,i)=>`slot-${String(i).padStart(2,'0')}`);
+
+export function makeMediaPendingSourceFence(row) {
+  if (!object(row) || !Number.isSafeInteger(row.id) || row.id < 1 || MEDIA_RESOURCE_SOURCE_FIELDS.some(key=>
+    !Object.hasOwn(row,key) || !(row[key]===null || typeof row[key]==='string' || typeof row[key]==='number' && Number.isFinite(row[key])))) return null;
+  return sha(JSON.stringify(MEDIA_RESOURCE_SOURCE_FIELDS.map(key=>[key,row[key]])));
+}
+function pendingDirectory(cache,create) {
+  const outer=directory(cache,create), dir=directory(join(outer.root,'pending-v1'),create);
+  directoryUnchanged(outer);return dir;
+}
+function readPendingJson(dir,name,keys) {
+  const file=readPrivateBytes(join(dir.root,name),MAX_MANIFEST_BYTES,undefined),json=file.bytes.toString('utf8');
+  validateJsonObjectText(json);const value=JSON.parse(json);
+  if(!exactKeys(value,keys))throw new Error('pending_manifest_invalid');
+  return {value,info:file.info};
+}
+function pendingClaim(dir) {
+  const claim=readPendingJson(dir,'claim.json',claimKeys);
+  if(claim.value.schema!=='lark_media_pending_claim/v1'||!validGeneration(claim.value.generation)||!validTime(claim.value.created_at_ms))
+    throw new Error('pending_claim_invalid');
+  return claim;
+}
+function pendingManifest(dir) {
+  const claim=pendingClaim(dir), file=readPendingJson(dir,'manifest.json',pendingKeys),m=file.value;
+  if(m.schema!=='lark_media_pending/v1'||m.generation!==claim.value.generation||m.created_at_ms!==claim.value.created_at_ms
+    ||!hashValid(m.source_fence)||!hashValid(m.sha256)||!Number.isSafeInteger(m.size_bytes)||m.size_bytes<1||m.size_bytes>MAX_MEDIA_RESOURCE_BYTES
+    ||!validTime(m.opening_at_ms)||m.opening_at_ms>m.created_at_ms||!validTime(m.expires_at_ms)||m.expires_at_ms-m.created_at_ms!==MEDIA_PENDING_TTL_MS
+    ||!(m.original_closing_at_ms===null||validTime(m.original_closing_at_ms)&&m.original_closing_at_ms>=m.opening_at_ms&&m.original_closing_at_ms<=m.created_at_ms)
+    ||!resumableStops.has(m.stop_reason))throw new Error('pending_manifest_invalid');
+  fileUnchanged(join(dir.root,'claim.json'),claim.info);directoryUnchanged(dir);
+  return {...file,claim};
+}
+// A private, nonblocking file lock serializes only local slot mutation/GC.
+// flock is on the inherited open-file description, retained by this Node fd;
+// process death releases it. This is unrelated to the API admission lease.
+function withPendingMutation(cache,callback) {
+  let fd;
+  try {
+    const dir=pendingDirectory(cache,true),path=join(dir.root,'.mutation.lock');
+    fd=openSync(path,constants.O_RDWR|constants.O_CREAT|constants.O_NOFOLLOW|constants.O_NONBLOCK,0o600);
+    const info=fstatSync(fd,{bigint:true});
+    if(!info.isFile()||info.nlink!==1n||!privateOwned(info)||info.size!==0n)throw new Error('pending_lock_invalid');
+    const lock=spawnSync('python3',['-B','-c','import fcntl,sys\ntry: fcntl.flock(3,fcntl.LOCK_EX|fcntl.LOCK_NB)\nexcept BlockingIOError: sys.exit(73)'],
+      {stdio:['ignore','ignore','ignore',fd],timeout:1000});
+    if(lock.status===73)return finite('blocked','resource_pending_busy');
+    if(lock.status!==0||lock.error)throw new Error('pending_lock_failed');
+    fileUnchanged(path,info);directoryUnchanged(dir);
+    const result=callback(dir);
+    fileUnchanged(path,info);directoryUnchanged(dir);return result;
+  }catch{return finite('invalid','resource_pending_invalid');}
+  finally{if(fd!==undefined)closeSync(fd);}
+}
+const pendingStatKeys=['dev','ino','size','mtimeNs','ctimeNs','mode','uid','nlink'];
+const pendingStat=info=>Object.fromEntries(pendingStatKeys.map(key=>[key,String(info[key])]));
+function capturePendingSlot(parent,slot) {
+  const dir=directory(join(parent.root,slot),false),names=readdirSync(dir.root).sort();
+  /** @type {JsonObject[]} */ const files=names.map(name=>{
+    if(!['claim.json','manifest.json','payload.blob'].includes(name))throw new Error('pending_unknown_file');
+    const info=lstatSync(join(dir.root,name),{bigint:true});
+    if(!info.isFile()||info.isSymbolicLink()||info.nlink!==1n||!privateOwned(info)||info.size>BigInt(MAX_MEDIA_RESOURCE_BYTES))throw new Error('pending_unsafe_file');
+    return {name,...pendingStat(info)};
+  });
+  directoryUnchanged(dir);
+  return {dir,receipt:{slot,dev:String(dir.info.dev),ino:String(dir.info.ino),files}};
+}
+function removePendingSlot(parent,expected) {
+  const current=capturePendingSlot(parent,expected.slot),dir=current.dir;
+  if(JSON.stringify(current.receipt)!==JSON.stringify(expected))throw new Error('pending_replaced');
+  for(const file of expected.files){
+    const path=join(dir.root,file.name),info=lstatSync(path,{bigint:true});
+    if(JSON.stringify({name:file.name,...pendingStat(info)})!==JSON.stringify(file))throw new Error('pending_replaced');
+    directoryUnchanged(dir);unlinkSync(path);
+  }
+  directoryUnchanged(dir);rmdirSync(dir.root);directoryUnchanged(parent);
+}
+// No link/unlink publication window: an interrupted exclusive write is merely
+// incomplete pending data. Never used for available-resource publication.
+function writePendingFile(dir,name,bytes) {
+  let fd;const path=join(dir.root,name);
+  try{directoryUnchanged(dir);fd=openSync(path,'wx',0o600);writeFileSync(fd,bytes);fsyncSync(fd);}
+  finally{if(fd!==undefined)closeSync(fd);}
+  directoryUnchanged(dir);
+}
+function reclaimExpiredPending(parent,nowMs,deps={}) {
+  for(const slot of slots) {
+    let captured;
+    try{captured=capturePendingSlot(parent,slot);}catch(error){if(errorCode(error)==='ENOENT')continue;throw error;}
+    const {dir,receipt}=captured;let created;
+    try{
+      const claim=pendingClaim(dir);created=claim.value.created_at_ms;
+      if(JSON.stringify({name:'claim.json',...pendingStat(claim.info)})!==JSON.stringify(receipt.files.find(file=>file.name==='claim.json')))
+        throw new Error('pending_replaced');
+    }catch(error){
+      if(error instanceof Error&&error.message==='pending_replaced'||receipt.files.some(file=>['payload.blob','manifest.json'].includes(file.name)))throw error;
+      // An incomplete first claim has no trustworthy logical time. Its entire
+      // known private file set must age for an hour by filesystem timestamps.
+      created=Math.max(Number(dir.info.birthtimeMs),...receipt.files.flatMap(file=>[Number(file.mtimeNs)/1e6,Number(file.ctimeNs)/1e6]));
+    }
+    if(!Number.isFinite(created)||created<0||created>nowMs)throw new Error('pending_clock_invalid');
+    if(nowMs-created>=MEDIA_PENDING_TTL_MS){deps.beforeReclaim?.();removePendingSlot(parent,receipt);}
+  }
+}
+/** Explicit apply only. Reads/messages never initialize or prune this cache. */
+export function reclaimPendingMediaResources(cache,options={},deps={}) {
+  const nowMs=options.nowMs??Date.now();if(!validTime(nowMs))return finite('invalid','resource_pending_invalid');
+  try{pendingDirectory(cache,false);}catch(error){return errorCode(error)==='ENOENT'?finite('ready',null):finite('invalid','resource_pending_invalid');}
+  return withPendingMutation(cache,parent=>{reclaimExpiredPending(parent,nowMs,deps);return finite('ready',null);});
+}
+
+/** Read-only; exact original binding and source fence, including row ID. */
+export function readPendingMediaResource(cache,binding,sourceFence,options={},deps={}) {
+  try {
+    const nowMs=options.nowMs??Date.now(),normalized=normalizedBinding(binding);
+    if(!validTime(nowMs)||!hashValid(sourceFence))throw new Error('pending_context_invalid');
+    let parent;
+    try{parent=pendingDirectory(cache,false);}catch(error){if(errorCode(error)==='ENOENT')return finite('missing','resource_pending_missing');throw error;}
+    let found=null;
+    for(const slot of slots) {
+      let dir,document;
+      try{dir=directory(join(parent.root,slot),false);document=pendingManifest(dir);}
+      catch(error){
+        if(errorCode(error)==='ENOENT'){
+          if(dir && readdirSync(dir.root).includes('manifest.json'))throw new Error('pending_incomplete_manifest');
+          continue;
+        }throw error;
+      }
+      const m=document.value;
+      if(m.created_at_ms>nowMs)throw new Error('pending_clock_invalid');
+      if(m.expires_at_ms<=nowMs||m.source_fence!==sourceFence||JSON.stringify(m.binding)!==JSON.stringify(normalized))continue;
+      const file=readPrivateBytes(join(dir.root,'payload.blob'),MAX_MEDIA_RESOURCE_BYTES,deps.afterBlobRead),image=assessMediaImageBytes(file.bytes).image;
+      if(file.bytes.length!==m.size_bytes||sha(file.bytes)!==m.sha256||!image||image.mime_type!==m.mime_type)throw new Error('pending_payload_invalid');
+      fileUnchanged(join(dir.root,'manifest.json'),document.info);fileUnchanged(join(dir.root,'payload.blob'),file.info);
+      directoryUnchanged(dir);directoryUnchanged(parent);normalizedBinding(binding);
+      const captured=capturePendingSlot(parent,slot);
+      if(!sameDirectory(dir.info,captured.dir.info)||[["claim.json",document.claim.info],["manifest.json",document.info],["payload.blob",file.info]].some(([name,info])=>
+        JSON.stringify({name,...pendingStat(info)})!==JSON.stringify(captured.receipt.files.find(entry=>entry.name===name))))throw new Error('pending_replaced');
+      const current={status:m.original_closing_at_ms===null?'quarantined':'pending',reason:m.original_closing_at_ms===null?'resource_pending_account_unverified':null,
+        bytes:file.bytes,opening_at_ms:m.opening_at_ms,original_closing_at_ms:m.original_closing_at_ms,created_at_ms:m.created_at_ms,
+        read_observed_at_ms:nowMs,expires_at_ms:m.expires_at_ms,
+        receipt:{...captured.receipt,generation:m.generation,manifest_sha256:sha(JSON.stringify(m))}};
+      if(found && (!found.bytes.equals(current.bytes)||found.original_closing_at_ms!==current.original_closing_at_ms))throw new Error('pending_conflict');
+      if(!found||current.expires_at_ms<found.expires_at_ms)found=current;
+    }
+    return found??finite('missing','resource_pending_missing');
+  }catch{return finite('invalid','resource_pending_invalid');}
+}
+
+/** Persist validated bytes without any available-resource publication. */
+export function retainPendingMediaResource(cache,binding,sourceFence,bytes,options,deps={}) {
+  try {
+    const normalized=normalizedBinding(binding),image=assessMediaImageBytes(bytes).image;
+    const {nowMs=Date.now(),openingAtMs,originalClosingAtMs=null,stopReason,freshDownload=false}=options;
+    if(!image||!hashValid(sourceFence)||!validTime(nowMs)||!validTime(openingAtMs)||openingAtMs>nowMs
+      ||!(originalClosingAtMs===null||validTime(originalClosingAtMs)&&originalClosingAtMs>=openingAtMs&&originalClosingAtMs<=nowMs)
+      ||!resumableStops.has(stopReason)||!validTime(nowMs+MEDIA_PENDING_TTL_MS))return finite('invalid','resource_pending_invalid');
+    return withPendingMutation(cache,parent=>{
+      reclaimExpiredPending(parent,nowMs,deps);
+      const existing=readPendingMediaResource(cache,binding,sourceFence,{nowMs});
+      if(['pending','quarantined'].includes(existing.status)) {
+        if(!existing.bytes.equals(bytes))return finite('invalid','resource_pending_conflict');
+        if(!(existing.status==='quarantined'&&freshDownload===true&&originalClosingAtMs!==null))return existing;
+        // This is a newly downloaded operation with its own closing proof,
+        // never an upgrade from a later profile over the old quarantined bytes.
+        const {slot,dev,ino,files}=existing.receipt;deps.beforeReplace?.();
+        removePendingSlot(parent,{slot,dev,ino,files});
+      } else if(existing.status!=='missing')return existing;
+      const slot=slots.find(name=>{try{lstatSync(join(parent.root,name));return false;}catch(error){if(errorCode(error)==='ENOENT')return true;throw error;}});
+      if(!slot)return finite('blocked','resource_pending_capacity');
+      mkdirSync(join(parent.root,slot),{mode:0o700});const dir=directory(join(parent.root,slot),false),generation=randomUUID();
+      writePendingFile(dir,'claim.json',Buffer.from(JSON.stringify({schema:'lark_media_pending_claim/v1',generation,created_at_ms:nowMs})+'\n'));
+      writePendingFile(dir,'payload.blob',bytes);normalizedBinding(binding);
+      const manifest={schema:'lark_media_pending/v1',generation,binding:normalized,source_fence:sourceFence,sha256:sha(bytes),size_bytes:bytes.length,
+        mime_type:image.mime_type,opening_at_ms:openingAtMs,original_closing_at_ms:originalClosingAtMs,created_at_ms:nowMs,
+        expires_at_ms:nowMs+MEDIA_PENDING_TTL_MS,stop_reason:stopReason};
+      writePendingFile(dir,'manifest.json',Buffer.from(JSON.stringify(manifest)+'\n'));
+      return readPendingMediaResource(cache,binding,sourceFence,{nowMs});
+    });
+  }catch{return finite('invalid','resource_pending_invalid');}
+}
+/** Delete only a consumed exact generation; no replacement or arbitrary path. */
+export function discardPendingMediaResource(cache,receipt) {
+  if(!exactKeys(receipt,['slot','dev','ino','files','generation','manifest_sha256'])||!slots.includes(receipt.slot)||!validGeneration(receipt.generation)||!hashValid(receipt.manifest_sha256))
+    return finite('invalid','resource_pending_invalid');
+  return withPendingMutation(cache,parent=>{
+    const dir=directory(join(parent.root,receipt.slot),false),document=pendingManifest(dir);
+    if(document.value.generation!==receipt.generation||sha(JSON.stringify(document.value))!==receipt.manifest_sha256)throw new Error('pending_replaced');
+    const {slot,dev,ino,files}=receipt;removePendingSlot(parent,{slot,dev,ino,files});return finite('removed',null);
+  });
 }

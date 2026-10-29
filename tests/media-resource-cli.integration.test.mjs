@@ -151,11 +151,11 @@ sys.stdout.write(json.dumps(result))
 
 function command(f, args, maintenance = false, expectedStatus = 0) {
   const entry = maintenance
-    ? [join(REPO, 'tests/helpers/enrichment-cli.mjs'), f.root]
+    ? [join(REPO, f.continuationHarness ? 'tests/helpers/resource-continuation-cli.mjs' : 'tests/helpers/enrichment-cli.mjs'), f.root]
     : [join(REPO, 'bin/exocortex.mjs')];
   const result = spawnSync(process.execPath, [...entry, ...args], {
     cwd: REPO, encoding: 'utf8', timeout: 20000,
-    env: { ...process.env, LARK_CLI: f.executable, TMPDIR: f.stagingParent, NO_COLOR: '1', TZ: 'UTC', LANG: 'en_US.UTF-8' },
+    env: { ...process.env, LARK_CLI: f.executable, TMPDIR: f.stagingParent, NO_COLOR: '1', TZ: 'UTC', LANG: 'en_US.UTF-8', EXO_SYNTHETIC_RESOURCE_STOP_LEASE: String(f.stopLease || 0) },
   });
   assert.equal(result.error, undefined, String(result.error));
   assert.equal(result.signal, null, result.stderr + result.stdout);
@@ -475,4 +475,55 @@ test('real messages revalidates the four challenged controls in old available ca
     assert.deepEqual(readFileSync(f.db), beforeDb);
     assert.equal(readFileSync(f.audit, 'utf8'), auditBytes);
   });
+});
+
+
+for(const stopLease of [3,4])test(`actual CLI process restart after lease ${stopLease} preserves source and enforces original closing proof`,t=>{
+  const f=fixture(t);f.continuationHarness=true;f.stopLease=stopLease;
+  const dbBytes=readFileSync(f.db),readArgs=['messages','--db',f.db,'--resource-dir',f.resourceDir,'--limit','3'];
+  const before=JSON.parse(command(f,[...readArgs,'--format','json']));
+  const args=['maintenance','enrich','--target','resources','--db',f.db,'--record-id','2',
+    '--resource-dir',f.resourceDir,'--max-cli-attempts','3','--max-seconds','30','--format','json','--apply'];
+  const first=JSON.parse(command(f,args,true,2));
+  assert.equal(first.stop_reason,'sync_busy');assert.equal(first.results[0].pending_state,stopLease===3?'quarantined':'retained');
+  const cacheBytes=()=>Object.fromEntries(readdirSync(join(f.resourceDir,'pending-v1')).sort().flatMap(name=>{
+    const path=join(f.resourceDir,'pending-v1',name);
+    return statSync(path).isDirectory()?readdirSync(path).sort().map(file=>[`${name}/${file}`,sha(readFileSync(join(path,file)))]):[[name,sha(readFileSync(path))]];
+  }));
+  const pendingBefore=cacheBytes();
+  const during=JSON.parse(command(f,[...readArgs,'--format','json']));
+  assert.equal(during[1].readiness.state,'blocked');assert.deepEqual(during[0],before[0]);assert.deepEqual(during[2],before[2]);
+  assert(!command(f,readArgs).includes('pending-v1'));assert.deepEqual(readFileSync(f.db),dbBytes);assert.deepEqual(cacheBytes(),pendingBefore);
+  const counts=()=>readFileSync(f.audit,'utf8').trim().split('\n').map(line=>JSON.parse(line));
+  const firstCalls=counts();assert.equal(firstCalls.filter(x=>x.args[0]==='api').length,1);
+  f.stopLease=0;
+  const second=JSON.parse(command(f,args,true));assert.equal(second.available,1);
+  const extraCalls=counts().slice(firstCalls.length);
+  assert.equal(extraCalls.filter(x=>x.args[0]==='api').length,stopLease===3?1:0);
+  assert.equal(extraCalls.filter(x=>x.args[0]==='contact').length,2);
+  const after=JSON.parse(command(f,[...readArgs,'--format','json']));assert.equal(after[1].readiness.state,'ready');
+  assert.deepEqual(after[0],before[0]);assert.deepEqual(after[2],before[2]);
+  for(const key of ['body','actor_id','container_id','occurred_at','occurred_at_ms','raw_json','canonical_json','content_hash'])assert.deepEqual(after[1][key],before[1][key]);
+  assert.equal(after[1].display.sender,before[1].display.sender);assert.equal(after[1].display.chat,before[1].display.chat);
+  assert.equal(after[1].display.recipient,before[1].display.recipient);
+  assert.deepEqual(readFileSync(f.db),dbBytes);assert.deepEqual(readdirSync(join(f.resourceDir,'pending-v1')),['.mutation.lock']);
+});
+
+
+test('three real CLI processes replace quarantine only after a new download plus original closing proof',t=>{
+  const f=fixture(t);f.continuationHarness=true;f.stopLease=3;
+  const args=['maintenance','enrich','--target','resources','--db',f.db,'--record-id','2',
+    '--resource-dir',f.resourceDir,'--max-cli-attempts','3','--max-seconds','30','--format','json','--apply'];
+  const before=readFileSync(f.db);
+  const first=JSON.parse(command(f,args,true,2));assert.equal(first.results[0].pending_state,'quarantined');
+  const manifest=()=>JSON.parse(readFileSync(join(f.resourceDir,'pending-v1','slot-00','manifest.json'),'utf8'));
+  const old=manifest();assert.equal(old.original_closing_at_ms,null);
+  f.stopLease=4;
+  const second=JSON.parse(command(f,args,true,2));assert.equal(second.results[0].pending_state,'retained');
+  const current=manifest();assert.notEqual(current.generation,old.generation);assert(current.original_closing_at_ms!==null);
+  assert(current.created_at_ms>=old.created_at_ms);
+  f.stopLease=0;const third=JSON.parse(command(f,args,true));assert.equal(third.available,1);assert.equal(third.results[0].pending_state,'reused');
+  const calls=readFileSync(f.audit,'utf8').trim().split('\n').map(line=>JSON.parse(line));
+  assert.equal(calls.filter(x=>x.args[0]==='api').length,2);
+  assert.deepEqual(readFileSync(f.db),before);
 });

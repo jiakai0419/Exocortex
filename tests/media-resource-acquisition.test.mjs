@@ -157,7 +157,8 @@ test('shared lease contention after one download keeps later resources explicitl
   const report=acquire(f,wire);
   assert.equal(report.stop_reason,'sync_busy');assert.equal(wire.calls.length,2);
   assert.deepEqual(report.results.map(item=>item.reason),['publication_not_attempted','batch_stopped','batch_stopped']);
-  assert.equal(report.available,0);assert(!existsSync(f.resourceDir));
+  assert.equal(report.available,0);assert.equal(report.results[0].pending_state,'quarantined');
+  assert.equal(messages(f)[0].readiness.state,'blocked');
 });
 
 test('unsafe destination discovered at publication stops remaining staged resources',t=>{
@@ -179,4 +180,68 @@ test('busy sync causes zero CLI calls and removes staging',t=>{
   const f=fixture(t),wire=transport(f);wire.deps.requestSessionDeps.tryAcquireLease=()=>({state:'busy'});
   const report=acquire(f,wire);assert.equal(report.stop_reason,'sync_busy');assert.equal(wire.calls.length,0);
   assert.equal(report.request_budget.cli_attempts,0);assert(!readdirSync(f.root).some(name=>name.startsWith('exocortex-media-')));
+});
+
+
+test('commit contention retains closed evidence and a fresh session reuses it without another resource request',t=>{
+  const f=fixture(t),wire=transport(f);let leases=0;
+  wire.deps.requestSessionDeps.tryAcquireLease=()=>++leases===4?{state:'busy'}:{state:'acquired',release(){}};
+  const before=readFileSync(f.db),first=acquire(f,wire);
+  assert.equal(first.stop_reason,'sync_busy');assert.equal(first.results[0].pending_state,'retained');
+  assert.equal(first.results[0].reason,'publication_not_attempted');assert.equal(messages(f)[0].readiness.state,'blocked');
+  const next=transport(f),second=acquire(f,next);
+  assert.equal(second.available,1);assert.equal(second.results[0].pending_state,'reused');
+  assert.equal(next.calls.length,2);assert(next.calls.every(args=>args[0]==='contact'));
+  assert.equal(messages(f)[0].readiness.state,'ready');assert.deepEqual(readFileSync(f.db),before);
+  assert.deepEqual(readdirSync(join(f.resourceDir,'pending-v1')),['.mutation.lock']);
+});
+
+test('missing original closing proof is quarantined; next profile cannot promote it and a fresh download is required',t=>{
+  const f=fixture(t),wire=transport(f);let leases=0;
+  wire.deps.requestSessionDeps.tryAcquireLease=()=>++leases===3?{state:'busy'}:{state:'acquired',release(){}};
+  const first=acquire(f,wire);assert.equal(first.results[0].pending_state,'quarantined');
+  const next=transport(f),second=acquire(f,next);
+  assert.equal(second.available,1);assert.equal(next.calls.filter(args=>args[0]==='api').length,1);
+  assert.equal(second.results[0].pending_state,undefined);
+  assert.deepEqual(readdirSync(join(f.resourceDir,'pending-v1')),['.mutation.lock']);
+});
+
+for(const mode of ['wrong account','changed source','corrupt pending'])test(`pending continuation cannot bypass ${mode}`,t=>{
+  const f=fixture(t),wire=transport(f);let leases=0;
+  wire.deps.requestSessionDeps.tryAcquireLease=()=>++leases===4?{state:'busy'}:{state:'acquired',release(){}};
+  assert.equal(acquire(f,wire).results[0].pending_state,'retained');
+  if(mode==='changed source')sqliteExec(f.db,"UPDATE records SET external_version='changed-pending-version' WHERE id=1;");
+  if(mode==='corrupt pending')writeFileSync(join(f.resourceDir,'pending-v1','slot-00','payload.blob'),'invalid synthetic pixels');
+  const next=transport(f,mode==='wrong account'?{profile:()=> 'ou_other_synthetic_account'}:{});
+  if(mode==='changed source')next.deps.requestSessionDeps.tryAcquireLease=(()=>{let n=0;return()=>++n===2?{state:'busy'}:{state:'acquired',release(){}};})();
+  const report=acquire(f,next);assert.equal(report.available,0);assert.equal(messages(f)[0].readiness.state,'blocked');
+  assert.equal(next.calls.filter(args=>args[0]==='api').length,0);
+});
+
+
+for(const mode of ['expired','backwards','expired and busy'])test(`continuation ${mode} during closing cannot publish or refresh the original TTL`,t=>{
+  const f=fixture(t),first=transport(f);let leases=0;
+  first.deps.requestSessionDeps.tryAcquireLease=()=>++leases===4?{state:'busy'}:{state:'acquired',release(){}};
+  assert.equal(acquire(f,first).results[0].pending_state,'retained');
+  const path=join(f.resourceDir,'pending-v1','slot-00','manifest.json'),manifest=readFileSync(path);
+  const stored=JSON.parse(manifest);let time=stored.created_at_ms+1;
+  const second=transport(f,{onProfile:n=>{if(n===2)time=mode==='backwards'?stored.created_at_ms-1:stored.expires_at_ms;}});
+  second.deps.now=()=>time;
+  if(mode==='expired and busy'){let n=0;second.deps.requestSessionDeps.tryAcquireLease=()=>++n===3?{state:'busy'}:{state:'acquired',release(){}};}
+  const report=acquire(f,second);assert.equal(report.available,0);assert.equal(messages(f)[0].readiness.state,'blocked');
+  assert.equal(second.calls.filter(args=>args[0]==='api').length,0);assert.deepEqual(readFileSync(path),manifest);
+});
+
+test('continuation retention checks and stores one boundary time without re-aging bytes',t=>{
+  const f=fixture(t),first=transport(f);let n=0;
+  first.deps.requestSessionDeps.tryAcquireLease=()=>++n===4?{state:'busy'}:{state:'acquired',release(){}};
+  assert.equal(acquire(f,first).results[0].pending_state,'retained');
+  const path=join(f.resourceDir,'pending-v1','slot-00','manifest.json'),before=readFileSync(path),stored=JSON.parse(before);
+  let closed=false,samples=0,leases=0;
+  const next=transport(f,{onProfile:n=>{if(n===2)closed=true;}});
+  next.deps.now=()=>closed&&++samples>=3?stored.expires_at_ms:stored.expires_at_ms-1;
+  next.deps.requestSessionDeps.tryAcquireLease=()=>++leases===3?{state:'busy'}:{state:'acquired',release(){}};
+  const result=acquire(f,next);assert.equal(result.available,0);assert.equal(result.stop_reason,'sync_busy');
+  assert.deepEqual(readFileSync(path),before);assert.equal(next.calls.filter(args=>args[0]==='api').length,0);
+  assert.equal(samples,2,'one closing observation and one shared retention/check time');
 });
