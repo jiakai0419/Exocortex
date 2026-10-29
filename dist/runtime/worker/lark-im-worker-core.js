@@ -412,7 +412,7 @@ function cyclePayload(cycle, steps, now = () => new Date().toISOString()) {
 function runCycleWithRunner(opts, cycle, runStep, writeLog, now = () => new Date().toISOString(), onComplete, beforeHistory) {
     const steps = [];
     for (const spec of buildCycleStepSpecs(opts, cycle)) {
-        const step = (spec.name === "history" ? beforeHistory?.(steps, (args = spec.args) => runStep(spec.name, args, spec.command || "sync")) : null) || runStep(spec.name, spec.args, spec.command || "sync");
+        const step = (spec.name === "history" ? beforeHistory?.(steps, (args = spec.args, limits) => runStep(spec.name, args, spec.command || "sync", limits)) : null) || runStep(spec.name, spec.args, spec.command || "sync");
         steps.push(step);
         writeLog(opts, { ...step, type: "lark_im_worker_step", cycle, step_index: steps.length - 1 });
     }

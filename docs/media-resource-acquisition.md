@@ -1,7 +1,10 @@
 # Message resource acquisition
 
 Native image messages contain a resource key, not image bytes. Exocortex's
-JSON ingestion does not automatically download those bytes. An explicit
+JSON ingestion itself does not download those bytes. The existing worker's
+shared idle allowance can run the [known-resource queue](resource-work.md),
+which invokes this same acquisition implementation for one exact image.
+An explicit
 `maintenance enrich --target resources` operation bridges this gap for exact
 existing record IDs; its default preview is local and read-only. `--apply`
 fetches resources using the existing user profile, and writes only a private
@@ -23,7 +26,9 @@ account and database-identity safety failures still stop the batch. No remaining
 inherits another resource's permission denial or format failure.
 The existing shared API lease, cooldown and request budgets apply. The CLI
 may retry a connection failure internally; this is not a claim of one HTTP
-attempt. No automatic background retry or new scheduler is introduced.
+attempt. The acquisition implementation has no retry loop or independent
+scheduler. The separate known-resource wrapper owns bounded durable deferral
+within the existing worker allowance, without adding API budget.
 
 The downloader uses a separate private staging directory and limits the
 child's output file to 16 MiB. The CLI buffers a remote response in memory;

@@ -343,7 +343,7 @@ node bin/exocortex.mjs check --live
 ### 业务数据维护
 
 <!-- BEGIN GENERATED maintenance-effects -->
-默认可能写数据库：`maintenance init`、`maintenance history`。`--apply` 不是维护命令的统一写入开关。
+默认可能写数据库：`maintenance init`、`maintenance history`、`maintenance resources`。`--apply` 不是维护命令的统一写入开关。
 
 下表由 registry 生成；默认效果表示可能产生的副作用，不保证每次调用都实际写入。预览也可能读取远端或写私有文件，不能当作离线或无副作用操作。
 
@@ -354,6 +354,7 @@ node bin/exocortex.mjs check --live
 | `maintenance enrich` | local-read | `--apply with --target records\|scopes\|recipients`：database-write；`--apply with --target resources`：remote-read, private-resource-write | `--target records\|scopes\|recipients`：remote-read；`--review-out`：private-review-file-write |
 | `maintenance preview` | local-read, remote-read, private-review-file-write, private-progress-file-write | 不支持 | — |
 | `maintenance history` | local-read, remote-read, database-write | 不支持 | — |
+| `maintenance resources` | local-read, remote-read, database-write, private-resource-write | 不支持 | — |
 | `maintenance repair` | local-read | database-write | — |
 | `maintenance replay` | local-read, remote-read | database-write | `--review-out`：private-review-file-write |
 | `maintenance prune-runs` | local-read | database-write | — |

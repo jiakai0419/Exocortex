@@ -42,13 +42,13 @@ function fixture(options = {}) {
     runCycle: (cycleOpts, cycle, deps) => {
       currentCycle = cycle;
       starts.push(clock);
-      return runCycleWithRunner(cycleOpts, cycle, (name, args) => {
+      return runCycleWithRunner(cycleOpts, cycle, (name, args, _command, limits = {}) => {
         const start = clock;
         let summary = { ok: true };
         if (name === 'history') {
           const arg = key => Number(args[args.indexOf(key) + 1]);
           const grant = { cli: arg('--max-cli-attempts'), self: arg('--max-self-attempts'), seconds: arg('--max-seconds') };
-          jobs.push({ name, cycle, at: clock, grant });
+          jobs.push({ name, cycle, at: clock, grant, timeoutMs: limits.timeoutMs });
           const value = options.history?.({ cycle, grant, advance }) || { duration: 8000, cli: 6, self: 4, processed: 12 };
           advance(value.duration || 0);
           summary = { ok: value.ok !== false, profile: 'known_record_history/v1', outcome: value.outcome || 'batch_processed',
@@ -73,7 +73,9 @@ test('sample actual surplus funds history with one CLI/self ledger, one deadline
   assert.equal(sample.name, 'sample'); assert.equal(sample.opts.maxApiCalls, 12); assert.equal(sample.opts.maxSelfCalls, 2);
   assert.equal(sample.opts.remoteSampleBudgetMs, 25_000);
   assert.equal(history.name, 'history'); assert.equal(history.at - sample.at, 8000);
-  assert.deepEqual(history.grant, { cli: 7, self: 4, seconds: 17 });
+  // The remaining 17 seconds include the existing two-second guardian cleanup.
+  assert.deepEqual(history.grant, { cli: 7, self: 4, seconds: 15 });
+  assert.equal(history.timeoutMs, 15_000);
   assert.deepEqual(result.starts, [0, 36_000, 72_000, 108_000]);
   assert.equal(result.events.find(e => e.cycle === 1 && e.name === 'history').elapsed_ms, 16_000);
   assert.deepEqual(result.sleeps.filter(s => s.cycle === 1).map(s => s.seconds), [1, 14]);
@@ -89,7 +91,8 @@ test('ordinary-to-merge with only three residual calls retains priority and rece
   assert.equal(first[1].grant.cli, 3);
   const second = result.jobs.filter(job => job.cycle === 2);
   assert.deepEqual(second.map(job => job.name), ['history']);
-  assert.deepEqual(second[0].grant, { cli: 12, self: 6, seconds: 25 });
+  assert.deepEqual(second[0].grant, { cli: 12, self: 6, seconds: 23 });
+  assert.equal(second[0].timeoutMs, 23_000);
   assert.equal(result.jobs.find(job => job.cycle === 3).name, 'sample', 'the sample skipped after the writer keeps its age');
 });
 
@@ -199,7 +202,7 @@ test('confirmed absence of history preserves the full ordinary sample budget and
 test('both directions of wall clock change leave the monotonic shared allowance unchanged', () => {
   for (const wallJump of [-60_000, 60_000]) {
     const result = fixture({ wallJump });
-    assert.equal(result.jobs.find(job => job.name === 'history').grant.seconds, 17);
+    assert.equal(result.jobs.find(job => job.name === 'history').grant.seconds, 15);
     assert.deepEqual(result.starts, [0, 36_000, 72_000, 108_000]);
   }
 });

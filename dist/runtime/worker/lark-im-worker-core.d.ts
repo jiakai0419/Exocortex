@@ -136,7 +136,11 @@ type WorkerCyclePayload = {
     cycle_policy?: string;
     failed_steps: string[];
 };
-type WorkerStepRunner = (name: string, args: string[], command?: "sync" | "maintenance") => WorkerEvent;
+type WorkerStepLimits = {
+    timeoutMs?: number;
+    remainingTimeMs?: () => number;
+};
+type WorkerStepRunner = (name: string, args: string[], command?: "sync" | "maintenance", limits?: WorkerStepLimits) => WorkerEvent;
 type WorkerLogWriter = (opts: WorkerCycleOptions, payload: WorkerEvent | WorkerCyclePayload) => void;
 declare function buildCycleStepSpecs(opts: WorkerCycleOptions, cycle?: number): WorkerStepSpec[];
 declare function compactRun(run: RunSummary | null | undefined): {
@@ -195,7 +199,7 @@ declare function compactSummary(summary: SyncSummary | null | undefined): {
  * reasons or unknown nested fields into the worker's history receipt. */
 declare function compactHistorySummary(summary: SyncSummary | null | undefined): JsonObject | null;
 declare function cyclePayload(cycle: number, steps: WorkerEvent[], now?: () => string): WorkerCyclePayload;
-declare function runCycleWithRunner(opts: WorkerCycleOptions, cycle: number, runStep: WorkerStepRunner, writeLog: WorkerLogWriter, now?: () => string, onComplete?: (steps: WorkerEvent[], payload: WorkerCyclePayload) => void, beforeHistory?: (steps: WorkerEvent[], runHistory: (args?: string[]) => WorkerEvent) => WorkerEvent | null): boolean;
+declare function runCycleWithRunner(opts: WorkerCycleOptions, cycle: number, runStep: WorkerStepRunner, writeLog: WorkerLogWriter, now?: () => string, onComplete?: (steps: WorkerEvent[], payload: WorkerCyclePayload) => void, beforeHistory?: (steps: WorkerEvent[], runHistory: (args?: string[], limits?: WorkerStepLimits) => WorkerEvent) => WorkerEvent | null): boolean;
 declare function summarizeWorkerEvents(events: unknown[], nowMs?: number): {
     has_events: boolean;
     last_event_type: string | null;

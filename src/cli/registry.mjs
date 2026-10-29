@@ -84,7 +84,7 @@ export const COMMANDS = Object.freeze([
     positive("--backup-keep-count", "backupKeepCount", 7, "Same-source backup count to retain."),
     positive("--backup-keep-days", "backupKeepDays", 30, "Same-source backup retention days."),
   ], ["backup-write", "same-source-backup-cleanup"]),
-  route("maintenance.enrich", "Preview enrichment of one target. Resources preview is offline; resources apply only writes a private sidecar and is never scheduled automatically. Other targets apply through their own database CAS.", [db, format, apply,
+  route("maintenance.enrich", "Preview enrichment of one target. Resources preview is offline; resources apply only writes a private sidecar. Other targets apply through their own database CAS.", [db, format, apply,
     option("--target", "target", "enum", "Explicit target. Recipients verifies exact sent private-chat targets. Resources verifies exact image targets with account and source fences; no SQLite writes.", { choices: ["records", "scopes", "recipients", "resources"], required: true }),
     option("--limit", "limit", "integer", "Records: 1000; scopes: 50; sender-only: 50 (maximum 100); unavailable for recipients or resources.", { min: 1 }),
     bool("--probe-apps", "probeApps", "Force application-name probes; records only."),
@@ -118,6 +118,12 @@ export const COMMANDS = Object.freeze([
     option('--max-self-attempts', 'maxSelfAttempts', 'integer', 'Shared actual self-profile attempt cap, including failed requests.', { min: 0, max: 6, default: 6 }),
     option('--max-seconds', 'maxSeconds', 'integer', 'Remote-work budget, 1 to 30 seconds; not the whole subprocess wall time.', { min: 1, max: 30, default: 30 }),
   ], ['local-read', 'remote-read', 'database-write']),
+  route("maintenance.resources", "Process one known image-resource task with durable bounded scheduling and account/source fences.", [
+    { ...db, default: undefined, required: true }, format, resourceDir,
+    option('--max-cli-attempts', 'maxCliAttempts', 'integer', 'Actual CLI process-attempt cap, including opening and closing identity checks; not an HTTP request count.', { min: 3, max: 12, default: 3 }),
+    option('--max-self-attempts', 'maxSelfAttempts', 'integer', 'Reserve exactly two self-profile attempts for the resource acquisition unit.', { min: 2, max: 2, default: 2 }),
+    option('--max-seconds', 'maxSeconds', 'integer', 'Remote-work budget, 1 to 30 seconds; not the whole subprocess wall time.', { min: 1, max: 30, default: 30 }),
+  ], ['local-read', 'remote-read', 'database-write', 'private-resource-write']),
   route("maintenance.repair", "Preview structural recovery; apply uses existing fences.", [db, format, apply], ["local-read"], "public-safe", [{ when: "--apply", effects: ["database-write"] }]),
   route("maintenance.replay", "Preview replay of explicit scopes and a fixed interval.", [
     { ...db, default: undefined, required: true }, format, apply,

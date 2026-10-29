@@ -40,7 +40,7 @@ test("operations maintenance safety contract is generated and does not imply a u
 test("maintenance catalog distinguishes database writes, file writes and supported apply gates", () => {
   const commands = COMMANDS.filter(({ group }) => group === "maintenance");
   assert.deepEqual(commands.filter(({ effects }) => effects.includes("database-write")).map(({ id }) => id),
-    ["maintenance.init", "maintenance.history"]);
+    ["maintenance.init", "maintenance.history", "maintenance.resources"]);
   assert.deepEqual(commands.filter(({ options }) => options.some(({ flag }) => flag === "--apply")).map(({ id }) => id),
     ["maintenance.enrich", "maintenance.repair", "maintenance.replay", "maintenance.prune-runs", "maintenance.compact"]);
   const preview = commands.find(({ id }) => id === "maintenance.preview");

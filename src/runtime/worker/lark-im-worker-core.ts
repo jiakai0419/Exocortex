@@ -303,7 +303,8 @@ type WorkerCyclePayload = {
   failed_steps: string[];
 };
 
-type WorkerStepRunner = (name: string, args: string[], command?: "sync" | "maintenance") => WorkerEvent;
+type WorkerStepLimits = { timeoutMs?: number; remainingTimeMs?: () => number };
+type WorkerStepRunner = (name: string, args: string[], command?: "sync" | "maintenance", limits?: WorkerStepLimits) => WorkerEvent;
 type WorkerLogWriter = (opts: WorkerCycleOptions, payload: WorkerEvent | WorkerCyclePayload) => void;
 
 function buildCycleStepSpecs(opts: WorkerCycleOptions, cycle = 1): WorkerStepSpec[] {
@@ -549,12 +550,12 @@ function runCycleWithRunner(
   writeLog: WorkerLogWriter,
   now: () => string = () => new Date().toISOString(),
   onComplete?: (steps: WorkerEvent[], payload: WorkerCyclePayload) => void,
-  beforeHistory?: (steps: WorkerEvent[], runHistory: (args?: string[]) => WorkerEvent) => WorkerEvent | null,
+  beforeHistory?: (steps: WorkerEvent[], runHistory: (args?: string[], limits?: WorkerStepLimits) => WorkerEvent) => WorkerEvent | null,
 ) {
   const steps: WorkerEvent[] = [];
   for (const spec of buildCycleStepSpecs(opts, cycle)) {
     const step = (spec.name === "history" ? beforeHistory?.(steps,
-      (args = spec.args) => runStep(spec.name, args, spec.command || "sync")) : null) || runStep(spec.name, spec.args, spec.command || "sync");
+      (args = spec.args, limits) => runStep(spec.name, args, spec.command || "sync", limits)) : null) || runStep(spec.name, spec.args, spec.command || "sync");
     steps.push(step);
     writeLog(opts, { ...step, type: "lark_im_worker_step", cycle, step_index: steps.length - 1 });
   }

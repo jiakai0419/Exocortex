@@ -16,10 +16,10 @@ test("checked-in route and option documentation exactly matches the public machi
   }
 });
 
-test("public catalog contains exactly six groups and eighteen canonical routes", () => {
+test("public catalog contains exactly six groups and nineteen canonical routes", () => {
   assert.deepEqual(GROUPS.map(({id}) => id), ["messages", "status", "check", "sync", "service", "maintenance"]);
-  assert.deepEqual(COMMANDS.map(({id}) => id), ["messages", "status", "check", "sync", "service.install", "service.start", "service.stop", "service.restart", "service.uninstall", "maintenance.init", "maintenance.backup", "maintenance.enrich", "maintenance.preview", "maintenance.history", "maintenance.repair", "maintenance.replay", "maintenance.prune-runs", "maintenance.compact"]);
-  assert.equal(new Set(COMMANDS.map(({id}) => id)).size, 18);
+  assert.deepEqual(COMMANDS.map(({id}) => id), ["messages", "status", "check", "sync", "service.install", "service.start", "service.stop", "service.restart", "service.uninstall", "maintenance.init", "maintenance.backup", "maintenance.enrich", "maintenance.preview", "maintenance.history", "maintenance.resources", "maintenance.repair", "maintenance.replay", "maintenance.prune-runs", "maintenance.compact"]);
+  assert.equal(new Set(COMMANDS.map(({id}) => id)).size, 19);
 });
 
 test("coverage remains an explicit fixed-endpoint check with one internal Python implementation", () => {
@@ -58,6 +58,6 @@ test("daily help leads with reading and status while research and worker remain 
   assert.ok(text.indexOf("status") < text.indexOf("check --help"));
   assert.doesNotMatch(text, /probe|worker|tools\//);
   const json = JSON.parse(renderHelp({all:true,options:{format:"json"}}));
-  assert.equal(json.commands.length,18);
+  assert.equal(json.commands.length,19);
   assert.ok(json.commands.find(({id}) => id === "check").options.some(({flag}) => flag === "--write-live-cache"));
 });

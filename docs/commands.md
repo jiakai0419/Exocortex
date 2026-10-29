@@ -2,7 +2,7 @@
 
 <!-- Generated from src/cli/registry.mjs through the public machine catalog. Update from registry; do not hand-edit option rows. -->
 
-公共规范入口：`node bin/exocortex.mjs`；人类快捷入口：`npm run exo --`。本表从 `--help --all --format json` 的 registry 目录生成，共 **6 个顶层命令、18 个执行路由**。默认帮助突出 messages、status 与帮助；开发和研究工具见 [Development](development.md)。
+公共规范入口：`node bin/exocortex.mjs`；人类快捷入口：`npm run exo --`。本表从 `--help --all --format json` 的 registry 目录生成，共 **6 个顶层命令、19 个执行路由**。默认帮助突出 messages、status 与帮助；开发和研究工具见 [Development](development.md)。
 
 默认路径相对安装 root，显式相对路径按 cwd 解析。`messages`、`sync` 与显式日志/unsafe 模式为私有输出；默认诊断只输出安全投影。`sync` 保留已有 JSON summary 契约，仅支持 JSON，可能包含私有路径与业务错误细节。域内参数关系仍由各命令校验，不因目录列出而自动允许任意组合。操作配方见 [Operations](operations.md)，行为变化与退役门槛见 [CLI migration](cli-migration.md)。
 
@@ -22,9 +22,10 @@
 | `service uninstall` | Stop and remove the installed service configuration. | service-lifecycle | `public-safe` |
 | `maintenance init` | Initialize schema with its independent initialization lock. | database-write, permissions-write | `public-safe` |
 | `maintenance backup` | Create and verify a private backup before publishing it. | backup-write, same-source-backup-cleanup | `public-safe` |
-| `maintenance enrich` | Preview enrichment of one target. Resources preview is offline; resources apply only writes a private sidecar and is never scheduled automatically. Other targets apply through their own database CAS. | local-read | `public-safe` |
+| `maintenance enrich` | Preview enrichment of one target. Resources preview is offline; resources apply only writes a private sidecar. Other targets apply through their own database CAS. | local-read | `public-safe` |
 | `maintenance preview` | Preview independent exact-target units with durable private reviews and locally validated resume. | local-read, remote-read, private-review-file-write, private-progress-file-write | `public-safe` |
 | `maintenance history` | Recheck a bounded batch of known historical records with durable debt and scan checkpoints. | local-read, remote-read, database-write | `public-safe` |
+| `maintenance resources` | Process one known image-resource task with durable bounded scheduling and account/source fences. | local-read, remote-read, database-write, private-resource-write | `public-safe` |
 | `maintenance repair` | Preview structural recovery; apply uses existing fences. | local-read | `public-safe` |
 | `maintenance replay` | Preview replay of explicit scopes and a fixed interval. | local-read, remote-read | `public-safe` |
 | `maintenance prune-runs` | Preview run-history retention; applying can remove coverage evidence. | local-read | `public-safe` |
@@ -239,7 +240,7 @@ Create and verify a private backup before publishing it.
 
 ### maintenance enrich
 
-Preview enrichment of one target. Resources preview is offline; resources apply only writes a private sidecar and is never scheduled automatically. Other targets apply through their own database CAS.
+Preview enrichment of one target. Resources preview is offline; resources apply only writes a private sidecar. Other targets apply through their own database CAS.
 
 默认效果：`local-read`；输出：`public-safe`。
 
@@ -301,6 +302,21 @@ Recheck a bounded batch of known historical records with durable debt and scan c
 | `--max-records` | integer | `1` | ≥ 1；≤ 12 | Maximum selected records; bounded acquisitions retain identity and per-record fences. |
 | `--max-cli-attempts` | integer | `4` | ≥ 2；≤ 12 | Shared actual CLI budget for the entire batch, including identity, pages and detail. |
 | `--max-self-attempts` | integer | `6` | ≥ 0；≤ 6 | Shared actual self-profile attempt cap, including failed requests. |
+| `--max-seconds` | integer | `30` | ≥ 1；≤ 30 | Remote-work budget, 1 to 30 seconds; not the whole subprocess wall time. |
+
+### maintenance resources
+
+Process one known image-resource task with durable bounded scheduling and account/source fences.
+
+默认效果：`local-read, remote-read, database-write, private-resource-write`；输出：`public-safe`。
+
+| 参数 | 类型/取值 | 默认 | 约束 | 说明 |
+| --- | --- | --- | --- | --- |
+| `--db` | path | — | 必填 | Database; default relative to installation root, explicit relative paths to cwd. |
+| `--format` | text/json | `text` | — | Output format. |
+| `--resource-dir` | path | — | — | Private resource sidecar directory; defaults to the resolved database path plus .resources. Explicit relative paths use cwd. |
+| `--max-cli-attempts` | integer | `3` | ≥ 3；≤ 12 | Actual CLI process-attempt cap, including opening and closing identity checks; not an HTTP request count. |
+| `--max-self-attempts` | integer | `2` | ≥ 2；≤ 2 | Reserve exactly two self-profile attempts for the resource acquisition unit. |
 | `--max-seconds` | integer | `30` | ≥ 1；≤ 30 | Remote-work budget, 1 to 30 seconds; not the whole subprocess wall time. |
 
 ### maintenance repair

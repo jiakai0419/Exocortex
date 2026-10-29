@@ -1,6 +1,9 @@
-# 手动补齐图片资源
+# 图片资源补齐
 
-`maintenance enrich --target resources` 是一次显式维护操作，不加入 worker、同步或自动调度。
+`maintenance enrich --target resources` 仍是一次显式、精确记录维护操作。
+现有 worker 的共享空闲预算另可调用 `maintenance resources`，通过持久队列补齐已知图片，
+复用同一资源采集实现；其准入、失败隔离和恢复边界见[资源任务](resource-work.md)。
+普通消息读取不触发资源下载。
 它只处理调用方选定的 1–20 个不重复的正整数 `--record-id`，不扫描其他记录，也不接受
 `--limit`、姓名、发送者、应用探测、unsafe 明细或 review 参数。除公共 `--db` 和
 `--format` 外，可用参数为 `--record-id`、`--apply`、`--max-cli-attempts`、

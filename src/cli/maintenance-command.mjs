@@ -7,6 +7,7 @@ import { executeEnrichment, EnrichmentInputError } from "../maintenance/enrich.m
 import { executeSyncRepair } from "../maintenance/repair.mjs";
 import { executeLarkImReplay, validateReplayOptions, safeReplayError, ReplayInputError } from "../maintenance/replay.mjs";
 import { executeLarkImHistory } from "../maintenance/history.mjs";
+import { executeResourceWork } from "../maintenance/resource-work.mjs";
 import { MaintenanceRequestError } from "../maintenance/request-session.mjs";
 import { MaintenanceReviewError, reviewRequested } from '../maintenance/review-artifact.mjs';
 import { publicEnrichmentError } from "../maintenance/enrichment-commit.mjs";
@@ -32,6 +33,9 @@ function runMaintenanceCommand(options, context) {
       report = (deps.executePreviewUnits || executePreviewUnits)(options, { ...deps, env: context.env, now: context.now });
     } else if (action === "history") {
       report = (deps.executeLarkImHistory || executeLarkImHistory)(options, { ...deps, env: context.env, now: context.now });
+    } else if (action === "resources") {
+      if (!context.provided.has("--db")) throw new CliUsageError("resources requires an explicit --db");
+      report = (deps.executeResourceWork || executeResourceWork)(options, { ...deps, env: context.env, now: context.now });
     } else if (action === "enrich") {
       report = (deps.executeEnrichment || executeEnrichment)(options, { ...deps, env: context.env, now: context.now });
     } else if (action === "repair") {

@@ -71,8 +71,10 @@ locally.
 
 The public maintenance result keeps `publication_not_attempted` for an
 uncommitted resource and indicates whether pending bytes were retained or
-reused. This is not a worker queue, automatic retry, new permission, expanded
-budget or wait loop. Source changes do not borrow old bytes. A missing/expired
+reused. This sidecar namespace does not itself schedule work, retry, add
+permission or expand budgets. The separate [known-resource queue](resource-work.md)
+may invoke the same producer, retaining every original-closing requirement.
+Source changes do not borrow old bytes. A missing/expired
 pending entry may follow the normal exact download path in a fresh explicit
 operation; invalid evidence must not silently fall back to another download.
 

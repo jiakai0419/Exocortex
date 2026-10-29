@@ -17,7 +17,7 @@ function invocationContext(extra = {}) {
   return createCommandContext({ root: "/synthetic/install", cwd: "/synthetic/caller", now: () => 1234567890, ...extra });
 }
 
-test("all eighteen routes dispatch once with shared context and no command aliases", async () => {
+test("all nineteen routes dispatch once with shared context and no command aliases", async () => {
   const calls = [];
   const stdout = writer();
   const loadCommand = async (group) => ({ [`run${group[0].toUpperCase()}${group.slice(1)}Command`]: async (options, context) => {
@@ -25,7 +25,7 @@ test("all eighteen routes dispatch once with shared context and no command alias
   } });
   for (const command of COMMANDS) {
     const extra = command.id === "maintenance.enrich" ? ["--target", "records"]
-      : command.id === "maintenance.history" ? ["--db", "synthetic.sqlite"]
+      : ["maintenance.history", "maintenance.resources"].includes(command.id) ? ["--db", "synthetic.sqlite"]
       : command.id === "maintenance.preview" ? ["--db", "synthetic.sqlite", "--plan", "synthetic-plan.json", "--progress-dir", "synthetic-progress"]
       : command.id === "maintenance.replay" ? ["--db", "synthetic.sqlite", "--scope-id", "synthetic.scope", "--start", "2040-01-01T00:00:00Z", "--end", "2040-01-02T00:00:00Z"] : [];
     assert.equal(await runCli([...command.path, ...extra], invocationContext({ stdout, loadCommand })), 0);
@@ -35,7 +35,7 @@ test("all eighteen routes dispatch once with shared context and no command alias
     assert.equal(call.options.action, command.path[1]);
     if (call.options.db) assert.match(call.options.db, /^\/synthetic\/(install|caller)\//);
   }
-  assert.equal(calls.length, 18);
+  assert.equal(calls.length, 19);
   assert.equal(stdout.value(), "");
 });
 
@@ -70,7 +70,7 @@ test("help works in a code-only fixture without dist, database, Python or extern
     assert.equal(result.stderr, "");
     const catalog = JSON.parse(result.stdout);
     assert.equal(catalog.groups.length, 6);
-    assert.equal(catalog.commands.length, 18);
+    assert.equal(catalog.commands.length, 19);
     assert.doesNotMatch(result.stdout, /\u001b|PRIVATE_|sqlite3.*failed/);
     const text = spawnSync(process.execPath, [entrypoint, "check", "--help"], {
       cwd: root, env: { PATH: "/synthetic/no-programs", HOME: root }, encoding: "utf8", timeout: 30000,

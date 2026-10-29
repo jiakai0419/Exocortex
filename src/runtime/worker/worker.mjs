@@ -10,6 +10,9 @@ import { fileURLToPath } from "node:url";
 import { performance } from "node:perf_hooks";
 import { readScheduledRemoteSampleAdmission, readScheduledRemoteCooldowns, runScheduledRemoteSample } from "./remote-sample-scheduler.mjs";
 import { selectHistoryTarget } from "../../maintenance/history.mjs";
+import { resourceWorkAvailable } from "../../maintenance/resource-work.mjs";
+import { readIdleFairState, claimIdleLane } from "./idle-fair-state.mjs";
+import { readOnlySqliteJson } from "../../storage/sqlite/readonly-query.mjs";
 import {
   adaptiveFairDecision,
   compactHistorySummary,
@@ -30,6 +33,9 @@ import {
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const CLI_PATH = resolve(PROJECT_ROOT, "bin/exocortex.mjs");
+// Existing runGuardedWorkerStep outer cleanup allowance; reserve it inside idle work.
+const IDLE_CHILD_CLEANUP_MS = 2000;
+const IDLE_LANES = ["sample", "history", "resources"];
 const STEP_OPERATIONS = {
   sent: "message_search_bundle",
   "discover-hot": "chat_discovery_bundle",
@@ -71,6 +77,8 @@ const STEP_OPERATIONS = {
  * @property {(cmd: string, args: string[], options: JsonObject) => SpawnResult=} runProcess
  * @property {string=} execPath
  * @property {() => Date=} now
+ * @property {number=} timeoutMs
+ * @property {(() => number)=} remainingTimeMs
  * @property {number=} timeoutSeconds
  * @property {string=} scriptPath
  * @property {"sync" | "maintenance"=} command
@@ -91,7 +99,7 @@ const STEP_OPERATIONS = {
  * @property {() => number=} monotonicNowMs
  * @property {Record<string, number>=} cooldownsByOperation
  * @property {(steps: JsonObject[], payload: JsonObject) => void=} onComplete
- * @property {(steps: JsonObject[], runHistory: (args?: string[]) => JsonObject) => JsonObject|null=} beforeHistory
+ * @property {(steps: JsonObject[], runHistory: (args?: string[], limits?: {timeoutMs?:number,remainingTimeMs?:()=>number}) => JsonObject) => JsonObject|null=} beforeHistory
  *
  * @typedef {object} RunWorkerDeps
  * @property {(opts: WorkerOptions, deps: JsonObject) => JsonObject=} runRemoteSample
@@ -103,7 +111,11 @@ const STEP_OPERATIONS = {
  * @property {() => number=} monotonicNowMs
  * @property {(opts: WorkerOptions, payload: JsonObject) => void=} writeScheduler
  * @property {Record<string, number>=} cooldownsByOperation
- * @property {(opts: WorkerOptions) => boolean=} hasHistoryWork
+ * @property {(opts: WorkerOptions, hintDeps?: JsonObject) => boolean=} hasHistoryWork
+ * @property {(opts: WorkerOptions, hintDeps?: JsonObject) => boolean=} hasResourceWork
+ * @property {(args: string[], limits: JsonObject) => JsonObject=} runResources
+ * @property {((db: string, deps?: JsonObject) => JsonObject|null)=} readIdleFairState
+ * @property {((db: string, state: JsonObject, lane: string, eligible: string[], deps?: JsonObject) => JsonObject|null)=} claimIdleLane
  * @property {(opts: WorkerOptions, deps: JsonObject) => JsonObject=} remoteSampleAdmission
  */
 
@@ -148,9 +160,12 @@ function runStep(name, args, deps = {}) {
   const execPath = deps.execPath || process.execPath;
   const startedAt = now().toISOString();
   const startedMonotonic = monotonicNow();
-  const result = run(execPath, [deps.scriptPath || CLI_PATH, deps.command || "sync", ...args], {
+  const configuredTimeout = Number(deps.timeoutMs ?? Number(deps.timeoutSeconds || WORKER_DEFAULTS.stepTimeoutSeconds) * 1000);
+  const liveRemaining = deps.remainingTimeMs ? deps.remainingTimeMs() : Infinity;
+  const timeout = Math.min(configuredTimeout, liveRemaining - (deps.remainingTimeMs ? IDLE_CHILD_CLEANUP_MS : 0));
+  const result = Number.isFinite(timeout) && timeout > 0 ? run(execPath, [deps.scriptPath || CLI_PATH, deps.command || "sync", ...args], {
     maxBuffer: 100 * 1024 * 1024,
-    timeout: Number(deps.timeoutSeconds || WORKER_DEFAULTS.stepTimeoutSeconds) * 1000,
+    timeout: Math.floor(timeout),
     ...(deps.cooldownsByOperation !== undefined || deps.activityEnv ? { env: {
       ...process.env,
       ...deps.activityEnv,
@@ -158,7 +173,7 @@ function runStep(name, args, deps = {}) {
         deps.cooldownsByOperation, {}, (deps.nowMs || Date.now)(),
       )),
     } } : {}),
-  });
+  }) : { status: null, stdout: "", stderr: "worker step idle deadline elapsed" };
   const finishedAt = now().toISOString();
   const elapsedMs = Math.max(0, monotonicNow() - startedMonotonic);
   const stdout = String(result.stdout || "");
@@ -192,7 +207,8 @@ function runStep(name, args, deps = {}) {
   const ok = result.status === 0 && validSummary && !processFailed;
   const partial = result.status === 2 && summary?.ok === false && summary?.partial === true && !processFailed;
   const transport = errorTransport || compactTransportStats(summary?.transport);
-  const outputSummary = name === "history" ? compactHistorySummary(summary) : compactSummary(summary);
+  const outputSummary = name === "history" ? compactHistorySummary(summary) :
+    name === "resources" ? compactResourceSummary(summary) : compactSummary(summary);
   let failureDetail = stderr.trim();
   if (result.guardian_diagnostic) {
     const stages = [result.guardian_diagnostic.primary?.stage, result.guardian_diagnostic.cleanup?.stage].filter(Boolean);
@@ -235,7 +251,7 @@ function runCycle(opts, cycle, deps = {}) {
   return runCycleWithRunner(
     opts,
     cycle,
-    (name, args, command) => {
+    (name, args, command, limits = {}) => {
       const startedMs = nowMs();
       const activeCooldowns = mergeTransportCooldowns(cooldowns, {}, startedMs);
       for (const key of Object.keys(cooldowns)) delete cooldowns[key];
@@ -256,11 +272,12 @@ function runCycle(opts, cycle, deps = {}) {
           stderr: "worker step deferred until its operation cooldown expires",
         };
       }
-      deps.activity?.update("step", { cycle, step: name, durationMs: opts.stepTimeoutSeconds * 1000 + ACTIVITY_GRACE_MS });
+      deps.activity?.update("step", { cycle, step: name, durationMs: (limits.timeoutMs ?? opts.stepTimeoutSeconds * 1000) + ACTIVITY_GRACE_MS });
       const step = runStep(name, args, {
         ...deps.runStep,
         activityEnv: deps.activityEnv,
         timeoutSeconds: opts.stepTimeoutSeconds,
+        ...limits,
         command: command || "sync",
         cooldownsByOperation: cooldowns,
         nowMs,
@@ -283,6 +300,32 @@ function runCycle(opts, cycle, deps = {}) {
   );
 }
 
+const RESOURCE_OUTCOMES = new Set(["processed", "no_eligible_known_resource", "batch_deferred", "blocked",
+  "exhausted", "source_changed", "clock_unavailable", "execution_failed"]);
+const IDLE_STOP_REASONS = new Set(["cli_budget", "self_budget", "time_budget", "clock_unavailable", "sync_busy",
+  "lease_unavailable", "rate_cooldown", "rate_limited", "shared_cooldown_unavailable"]);
+
+/** A resource child never inherits the generic sync projection, which may expose
+ * target identifiers. Missing counters remain missing, never fabricated zeros. */
+function compactResourceSummary(summary) {
+  if (!summary || typeof summary !== "object" || Array.isArray(summary)) return null;
+  const result = { ok: summary.ok === true };
+  if (summary.profile === "known_record_resources/v1") result.profile = summary.profile;
+  if (RESOURCE_OUTCOMES.has(summary.outcome)) result.outcome = summary.outcome;
+  for (const field of ["processed", "available", "deferred", "blocked"]) {
+    if (Number.isSafeInteger(summary[field]) && summary[field] >= 0) result[field] = summary[field];
+  }
+  const budget = summary.request_budget;
+  if (budget && typeof budget === "object" && !Array.isArray(budget)) {
+    result.request_budget = Object.fromEntries(["max_cli_attempts", "cli_attempts", "max_self_attempts", "self_attempts",
+      "max_seconds", "min_interval_ms", "elapsed_ms"].filter(field => Number.isSafeInteger(budget[field]) && budget[field] >= 0)
+      .map(field => [field, budget[field]]));
+    if (typeof budget.complete === "boolean") result.request_budget.complete = budget.complete;
+    if (budget.stop_reason === null || IDLE_STOP_REASONS.has(budget.stop_reason)) result.request_budget.stop_reason = budget.stop_reason;
+  }
+  return result;
+}
+
 /** Never infer zero from a missing/projected counter. Process failures and
  * incomplete receipts consume their whole reservation and stop this idle slice. */
 function trustedIdleBudget(value, cli, self, sample = false) {
@@ -294,23 +337,51 @@ function trustedIdleBudget(value, cli, self, sample = false) {
     value.self_attempts <= self && value.self_attempts <= value.cli_attempts);
 }
 
-/** Two complete jobs share one in-memory allowance. The sampler keeps its full
- * list contract when it goes first. Only its measured surplus may fund history;
- * history-first never squeezes a legacy sampler into an unproven smaller plan.
- * Waiting ages track first opportunities, not successful work, and survive
- * unserved cycles, not restarts. No extra scheduling loop,
- * persistent budget, API concurrency, or speculative refund is introduced.
+/** Three optional lanes share a single allowance. Persist only first-service
+ * order; surplus work cannot erase a lane's next first opportunity. A claimed
+ * failed attempt still rotates. Metadata lease/CAS failure is not a service.
  * @param {WorkerOptions} opts
  * @param {number} cycle
- * @param {(args?: string[]) => JsonObject} runHistory
- * @param {{history:number|null,sample:number|null}} waiting
+ * @param {(args?: string[], limits?: {timeoutMs?:number,remainingTimeMs?:()=>number}) => JsonObject} runHistory
  * @param {JsonObject} deps
  */
-function runSharedIdleWork(opts, cycle, runHistory, waiting, deps) {
+function runSharedIdleWork(opts, cycle, runHistory, deps) {
   const now = deps.nowMs, monotonic = deps.monotonicNowMs;
   const began = monotonic(), startedAt = new Date(now()).toISOString();
-  let historyAvailable = true;
-  try { historyAvailable = deps.hasHistoryWork(opts) !== false; } catch { /* Child admission remains authoritative. */ }
+  // Hints are charged from began; preserve the existing sampler-only allowance.
+  let deadline = began + Math.max(1000, Math.min(55_000, (opts.intervalSeconds - 5) * 1000));
+  let previous = began, clockFailed = !Number.isFinite(began), cliRemaining = 12, selfRemaining = 6, called = false;
+  /** @type {JsonObject|null} */ let historyStep = null;
+  /** @type {JsonObject|null} */ let resourceStep = null;
+  let idleOutcome = "completed";
+  const remaining = () => {
+    if (clockFailed) return 0;
+    const observed = monotonic();
+    if (!Number.isFinite(deadline) || !Number.isFinite(observed) || observed < previous) {
+      clockFailed = true; return 0;
+    }
+    previous = observed;
+    return Math.max(0, deadline - observed);
+  };
+  let historyAvailable = true, resourcesAvailable = false;
+  // Bound all default local hints together, including a multi-query history
+  // selection; no single hint may use its legacy independent 30-second timeout.
+  const hintDeadline = Math.min(deadline, began + 2000);
+  const hintDeps = { sqliteJson: (db, sql, label, queryDeps = {}) => {
+    const left = Math.floor(Math.min(remaining(), hintDeadline - previous));
+    if (left < 1) throw new Error("idle hint deadline elapsed");
+    const rows = readOnlySqliteJson(db, sql, label, { timeoutMs: Math.min(left, queryDeps.timeoutMs || 1000) });
+    if (remaining() === 0 || previous >= hintDeadline) throw new Error("idle hint deadline elapsed");
+    return rows;
+  } };
+  if (deps.runResources && remaining() > 0) {
+    try { resourcesAvailable = deps.hasResourceWork(opts, hintDeps) === true; } catch { /* An unknown queue cannot become eligible. */ }
+  }
+  if (remaining() > 0) {
+    try { historyAvailable = deps.hasHistoryWork(opts, hintDeps) !== false; } catch { /* Child admission remains authoritative. */ }
+  }
+  deadline = began + Math.max(1000, Math.min(historyAvailable || resourcesAvailable ? 25_000 : 55_000,
+    (opts.intervalSeconds - 5) * 1000));
   const finalCycle = opts.maxCycles !== null && cycle >= opts.maxCycles;
   let admission = { outcome: "disabled" };
   if (!finalCycle && opts.remoteSampleIntervalSeconds !== 0 && deps.sample) {
@@ -318,85 +389,104 @@ function runSharedIdleWork(opts, cycle, runHistory, waiting, deps) {
     catch { admission = { outcome: "failed", reason: "scheduler_unavailable", next_due: null }; }
     if (admission.outcome === "failed") deps.onSample(admission);
   }
-  const sampleDue = admission.outcome === "due";
-  if (!historyAvailable) waiting.history = null;
-  else if (waiting.history === null) waiting.history = began;
-  if (!sampleDue) waiting.sample = null;
-  else if (waiting.sample === null) waiting.sample = began;
-  const jobs = [
-    ...(sampleDue ? [{ name: "sample", since: waiting.sample }] : []),
-    ...(historyAvailable ? [{ name: "history", since: waiting.history }] : []),
-  ].sort((a, b) => Number(a.since) - Number(b.since)); // A first-cycle tie keeps the ordinary sample first.
-  const duration = Math.max(1000, Math.min(historyAvailable ? 25_000 : 55_000, (opts.intervalSeconds - 5) * 1000));
-  const deadline = began + duration;
-  let previous = began, cliRemaining = 12, selfRemaining = 6, called = false;
-  /** @type {JsonObject|null} */ let historyStep = null;
-  const remaining = () => {
-    const observed = monotonic();
-    if (!Number.isFinite(deadline) || !Number.isFinite(previous) || !Number.isFinite(observed) || observed < previous) return 0;
-    previous = observed;
-    return Math.max(0, deadline - observed);
-  };
-  for (const job of jobs) {
-    if (remaining() < 1000 || selfRemaining < 2 || cliRemaining < 3) break;
-    // No duplicate collector planner: preserve its whole CLI admission contract.
-    // A zero-request history race may leave all twelve calls available.
-    if (job.name === "sample" && (cliRemaining !== 12 || remaining() < 3000)) continue;
+  // Three producer seconds are necessary for its two fixed request gaps. Give
+  // the wrapper four seconds so ordinary local preparation/flooring does not
+  // immediately turn that into two; the producer still rechecks before claim.
+  const minimumMs = lane => lane === "resources" ? 6000 : 3000;
+  const eligible = [...(admission.outcome === "due" ? ["sample"] : []),
+    ...(historyAvailable ? ["history"] : []), ...(resourcesAvailable ? ["resources"] : [])]
+    .filter(lane => remaining() >= minimumMs(lane));
+  let state = null;
+  if (eligible.length && remaining() >= 3000) {
+    try { state = deps.readFair(opts.db, { nowMs: now, monotonicNowMs: monotonic, monotonicDeadlineMs: deadline }); }
+    catch { /* Untrusted scheduling state admits no optional child. */ }
+  }
+  if (eligible.length && !state) idleOutcome = "state_unavailable";
+  const jobs = state ? eligible.slice().sort((a, b) => state.last_served[a] - state.last_served[b] ||
+    IDLE_LANES.indexOf(a) - IDLE_LANES.indexOf(b)) : [];
+  for (const name of jobs) {
+    if (remaining() < 3000 || selfRemaining < 2 || cliRemaining < 3) break;
+    if (remaining() < minimumMs(name)) continue;
+    // Preserve the existing sampler's indivisible full call-plan admission.
+    if (name === "sample" && cliRemaining !== 12) continue;
     if (called) {
-      if (remaining() <= 1000) break;
+      if (remaining() < minimumMs(name) + 1000) continue;
       deps.sleepSeconds(1);
-      if (remaining() < (job.name === "sample" ? 3000 : 1000)) break;
+      if (remaining() < minimumMs(name)) continue;
     }
-    const maxCli = cliRemaining, maxSelf = job.name === "sample" ? 2 : selfRemaining;
-    // Spending the first opportunity is independent of progress or a valid
-    // receipt. A failed job must not keep either peer behind it indefinitely.
-    // Surplus-only history keeps its age until it progresses or gets to go first.
-    const firstOpportunity = !called;
-    // Reserve before spawning. Only a complete, strictly checked receipt refunds.
+    if (!called) {
+      let claimed = null;
+      const beforeClaim = remaining();
+      const claimEligible = eligible.filter(lane => beforeClaim >= minimumMs(lane));
+      if (!claimEligible.includes(name)) continue;
+      try { claimed = deps.claimFair(opts.db, state, name, claimEligible,
+        { nowMs: now, monotonicNowMs: monotonic, monotonicDeadlineMs: deadline - minimumMs(name) }); }
+      catch { /* A failed/uncertain CAS cannot admit optional work. */ }
+      if (!claimed) { idleOutcome = "state_unavailable"; break; }
+      state = claimed;
+    }
+    // Re-read after metadata I/O, then reserve before spawning the complete job.
+    const availableMs = Math.floor(remaining());
+    if (availableMs < minimumMs(name)) { idleOutcome = "admission_expired"; break; }
+    const maxCli = name === "resources" ? 3 : cliRemaining;
+    const maxSelf = name === "history" ? selfRemaining : 2;
     cliRemaining -= maxCli; selfRemaining -= maxSelf;
     called = true;
     let receipt;
-    if (job.name === "sample") {
-      const budgetMs = Math.floor(remaining());
+    if (name === "sample") {
       let sampled;
-      if (firstOpportunity) waiting.sample = null;
       try { sampled = deps.sample({ ...opts, maxApiCalls: maxCli, maxSelfCalls: maxSelf,
-        remoteSampleBudgetMs: budgetMs }, { nowMs: now, cooldownsByOperation: deps.cooldowns,
+        remoteSampleBudgetMs: availableMs }, { nowMs: now, cooldownsByOperation: deps.cooldowns,
         returnReport: true, remainingTimeMs: remaining }); }
-      catch { break; }
+      catch { idleOutcome = "untrusted_result"; break; }
       deps.onSample(sampled);
       receipt = sampled?.budget_receipt;
-      if (!trustedIdleBudget(receipt, maxCli, maxSelf, true)) break;
+      if (!trustedIdleBudget(receipt, maxCli, maxSelf, true)) { idleOutcome = "untrusted_result"; break; }
       cliRemaining += maxCli - receipt.cli_attempts;
       selfRemaining += maxSelf - receipt.self_attempts;
-      if (sampled.outcome === "ok") waiting.sample = null;
       if (!["ok", "not_due", "disabled"].includes(sampled.outcome)) break;
     } else {
-      const seconds = Math.min(30, Math.floor(remaining() / 1000));
+      const timeoutMs = availableMs - IDLE_CHILD_CLEANUP_MS;
+      const seconds = Math.min(30, Math.floor(timeoutMs / 1000));
       if (seconds < 1) break;
-      if (firstOpportunity) waiting.history = null;
-      historyStep = runHistory(["history", "--db", opts.db, ...(opts.logDir ? ["--log-dir", opts.logDir] : []),
-        "--max-records", "12", "--max-cli-attempts", String(maxCli), "--max-self-attempts", String(maxSelf),
-        "--max-seconds", String(seconds), "--format", "json"]);
-      receipt = historyStep?.summary?.request_budget;
-      if (historyStep?.guardian_diagnostic || !trustedIdleBudget(receipt, maxCli, maxSelf)) break;
+      const limits = { timeoutMs, remainingTimeMs: remaining };
+      let step;
+      try {
+        step = name === "resources" ? deps.runResources(["resources", "--db", opts.db,
+          "--max-cli-attempts", String(maxCli), "--max-self-attempts", String(maxSelf),
+          "--max-seconds", String(seconds), "--format", "json"], limits) :
+          runHistory(["history", "--db", opts.db, ...(opts.logDir ? ["--log-dir", opts.logDir] : []),
+            "--max-records", "12", "--max-cli-attempts", String(maxCli), "--max-self-attempts", String(maxSelf),
+            "--max-seconds", String(seconds), "--format", "json"], limits);
+      } catch { idleOutcome = "untrusted_result"; break; }
+      if (name === "resources") resourceStep = step; else historyStep = step;
+      receipt = step?.summary?.request_budget;
+      const validResource = name !== "resources" || step?.summary?.profile === "known_record_resources/v1" &&
+        RESOURCE_OUTCOMES.has(step.summary.outcome) && receipt?.complete === true && receipt.max_seconds === seconds &&
+        receipt.min_interval_ms === 1000 && Number.isSafeInteger(receipt.elapsed_ms) && receipt.elapsed_ms >= 0 &&
+        (receipt.stop_reason === null || IDLE_STOP_REASONS.has(receipt.stop_reason)) &&
+        ["processed", "available", "deferred", "blocked"].every(field => Number.isSafeInteger(step.summary[field]) && step.summary[field] >= 0);
+      if (step?.guardian_diagnostic || !trustedIdleBudget(receipt, maxCli, maxSelf) || !validResource) {
+        idleOutcome = "untrusted_result"; break;
+      }
       cliRemaining += maxCli - receipt.cli_attempts;
       selfRemaining += maxSelf - receipt.self_attempts;
-      const summary = historyStep.summary;
-      if (summary?.outcome === "no_eligible_known_record" ||
-          Number(summary?.processed) > 0 && summary?.outcome !== "legacy_required") waiting.history = null;
-      // Surplus-only no progress, including ordinary->merge, keeps its next turn.
-      if (historyStep.ok !== true || ["sync_busy", "lease_unavailable", "rate_limited", "rate_cooldown",
+      if (step.ok !== true || ["sync_busy", "lease_unavailable", "rate_limited", "rate_cooldown",
         "shared_cooldown_unavailable", "clock_unavailable"].includes(receipt.stop_reason)) break;
     }
+    if (remaining() === 0) break;
   }
   const finished = monotonic();
+  if (!Number.isFinite(finished) || finished < previous) clockFailed = true;
   const elapsed = Number.isFinite(finished) && finished >= began ? finished - began : 0;
-  // This logical history/idle step includes the synchronous sample and gap.
-  // Its child request_budget.elapsed_ms remains the actual writer duration.
-  return { ...(historyStep || { name: "history", ok: true, exit_code: 0, stderr: "",
+  const base = historyStep || { name: "history", ok: true, exit_code: 0, stderr: "",
     summary: { ok: true, profile: "known_record_history/v1", outcome: "batch_deferred", processed: 0,
-      cursor_policy: "unchanged", coverage: "known_rows_only" } }),
+      cursor_policy: "unchanged", coverage: "known_rows_only" } };
+  // Keep the established logical history/idle event; nested resource projection
+  // is already finite and contains no target-specific fields.
+  return { ...base, summary: { ...base.summary,
+    idle_outcome: clockFailed ? "clock_unavailable" : idleOutcome,
+    ...(resourceStep ? { resources: compactResourceSummary(resourceStep.summary) } : {}) },
     started_at: startedAt, finished_at: new Date(now()).toISOString(), elapsed_ms: elapsed };
 }
 
@@ -416,9 +506,20 @@ function runWorker(opts, deps = {}) {
   const controller = deps.remoteSampleController || null;
   const sample = deps.runRemoteSample || (controller ? (_opts, sampleDeps) => controller.run(sampleDeps) :
     !deps.runCycle ? runScheduledRemoteSample : null);
-  const hasHistoryWork = deps.hasHistoryWork || (!deps.runCycle ? candidate => Boolean(selectHistoryTarget(candidate.db)) : () => true);
+  const hasHistoryWork = deps.hasHistoryWork || (!deps.runCycle ? (candidate, hintDeps) => Boolean(selectHistoryTarget(candidate.db, hintDeps)) : () => true);
   const remoteSampleAdmission = deps.remoteSampleAdmission || (!deps.runCycle ? readScheduledRemoteSampleAdmission : () => ({ outcome: "due" }));
-  const waiting = { history: /** @type {number|null} */ (null), sample: /** @type {number|null} */ (null) };
+  const runResources = deps.runResources || (!deps.runCycle ? (args, limits) => runStep("resources", args, {
+    command: "maintenance", nowMs, monotonicNowMs: monotonicNow, cooldownsByOperation: cooldowns, ...limits,
+  }) : null);
+  const hasResourceWork = deps.hasResourceWork || (!deps.runCycle ? (candidate, hintDeps) => resourceWorkAvailable(candidate.db, { ...hintDeps, now: nowMs }) : () => Boolean(deps.runResources));
+  const memoryFair = { sequence: 0, last_served: { sample: 0, history: 0, resources: 0 } };
+  const readFair = deps.readIdleFairState || (!deps.runCycle ? readIdleFairState : () => structuredClone(memoryFair));
+  const claimFair = deps.claimIdleLane || (!deps.runCycle ? claimIdleLane : (_db, state, lane) => {
+    if (state.sequence !== memoryFair.sequence) return null;
+    memoryFair.sequence += 1;
+    memoryFair.last_served[lane] = memoryFair.sequence;
+    return structuredClone(memoryFair);
+  });
   if (!deps.runCycle) Object.assign(cooldowns, mergeTransportCooldowns(cooldowns, readScheduledRemoteCooldowns(opts, { nowMs }), nowMs()));
   const activity = deps.activity || (!deps.runCycle ? createActivityWriter({ db: opts.db, role: "worker", now: nowMs,
     emit: (event) => writeLog(opts, event, { stdout: { write() {} } }), }) : undefined);
@@ -466,10 +567,10 @@ function runWorker(opts, deps = {}) {
       onComplete: (steps) => { observedSteps = steps; },
       beforeHistory: (steps, runHistory) => {
         sampleAttempted = true;
-        if (!runHistory || !cycleHealthyWithoutHistory(steps, false) ||
-            !sample || opts.remoteSampleIntervalSeconds === 0) return null;
-        return runSharedIdleWork(opts, cycle, runHistory, waiting, { nowMs, monotonicNowMs: monotonicNow,
-          hasHistoryWork, remoteSampleAdmission, sample, cooldowns, onSample, sleepSeconds: sleep });
+        if (!runHistory || !cycleHealthyWithoutHistory(steps, false)) return null;
+        return runSharedIdleWork(opts, cycle, runHistory, { nowMs, monotonicNowMs: monotonicNow,
+          hasHistoryWork, hasResourceWork, runResources, readFair, claimFair,
+          remoteSampleAdmission, sample, cooldowns, onSample, sleepSeconds: sleep });
       },
     }) === true;
     ok = cycleOk && ok;
@@ -518,6 +619,7 @@ export {
   parseArgs,
   runCycle,
   runStep,
+  compactResourceSummary,
   runWorker,
   sleepSeconds,
   usage,

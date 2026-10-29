@@ -94,6 +94,8 @@ test("concurrent initializers serialize, all succeed, and apply every migration 
     { version: "016", count: 1 },
     { version: "017", count: 1 },
     { version: "018", count: 1 },
+    { version: "019", count: 1 },
+    { version: "020", count: 1 },
   ]);
 
   const indexes = sqliteJson(
