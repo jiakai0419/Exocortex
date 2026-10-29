@@ -1,7 +1,7 @@
 // @ts-check
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { closeSync, constants, fstatSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { performance } from "node:perf_hooks";
@@ -18,6 +18,39 @@ const syncWaitContexts = new WeakMap();
 const COOLDOWN_OPERATIONS = new Set(["message_history_bundle", "message_search_bundle", "chat_discovery_bundle",
   "self_profile", "contact_search", "chat_members", "chat_bots", "application_info", "other"]);
 const MAX_COOLDOWNS = 128;
+const COOLDOWN_NAME = /^([a-z_]+)-(\d+)\.json$/;
+const COOLDOWN_VALUE = "value.json";
+
+/** Legacy records are files; atomically published records are nonempty private
+ * directories containing one single-link file. Never follow a directory alias
+ * or accept an active record whose directory changed during the bounded read.
+ * @param {string} file */
+function readCooldownRecord(file) {
+  try {
+    const before = lstatSync(file, { bigint: true });
+    if (!before.isDirectory()) return readStableJsonFile(file, { maxBytes: 512 });
+    privateDirectory(file, false);
+    const names = readdirSync(file);
+    if (names.length !== 1 || names[0] !== COOLDOWN_VALUE) throw new Error("invalid_cooldown_record");
+    const loaded = readStableJsonFile(join(file, COOLDOWN_VALUE), { maxBytes: 512 });
+    const after = lstatSync(file, { bigint: true });
+    if (loaded.status !== "ready" || !["dev", "ino", "mode", "uid", "nlink", "mtimeNs", "ctimeNs"]
+      .every(key => before[key] === after[key])) throw new Error("unstable_cooldown_record");
+    return loaded;
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") {
+      try { lstatSync(file); } catch (missing) { if (errorCode(missing) === "ENOENT") return { status: "missing", value: null }; }
+    }
+    return { status: "invalid", value: null };
+  }
+}
+
+/** Clean only our known temporary payload, never recursively delete entries.
+ * @param {string} directory */
+function removeCooldownTemporary(directory) {
+  try { unlinkSync(join(directory, COOLDOWN_VALUE)); } catch { /* Absent or unavailable. */ }
+  try { rmdirSync(directory); } catch { /* Do not remove unknown entries. */ }
+}
 
 /** @param {string} directory @param {boolean} create */
 function privateDirectory(directory, create) {
@@ -36,7 +69,8 @@ function privateDirectory(directory, create) {
 
 /** Immutable per-operation timestamps preserve the maximum under concurrent
  * publication; no last-writer-wins map can shorten another process's cooldown.
- * Atomic hard-link publication exposes only fully written private records.
+ * Atomic nonempty-directory rename exposes fully written single-link records
+ * and cannot replace another valid record with the same operation and expiry.
  * Expired records can be deleted independently; no live lease is revoked.
  * @param {{operation: string, nowMs?: number}} options
  * @param {{directory?: string}} [deps]
@@ -53,10 +87,10 @@ function readSharedLarkCooldown(options, deps = {}) {
     if (names.length > MAX_COOLDOWNS) throw new Error("cooldown_limit");
     let until = 0;
     for (const name of names) {
-      const match = /^([a-z_]+)-(\d+)\.json$/.exec(name);
+      const match = COOLDOWN_NAME.exec(name);
       if (!match || !COOLDOWN_OPERATIONS.has(match[1]) || !Number.isSafeInteger(Number(match[2]))) throw new Error("invalid_cooldown");
       const file = join(directory, name);
-      const loaded = readStableJsonFile(file, { maxBytes: 512 });
+      const loaded = readCooldownRecord(file);
       if (loaded.status === "missing") continue;
       if (loaded.status !== "ready") {
         // A concurrent publisher may prune an expired immutable record after
@@ -86,30 +120,48 @@ function writeSharedLarkCooldown(options, deps = {}) {
     const root = deps.directory || `/tmp/exocortex-lark-api-${process.getuid?.()}`;
     const directory = join(root, "cooldowns");
     privateDirectory(root, true); privateDirectory(directory, true);
-    if (readSharedLarkCooldown({ operation: options.operation, nowMs: now }, deps).state === "unavailable") return false;
+    const existing = readSharedLarkCooldown({ operation: options.operation, nowMs: now }, deps);
+    if (existing.state === "unavailable") return false;
     // Filenames are immutable and unique to their expiry, so an expired record
     // cannot have been replaced with a new active value when it is removed.
     for (const name of readdirSync(directory)) {
-      const match = /^([a-z_]+)-(\d+)\.json$/.exec(name);
+      const match = COOLDOWN_NAME.exec(name);
       if (match && Number(match[2]) <= now) {
-        try { unlinkSync(join(directory, name)); } catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
+        const expired = join(directory, name);
+        try {
+          if (lstatSync(expired).isDirectory()) {
+            privateDirectory(expired, false);
+            const retired = join(directory, `${randomUUID()}.tmp`);
+            mkdirSync(retired, { mode: 0o700 });
+            try { renameSync(expired, retired); } finally { removeCooldownTemporary(retired); }
+          } else unlinkSync(expired);
+        } catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
       }
     }
+    // Idempotent or smaller resets need no additional immutable record. This
+    // also avoids consuming the capacity guard on repeated same-reset writes.
+    if (existing.state === "cooldown" && Number(existing.untilMs) >= options.untilMs) return true;
     const names = readdirSync(directory).filter((name) => !name.endsWith(".tmp"));
     if (names.length >= MAX_COOLDOWNS) return false;
     const target = join(directory, `${options.operation}-${options.untilMs}.json`);
     temporary = join(directory, `${randomUUID()}.tmp`);
-    fd = openSync(temporary, "wx", 0o600);
+    mkdirSync(temporary, { mode: 0o700 });
+    fd = openSync(join(temporary, COOLDOWN_VALUE), "wx", 0o600);
     writeFileSync(fd, JSON.stringify({ version: 1, operation: options.operation, untilMs: options.untilMs }));
     fsyncSync(fd); closeSync(fd); fd = undefined;
-    try { linkSync(temporary, target); } catch (error) { if (errorCode(error) !== "EEXIST") throw error; }
-    unlinkSync(temporary); temporary = "";
+    // A hard link/unlink window exposes nlink=2. A complete directory rename
+    // instead exposes only a single-link payload. The nonempty target cannot
+    // be replaced by another same-expiry publisher; both can validate it.
+    try { renameSync(temporary, target); temporary = ""; }
+    catch (error) {
+      if (!["EEXIST", "ENOTEMPTY", "ENOTDIR", "EISDIR"].includes(errorCode(error) || "")) throw error;
+    }
     const result = readSharedLarkCooldown({ operation: options.operation, nowMs: now }, deps);
     return result.state === "cooldown" && Number(result.untilMs) >= options.untilMs;
   } catch { return false; }
   finally {
     try { if (fd !== undefined) closeSync(fd); } catch { /* Closed or unavailable. */ }
-    try { if (temporary) unlinkSync(temporary); } catch { /* Unpublished or already removed. */ }
+    if (temporary) removeCooldownTemporary(temporary);
   }
 }
 

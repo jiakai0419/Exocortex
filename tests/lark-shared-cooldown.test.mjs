@@ -13,6 +13,7 @@ function fixture(t) {
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   return { directory };
 }
+const payloadFile = file => statSync(file).isDirectory() ? join(file, "value.json") : file;
 
 test("cooldowns survive new readers, isolate operations and never shorten a maximum", (t) => {
   const deps = fixture(t);
@@ -25,7 +26,7 @@ test("cooldowns survive new readers, isolate operations and never shorten a maxi
   assert.equal(readSharedLarkCooldown({ operation: "self_profile", nowMs }, deps).untilMs, nowMs + 9000);
   const files = readdirSync(join(deps.directory, "cooldowns"));
   for (const name of files) {
-    const file = join(deps.directory, "cooldowns", name);
+    const file = payloadFile(join(deps.directory, "cooldowns", name));
     assert.equal(statSync(file).mode & 0o777, 0o600);
     assert.deepEqual(Object.keys(JSON.parse(readFileSync(file, "utf8"))).sort(), ["operation", "untilMs", "version"]);
   }
@@ -45,7 +46,7 @@ test("unknown operations, damaged records and unsafe permissions fail closed", (
   assert.equal(writeSharedLarkCooldown({ operation: "synthetic-private-sentinel", nowMs, untilMs: nowMs + 1 }, deps), false);
   assert.equal(readSharedLarkCooldown({ operation: "unknown", nowMs }, deps).state, "unavailable");
   writeSharedLarkCooldown({ operation, nowMs, untilMs: nowMs + 1 }, deps);
-  const file = join(deps.directory, "cooldowns", readdirSync(join(deps.directory, "cooldowns"))[0]);
+  const file = payloadFile(join(deps.directory, "cooldowns", readdirSync(join(deps.directory, "cooldowns"))[0]));
   writeFileSync(file, "synthetic-private-sentinel");
   assert.equal(readSharedLarkCooldown({ operation, nowMs }, deps).state, "unavailable");
   assert.equal(writeSharedLarkCooldown({ operation, nowMs, untilMs: nowMs + 2 }, deps), false);
@@ -56,7 +57,7 @@ test("unknown operations, damaged records and unsafe permissions fail closed", (
 test("cooldown hardlinks and FIFO replacement are rejected through bounded descriptor reads", (t) => {
   const deps = fixture(t);
   assert.equal(writeSharedLarkCooldown({ operation, nowMs, untilMs: nowMs + 1000 }, deps), true);
-  const file = join(deps.directory, "cooldowns", `${operation}-${nowMs + 1000}.json`);
+  const file = payloadFile(join(deps.directory, "cooldowns", readdirSync(join(deps.directory, "cooldowns"))[0]));
   assert.equal(statSync(file).nlink, 1);
   linkSync(file, join(deps.directory, "alias"));
   assert.equal(readSharedLarkCooldown({ operation, nowMs }, deps).state, "unavailable");
@@ -70,13 +71,20 @@ test("cooldown hardlinks and FIFO replacement are rejected through bounded descr
 test("concurrent publishers preserve the largest reset across independent processes", async (t) => {
   const deps = fixture(t);
   const moduleUrl = new URL("../src/runtime/lark-api-lease.mjs", import.meta.url).href;
-  await Promise.all(Array.from({ length: 8 }, (_, index) => new Promise((resolve, reject) => {
+  const results = await Promise.all(Array.from({ length: 8 }, (_, index) => new Promise((resolve) => {
     const child = spawn(process.execPath, ["--input-type=module", "-e", `
       import {writeSharedLarkCooldown} from ${JSON.stringify(moduleUrl)};
       const ok = writeSharedLarkCooldown({operation:'message_history_bundle',nowMs:${nowMs},untilMs:${nowMs}+Number(process.argv[2])}, {directory:process.argv[1]});
-      process.exit(ok ? 0 : 1);`, deps.directory, String((index + 1) * 1000)]);
-    child.on("error", reject); child.on("exit", (code) => code === 0 ? resolve(null) : reject(new Error(`synthetic cooldown child ${code}`)));
+      process.stdout.write(JSON.stringify({ok}));process.exitCode = ok ? 0 : 1;`, deps.directory, String((index + 1) * 1000)]);
+    let stdout = "", stderr = "", error = null;
+    const timer = setTimeout(() => child.kill("SIGKILL"), 5000);
+    child.stdout.on("data", data => stdout += data); child.stderr.on("data", data => stderr += data);
+    child.on("error", value => error = { message: value.message, code: value.code });
+    // Wait for every child before fixture cleanup, even when one fails. Retain
+    // the actual failing process output instead of replacing it with exit 1.
+    child.on("close", (status, signal) => { clearTimeout(timer); resolve({ index, status, signal, error, stdout, stderr }); });
   })));
+  assert(results.every(result => result.status === 0 && !result.signal && !result.error), JSON.stringify(results));
   assert.equal(readSharedLarkCooldown({ operation, nowMs }, deps).untilMs, nowMs + 8000);
 });
 
