@@ -1,6 +1,6 @@
 /** Write only a locally constructed or already sanitized public message.
  * @param {{stdout:{write:(text:string)=>unknown}, stderr:{write:(text:string)=>unknown}}} streams
- * @param {{format?:string, code:"invalid_arguments"|"execution_failed", message:string, reason?:string, textPrefix?:string, requestBudget?:Record<string,number|string|null>}} error
+ * @param {{format?:string, code:"invalid_arguments"|"execution_failed", message:string, reason?:string, textPrefix?:string, requestBudget?:Record<string,number|string|null>, readDiagnostic?:unknown}} error
  */
 export function writeCliError(streams: {
     stdout: {
@@ -9,13 +9,14 @@ export function writeCliError(streams: {
     stderr: {
         write: (text: string) => unknown;
     };
-}, { format, code, message, reason, textPrefix, requestBudget }: {
+}, { format, code, message, reason, textPrefix, requestBudget, readDiagnostic }: {
     format?: string;
     code: "invalid_arguments" | "execution_failed";
     message: string;
     reason?: string;
     textPrefix?: string;
     requestBudget?: Record<string, number | string | null>;
+    readDiagnostic?: unknown;
 }): void;
 /** One invocation captures its clock and path roots before any work starts. */
 export function createCommandContext(overrides?: {}): {
@@ -38,7 +39,8 @@ export class CliUsageError extends Error {
 }
 /** A deliberately public message constructed locally, never remote stderr. */
 export class CliExecutionError extends Error {
-    /** @param {string} message @param {string} [reason] */
-    constructor(message: string, reason?: string);
+    /** @param {string} message @param {string} [reason] @param {unknown} [readDiagnostic] */
+    constructor(message: string, reason?: string, readDiagnostic?: unknown);
     reason: string | undefined;
+    readDiagnostic: Readonly<Record<string, any>> | null;
 }

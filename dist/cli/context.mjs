@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { copySqliteReadDiagnostic, renderSqliteReadDiagnostic } from "../diagnostics/sqlite-read-diagnostic.mjs";
 export const PROJECT_ROOT = fileURLToPath(new URL("../../", import.meta.url));
 const PUBLIC_ERROR_REASONS = new Set(["dependency_unavailable", "read_timeout", "read_failed", "invalid_response"]);
 export class CliUsageError extends Error {
@@ -7,25 +8,27 @@ export class CliUsageError extends Error {
 }
 /** A deliberately public message constructed locally, never remote stderr. */
 export class CliExecutionError extends Error {
-    /** @param {string} message @param {string} [reason] */
-    constructor(message, reason) {
+    /** @param {string} message @param {string} [reason] @param {unknown} [readDiagnostic] */
+    constructor(message, reason, readDiagnostic) {
         super(message);
         this.name = "CliExecutionError";
         this.reason = PUBLIC_ERROR_REASONS.has(reason || "") ? reason : undefined;
+        this.readDiagnostic = this.reason ? copySqliteReadDiagnostic(readDiagnostic) : null;
     }
 }
 /** Write only a locally constructed or already sanitized public message.
  * @param {{stdout:{write:(text:string)=>unknown}, stderr:{write:(text:string)=>unknown}}} streams
- * @param {{format?:string, code:"invalid_arguments"|"execution_failed", message:string, reason?:string, textPrefix?:string, requestBudget?:Record<string,number|string|null>}} error
+ * @param {{format?:string, code:"invalid_arguments"|"execution_failed", message:string, reason?:string, textPrefix?:string, requestBudget?:Record<string,number|string|null>, readDiagnostic?:unknown}} error
  */
-export function writeCliError(streams, { format, code, message, reason, textPrefix = "", requestBudget }) {
+export function writeCliError(streams, { format, code, message, reason, textPrefix = "", requestBudget, readDiagnostic }) {
+    const diagnostic = PUBLIC_ERROR_REASONS.has(reason || "") ? copySqliteReadDiagnostic(readDiagnostic) : null;
     if (format === "json") {
         streams.stdout.write(`${JSON.stringify({ schema_version: 1, ok: false, error: { code, message,
-                ...(PUBLIC_ERROR_REASONS.has(reason || "") ? { reason } : {}) },
+                ...(PUBLIC_ERROR_REASONS.has(reason || "") ? { reason } : {}), ...(diagnostic ? { read_diagnostic: diagnostic } : {}) },
             ...(requestBudget ? { request_budget: requestBudget } : {}) })}\n`);
     }
     else
-        streams.stderr.write(`${textPrefix}${message}\n`);
+        streams.stderr.write(`${textPrefix}${message}\n${renderSqliteReadDiagnostic(diagnostic)}`);
 }
 /** One invocation captures its clock and path roots before any work starts. */
 export function createCommandContext(overrides = {}) {
