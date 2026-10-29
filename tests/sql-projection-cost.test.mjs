@@ -39,9 +39,23 @@ const repo = fileURLToPath(new URL('..', import.meta.url));
 // the over-budget statement is executed. Python 3.11+ can additionally bound
 // VDBE allocation during prepare; older supported Python still streams rows.
 const PROFILER = String.raw`
-import hashlib, json, sqlite3, sys
+import json, sys, time
+wall_start, cpu_start = time.perf_counter(), time.process_time()
+trace_count = 0
+def trace(phase, **fields):
+    global trace_count
+    # Bound diagnostics independently of SQL/result/opcode budgets. Never emit SQL.
+    if trace_count >= 512:
+        return
+    trace_count += 1
+    print(json.dumps(dict(phase=phase, wall_ms=round((time.perf_counter()-wall_start)*1000, 6),
+                          cpu_ms=round((time.process_time()-cpu_start)*1000, 6), **fields),
+                     separators=(',', ':')), file=sys.stderr, flush=True)
+trace('startup')
+import hashlib, sqlite3
 from pathlib import Path
 p = json.load(sys.stdin)
+trace('input_read', sqlite_version=sqlite3.sqlite_version)
 sql = p['sql']
 report = {'complete': False, 'statements': [], 'opcodes': 0, 'rows': [],
           'sqlite_version': sqlite3.sqlite_version, 'sql_bytes': len(sql.encode()),
@@ -49,7 +63,9 @@ report = {'complete': False, 'statements': [], 'opcodes': 0, 'rows': [],
 conn = None
 try:
     uri = Path(p['db']).resolve().as_uri() + ('?mode=ro' if p.get('readonly') else '?mode=rw')
+    trace('connect_start')
     conn = sqlite3.connect(uri, uri=True, isolation_level=None, cached_statements=0)
+    trace('connect_done')
     report['sqlite_source_id'] = conn.execute('SELECT sqlite_source_id()').fetchone()[0]
     if p.get('readonly'):
         conn.execute('PRAGMA query_only=ON')
@@ -64,7 +80,10 @@ try:
             continue
         statement = sql[start:end]
         count = 0
+        index = len(report['statements'])
+        trace('prepare_start', statement=index, opcodes=report['opcodes'])
         explain = conn.execute('EXPLAIN ' + statement)
+        trace('prepare_done', statement=index, opcodes=report['opcodes'])
         try:
             for unused in explain:
                 count += 1
@@ -73,8 +92,10 @@ try:
                     raise RuntimeError('opcode_budget_exceeded')
         finally:
             explain.close()
+        trace('explain_done', statement=index, statement_opcodes=count, opcodes=report['opcodes'])
         report['statements'].append({'opcodes': count, 'bytes': len(statement.encode()),
                                      'sha256': hashlib.sha256(statement.encode()).hexdigest()})
+        trace('step_start', statement=index, opcodes=report['opcodes'])
         actual = conn.execute(statement)
         try:
             if actual.description:
@@ -85,6 +106,7 @@ try:
                     report['rows'].append(dict(zip(names, row)))
         finally:
             actual.close()
+        trace('step_done', statement=index, opcodes=report['opcodes'])
         start = end
         report['consumed_bytes'] = len(sql[:end].encode())
     # Generated programs end in a semicolon. Reject any unmeasured remainder,
@@ -95,12 +117,16 @@ try:
     report['complete'] = True
 except Exception as error:
     # No SQL, fixture payload or huge EXPLAIN rows enter test diagnostics.
+    trace('failure', kind=type(error).__name__, statement=len(report['statements']), opcodes=report['opcodes'])
     report['failure'] = type(error).__name__
     if str(error) in ('opcode_budget_exceeded', 'unconsumed_sql_tail', 'result_row_capacity_exceeded'):
         report['failure'] = str(error)
 finally:
     if conn is not None:
+        trace('close_start', opcodes=report['opcodes'])
         conn.close()
+        trace('close_done', opcodes=report['opcodes'])
+trace('exit', complete=report['complete'], statements=len(report['statements']), opcodes=report['opcodes'])
 print(json.dumps(report, separators=(',', ':')))
 `;
 
@@ -125,7 +151,9 @@ cp.spawnSync = (command, args, options) => {
     readonly: args.includes('-readonly'), prepare_limit: p.prepare_limit,
     budget: p.budget - reports.reduce((n, r) => n + r.opcodes, 0),
   }), encoding: 'utf8', maxBuffer: p.output_limit, timeout: 30_000 });
-  if (result.error || result.status !== 0) throw new Error('cost profiler failed');
+  if (result.error || result.status !== 0) throw new Error('cost profiler failed: ' + JSON.stringify({
+    status: result.status, signal: result.signal, error_code: result.error?.code, stderr: result.stderr,
+  }));
   const report = JSON.parse(result.stdout);
   reports.push(report);
   if (!report.complete) throw new Error('SQL structural budget or complete-consumption failure: ' + report.failure);
@@ -180,8 +208,12 @@ function profile(f, sql, { budget = FIXED_BUDGET + ROW_OVERHEAD, readonly = fals
     input: JSON.stringify({ db: f.db, sql, budget, readonly, prepare_limit: STATEMENT_PREPARE_LIMIT }),
     encoding: 'utf8', maxBuffer: OUTPUT_LIMIT, timeout: 30_000,
   });
-  assert.equal(result.error, undefined, 'the bounded profiler must not overflow stdout or fail to launch');
-  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.error, undefined, 'the bounded profiler must not overflow stdout or fail to launch: ' + JSON.stringify({
+    status: result.status, signal: result.signal, error_code: result.error?.code, stderr: result.stderr,
+  }));
+  assert.equal(result.status, 0, JSON.stringify({
+    status: result.status, signal: result.signal, error_code: result.error?.code, stderr: result.stderr,
+  }));
   return JSON.parse(result.stdout);
 }
 
@@ -208,7 +240,9 @@ function measuredRun(f, records, budget) {
       prepare_limit: STATEMENT_PREPARE_LIMIT, output_limit: OUTPUT_LIMIT }),
     encoding: 'utf8', maxBuffer: OUTPUT_LIMIT, timeout: 90_000,
   });
-  assert.equal(result.error, undefined, 'the profiler cannot silently overflow or skip');
+  assert.equal(result.error, undefined, 'the profiler cannot silently overflow or skip: ' + JSON.stringify({
+    status: result.status, signal: result.signal, error_code: result.error?.code, stderr: result.stderr,
+  }));
   const value = result.stdout ? JSON.parse(result.stdout) : {};
   assert.equal(result.status, 0, JSON.stringify({ failure: value.failure || result.stderr,
     reports: value.reports?.map(report => ({ complete: report.complete, failure: report.failure, opcodes: report.opcodes })) }));
