@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
 import test from 'node:test';
@@ -57,9 +57,17 @@ function jpeg(width = 1, height = 1) {
     segment(0xda, Buffer.from([1, 1, 0, 0, 63, 0])), Buffer.from([0x3f, 255, 217])]);
 }
 
-function fixture(t, { bytes = png(), mime = 'image/png', resourceSpecs = null } = {}) {
+function fixture(t, { bytes = png(), mime = 'image/png', resourceSpecs = null,
+  savedPathMode = 'absolute', symlinkParent = false, symlinkOutput = false, foreignPath = false } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'synthetic-media-cli-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
+  let stagingParent = tmpdir();
+  if (symlinkParent) {
+    const actual = join(root, 'actual-staging-parent');
+    mkdirSync(actual, { mode: 0o700 });
+    stagingParent = join(root, 'staging-parent-alias');
+    symlinkSync(actual, stagingParent);
+  }
   const db = join(root, 'messages.sqlite'), resourceDir = join(root, 'private-images');
   ensureInitialized(db);
   const rows = ['older', 'image', 'newer'].map((label, index) => {
@@ -96,8 +104,8 @@ function fixture(t, { bytes = png(), mime = 'image/png', resourceSpecs = null } 
       { bytes: (spec.bytes || bytes).toString('base64'), mime: spec.mime || mime, denial: spec.denial || false,
         savedPath: spec.savedPath || null }]];
   }));
-  const config = { self: SELF, author: AUTHOR, audit, resources,
-    tempRoot: realpathSync(tmpdir()) };
+  const config = { self: SELF, author: AUTHOR, audit, resources, savedPathMode, symlinkOutput, foreignPath,
+    tempRoot: realpathSync(stagingParent) };
   writeFileSync(executable, `#!/usr/bin/env python3
 import base64, json, os, resource, sys
 config = json.loads(${JSON.stringify(JSON.stringify(config))})
@@ -126,12 +134,18 @@ else:
         sys.stdout.write(json.dumps({'code': 210508, 'msg': 'permission denied: synthetic resource'}))
         sys.exit(1)
     data = base64.b64decode(resource_config['bytes'])
-    with open(output, 'xb') as image:
+    actual_output = 'synthetic-link-target.bin' if config['symlinkOutput'] else output
+    with open(actual_output, 'xb') as image:
         image.write(data)
-    result = {'saved_path': resource_config['savedPath'] or output, 'size_bytes': len(data), 'content_type': resource_config['mime']}
+    if config['symlinkOutput']:
+        os.symlink(actual_output, output)
+    saved_path = output if config['savedPathMode'] == 'relative' else os.path.abspath(output)
+    if config['foreignPath']:
+        saved_path = os.path.join(os.path.dirname(os.getcwd()), 'foreign-resource.bin')
+    result = {'saved_path': resource_config['savedPath'] or saved_path, 'size_bytes': len(data), 'content_type': resource_config['mime']}
 sys.stdout.write(json.dumps(result))
 `, { mode: 0o700 });
-  return { root, db, resourceDir, rows, bytes, executable, audit };
+  return { root, db, resourceDir, rows, bytes, executable, audit, stagingParent };
 }
 
 function command(f, args, maintenance = false, expectedStatus = 0) {
@@ -140,7 +154,7 @@ function command(f, args, maintenance = false, expectedStatus = 0) {
     : [join(REPO, 'bin/exocortex.mjs')];
   const result = spawnSync(process.execPath, [...entry, ...args], {
     cwd: REPO, encoding: 'utf8', timeout: 20000,
-    env: { ...process.env, LARK_CLI: f.executable, NO_COLOR: '1', TZ: 'UTC', LANG: 'en_US.UTF-8' },
+    env: { ...process.env, LARK_CLI: f.executable, TMPDIR: f.stagingParent, NO_COLOR: '1', TZ: 'UTC', LANG: 'en_US.UTF-8' },
   });
   assert.equal(result.error, undefined, String(result.error));
   assert.equal(result.signal, null, result.stderr + result.stdout);
@@ -373,5 +387,34 @@ test('real resource CLI distinguishes individual content failures from stopped o
     }
     assert.deepEqual(readFileSync(f.db), beforeDb);
     assert.equal(readFileSync(f.audit, 'utf8'), auditBytes, 'messages never retries a stopped resource batch');
+  });
+});
+
+test('real resource CLI accepts exact relative and canonical absolute paths without accepting unsafe outputs', async t => {
+  for (const scenario of [
+    { name: 'relative saved path', options: { savedPathMode: 'relative' }, reason: null },
+    { name: 'absolute child cwd saved path', options: {}, reason: null },
+    { name: 'absolute path through a symlink temporary parent', options: { symlinkParent: true }, reason: null },
+    { name: 'foreign absolute path stays rejected', options: { foreignPath: true }, reason: 'download_response_invalid' },
+    { name: 'symlink output stays rejected', options: { savedPathMode: 'relative', symlinkOutput: true }, reason: 'download_file_invalid' },
+  ]) await t.test(scenario.name, t => {
+    const f = fixture(t, scenario.options), beforeDb = readFileSync(f.db);
+    const readArgs = ['messages', '--db', f.db, '--resource-dir', f.resourceDir, '--limit', '3'];
+    const before = JSON.parse(command(f, [...readArgs, '--format', 'json']));
+    const text = command(f, ['maintenance', 'enrich', '--target', 'resources', '--db', f.db,
+      '--record-id', '2', '--resource-dir', f.resourceDir, '--max-cli-attempts', '3', '--max-seconds', '30',
+      '--format', 'json', '--apply'], true, scenario.reason ? 2 : 0);
+    const result = JSON.parse(text), available = scenario.reason ? 0 : 1;
+    assertPublic(f, text);
+    assert.equal(result.available, available);
+    assert.equal(result.results[0].reason, scenario.reason);
+    assert.equal(result.request_budget.cli_attempts, scenario.reason ? 2 : 3);
+    const auditBytes = readFileSync(f.audit, 'utf8'), calls = auditBytes.trim().split('\n').map(line => JSON.parse(line));
+    assert.ok(calls.every(call => !existsSync(call.cwd)), 'all private staging is removed');
+    const after = JSON.parse(command(f, [...readArgs, '--format', 'json']));
+    assert.equal(after[1].readiness.state, available ? 'ready' : 'blocked');
+    assert.deepEqual(after[0], before[0]); assert.deepEqual(after[2], before[2]);
+    assert.deepEqual(readFileSync(f.db), beforeDb, 'path normalization never modifies source records');
+    assert.equal(readFileSync(f.audit, 'utf8'), auditBytes, 'message reads never fetch a path mismatch');
   });
 });

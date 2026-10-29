@@ -29,8 +29,14 @@ The downloader uses a separate private staging directory and limits the
 child's output file to 16 MiB. The CLI buffers a remote response in memory;
 the file limit does not establish a streaming or memory limit. Read staged
 files with no-follow, same-owner, single-link, regular-file and stable-descriptor
-checks. Require exact output-path, byte-count and image MIME agreement. Verify
-the image container and dimensions before publication, then verify the current
+checks. Require exact output-path, byte-count and image MIME agreement.
+The controlled temporary parent is resolved before creating staging, so an
+absolute CLI `saved_path` agrees with its child working directory on systems
+where `/var` aliases `/private/var`. The response still must name the exact
+requested target; arbitrary response aliases and symlink output files are not
+accepted. The official generic file response uses top-level metadata, so no
+success-envelope unwrapping or permissive response-path resolution is added.
+Verify the image container and dimensions before publication, then verify the current
 user again and re-read the downloaded source rows under the shared local commit
 lease. A changed message source blocks that row; independent unchanged rows may
 still publish. Publish only unchanged rows into the database/account/message/version/

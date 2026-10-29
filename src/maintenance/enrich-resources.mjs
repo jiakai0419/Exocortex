@@ -1,6 +1,6 @@
 // @ts-check
 import { spawnSync } from 'node:child_process';
-import { constants, closeSync, fstatSync, lstatSync, mkdtempSync, openSync, readSync, rmSync } from 'node:fs';
+import { constants, closeSync, fstatSync, lstatSync, mkdtempSync, openSync, readSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createLarkImAdapter } from '../adapters/lark-im/adapter.mjs';
@@ -95,7 +95,7 @@ export function enrichResources(options,deps={}) {
   if(options.apply!==true || !candidates.length)return finish();
   // Staging stays outside the source DB/store until all remote and local fences
   // pass. The private directory is removed even after a timeout/denial.
-  const stage=mkdtempSync(join(deps.tmpdir || tmpdir(),'exocortex-media-'));
+  const stage=mkdtempSync(join(realpathSync(deps.tmpdir || tmpdir()),'exocortex-media-'));
   let session;
   /** @type {Row|null} */ let activeCandidate=null;
   let activeAttempts=0;
