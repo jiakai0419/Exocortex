@@ -89,5 +89,15 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
+      - name: Build strict JPEG validator from an installed dependency
+        shell: bash
+        run: |
+          jpeg_prefix="$(brew --prefix jpeg-turbo)"
+          test -f "$jpeg_prefix/lib/libjpeg.a"
+          test -x "$jpeg_prefix/bin/cjpeg"
+          test -x "$jpeg_prefix/bin/jpegtran"
+          printf 'EXOCORTEX_LIBJPEG_PREFIX=%s\n' "$jpeg_prefix" >> "$GITHUB_ENV"
+          EXOCORTEX_LIBJPEG_PREFIX="$jpeg_prefix" npm run build:jpeg
+
       - name: Build, typecheck, syntax, tests and generated files
         run: npm run verify

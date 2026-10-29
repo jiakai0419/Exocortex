@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "build:jpeg": "node tools/build-jpeg-validator.mjs",
     "build:check": "node tools/verify.mjs --generated-only",
     "check": "npm run build && node tools/check-syntax.mjs",
     "help": "node bin/exocortex.mjs --help",

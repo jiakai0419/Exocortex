@@ -123,9 +123,9 @@ test('nested raw_api source must agree with native and outer identity',t=>{
   }
 });
 
-test('generated PNG/GIF decode while JPEG and WebP remain unsupported on every platform',()=>{
+test('generated PNG/GIF and strictly decoded JPEG pass while WebP remains unsupported',()=>{
   for(const [bytes,mime] of [[png(),'image/png'],[gif(),'image/gif'],[jpeg(),'image/jpeg'],[webp(),'image/webp']]) {
-    assert.deepEqual(inspectMediaImageBytes(bytes),['image/webp','image/jpeg'].includes(mime)
+    assert.deepEqual(inspectMediaImageBytes(bytes),mime==='image/webp'
       ?null:{mime_type:mime,width:1,height:1});
     for(const length of [0,8,bytes.length-1])assert.equal(inspectMediaImageBytes(bytes.subarray(0,length)),null);
     assert.equal(inspectMediaImageBytes(Buffer.concat([bytes,Buffer.from([0])])),null);
@@ -143,7 +143,7 @@ test('incomplete JPEG entropy and WebP containers cannot become available',async
   for(let i=0;i<containers.length;i++)await t.test(`container ${i}`,t=>{
     const e=setup(t), bytes=containers[i];
     assert.equal(inspectMediaImageBytes(bytes),null);
-    const reason='resource_format_unsupported';
+    const reason=i===0?'resource_image_invalid':'resource_format_unsupported';
     assert.deepEqual(assessMediaImageBytes(bytes),{reason});
     assert.deepEqual(publishMediaResource(e.cache,e.binding,bytes,{nowMs}),{status:'invalid',reason});
     assert.equal(existsSync(e.cache),false);
@@ -155,34 +155,40 @@ test('incomplete JPEG entropy and WebP containers cannot become available',async
   });
 });
 
-test('JPEG single-block controls and missing-MCU variants cannot publish or reuse old available evidence',async t=>{
-  // One DC0/EOB block is sufficient for 1x1 or 8x8, but not for larger frames.
-  // A tolerant OS decoder fills missing blocks; none proves a strict JPEG path.
+test('strict JPEG supports complete single-block controls and rejects missing MCUs through publish/read',async t=>{
+  // One DC0/EOB block suffices for 1x1 or 8x8, not larger frames.
   for(const [width,height] of [[1,1],[8,8],[16,16],[32,32],[16,8]])await t.test(`${width}x${height}`,t=>{
-    const bytes=jpeg(width,height),e=setup(t);
-    assert.deepEqual(assessMediaImageBytes(bytes),{reason:'resource_format_unsupported'});
-    assert.deepEqual(publishMediaResource(e.cache,e.binding,bytes,{nowMs}),{status:'invalid',reason:'resource_format_unsupported'});
+    const bytes=jpeg(width,height),e=setup(t),complete=width<=8&&height<=8;
+    if(complete) {
+      assert.deepEqual(assessMediaImageBytes(bytes),{image:{mime_type:'image/jpeg',width,height}});
+      const result=publishMediaResource(e.cache,e.binding,bytes,{nowMs});assert.equal(result.status,'available');
+      assert.deepEqual(readMediaResource(e.cache,e.binding),result);return;
+    }
+    assert.deepEqual(assessMediaImageBytes(bytes),{reason:'resource_image_invalid'});
+    assert.deepEqual(publishMediaResource(e.cache,e.binding,bytes,{nowMs}),{status:'invalid',reason:'resource_image_invalid'});
     assert.equal(existsSync(e.cache),false);
     const good=publishMediaResource(e.cache,e.binding,png(),{nowMs});assert.equal(good.status,'available');
     const path=join(e.cache,`${good.binding_digest}.json`), manifest=JSON.parse(readFileSync(path,'utf8')),sha256=hash(bytes);
     writeFileSync(join(e.cache,`${sha256}.blob`),bytes,{mode:0o600});
     writeFileSync(path,JSON.stringify({...manifest,sha256,size_bytes:bytes.length,mime_type:'image/jpeg'}));
-    assert.deepEqual(readMediaResource(e.cache,e.binding),{status:'invalid',reason:'resource_format_unsupported'});
+    assert.deepEqual(readMediaResource(e.cache,e.binding),{status:'invalid',reason:'resource_image_invalid'});
   });
 });
 
-test('unsupported JPEG/WebP assessments cannot write temporary files or spawn tolerant decoders',()=>{
-  const fields=[[fs,'mkdtempSync'],[fs,'mkdirSync'],[fs,'writeFileSync'],[childProcess,'spawnSync'],[childProcess,'spawn'],[childProcess,'execFileSync']];
-  const saved=fields.map(([api,key])=>[api,key,api[key]]);let attempts=0;
+test('JPEG assessments create no temporary images and never fall back from the strict helper',()=>{
+  const fields=[[fs,'mkdtempSync'],[fs,'mkdirSync'],[fs,'writeFileSync'],[childProcess,'spawn'],[childProcess,'execFileSync']];
+  const saved=fields.map(([api,key])=>[api,key,api[key]]),originalSpawn=childProcess.spawnSync;let attempts=0,strictAttempts=0;
   try {
     for(const [api,key] of fields)api[key]=()=>{attempts++;throw new Error('unexpected decoder side effect');};
+    childProcess.spawnSync=()=>{strictAttempts++;throw new Error('strict helper unavailable');};
     syncBuiltinESMExports();
-    for(const bytes of [jpeg(),jpeg(16,16),webp()])
-      assert.deepEqual(assessMediaImageBytes(bytes),{reason:'resource_format_unsupported'});
-    assert.equal(attempts,0);
+    for(const bytes of [jpeg(),jpeg(16,16)])
+      assert.deepEqual(assessMediaImageBytes(bytes),{reason:'resource_decoder_unavailable'});
+    assert.deepEqual(assessMediaImageBytes(webp()),{reason:'resource_format_unsupported'});
+    assert.equal(attempts,0);assert.equal(strictAttempts,2);
   } finally {
     for(const [api,key,value] of saved)api[key]=value;
-    syncBuiltinESMExports();
+    childProcess.spawnSync=originalSpawn;syncBuiltinESMExports();
   }
 });
 

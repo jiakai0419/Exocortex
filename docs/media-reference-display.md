@@ -23,9 +23,10 @@
   `availability: unverified`（贴纸为 `unsupported`）。`reference_only` 不证明
   远端拒权、失效或可下载。图片经过独立本地文件验证后才允许 `status: rendered`、
   `reason: null` 和 `resource.state/availability: available`，并包含 path、
-  size_bytes、mime_type、sha256、binding_digest、observed_at。目前仅 PNG/GIF 可用；
-  JPEG/WebP 即使已有缓存也不能凭容错解码而变为 ready，有限验证原因为
-  resource_format_unsupported。失效缓存为
+  size_bytes、mime_type、sha256、binding_digest、observed_at。PNG/GIF 使用像素流验证，
+  JPEG 需要[严格原生验证](strict-jpeg-resource-validation.md)，包含旧缓存重验；
+  WebP 仍为 resource_format_unsupported。验证器缺失、预算耗尽、损坏或编码不支持
+  均保留对应有限原因，不能凭容错解码成为 ready。失效缓存为
   `media_resource_invalid`，不会沿用旧 ready。
 - 原生数据无效、重复 JSON 键、超出解析边界、空/类型错误的引用均不能形成
   有效资源引用；未知字段仍留在 raw，不猜测它是正文或资源证据。

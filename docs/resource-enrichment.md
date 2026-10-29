@@ -40,7 +40,7 @@ node bin/exocortex.mjs messages --db /tmp/exo-synthetic/messages.sqlite \
 
 请求前后须验证账号，并在发布前复核来源记录围栏；版本、内容 hash、消息、会话或资源 key 有漂移时
 不得发布可用证据。下载成功和非空文件本身都不构成可用；须通过侧车的绑定与图片
-字节验证。当前只补齐通过严格 PNG/GIF 像素流验证的 image；JPEG/WebP 明确为本地验证格式不支持，
+字节验证。PNG/GIF 使用严格像素流验证，JPEG 使用[严格原生验证器](strict-jpeg-resource-validation.md)；WebP 仍为本地验证格式不支持，
 不是请求成功即完成。贴纸保留忠实类型及官方资源接口不支持的明确状态，
 不发试探下载请求，不把未知或缺失资源标为 ready。
 

@@ -6,6 +6,7 @@ import { constants, closeSync, fstatSync, fsyncSync, linkSync, lstatSync, mkdirS
 import { basename, dirname, join, resolve } from 'node:path';
 import { inflateSync } from 'node:zlib';
 import { validateJsonObjectText } from '../../../dist/core/json-text-patch.js';
+import { validateJpegResource } from './jpeg-resource-validator.mjs';
 
 /** @typedef {Record<string,any>} JsonObject */
 export const MAX_MEDIA_RESOURCE_BYTES = 16 * 1024 * 1024;
@@ -278,59 +279,6 @@ function gif(bytes) {
   }
   throw new Error('gif_truncated');
 }
-function jpeg(bytes) {
-  let at = 2, width = 0, height = 0, scans = 0, frame = 0, precision = 0;
-  const components = new Set();
-  while (at < bytes.length) {
-    if (bytes[at++] !== 0xff) throw new Error('jpeg_marker');
-    while (at < bytes.length && bytes[at] === 0xff) at++;
-    const marker = bytes[at++];
-    if (marker === 0xd9) {
-      if (at !== bytes.length || !width || !scans) throw new Error('jpeg_end');
-      return { mime_type: 'image/jpeg', width, height, max_decoded_bytes_per_pixel:precision>8?8:4 };
-    }
-    if ([0,0xd8,0x01].includes(marker) || marker >= 0xd0 && marker <= 0xd7 || at + 2 > bytes.length) throw new Error('jpeg_marker');
-    const size = bytes.readUInt16BE(at), end = at + size;
-    if (size < 2 || end > bytes.length) throw new Error('jpeg_truncated');
-    if ([0xc0,0xc1,0xc2].includes(marker)) {
-      if (size < 8 || width) throw new Error('jpeg_frame');
-      height = bytes.readUInt16BE(at+3); width = bytes.readUInt16BE(at+5); dimensions(width,height);
-      if (![8,12].includes(bytes[at+2]) || marker === 0xc0 && bytes[at+2] !== 8
-        || ![1,3,4].includes(bytes[at+7]) || size !== 8+3*bytes[at+7]) throw new Error('jpeg_frame');
-      frame = marker;precision=bytes[at+2];
-      for (let i=0;i<bytes[at+7];i++) {
-        const id=bytes[at+8+3*i], factors=bytes[at+9+3*i], table=bytes[at+10+3*i];
-        if (components.has(id) || !(factors>>4) || factors>>4>4 || !(factors&15) || (factors&15)>4 || table>3) throw new Error('jpeg_component');
-        components.add(id);
-      }
-    }
-    if (marker === 0xda) {
-      const count = bytes[at+2];
-      if (!width || size < 8 || count<1 || count>components.size || size !== 6+2*count) throw new Error('jpeg_scan');
-      const selected = new Set();
-      for (let i=0;i<count;i++) {
-        const id=bytes[at+3+2*i], tables=bytes[at+4+2*i];
-        if (!components.has(id) || selected.has(id) || tables>>4>3 || (tables&15)>3) throw new Error('jpeg_scan');
-        selected.add(id);
-      }
-      const low=bytes[end-3], high=bytes[end-2], successive=bytes[end-1];
-      if (low>high || high>63 || successive>>4>13 || (successive&15)>13
-        || frame!==0xc2 && (low!==0 || high!==63 || successive!==0)
-        || frame===0xc2 && (low===0 && high!==0 || low>0 && count!==1)) throw new Error('jpeg_spectral');
-      scans++; at = end; let data = 0;
-      while (at < bytes.length) {
-        if (bytes[at] !== 0xff) { data++; at++; continue; }
-        if (at+1 >= bytes.length) throw new Error('jpeg_truncated');
-        const next = bytes[at+1];
-        if (next === 0 || next >= 0xd0 && next <= 0xd7) { data++; at += 2; continue; }
-        if (next === 0xff) { at++; continue; }
-        break;
-      }
-      if (!data) throw new Error('jpeg_empty_scan');
-    } else at = end;
-  }
-  throw new Error('jpeg_truncated');
-}
 function webp(bytes) {
   if (bytes.length < 20 || bytes.readUInt32LE(4) !== bytes.length-8) throw new Error('webp_length');
   let at = 12, width = 0, height = 0, image = false;
@@ -365,9 +313,8 @@ export function assessMediaImageBytes(bytes) {
     if (bytes.subarray(0,8).equals(Buffer.from('89504e470d0a1a0a','hex'))) image=png(bytes);
     else if (['GIF87a','GIF89a'].includes(bytes.toString('latin1',0,6))) image=gif(bytes);
     else if (bytes[0] === 0xff && bytes[1] === 0xd8) {
-      // System decoders may fill missing MCUs and still return success and the
-      // declared dimensions. Container checks alone cannot prove JPEG pixels.
-      jpeg(bytes);throw Object.assign(new Error('format_unsupported'),{code:'MEDIA_FORMAT_UNSUPPORTED'});
+      // The mature decoder owns JPEG structure, entropy, coverage and budgets.
+      return validateJpegResource(bytes);
     }
     else if (bytes.toString('latin1',0,4) === 'RIFF' && bytes.toString('latin1',8,12) === 'WEBP') {
       webp(bytes);throw Object.assign(new Error('format_unsupported'),{code:'MEDIA_FORMAT_UNSUPPORTED'});

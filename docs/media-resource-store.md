@@ -54,13 +54,15 @@ disposal 0–3、注释和应用扩展保留；应用固定头和 sub-block fram
 无效透明/背景索引均拒绝；透明标志关闭时不误验未使用的索引字段。
 未定义 disposal 4–7、Plain Text 及未知 rendering/control 扩展明确为格式不支持，
 不能静默丢弃绘制内容。应用扩展的私有语义和所有播放器的表现不在验证保证内。
-JPEG 和 WebP 目前只核对容器基本结构，不建立可用资源证据：结构合法时明确返回
-`invalid/resource_format_unsupported`，损坏容器仍返回图片验证失败。macOS `sips`
-对缺少 JPEG MCU 编码或缺失 WebP 压缩数据的合成输入可以补像素并成功退出；
-输出 PNG 尺寸正确也不能证明源像素流完整，因此不再使用它作发布/读取证明。
-在严格解码器或完整码流验证到位前，即使某张 JPEG 能被客户端打开，也不会标为
-available；这是本地格式验证能力限制，不是上游拒权、永久不可见或内容已恢复。
-此限制同样适用于旧缓存中的 JPEG/WebP，后续读取必须降回明确不支持。
+JPEG 使用 [严格 libjpeg-turbo 子进程契约](strict-jpeg-resource-validation.md)：
+完整尺寸解码、任何 warning/fatal 失败、不补 EOF、核对实际使用的表、完整输入消费，
+并检查受支持的顺序/渐进扫描覆盖。构建回执绑定源码、静态依赖及可执行文件；
+缺失或不匹配的验证器返回 `resource_decoder_unavailable`，超预算返回
+`resource_validation_limit`，损坏数据返回 `resource_image_invalid`，支持子集之外
+返回 `resource_format_unsupported`。读取旧缓存同样重新验证，不信任历史 available。
+WebP 仍只核对容器基本结构，结构合法时返回 `invalid/resource_format_unsupported`。
+macOS `sips` 对缺少 MCU 或压缩数据的输入可以补像素并成功退出，不能作完整性证明。
+JPEG 验证通过 stdin 传入字节，不创建临时图片，不使用系统容错解码器。
 不通过扩展名、非空字节、头尾标记或系统解码成功绕过该边界。
 PNG/GIF 验证仍在内存内执行，继续拒绝 HTML/JSON、只有魔数、截断文件和超预算
 像素流。没有 OCR、图片描述、客户端启动或隐式网络请求。

@@ -52,7 +52,7 @@ function jpeg(width = 1, height = 1) {
   const ac = Buffer.alloc(18); ac[0] = 16; ac[1] = 1;
   const frame = Buffer.from([8, 0, 1, 0, 1, 1, 1, 0x11, 0]);
   frame.writeUInt16BE(height, 1); frame.writeUInt16BE(width, 3);
-  // One DC0/EOB block is complete for 1x1; a 16x16 declaration lacks MCUs.
+  // One DC0/EOB block is complete for 1x1/8x8; a 16x16 declaration lacks MCUs.
   return Buffer.concat([Buffer.from([255, 216]), segment(0xdb, Buffer.from([0, ...Array(64).fill(1)])),
     segment(0xc0, frame), segment(0xc4, Buffer.concat([dc, ac])),
     segment(0xda, Buffer.from([1, 1, 0, 0, 63, 0])), Buffer.from([0x3f, 255, 217])]);
@@ -262,37 +262,80 @@ test('real CLI downloads a synthetic image through its guard and publishes a rea
   assert.equal(readFileSync(f.audit, 'utf8'), auditBytes, 'both message read formats make no extra resource/profile requests');
 });
 
-test('real CLI rejects both complete and missing-MCU JPEG resources as an unsupported local format', async t => {
-  for (const size of [1, 16]) await t.test(`${size}x${size}`, t => {
+test('real CLI publishes complete JPEG resources and rejects missing MCUs without changing messages', async t => {
+  for (const size of [1, 8, 16]) await t.test(`${size}x${size}`, t => {
+    const complete = size <= 8;
     const f = fixture(t, { bytes: jpeg(size, size), mime: 'image/jpeg' }), beforeDb = readFileSync(f.db);
     const readArgs = ['messages', '--db', f.db, '--resource-dir', f.resourceDir, '--limit', '3'];
     const before = JSON.parse(command(f, [...readArgs, '--format', 'json']));
+    assert.equal(before[1].readiness.state, 'blocked');
+    assert.equal(existsSync(f.audit), false);
     const appliedText = command(f, ['maintenance', 'enrich', '--target', 'resources', '--db', f.db,
       '--record-id', '2', '--resource-dir', f.resourceDir, '--max-cli-attempts', '3', '--max-seconds', '30',
-      '--format', 'json', '--apply'], true, 2);
+      '--format', 'json', '--apply'], true, complete ? 0 : 2);
     const applied = JSON.parse(appliedText);
     assertPublic(f, appliedText);
-    assert.equal(applied.ok, false);
-    assert.equal(applied.available, 0);
-    assert.equal(applied.stop_reason, undefined, 'one unsupported format is an item outcome, not a remote batch stop');
-    assert.equal(applied.results[0].reason, 'resource_format_unsupported');
-    assert.equal(applied.request_budget.cli_attempts, 2);
-    assert.equal(existsSync(f.resourceDir), false, 'unsupported JPEG must never publish available cache evidence');
+    assert.equal(applied.ok, complete);
+    assert.equal(applied.available, complete ? 1 : 0);
+    assert.equal(applied.failed, complete ? 0 : 1);
+    assert.equal(applied.stop_reason, undefined, 'corrupt content is an item outcome, not a remote batch stop');
+    assert.equal(applied.results[0].reason, complete ? null : 'download_image_invalid');
+    assert.equal(applied.request_budget.cli_attempts, complete ? 3 : 2);
+    assert.equal(existsSync(f.resourceDir), complete, 'only complete JPEG can publish cache evidence');
     const auditBytes = readFileSync(f.audit, 'utf8');
     const calls = auditBytes.trim().split('\n').map(line => JSON.parse(line));
-    assert.deepEqual(calls.map(call => call.args.slice(0, 2)), [['contact', '+get-user'], ['api', 'GET']]);
-    assert.ok(calls.every(call => !existsSync(call.cwd)), 'failed acquisition still cleans its private staging');
+    assert.deepEqual(calls.map(call => call.args.slice(0, 2)), complete
+      ? [['contact', '+get-user'], ['api', 'GET'], ['contact', '+get-user']]
+      : [['contact', '+get-user'], ['api', 'GET']]);
+    assert.ok(calls.every(call => !existsSync(call.cwd)), 'acquisition always cleans its private staging');
     const after = JSON.parse(command(f, [...readArgs, '--format', 'json']));
-    assert.deepEqual(after, before, 'failed acquisition cannot change source or its existing display projection');
-    assert.equal(after[1].readiness.state, 'blocked');
-    assert.ok(after[1].readiness.reasons.includes('content_resource_unavailable'));
+    assert.deepEqual(after.map(row => row.id), [3, 2, 1]);
+    assert.deepEqual(after[0], before[0]); assert.deepEqual(after[2], before[2]);
+    const image = after[1], resource = image.display.media.resource;
+    assert.equal(image.readiness.state, complete ? 'ready' : 'blocked');
+    if (complete) {
+      assert.equal(resource.availability, 'available');
+      assert.equal(resource.mime_type, 'image/jpeg');
+      assert.equal(resource.size_bytes, f.bytes.length);
+      assert.equal(resource.sha256, sha(f.bytes));
+      assert.equal(dirname(resource.path), realpathSync(f.resourceDir));
+      assert.deepEqual(readFileSync(resource.path), f.bytes);
+      assert.equal(statSync(f.resourceDir).mode & 0o777, 0o700);
+      assert.equal(statSync(resource.path).mode & 0o777, 0o600);
+    } else {
+      assert.deepEqual(after, before, 'failed acquisition cannot change source or existing display');
+      assert.ok(image.readiness.reasons.includes('content_resource_unavailable'));
+      assert.equal(resource.path, undefined);
+    }
+    for (const key of ['body', 'actor_id', 'container_id', 'direction', 'external_id', 'external_version',
+      'occurred_at', 'occurred_at_ms', 'raw_json', 'canonical_json', 'content_hash', 'raw', 'canonical']) {
+      assert.deepEqual(image[key], before[1][key], `${key} must preserve source data`);
+    }
+    for (const key of ['body', 'sender', 'recipient', 'chat', 'scene', 'external_id', 'sender_type', 'message_type']) {
+      assert.deepEqual(image.display[key], before[1].display[key], `${key} must preserve source display`);
+    }
+    const terminal = command(f, readArgs).replace(/\x1b\[[0-9;]*m/g, ''), flattened = terminal.replace(/\n +/g, '');
+    assert.match(terminal, /Messages \(3\)/);
+    assert.equal(terminal.includes('本地资源已验证'), complete);
+    assert.equal(flattened.includes(f.resourceDir), complete);
+    if (complete) {
+      assert.ok(flattened.includes(resource.path)); assert.ok(terminal.includes('image/jpeg'));
+      assert.equal(terminal.includes(f.rows[1].body), false, 'verified resource must not invent a caption');
+    }
+    for (const neighbor of [after[0], after[2]]) assert.ok(flattened.includes(neighbor.body.replace(/\s+/g, ' ').trim()));
+    for (const row of after) assert.ok(flattened.includes(row.display.external_id));
+    const positions = after.map(row => flattened.indexOf(new Date(row.occurred_at).toLocaleString('en-US', { timeZone: 'UTC' })));
+    assert.ok(positions.every(position => position >= 0));
+    assert.ok(positions[0] < positions[1] && positions[1] < positions[2]);
+    assert.ok(terminal.includes(AUTHOR)); assert.ok(terminal.includes(CHAT_NAME));
     assert.deepEqual(readFileSync(f.db), beforeDb);
-    assert.equal(readFileSync(f.audit, 'utf8'), auditBytes, 'messages must remain local after failed acquisition');
+    assert.equal(readFileSync(f.audit, 'utf8'), auditBytes, 'both messages formats remain local after acquisition');
   });
 });
 
-test('real messages CLI never trusts legacy JPEG cache and preserves neighboring messages', async t => {
-  for (const size of [1, 16]) await t.test(`${size}x${size}`, t => {
+test('real messages CLI revalidates legacy JPEG bytes and preserves neighboring messages', async t => {
+  for (const size of [1, 8, 16]) await t.test(`${size}x${size}`, t => {
+    const complete = size <= 8;
     const f = fixture(t), beforeDb = readFileSync(f.db);
     const readArgs = ['messages', '--db', f.db, '--resource-dir', f.resourceDir, '--limit', '3'];
     const before = JSON.parse(command(f, [...readArgs, '--format', 'json']));
@@ -311,11 +354,19 @@ test('real messages CLI never trusts legacy JPEG cache and preserves neighboring
     assert.deepEqual(after.map(row => row.id), [3, 2, 1]);
     assert.deepEqual(after[0], before[0]); assert.deepEqual(after[2], before[2]);
     const image = after[1], resource = image.display.media.resource;
-    assert.equal(image.readiness.state, 'blocked');
-    assert.ok(image.readiness.reasons.includes('content_resource_invalid'));
-    assert.equal(resource.availability, 'invalid');
-    assert.equal(resource.verification_reason, 'resource_format_unsupported');
-    assert.equal(resource.path, undefined, 'unsupported cache is not exposed as a usable local image');
+    assert.equal(image.readiness.state, complete ? 'ready' : 'blocked');
+    assert.equal(resource.availability, complete ? 'available' : 'invalid');
+    if (complete) {
+      assert.equal(resource.verification_reason, undefined);
+      assert.equal(resource.mime_type, 'image/jpeg');
+      assert.equal(resource.size_bytes, bytes.length); assert.equal(resource.sha256, sha256);
+      assert.equal(dirname(resource.path), realpathSync(f.resourceDir));
+      assert.deepEqual(readFileSync(resource.path), bytes);
+    } else {
+      assert.ok(image.readiness.reasons.includes('content_resource_invalid'));
+      assert.equal(resource.verification_reason, 'resource_image_invalid');
+      assert.equal(resource.path, undefined, 'missing-MCU cache is not exposed as a usable image');
+    }
     for (const key of ['body', 'actor_id', 'container_id', 'direction', 'external_id', 'external_version',
       'occurred_at', 'occurred_at_ms', 'raw_json', 'canonical_json', 'content_hash', 'raw', 'canonical']) {
       assert.deepEqual(image[key], before[1][key], `${key} must preserve source data`);
@@ -325,15 +376,21 @@ test('real messages CLI never trusts legacy JPEG cache and preserves neighboring
     }
     const terminal = command(f, readArgs).replace(/\x1b\[[0-9;]*m/g, ''), flattened = terminal.replace(/\n +/g, '');
     assert.match(terminal, /Messages \(3\)/);
-    assert.equal(terminal.includes('本地资源已验证'), false);
-    assert.equal(flattened.includes(f.resourceDir), false);
+    assert.equal(terminal.includes('本地资源已验证'), complete);
+    assert.equal(flattened.includes(f.resourceDir), complete);
+    if (complete) {
+      assert.ok(flattened.includes(resource.path)); assert.ok(terminal.includes('image/jpeg'));
+      assert.equal(terminal.includes(f.rows[1].body), false);
+    }
+    for (const row of after) assert.ok(flattened.includes(row.display.external_id));
+    assert.ok(terminal.includes(AUTHOR)); assert.ok(terminal.includes(CHAT_NAME));
     for (const neighbor of [after[0], after[2]]) assert.ok(flattened.includes(neighbor.body.replace(/\s+/g, ' ').trim()));
     const positions = after.map(row => flattened.indexOf(new Date(row.occurred_at).toLocaleString('en-US', { timeZone: 'UTC' })));
     assert.ok(positions.every(position => position >= 0));
     assert.ok(positions[0] < positions[1] && positions[1] < positions[2]);
     assert.deepEqual(readFileSync(f.db), beforeDb);
     assert.deepEqual(new Map(readdirSync(f.resourceDir).map(name => [name, readFileSync(join(f.resourceDir, name))])), cacheBefore,
-      'reading unsupported cached JPEG never rewrites or deletes sidecar bytes');
+      'revalidating cached JPEG never rewrites or deletes sidecar bytes');
     assert.equal(readFileSync(f.audit, 'utf8'), auditBytes, 'both message formats make no extra API requests');
   });
 });
@@ -341,9 +398,9 @@ test('real messages CLI never trusts legacy JPEG cache and preserves neighboring
 test('real resource CLI distinguishes individual content failures from stopped or unpublished batch items', async t => {
   const valid = () => ({ bytes: png(), mime: 'image/png' });
   for (const scenario of [
-    { name: 'unsupported JPEG does not prevent later independent PNG',
+    { name: 'missing-MCU JPEG does not prevent later independent PNG',
       specs: [valid(), { bytes: jpeg(16, 16), mime: 'image/jpeg' }, valid()], attempts: 5,
-      reasons: [null, 'resource_format_unsupported', null], available: 2 },
+      reasons: [null, 'download_image_invalid', null], available: 2 },
     { name: 'invalid image bytes do not prevent later independent PNG',
       specs: [{ bytes: Buffer.from('<html>synthetic invalid image</html>') }, valid(), valid()], attempts: 5,
       reasons: ['download_image_invalid', null, null], available: 2 },
@@ -355,7 +412,7 @@ test('real resource CLI distinguishes individual content failures from stopped o
       reasons: ['permission_denied', 'batch_stopped', 'batch_stopped'], available: 0 },
     { name: 'a later denial cannot overwrite an earlier local content diagnosis',
       specs: [{ bytes: jpeg(16, 16), mime: 'image/jpeg' }, { denial: true }, valid()], attempts: 3, stop: 'permission_denied',
-      reasons: ['resource_format_unsupported', 'permission_denied', 'batch_stopped'], available: 0 },
+      reasons: ['download_image_invalid', 'permission_denied', 'batch_stopped'], available: 0 },
     { name: 'unsafe response path stops rather than continuing content work',
       specs: [{ ...valid(), savedPath: '../unrelated-resource' }, valid(), valid()], attempts: 2, stop: 'download_response_invalid',
       reasons: ['download_response_invalid', 'batch_stopped', 'batch_stopped'], available: 0 },

@@ -49,10 +49,12 @@ exposes its local path, MIME, size, hash and observation time; terminal text
 shows the verified resource path. Neither output invents OCR, a caption or
 source prose; the saved body, source payload, identity, time and ordering stay
 unchanged. Missing, altered, mismatched or invalid files remain incomplete.
-Only PNG/GIF with validated complete pixel streams are currently available.
-JPEG/WebP return an explicit unsupported-format result even when an operating
-system decoder can open them: tolerant pixel repair is not completeness proof.
-Local reads do not create decoder files or launch a decoder process.
+PNG/GIF use the store's complete pixel-stream checks. JPEG additionally requires
+the installed [strict native validator](strict-jpeg-resource-validation.md),
+including full decoding, zero warnings, complete consumption and scan coverage.
+Missing dependency, invalid data, unsupported encoding and budget exhaustion
+remain distinct incomplete outcomes. WebP remains unsupported. Local reads do
+not create decoder files; JPEG bytes travel over stdin to the bounded helper.
 `--resource-dir` selects an explicit private store for acquisition and reading;
 the default is `<absolute database path>.resources`.
 

@@ -8,6 +8,7 @@
 
 ```sh
 npm ci
+npm run build:jpeg # needs an installed libjpeg-turbo prefix; see below
 npm run verify
 ```
 
@@ -16,6 +17,7 @@ npm run verify
 | npm 任务 | 用途与效果 |
 | --- | --- |
 | `npm run build` | 按 tsconfig.build 生成当前 dist，生成物随源码提交 |
+| `npm run build:jpeg` | 从已有 libjpeg-turbo 静态库构建 JPEG 验证器和回执；不安装依赖、不下载数据 |
 | `npm run typecheck` | noEmit 类型检查，覆盖 bin、tools、src |
 | `npm run check` | 先 build，再运行源码语法发现 |
 | `npm test` | 先 build，再完整运行 tests/*.test.mjs，最多四个文件并行 |
@@ -25,6 +27,12 @@ npm run verify
 缺失声明、陈旧内容、孤立生成文件都应使 build:check 和 verify 失败，且保持当前 dist 不变；Git 中 dist 干净不等于输出正确。修改源码后先显式执行 `npm run build` 更新生成物，再执行 verify；源码与生成物一并提交。普通 build 不负责移除不再生成的孤立文件，删除源模块时同时处理对应旧生成物。不要在运行中的 checkout 执行会构建 dist 的任务。
 
 ### macOS CI
+
+JPEG 完整性验证还需要 C11 编译器及已有的 libjpeg-turbo 头文件、静态库和测试工具。
+构建与部署约定见 [严格 JPEG 验证](strict-jpeg-resource-validation.md)。本地可设置
+`EXOCORTEX_LIBJPEG_PREFIX` 后执行 `npm run build:jpeg`；CI 通过 `brew --prefix jpeg-turbo`
+选择 runner 已安装版本并显式构建。缺失依赖立即失败，不能等待全量测试结束、跳过
+JPEG 控制或自动安装软件。此候选实际验证版本为 3.1.4.1，远端 runner 能力仍需 CI 确认。
 
 唯一完整 CI job `Check and test` 使用标准 `macos-26` ARM64 runner，保留 Node.js 22、`npm ci` 和完整 `npm run verify`，不另设 Linux 全量矩阵。测试仍最多四个文件并行，job 上限为 60 分钟，为 macOS runner 上的完整合成集成测试留出余量，不因平台跳过测试。
 

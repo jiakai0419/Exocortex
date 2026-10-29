@@ -23,7 +23,7 @@ const parse = value => { try {return JSON.parse(value);} catch {return {};} };
 const localFailure = reason => Object.assign(new Error(reason),{resourceReason:reason});
 const localReasons = new Set(['profile_unverified','account_mismatch','account_changed','source_changed',
   'download_response_invalid','download_file_invalid','download_image_invalid','resource_publish_failed',
-  'resource_format_unsupported','resource_decoder_unavailable','resource_pending_invalid','resource_pending_busy']);
+  'resource_format_unsupported','resource_decoder_unavailable','resource_validation_limit','resource_pending_invalid','resource_pending_busy']);
 const continuationCurrent=(evidence,time)=>Number.isSafeInteger(time)&&time>=evidence.read_observed_at_ms&&time>=evidence.created_at_ms&&time<evidence.expires_at_ms;
 const resumableStops = new Set(['sync_busy','cli_budget','self_budget','time_budget']);
 // Only these byte-content outcomes are independent of batch safety admission.
@@ -52,7 +52,7 @@ function readDownload(stage, filename, response) {
     if(length!==response.size_bytes||current.isSymbolicLink()||!current.isFile()||!same(before,after)||!same(after,current))
       throw localFailure('download_file_invalid');
     const result=bytes.subarray(0,length), assessment=assessMediaImageBytes(result), image=assessment.image;
-    if(['resource_format_unsupported','resource_decoder_unavailable'].includes(assessment.reason || ''))
+    if(['resource_format_unsupported','resource_decoder_unavailable','resource_validation_limit'].includes(assessment.reason || ''))
       throw localFailure(assessment.reason);
     if (!image || response.content_type.split(';')[0].trim().toLowerCase()!==image.mime_type)
       throw localFailure('download_image_invalid');
