@@ -7,7 +7,6 @@ import {
   linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync,
   rmSync, symlinkSync, writeFileSync,
 } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validateJpegResource } from '../src/adapters/lark-im/jpeg-resource-validator.mjs';
@@ -73,7 +72,9 @@ function rewriteReceipt(install, change) {
 
 test('JPEG resource wrapper validates its installation, bounded process and finite protocol', async t => {
   dependencies();
-  const temporary = mkdtempSync(join(tmpdir(), 'synthetic-jpeg-wrapper-'));
+  // A stable code installation; a busy user TMPDIR is deliberately not a trust
+  // anchor. Separate directory-fence controls exercise that conservative case.
+  const temporary = mkdtempSync('/tmp/synthetic-jpeg-wrapper-');
   t.after(() => rmSync(temporary, { recursive: true, force: true }));
   const bytes = syntheticJpeg(), originalBytes = Buffer.from(bytes);
   const baseline = installation(temporary, 'baseline');

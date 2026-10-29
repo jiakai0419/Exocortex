@@ -97,6 +97,43 @@ Changing C source requires rebuilding. No image or other private data enters the
 build receipt. The compiler, tools and native archive are only build/test inputs;
 static linking avoids a runtime dependency on that machine-specific prefix.
 
+The caller also holds directory descriptors for the canonical installation path,
+from the filesystem root through the helper's parent (at most 64 directories).
+Before and after the child returns, both each open directory and its pathname must
+have the captured device, inode, birth time, owner, group and mode, with no new
+path alias. Starting at the root, a continuous prefix is protected from rename
+only while the preceding directory is not owned by this UID, has no group/other
+write bit, and denies write access. A writable ancestor ends that prefix for all
+descendants; a deeper root-owned directory never starts a new trusted prefix.
+Every directory outside the prefix must also retain its ctime. All descriptors
+close on success, rejection and process errors. Original helper/receipt/source
+hash, ownership, mode and stable-file checks remain mandatory.
+
+This is a bounded detection fence: replacing and restoring the parent or an
+ancestor makes the returned decoder claim unusable, even if the original helper
+file itself is unchanged. Tests include the first mutable directory below the
+protected prefix: detection relies on that moved directory's own ctime changing,
+not on observing changes in its protected parent. This is an exercised filesystem
+property, not a claim about every possible filesystem or privileged clock change.
+It does not prevent a substituted same-UID executable
+from starting, nor protect against a machine owner forging installation evidence,
+privileged mount manipulation or special ACL rights not represented by ordinary
+write-access checks. Install under a stable private code directory. Ordinary
+unrelated entries created directly in a protected ancestor such as `/private/tmp`
+do not invalidate its identity; changes inside a mutable ancestor do conservatively
+return `resource_decoder_unavailable`. In particular Darwin's user temporary
+directory is not promoted to a trusted anchor: unrelated concurrent changes there
+can reject a helper installed below it. The same conservative behavior applies to
+any mutable ancestor, including a writable code-parent directory; it is not
+specific to temporary directories. The reader does not retry or weaken this
+fence. This limitation is preferable to accepting a result after an undetectable
+path substitution, and requires explicit concurrent test/deployment checks.
+
+The macOS investigation could not execute the checked binary through an inherited
+`/dev/fd` descriptor (`EACCES`, no helper started). That route is not retried or
+used as a fallback. No watcher, new runtime language, guardian process or runtime
+build dependency is introduced by the directory fence.
+
 CI/deployment must explicitly provide this dependency and build/copy step before
 verification or activation. No package manager, network installation or production
 configuration change is performed by this patch.
