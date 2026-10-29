@@ -234,7 +234,8 @@ test('JPEG resource wrapper validates its installation, bounded process and fini
   await t.test('timeout, signal, stderr and spawn errors never expose raw diagnostics', () => {
     const cases = [
       [{ error: Object.assign(new Error('SYNTHETIC-PRIVATE-CONTENT'), { code: 'ETIMEDOUT' }), status: null }, 'resource_validation_limit'],
-      [{ signal: 'SIGKILL', status: null }, 'resource_validation_limit'],
+      [{ signal: 'SIGKILL', status: null }, 'resource_decoder_unavailable'],
+      [{ error: Object.assign(new Error('SYNTHETIC-PRIVATE-CONTENT'), { code: 'ETIMEDOUT' }), signal: 'SIGKILL', status: null }, 'resource_validation_limit'],
       [{ signal: 'SIGXCPU', status: null }, 'resource_validation_limit'],
       [{ signal: 'SIGSEGV', status: null }, 'resource_decoder_unavailable'],
       [{ signal: 'SIGTERM', status: null }, 'resource_decoder_unavailable'],

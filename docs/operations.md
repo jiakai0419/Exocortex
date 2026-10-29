@@ -27,8 +27,13 @@
 
 ```bash
 npm ci
+npm run build:jpeg
 npm run verify
 ```
+
+严格 JPEG 验证还需要已安装的 libjpeg-turbo（同一 prefix 的 headers、静态库、许可证及合成测试编码工具）和 C11 编译器；非标准路径显式设置 `EXOCORTEX_LIBJPEG_PREFIX`。上述构建只生成当前 checkout 的 `build/native`，不会下载或安装依赖。具体要求见 [JPEG 构建契约](strict-jpeg-resource-validation.md)。缺少 helper 的完整测试应失败，不能跳过该门禁。
+
+`build/native` 不在 Git 中。准备发布或恢复时，须在目标 checkout 重新构建并验证，或恢复已核验且平台、架构、源码匹配的 helper、相邻回执和许可证目录；只恢复 Git bundle 不足以恢复 JPEG 能力。默认使用 checkout 内的 helper 路径，无需改变服务账号或权限。实际启用前验证真实 `messages` 的资源读取与耗时；本地合成解码通过不代表生产端到端延迟通过。
 
 `verify` 是开发配方：先检查当前生成物，再完成 build、typecheck、syntax 和 test，不调用 service 或 maintenance 命令。缺失或陈旧的 dist 在被构建覆盖前失败；修改源码后先显式 build，源码与生成物一起提交。构建仍写当前 `dist`，只应在隔离开发 checkout 执行。运行维护按下文显式停服、替换已验证候选、启动及验收；检查命令不会代为重启。
 

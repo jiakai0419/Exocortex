@@ -58,7 +58,7 @@ export function validateJpegResource(bytes,expected=undefined,deps={}) {
     const result=(deps.spawnSync||spawnSync)(helper,[],{input:bytes,encoding:'utf8',timeout:5000,killSignal:'SIGKILL',
       maxBuffer:8192,env:{PATH:'/usr/bin:/bin',LANG:'C',LC_ALL:'C',TZ:'UTC'}});
     if(!unchanged(helper,installed.info)||!unchanged(`${helper}.json`,receiptFile.info))return failure('resource_decoder_unavailable');
-    if(result.error||result.signal)return failure(/** @type {NodeJS.ErrnoException|undefined} */(result.error)?.code==='ETIMEDOUT'||['SIGKILL','SIGXCPU'].includes(result.signal||'')
+    if(result.error||result.signal)return failure(/** @type {NodeJS.ErrnoException|undefined} */(result.error)?.code==='ETIMEDOUT'||result.signal==='SIGXCPU'
       ?'resource_validation_limit':'resource_decoder_unavailable');
     if(result.stderr)return failure('resource_decoder_unavailable');
     const json=String(result.stdout);validateJsonObjectText(json);const response=JSON.parse(json);

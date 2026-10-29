@@ -49,6 +49,11 @@ metadata strings, decoded pixels, raw decoder errors or paths appear in the
 finite protocol or logs. Input travels over stdin; output is a small structured
 receipt. No temporary image files or implicit network access are needed.
 
+Failure reasons follow observed execution evidence. An outer `ETIMEDOUT`, a
+`SIGXCPU` result, or the helper's verified limit receipt establishes a validation
+limit. A standalone `SIGKILL` does not: it can also be an external termination,
+so it reports decoder unavailability. Neither outcome supplies usable pixels.
+
 ## Build and runtime dependency
 
 Build a small static client with the same libjpeg-turbo prefix's headers and

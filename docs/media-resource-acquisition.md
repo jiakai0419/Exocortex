@@ -41,7 +41,12 @@ user again and re-read the downloaded source rows under the shared local commit
 lease. A changed message source blocks that row; independent unchanged rows may
 still publish. Publish only unchanged rows into the database/account/message/version/
 resource binding described in [the store contract](media-resource-store.md).
-Clean up temporary bytes after success or failure.
+Clean up the download staging directory after success or failure. Exact local
+admission stops may retain already validated bytes in the separate bounded
+[pending namespace](media-resource-pending.md). A missing original closing
+account observation remains quarantine and requires a fresh download; only an
+originally closed operation may later resume publication without fetching again.
+Neither state is available to `messages` before its normal publication fences.
 
 `messages` checks that same binding and the actual local file on every read.
 Only a verified available resource can make an image's content complete. JSON
