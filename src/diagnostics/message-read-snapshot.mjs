@@ -1,5 +1,6 @@
 // @ts-check
 import { readOnlySqliteJson, SqliteReadError } from '../storage/sqlite/readonly-query.mjs';
+import { sqliteReadDiagnostic } from './sqlite-read-diagnostic.mjs';
 import { READINESS_CONTRACT_VERSION } from './message-readiness-ledger.mjs';
 import { MESSAGE_READINESS_OBSERVATION_FIELDS, selectMessageReadinessObservations } from './message-completeness-summary.mjs';
 import { larkSenderNameIsUnknownSql } from '../../dist/storage/sqlite/lark-name-projection.js';
@@ -49,7 +50,8 @@ const rowQuery = (kind, columns, query, order) => `SELECT ${quote(kind)} AS kind
 const existsTable = table => `EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=${quote(table)})`;
 const routeIndexColumns = `(SELECT group_concat(name,',') FROM pragma_index_info(${quote(ROUTE_INDEX)}))='source_id,account_key,route_key'`;
 const existsRouteIndex = `EXISTS(SELECT 1 FROM sqlite_schema WHERE type='index' AND name=${quote(ROUTE_INDEX)} AND ${routeIndexColumns})`;
-const invalid = () => new SqliteReadError('invalid_response', 'read message snapshot returned invalid data');
+const invalid = () => new SqliteReadError('invalid_response', 'read message snapshot returned invalid data',
+  sqliteReadDiagnostic({ stage: 'snapshot_validate', kind: 'invalid_shape' }));
 
 /**
  * A bounded page and its evidence share one read transaction/statement. The

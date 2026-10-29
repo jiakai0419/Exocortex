@@ -30,7 +30,8 @@ export async function runCli(argv, overrides = {}) {
     const usage = error instanceof CliUsageError;
     const message = usage || error instanceof CliExecutionError ? error.message : "Unable to complete command; check its required dependencies and local evidence.";
     writeCliError(context, { format, code: usage ? "invalid_arguments" : "execution_failed", message,
-      reason: error instanceof CliExecutionError ? error.reason : undefined, textPrefix: "Error: " });
+      reason: error instanceof CliExecutionError ? error.reason : undefined,
+      readDiagnostic: error instanceof CliExecutionError ? error.readDiagnostic : undefined, textPrefix: "Error: " });
     return 1;
   }
 }

@@ -73,7 +73,7 @@ test("typed query failures cross the CLI boundary only as fixed categories and i
   const cases = [
     [{ status: null, error: Object.assign(new Error(PRIVATE), { code: "ENOENT" }) }, "dependency_unavailable", /SQLite command unavailable/],
     [{ status: null, error: Object.assign(new Error(PRIVATE), { code: "ETIMEDOUT" }) }, "read_timeout", /query timed out/],
-    [{ status: null, signal: "SIGKILL" }, "read_timeout", /query timed out/],
+    [{ status: null, signal: "SIGKILL" }, "read_failed", /Message query failed/],
     [{ status: 1, stderr: PRIVATE }, "read_failed", /Message query failed/],
     [{ status: 0, stdout: `{${PRIVATE}` }, "invalid_response", /invalid query response/],
     [{ status: 0, stdout: JSON.stringify({ private: PRIVATE }) }, "invalid_response", /invalid query response/],

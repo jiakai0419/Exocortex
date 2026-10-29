@@ -5,7 +5,7 @@ import { CliExecutionError } from "./context.mjs";
 import { loadMessages, retainMessagesMetadata, readMessagesMetadata } from "../diagnostics/messages-report.mjs";
 import { applyLocalChatAppNames, LocalChatAppNamesError, readLocalChatAppNames } from "../diagnostics/local-chat-app-names.mjs";
 import { renderMessagesText } from "../terminal/messages-view.mjs";
-import { SqliteReadError } from "../storage/sqlite/readonly-query.mjs";
+import { SqliteReadError, readSqliteReadDiagnostic } from "../storage/sqlite/readonly-query.mjs";
 
 const READ_ERRORS = Object.freeze({
   dependency_unavailable: "SQLite command unavailable; install SQLite CLI and ensure sqlite3 is on PATH.",
@@ -28,7 +28,7 @@ export function executeMessages(options, deps = {}) {
   } catch (error) {
     if (error instanceof LocalChatAppNamesError) throw new CliExecutionError(error.message);
     if (error instanceof SqliteReadError && Object.hasOwn(READ_ERRORS, error.reason)) {
-      throw new CliExecutionError(READ_ERRORS[error.reason], error.reason);
+      throw new CliExecutionError(READ_ERRORS[error.reason], error.reason, readSqliteReadDiagnostic(error));
     }
     throw error;
   }
