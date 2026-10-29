@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import childProcess from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 import { deflateSync } from 'node:zlib';
+import { mediaControlCases } from './helpers/media-control-fixtures.mjs';
 import { MAX_MEDIA_RESOURCE_BYTES, assessMediaImageBytes, inspectMediaImageBytes, makeMediaResourceBinding,
   publishMediaResource, readMediaResource, resourceStorePath } from '../src/adapters/lark-im/media-resource-store.mjs';
 
@@ -236,6 +237,24 @@ test('GIF validates LZW clear/stop, output count, palette and blocks',()=>{
   assert.equal(inspectMediaImageBytes(wrongCount),null);
   const noPalette=gif();noPalette[10]=0;assert.equal(inspectMediaImageBytes(noPalette),null);
   const missingColor=gif();missingColor[30]=0x54;assert.equal(inspectMediaImageBytes(missingColor),null);
+});
+
+test('PNG/GIF finite rendering controls are enforced through assess, publish and old-cache reread',async t=>{
+  for(const {name,bytes,mime,reason} of mediaControlCases())await t.test(name,t=>{
+    const e=setup(t),assessed=assessMediaImageBytes(bytes);
+    if(reason)assert.deepEqual(assessed,{reason});
+    else assert.equal(assessed.image?.mime_type,mime);
+    const result=publishMediaResource(e.cache,e.binding,bytes,{nowMs});
+    if(!reason) {
+      assert.equal(result.status,'available');assert.equal(readMediaResource(e.cache,e.binding).status,'available');return;
+    }
+    assert.deepEqual(result,{status:'invalid',reason});assert.equal(existsSync(e.cache),false);
+    const good=publishMediaResource(e.cache,e.binding,png(),{nowMs});assert.equal(good.status,'available');
+    const path=join(e.cache,`${good.binding_digest}.json`),manifest=JSON.parse(readFileSync(path,'utf8')),sha256=hash(bytes);
+    writeFileSync(join(e.cache,`${sha256}.blob`),bytes,{mode:0o600});
+    writeFileSync(path,JSON.stringify({...manifest,sha256,size_bytes:bytes.length,mime_type:mime}));
+    assert.deepEqual(readMediaResource(e.cache,e.binding),{status:'invalid',reason});
+  });
 });
 
 test('JPEG rejects zero/missing scan components and WebP rejects reserved header/padding',()=>{

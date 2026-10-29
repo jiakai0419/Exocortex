@@ -95,9 +95,14 @@ function crc32(bytes) {
   }
   return (crc ^ 0xffffffff) >>> 0;
 }
+function unsupportedImageControl() {
+  throw Object.assign(new Error('format_unsupported'),{code:'MEDIA_FORMAT_UNSUPPORTED'});
+}
 function png(bytes) {
   let offset = 8, width = 0, height = 0, depth = 0, channels = 0, interlace = 0;
   let ihdr = false, ended = false, imageEnded = false, palette = 0;
+  const controls = new Set();
+  /** @type {Buffer|null} */ let histogram = null;
   const compressed = [];
   while (offset < bytes.length) {
     if (offset + 12 > bytes.length) throw new Error('png_truncated');
@@ -114,9 +119,28 @@ function png(bytes) {
       if (!validDepths[color]?.includes(depth) || data[10] !== 0 || data[11] !== 0 || interlace > 1) throw new Error('png_header');
       channels = ({ 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 })[color]; ihdr = true;
     } else if (type === 'PLTE') {
-      if (compressed.length || palette || length < 3 || length > 768 || length % 3
+      if (compressed.length || palette || controls.size || length < 3 || length > 768 || length % 3
         || [0,4].includes(bytes[25]) || bytes[25] === 3 && length/3 > 2**depth) throw new Error('png_palette');
       palette = length/3;
+    } else if (['tRNS','bKGD','hIST'].includes(type)) {
+      if (compressed.length || controls.has(type)) throw new Error('png_control_order');
+      const color=bytes[25];
+      if(type==='tRNS') {
+        if([4,6].includes(color) || color===0 && length!==2 || color===2 && length!==6
+          || color===3 && (!palette || length>palette)) throw new Error('png_transparency');
+      } else if(type==='bKGD') {
+        if(color===3 ? !palette || length!==1 || data[0]>=palette : length!==([0,4].includes(color)?2:6))
+          throw new Error('png_background');
+      } else {
+        if(!palette || length!==palette*2) throw new Error('png_histogram');
+        histogram=data;
+      }
+      // PNG decoders mask unused high bits of low-depth tRNS/bKGD samples.
+      // Do not reject those legal fields merely for their unused high bits.
+      controls.add(type);
+    } else if (['acTL','fcTL','fdAT'].includes(type)) {
+      // A complete default IDAT is not evidence for declared animation frames.
+      unsupportedImageControl();
     } else if (type === 'IDAT') {
       if (imageEnded) throw new Error('png_order');
       compressed.push(data);
@@ -158,7 +182,10 @@ function png(bytes) {
           const predictor=filter===1?a:filter===2?b:filter===3?Math.floor((a+b)/2):filter===4?(pa<=pb&&pa<=pc?a:pb<=pc?b:c):0;
           current[x]=(current[x]+predictor)&255;
         }
-        for(let x=0;x<w;x++)if(((current[Math.floor(x*depth/8)]>>(8-depth-(x*depth%8)))&((1<<depth)-1))>=palette)throw new Error('png_palette_index');
+        for(let x=0;x<w;x++) {
+          const index=(current[Math.floor(x*depth/8)]>>(8-depth-(x*depth%8)))&((1<<depth)-1);
+          if(index>=palette || histogram && histogram.readUInt16BE(index*2)===0)throw new Error('png_palette_index');
+        }
         previous=current;
       }
       at+=size;
@@ -197,7 +224,9 @@ function gif(bytes) {
   if (bytes.length < 14) throw new Error('gif_truncated');
   const width = bytes.readUInt16LE(6), height = bytes.readUInt16LE(8); dimensions(width, height);
   const globalColors = bytes[10] & 128 ? 2 ** ((bytes[10] & 7) + 1) : 0;
+  if(globalColors && bytes[11]>=globalColors)throw new Error('gif_background');
   let at = 13 + 3 * globalColors, images = 0, totalPixels = 0;
+  /** @type {{transparent:number|null}|null} */ let control=null;
   const blocks = (collect = false) => {
     const parts = [];
     while (at < bytes.length) {
@@ -209,19 +238,42 @@ function gif(bytes) {
   };
   while (at < bytes.length) {
     const tag = bytes[at++];
-    if (tag === 0x3b) { if (!images || at !== bytes.length) throw new Error('gif_end'); return { mime_type: 'image/gif', width, height }; }
-    if (tag === 0x21) { if (at >= bytes.length) throw new Error('gif_truncated'); at++; blocks(); continue; }
+    if (tag === 0x3b) { if (!images || control || at !== bytes.length) throw new Error('gif_end'); return { mime_type: 'image/gif', width, height }; }
+    if (tag === 0x21) {
+      if (at >= bytes.length) throw new Error('gif_truncated');
+      const label=bytes[at++];
+      if(label===0xf9) {
+        if(control || at+6>bytes.length || bytes[at]!==4 || bytes[at+5]!==0 || bytes[at+1]&0xe0)
+          throw new Error('gif_control');
+        const packed=bytes[at+1];
+        if((packed>>2&7)>3)unsupportedImageControl();
+        control={transparent:packed&1?bytes[at+4]:null};at+=6;
+      } else {
+        // Unknown rendering/control blocks, including Plain Text, cannot be
+        // dropped while treating the file's raster images as complete content.
+        if(label<0xfa)unsupportedImageControl();
+        if(label===0xff) {
+          if(at+12>bytes.length || bytes[at]!==11)throw new Error('gif_application');
+          for(let i=at+1;i<at+9;i++)if(bytes[i]<0x20 || bytes[i]>0x7e)throw new Error('gif_application');
+          at+=12;
+        }
+        blocks();
+      }
+      continue;
+    }
     if (tag !== 0x2c || at + 9 > bytes.length) throw new Error('gif_block');
     const x = bytes.readUInt16LE(at), y = bytes.readUInt16LE(at+2), w = bytes.readUInt16LE(at+4), h = bytes.readUInt16LE(at+6);
     dimensions(w,h); if (x+w > width || y+h > height) throw new Error('gif_frame');
     if ((totalPixels += w*h) > MAX_DECODED_BYTES) throw new Error('image_decoded_limit');
     const flags = bytes[at+8], colors = flags & 128 ? 2 ** ((flags & 7) + 1) : globalColors; at += 9;
     if (!colors || flags & 24) throw new Error('gif_palette');
+    if(control?.transparent!==null && control?.transparent!==undefined && control.transparent>=colors)
+      throw new Error('gif_transparency');
     if (flags & 128) at += 3 * colors;
     if (at >= bytes.length || bytes[at] < 2 || bytes[at] > 8) throw new Error('gif_code_size');
     const minimum = bytes[at++], codes = blocks(true);
     if (!codes?.length) throw new Error('gif_empty');
-    gifPixels(codes, minimum, w*h, colors); images++;
+    gifPixels(codes, minimum, w*h, colors); images++;control=null;
   }
   throw new Error('gif_truncated');
 }

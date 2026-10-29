@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { deflateSync } from 'node:zlib';
 import { ensureInitialized, quoteSql, sqliteExec } from '../dist/storage/sqlite/ingestion-store.js';
 import { SENT_SCOPE_ID } from '../src/adapters/lark-im/core.mjs';
+import { mediaControlCases } from './helpers/media-control-fixtures.mjs';
 
 // Every byte, identity and message is authored here. The only executable named
 // LARK_CLI is a fixture-owned Python program with no network or credential code.
@@ -416,5 +417,62 @@ test('real resource CLI accepts exact relative and canonical absolute paths with
     assert.deepEqual(after[0], before[0]); assert.deepEqual(after[2], before[2]);
     assert.deepEqual(readFileSync(f.db), beforeDb, 'path normalization never modifies source records');
     assert.equal(readFileSync(f.audit, 'utf8'), auditBytes, 'message reads never fetch a path mismatch');
+  });
+});
+
+const challengedControls = new Set(['png_rgba_forbidden_trns', 'gif_gce_size_1',
+  'gif_background_index_outside_two_color_palette', 'png_animation_declares_two_frames_with_no_fctl']);
+
+test('real acquisition and messages preserve valid controls but never make unsupported or malformed controls ready', async t => {
+  const selected = new Set([...challengedControls, 'png_unknown_ancillary_before',
+    'gif_valid_gce_disposal_3', 'gif_gce_crosses_comment_application_special']);
+  for (const sample of mediaControlCases().filter(item => selected.has(item.name))) await t.test(sample.name, t => {
+    const f = fixture(t, { bytes: sample.bytes, mime: sample.mime }), beforeDb = readFileSync(f.db);
+    const readArgs = ['messages', '--db', f.db, '--resource-dir', f.resourceDir, '--limit', '3'];
+    const before = JSON.parse(command(f, [...readArgs, '--format', 'json']));
+    const appliedText = command(f, ['maintenance', 'enrich', '--target', 'resources', '--db', f.db,
+      '--record-id', '2', '--resource-dir', f.resourceDir, '--max-cli-attempts', '3', '--max-seconds', '30',
+      '--format', 'json', '--apply'], true, sample.reason ? 2 : 0);
+    const applied = JSON.parse(appliedText);
+    assertPublic(f, appliedText);
+    assert.equal(applied.available, sample.reason ? 0 : 1);
+    assert.equal(applied.results[0].reason, sample.reason === 'resource_image_invalid' ? 'download_image_invalid' : sample.reason);
+    const auditBytes = readFileSync(f.audit, 'utf8');
+    const after = JSON.parse(command(f, [...readArgs, '--format', 'json']));
+    assert.equal(after[1].readiness.state, sample.reason ? 'blocked' : 'ready');
+    assert.deepEqual(after.map(row => row.id), [3, 2, 1]);
+    assert.deepEqual(after[0], before[0]); assert.deepEqual(after[2], before[2]);
+    for (const key of ['body', 'actor_id', 'container_id', 'direction', 'external_id', 'external_version',
+      'occurred_at', 'occurred_at_ms', 'raw_json', 'canonical_json', 'content_hash']) assert.deepEqual(after[1][key], before[1][key]);
+    const terminal = command(f, readArgs);
+    assert.equal(terminal.includes('本地资源已验证'), !sample.reason);
+    assert.deepEqual(readFileSync(f.db), beforeDb);
+    assert.equal(readFileSync(f.audit, 'utf8'), auditBytes);
+  });
+});
+
+test('real messages revalidates the four challenged controls in old available cache evidence', async t => {
+  for (const sample of mediaControlCases().filter(item => challengedControls.has(item.name))) await t.test(sample.name, t => {
+    const f = fixture(t), beforeDb = readFileSync(f.db);
+    const readArgs = ['messages', '--db', f.db, '--resource-dir', f.resourceDir, '--limit', '3'];
+    command(f, ['maintenance', 'enrich', '--target', 'resources', '--db', f.db, '--record-id', '2',
+      '--resource-dir', f.resourceDir, '--max-cli-attempts', '3', '--max-seconds', '30', '--format', 'json', '--apply'], true);
+    const before = JSON.parse(command(f, [...readArgs, '--format', 'json']));
+    const filename = readdirSync(f.resourceDir).find(name => name.endsWith('.json'));
+    const path = join(f.resourceDir, filename), manifest = JSON.parse(readFileSync(path, 'utf8')), hash = sha(sample.bytes);
+    writeFileSync(join(f.resourceDir, `${hash}.blob`), sample.bytes, { mode: 0o600 });
+    writeFileSync(path, JSON.stringify({ ...manifest, sha256: hash, size_bytes: sample.bytes.length, mime_type: sample.mime }));
+    const cacheBefore = new Map(readdirSync(f.resourceDir).map(name => [name, readFileSync(join(f.resourceDir, name))]));
+    const auditBytes = readFileSync(f.audit, 'utf8'), after = JSON.parse(command(f, [...readArgs, '--format', 'json']));
+    assert.equal(after[1].readiness.state, 'blocked');
+    assert.ok(after[1].readiness.reasons.includes('content_resource_invalid'));
+    assert.equal(after[1].display.media.resource.verification_reason, sample.reason);
+    assert.equal(after[1].display.media.resource.path, undefined);
+    assert.deepEqual(after.map(row => row.id), [3, 2, 1]);
+    assert.deepEqual(after[0], before[0]); assert.deepEqual(after[2], before[2]);
+    assert.equal(command(f, readArgs).includes('本地资源已验证'), false);
+    assert.deepEqual(new Map(readdirSync(f.resourceDir).map(name => [name, readFileSync(join(f.resourceDir, name))])), cacheBefore);
+    assert.deepEqual(readFileSync(f.db), beforeDb);
+    assert.equal(readFileSync(f.audit, 'utf8'), auditBytes);
   });
 });
