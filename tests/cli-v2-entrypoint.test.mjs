@@ -55,6 +55,7 @@ test("help works in a code-only fixture without dist, database, Python or extern
   const root = mkdtempSync(join(tmpdir(), "synthetic-cli-help-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   for (const path of ["bin/exocortex.mjs", "src/cli/registry.mjs", "src/cli/context.mjs", "src/cli/parse-options.mjs",
+    "src/diagnostics/sqlite-read-diagnostic.mjs",
     "src/runtime/worker/options.mjs", "src/adapters/lark-im/sync-options.mjs", "src/terminal/text-layout.mjs"]) {
     const destination = join(root, path);
     mkdirSync(dirname(destination), { recursive: true });

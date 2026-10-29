@@ -30,6 +30,7 @@ CREATE TABLE lark_im_resource_scan (
   horizon_id INTEGER NOT NULL DEFAULT 0 CHECK(horizon_id>=0),
   last_head_id INTEGER NOT NULL DEFAULT 0 CHECK(last_head_id>=0),
   next_scan_at_ms INTEGER NOT NULL DEFAULT 0 CHECK(next_scan_at_ms>=0),
+  recovery_after_work_key TEXT NOT NULL DEFAULT '' CHECK(recovery_after_work_key='' OR length(recovery_after_work_key)=64 AND recovery_after_work_key NOT GLOB '*[^a-f0-9]*'),
   priority_streak INTEGER NOT NULL DEFAULT 0 CHECK(priority_streak BETWEEN 0 AND 2),
   generation INTEGER NOT NULL DEFAULT 0 CHECK(generation>=0)
 );

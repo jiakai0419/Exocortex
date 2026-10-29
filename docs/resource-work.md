@@ -54,9 +54,19 @@ SQL admission fence. It never bypasses sync intent or cooldown policy. A claim
 uses source and task generation CAS, a random token and the existing process
 owner identity. Result writes require that exact token/generation and original
 source. A queued image that has become text, lost its account evidence or
-otherwise no longer matches is terminally marked `source_changed` by task CAS;
-it cannot remain an endlessly selected head. Source changes after acquisition
-also cannot receive a successful stale queue result.
+otherwise no longer matches is marked `source_changed` only while both task CAS
+and the exact observed current source still hold. A source row outside the
+bounded payload set requires the corresponding absence/size predicate under
+the same transaction. A restored eligible source can be enrolled normally even
+when its fence equals the original task fence. Same-binding restoration preserves
+attempt/failure/deferral counts and cannot revive an exhausted attempt budget.
+It cannot remain an endlessly
+selected head or be permanently hidden by an earlier changed-source observation.
+Source changes after acquisition also cannot receive a successful stale queue
+result. The `processed`, `available` and `blocked` task counters are published
+only after that task's guarded result transaction commits. A producer sidecar
+may already exist if the later queue CAS fails; failure does not delete it or
+claim a successful queue result.
 
 ## One existing producer and unchanged total budget
 
@@ -110,8 +120,15 @@ Once the request session latches busy, cooldown or budget stop, the wrapper
 does not take a later lease to bypass that stop and commit a result. The durable
 claim remains until its **120-second** expiry and the original process owner
 is positively dead. Expiry alone, an alive owner or unknown liveness never
-permits recovery. At most two expired claims are examined per invocation;
-recovery preserves attempt count and terminates the eighth interrupted unit.
+permits recovery. At most two expired claims are examined per invocation.
+Migration 019's durable `recovery_after_work_key` cursor traverses expired claims
+in work-key order with one bounded wrap. Even an alive or unknown owner advances
+that cursor under account admission and scan-generation CAS, without renewing
+or changing its claim. It therefore cannot indefinitely hide later dead owners.
+A recovery update also requires the observed task generation, token, owner and
+expiry to remain unchanged. Recovery preserves attempt count and terminates the
+eighth interrupted unit. Cursor advancement and any recoveries commit together;
+a stopped command cannot advance the cursor outside the normal lease.
 This interrupted-job recovery delay is explicitly not a seconds-level ready
 guarantee. Normal successful, blocked and unstopped transient results finish
 their claim immediately under the ordinary result lease.

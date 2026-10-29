@@ -173,3 +173,93 @@ test('result generation conflict cannot overwrite another queue generation or re
   const f=fixture(t);f.settings.onProfile=n=>{if(n===2)sqliteExec(f.db,'UPDATE lark_im_resource_work SET generation=generation+1;');};
   const r=f.run();assert.equal(r.ok,false);assert.equal(r.outcome,'execution_failed');assert.equal(f.tasks()[0].state,'running');assert.equal(f.tasks()[0].generation,2);
 });
+
+
+test('bounded recovery cursor passes alive and unknown expired owners on the next invocation',t=>{
+  const f=fixture(t,3);f.settings.remoteBusyAt=1;f.run();f.settings.remoteBusyAt=0;
+  const ordered=sqliteQuery(f.db,'SELECT work_key,record_id FROM lark_im_resource_work ORDER BY work_key;');
+  for(const [i,x] of ordered.entries())sqliteExec(f.db,`UPDATE lark_im_resource_work SET state='running',attempt_token=${q(`synthetic-token-${i}`)},claim_owner=${q(`synthetic-owner-${i}`)},claim_until_ms=${f.wall-1000+i},attempts=1,generation=generation+1 WHERE work_key=${q(x.work_key)};`);
+  const before=f.tasks(),seen=[];f.deps.ownerState=owner=>{seen.push(owner);return owner.endsWith('0')?'alive':owner.endsWith('1')?'unknown':'dead';};
+  assert.equal(f.run().request_budget.cli_attempts,0);
+  assert.deepEqual(seen,['synthetic-owner-0','synthetic-owner-1']);
+  const persisted=sqliteQuery(f.db,'SELECT recovery_after_work_key FROM lark_im_resource_scan;')[0].recovery_after_work_key;
+  assert.equal(persisted,ordered[1].work_key);
+  seen.length=0;
+  // A fresh invocation consumes only persisted database state, no process cursor.
+  const result=executeResourceWork({...f.options},{...f.deps});
+  assert.equal(result.available,1,JSON.stringify(result));assert.equal(seen.length,2);assert(seen.includes('synthetic-owner-2'));
+  assert.equal(f.tasks().find(x=>x.work_key===ordered[2].work_key).state,'available');
+  for(const x of before.filter(x=>x.work_key!==ordered[2].work_key))assert.deepEqual(f.tasks().find(y=>y.work_key===x.work_key),x,'live/unknown claim is unchanged');
+});
+
+for(const outsidePayload of [false,true])test(`changed-source observation CAS rejects restoration before commit (outside payload ${outsidePayload})`,t=>{
+  const f=fixture(t,2);assert.equal(f.run().available,1);
+  const original=sqliteQuery(f.db,'SELECT canonical_json,body FROM records WHERE id=1;')[0];
+  sqliteExec(f.db,outsidePayload?`UPDATE records SET body=${q('x'.repeat(128*1024))} WHERE id=1;`:`UPDATE records SET canonical_json=json_set(canonical_json,'$.chat_name','Synthetic temporary source') WHERE id=1;`);
+  const lease=f.deps.tryAcquireLease;let restored=false;
+  f.deps.tryAcquireLease=args=>{if(!restored){restored=true;sqliteExec(f.db,`UPDATE records SET canonical_json=${q(original.canonical_json)},body=${q(original.body)} WHERE id=1;`);}return lease(args);};
+  const rejected=f.run();assert.equal(rejected.ok,false);assert.equal(rejected.outcome,'execution_failed');
+  assert.equal(rejected.processed,0);assert.equal(rejected.available,0);assert.equal(rejected.blocked,0);
+  assert.equal(f.tasks()[0].state,'pending');assert.equal(f.tasks()[0].attempts,0);
+  assert.equal(f.run().available,1,'restored original source remains normally serviceable');
+});
+
+test('normal discovery reopens a source_changed task when its original exact source returns',t=>{
+  const f=fixture(t,2);assert.equal(f.run().available,1);
+  const original=sqliteQuery(f.db,'SELECT canonical_json FROM records WHERE id=1;')[0].canonical_json;
+  sqliteExec(f.db,`UPDATE records SET canonical_json=json_set(canonical_json,'$.sender_name_account_key',${q(sha('synthetic-other-account'))}) WHERE id=1;`);
+  assert.equal(f.run().outcome,'source_changed');assert.equal(f.tasks()[0].state,'blocked');
+  sqliteExec(f.db,`UPDATE records SET canonical_json=${q(original)} WHERE id=1;`);f.advance(61000);
+  assert.equal(f.run().available,1,'same original fence can re-enter after source_changed');assert.equal(f.tasks()[0].state,'available');
+});
+
+test('task result CAS failure publishes no successful or blocked task counter',t=>{
+  const f=fixture(t);f.settings.onProfile=n=>{if(n===2)sqliteExec(f.db,'UPDATE lark_im_resource_work SET generation=generation+1;');};
+  const r=f.run();assert.equal(r.ok,false);assert.equal(r.outcome,'execution_failed');
+  assert.equal(r.processed,0);assert.equal(r.available,0);assert.equal(r.blocked,0);assert.equal(f.tasks()[0].state,'running');
+});
+
+
+test('result changed-source observation is fenced and no task success leaks before commit',t=>{
+  const f=fixture(t),original=sqliteQuery(f.db,'SELECT body FROM records WHERE id=1;')[0].body;
+  let restore=false;const lease=f.deps.tryAcquireLease;
+  f.deps.tryAcquireLease=args=>{if(restore){restore=false;sqliteExec(f.db,`UPDATE records SET body=${q(original)} WHERE id=1;`);}return lease(args);};
+  f.deps.enrichResources=(options,deps)=>{const r=enrichResources(options,deps);assert.equal(r.available,1);sqliteExec(f.db,"UPDATE records SET body='Synthetic changed source after publication' WHERE id=1;");restore=true;return r;};
+  const result=f.run();assert.equal(result.outcome,'execution_failed');assert.equal(result.ok,false);assert.equal(result.available,0);assert.equal(result.processed,0);assert.equal(result.blocked,0);
+  assert.equal(f.tasks()[0].state,'running');assert.equal(sqliteQuery(f.db,'SELECT body FROM records WHERE id=1;')[0].body,original);
+  assert.equal(loadMessages(f.db,{limit:20,resourceDir:f.resourceDir})[0].readiness.state,'ready','a safe sidecar is not deleted by later queue CAS rejection');
+});
+
+test('same-binding source restoration preserves attempt budget and existing failure counts',t=>{
+  const f=fixture(t,2);assert.equal(f.run().available,1);
+  const original=sqliteQuery(f.db,'SELECT canonical_json FROM records WHERE id=1;')[0].canonical_json;
+  sqliteExec(f.db,`UPDATE lark_im_resource_work SET attempts=7,failures=1,deferrals=2 WHERE record_id=1;
+    UPDATE records SET canonical_json=json_set(canonical_json,'$.sender_name_account_key',${q(sha('synthetic-other-account'))}) WHERE id=1;`);
+  assert.equal(f.run().outcome,'source_changed');
+  sqliteExec(f.db,`UPDATE records SET canonical_json=${q(original)} WHERE id=1;`);f.advance(61000);
+  assert.equal(f.run().available,1);assert.equal(f.tasks()[0].attempts,8);assert.equal(f.tasks()[0].failures,1);assert.equal(f.tasks()[0].deferrals,2);
+  const calls=f.calls.length;
+  sqliteExec(f.db,"UPDATE lark_im_resource_work SET state='blocked',reason='source_changed' WHERE record_id=1;");f.advance(61000);
+  assert.equal(f.run().request_budget.cli_attempts,0);assert.equal(f.calls.length,calls);assert.equal(f.tasks()[0].state,'exhausted');assert.equal(f.tasks()[0].attempts,8);
+});
+
+test('recovery cursor transaction conflict preserves the expired claim and cursor',t=>{
+  const f=fixture(t);f.settings.remoteBusyAt=1;f.run();f.advance(121000);f.deps.ownerState=()=> 'dead';
+  const before=f.tasks()[0];let changed=false;
+  f.deps.sqliteWrite=(db,sql,label)=>{if(!changed&&sql.includes('SET recovery_after_work_key=')){changed=true;sqliteExec(db,'UPDATE lark_im_resource_scan SET generation=generation+1;');}return sqliteQuery(db,sql,label);};
+  const result=f.run();assert.equal(result.outcome,'execution_failed');assert.equal(result.request_budget.cli_attempts,0);assert.deepEqual(f.tasks()[0],before);
+  assert.equal(sqliteQuery(f.db,'SELECT recovery_after_work_key FROM lark_im_resource_scan;')[0].recovery_after_work_key,'');
+});
+
+test('recovery cannot clear a changed owner or expiry even with the same task token',t=>{
+  const f=fixture(t);f.settings.remoteBusyAt=1;f.run();f.advance(121000);f.deps.ownerState=()=> 'dead';
+  const before=f.tasks()[0];let changed=false;
+  f.deps.sqliteWrite=(db,sql,label)=>{if(!changed&&sql.includes('SET recovery_after_work_key=')){changed=true;sqliteExec(db,`UPDATE lark_im_resource_work SET claim_owner='synthetic-replaced-owner',claim_until_ms=${f.wall+120000};`);}return sqliteQuery(db,sql,label);};
+  assert.equal(f.run().request_budget.cli_attempts,0);const after=f.tasks()[0];
+  assert.equal(after.state,'running');assert.equal(after.claim_owner,'synthetic-replaced-owner');assert.equal(after.claim_until_ms,f.wall+120000);assert.equal(after.attempt_token,before.attempt_token);assert.equal(after.generation,before.generation);
+});
+
+test('confirmed denial task CAS failure does not publish a blocked task counter',t=>{
+  const f=fixture(t);f.settings.denied=true;f.settings.onProfile=n=>{if(n===2)sqliteExec(f.db,'UPDATE lark_im_resource_work SET generation=generation+1;');};
+  const r=f.run();assert.equal(r.ok,false);assert.equal(r.outcome,'execution_failed');assert.equal(r.blocked,0);assert.equal(r.processed,0);assert.equal(r.available,0);assert.equal(f.tasks()[0].state,'running');
+});

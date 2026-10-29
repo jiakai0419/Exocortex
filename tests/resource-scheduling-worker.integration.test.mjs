@@ -91,8 +91,14 @@ function sessionDeps(dir, { closedPending = false } = {}) {
 }
 function observe(dir, context) {
   const db = join(dir, 'synthetic.sqlite'), before = sqliteQuery(db, 'SELECT * FROM records ORDER BY id;');
+  // Producers and observations share the fixture's wall clock. The stress case
+  // advances idle sleeps virtually; real Date.now() would reject later valid
+  // recipient evidence as future-dated. Freeze only the reader's validation
+  // clock, not the parent monotonic source/completion measurements.
+  const observationClock = join(dir, 'messages-observation-clock.mjs');
+  writeFileSync(observationClock, `Date.now = () => ${now(dir)};\n`);
   const invoke = format => {
-    const child = spawnSync(process.execPath, ['--import', join(dir, 'deny-network.mjs'), join(ROOT, 'bin/exocortex.mjs'),
+    const child = spawnSync(process.execPath, ['--import', join(dir, 'deny-network.mjs'), '--import', observationClock, join(ROOT, 'bin/exocortex.mjs'),
       'messages', '--db', db, '--limit', '100', '--format', format], { cwd: dir, encoding: 'utf8', timeout: 15000,
       env: { ...process.env, LARK_CLI: join(dir, 'reject-lark'), NO_COLOR: '1', TZ: 'UTC' } });
     assert.equal(child.status, 0, child.stderr || child.stdout); assert.equal(child.stderr, '');
@@ -267,7 +273,8 @@ if (process.argv[2] === '--remote') {
     assert(resourceSteps.every(x => !x.step.guardian_diagnostic));
     assert(journal.some(x => x.type === 'cli_start' && x.operation === 'resources'), 'worker must execute the real resource CLI');
     assert(journal.some(x => x.type === 'sample_step')); assert(journal.some(x => x.type === 'cli_start' && x.operation === 'history'));
-    const claims = journal.filter(x => x.type === 'lane_claim' && x.claimed);
+    const claims = journal.filter(x => x.type === 'lane_claim');
+    assert(claims.every(x => x.claimed === true), 'this workload must retain and reject failed/unknown admissions, not filter them out');
     assert(new Set(claims.map(x => x.pid)).size >= 2, 'persistent fairness is exercised from two worker processes');
     assert(claims.every((x, i) => i === 0 || x.sequence > claims[i - 1].sequence));
     assert.deepEqual(claims.slice(0, 3).map(x => x.lane), ['sample', 'history', 'resources']);
@@ -275,10 +282,21 @@ if (process.argv[2] === '--remote') {
       const eligible = claims.filter(x => x.eligible.includes(lane));
       for (let index = 0; index + 3 <= eligible.length; index++)
         assert(eligible.slice(index, index + 3).some(x => x.lane === lane), `${lane} gets first service within three eligible slices`);
+      for (let index = 0; index + 3 <= claims.length; index++) {
+        const window = claims.slice(index, index + 3);
+        if (window.every(x => x.eligible.includes(lane)))
+          assert(window.some(x => x.lane === lane), `${lane} gets first service within three consecutive continuously eligible slices`);
+      }
     }
     for (const claim of claims) {
       const start = journal.indexOf(claim), end = journal.findIndex((x, i) => i > start && x.type === 'cycle');
       assert(end > start);
+      const firstStarted = journal.slice(start + 1, end).find(x =>
+        x.type === 'cli_start' && ['history', 'resources'].includes(x.operation)
+        || x.type === 'api' && x.command === 'synthetic:sample');
+      assert(firstStarted, 'a committed claim must have an observed first child in this accepted interval');
+      assert.equal(firstStarted.type === 'api' ? 'sample' : firstStarted.operation, claim.lane,
+        'the claimed lane must be the first actually started guarded CLI or sampling executable');
       const calls = journal.slice(start, end).filter(x => x.type === 'api');
       assert(calls.length <= 12, 'all optional lanes consume one shared twelve-call allowance');
       assert(calls.filter(x => x.route === 'self').length <= 6, 'all optional lanes share six self observations');
@@ -304,6 +322,14 @@ if (process.argv[2] === '--remote') {
     for (const id of ['om_img00', 'om_img01', 'om_deny0']) assert.equal(journal.filter(x => x.type === 'api' && x.route === 'download' && x.id === id).length, 1, `${id}: exact denial/closed pending/available never re-downloads`);
     assert(journal.some(x => x.type === 'closed_pending_contention'));
     const manifest = read(join(dir, 'publisher.json'));
+    const recipients = manifest.entries.filter(source => source.kind === 'recipient');
+    const storedRecipients = final.filter(row => recipients.some(source => source.message.message_id === row.external_id));
+    assert.equal(storedRecipients.length, recipients.length - 1, 'only the last post-cycle source event remains uncollected');
+    for (const row of storedRecipients) {
+      assert.equal(row.readiness.state, 'ready', `${row.external_id}: stored recipient with available authoritative answers must be complete`);
+      assert.deepEqual(row.readiness.reasons, []);
+      assert.equal(row.display.recipient, `Synthetic Peer ${row.external_id.slice(3)}`);
+    }
     // The last publication intentionally waits for the next forward cycle;
     // retain it in the source denominator as not-yet-collected, not success.
     const cohort = manifest.entries.map(source => {
@@ -321,7 +347,7 @@ if (process.argv[2] === '--remote') {
     assert(cohort.filter(x => x.label.startsWith('a') || x.label === 'deny0').every(x => x.censored));
     assert.equal(final.length, manifest.entries.length - 1);
     t.diagnostic(JSON.stringify({ workload: 'adversarial: every eligible sample exhausts all twelve CLI calls; continuous recipient traffic and old denied identities',
-      clock: 'synthetic worker idle advances; actual monotonic I/O; inter-request waits elided but charged to each request-session deadline',
+      clock: 'synthetic worker idle advances; reader Date.now fixed to each shared observation; actual monotonic I/O; inter-request waits elided but charged to each request-session deadline',
       sourceDenominator: cohort.length, storedDenominator: final.length,
       complete: cohort.filter(x => !x.censored).length, unresolved: cohort.filter(x => x.censored).length, cohort,
       limit: 'synthetic service opportunities; no production percentile or unconditional source-to-ready bound' }));

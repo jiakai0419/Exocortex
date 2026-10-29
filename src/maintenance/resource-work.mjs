@@ -30,6 +30,9 @@ const sourceBytes=MEDIA_RESOURCE_SOURCE_FIELDS.map(k=>`COALESCE(length(CAST(${k}
 const pageColumns=`id,(${sourceBytes}) AS source_bytes`;
 const keyWhere=t=>`source_id='lark.im' AND account_key=${q(t.account_key)} AND work_key=${q(t.work_key)}`;
 const sourceSql=row=>`EXISTS(SELECT 1 FROM records r WHERE ${MEDIA_RESOURCE_SOURCE_FIELDS.map(k=>`r.${k} IS ${q(row[k])}`).join(' AND ')})`;
+// A missing bounded payload is an observation, not authority to terminate work.
+// Fence that exact absence/size fact too, so restoration cannot be blocked.
+const observedSourceSql=(row,id)=>row?sourceSql(row):`NOT EXISTS(SELECT 1 FROM records WHERE id=${id} AND (${sourceBytes})<=${MAX_ROW_BYTES})`;
 const stop=reason=>{throw Object.assign(new Error('resource work stopped'),{resourceStop:reason});};
 
 /** Exact stable endpoint identity excludes source version and derived names.
@@ -111,7 +114,7 @@ export function executeResourceWork(options,deps={}) {
       CREATE TEMP TABLE __resource_fence(allowed INTEGER NOT NULL CHECK(allowed=1));
       ${sql}\nCOMMIT;`,'commit resource work');};
     let scan=query(`SELECT * FROM ${SCAN} WHERE source_id='lark.im';`,'read resource scan')[0];
-    if(!scan||!integer(scan.generation)||!integer(scan.after_id)||!integer(scan.horizon_id))throw new Error('resource schema unavailable');
+    if(!scan||!integer(scan.generation)||!integer(scan.after_id)||!integer(scan.horizon_id)||!/^([a-f0-9]{64})?$/.test(scan.recovery_after_work_key??'invalid'))throw new Error('resource schema unavailable');
     const head=query(`SELECT COALESCE(MAX(id),0) AS id FROM records WHERE ${sourceWhere};`,'read resource head')[0].id;
     if(scan.next_scan_at_ms<=wall||head>scan.last_head_id) {
       const horizon=scan.horizon_id>scan.after_id?scan.horizon_id:head,after=scan.horizon_id>scan.after_id?scan.after_id:0;
@@ -123,35 +126,50 @@ export function executeResourceWork(options,deps={}) {
       const rows=ids.length?snapshot(ids):[];
       if(rows.reduce((n,r)=>n+Buffer.byteLength(r.raw_json||'')+Buffer.byteLength(r.canonical_json||''),0)>MAX_PAGE_BYTES)throw new Error('resource page limit');
       const targets=rows.map(row=>resourceWorkIdentity(options.db,row)).filter(t=>t&&t.account_key===account);
-      const changed=`(${TABLE}.binding_key<>excluded.binding_key OR ${TABLE}.state='blocked' AND ${TABLE}.reason='source_changed' AND ${TABLE}.source_fence<>excluded.source_fence)`;
+      const bindingChanged=`${TABLE}.binding_key<>excluded.binding_key`;
+      const reopened=`${TABLE}.state='blocked' AND ${TABLE}.reason='source_changed'`;
+      const changed=`(${bindingChanged} OR ${reopened})`;
+      const exhausted=`${TABLE}.attempts>=8 OR ${TABLE}.failures>=3`;
       const denied=`${TABLE}.state='blocked' AND ${TABLE}.reason IN ${PERMANENT}`;
       const next=history.length?history.at(-1).id:horizon;
       local(()=>write(`INSERT INTO __resource_fence SELECT CASE WHEN EXISTS(SELECT 1 FROM ${SCAN} WHERE source_id='lark.im' AND generation=${scan.generation}) THEN 1 ELSE 0 END;
         ${targets.map(t=>`INSERT INTO ${TABLE}(source_id,account_key,work_key,record_id,binding_key,source_fence,enqueued_at_ms)
           SELECT 'lark.im',${q(account)},${q(t.work_key)},${t.record_id},${q(t.binding_key)},${q(t.source_fence)},${wall} WHERE ${sourceSql(t.row)}
           ON CONFLICT(source_id,account_key,work_key) DO UPDATE SET record_id=excluded.record_id,binding_key=excluded.binding_key,source_fence=excluded.source_fence,
-          state=CASE WHEN ${denied} THEN 'blocked' WHEN ${changed} THEN 'pending' ELSE ${TABLE}.state END,
-          reason=CASE WHEN ${denied} THEN ${TABLE}.reason WHEN ${changed} THEN NULL ELSE ${TABLE}.reason END,
-          attempts=CASE WHEN ${changed} AND NOT(${denied}) THEN 0 ELSE ${TABLE}.attempts END,
-          failures=CASE WHEN ${changed} AND NOT(${denied}) THEN 0 ELSE ${TABLE}.failures END,
-          deferrals=CASE WHEN ${changed} AND NOT(${denied}) THEN 0 ELSE ${TABLE}.deferrals END,
+          state=CASE WHEN ${denied} THEN 'blocked' WHEN ${bindingChanged} THEN 'pending' WHEN ${reopened} THEN CASE WHEN ${exhausted} THEN 'exhausted' ELSE 'pending' END ELSE ${TABLE}.state END,
+          reason=CASE WHEN ${denied} THEN ${TABLE}.reason WHEN ${bindingChanged} THEN NULL WHEN ${reopened} THEN CASE WHEN ${exhausted} THEN 'retry_exhausted' ELSE NULL END ELSE ${TABLE}.reason END,
+          attempts=CASE WHEN ${bindingChanged} AND NOT(${denied}) THEN 0 ELSE ${TABLE}.attempts END,
+          failures=CASE WHEN ${bindingChanged} AND NOT(${denied}) THEN 0 ELSE ${TABLE}.failures END,
+          deferrals=CASE WHEN ${bindingChanged} AND NOT(${denied}) THEN 0 ELSE ${TABLE}.deferrals END,
           retry_at_ms=CASE WHEN ${changed} AND NOT(${denied}) THEN 0 ELSE ${TABLE}.retry_at_ms END,
           generation=${TABLE}.generation+1
           WHERE ${TABLE}.state<>'running' AND (${TABLE}.source_fence<>excluded.source_fence OR ${changed});`).join('\n')}
         UPDATE ${SCAN} SET after_id=${next},horizon_id=${horizon},last_head_id=${head},next_scan_at_ms=${wall+SCAN_INTERVAL},generation=generation+1 WHERE source_id='lark.im';`));
       scan=query(`SELECT * FROM ${SCAN} WHERE source_id='lark.im';`,'reread resource scan')[0];
     }
-    const stale=query(`SELECT * FROM ${TABLE} WHERE source_id='lark.im' AND account_key=${q(account)} AND state='running' AND claim_until_ms<=${wall} ORDER BY claim_until_ms LIMIT 2;`,'read expired resource claims');
-    for(const task of stale)if((deps.ownerState||defaultOwnerState)(task.claim_owner)==='dead')local(()=>write(`UPDATE ${TABLE} SET state=CASE WHEN attempts>=8 THEN 'exhausted' ELSE 'deferred' END,
-      reason=CASE WHEN attempts>=8 THEN 'retry_exhausted' ELSE 'lease_unavailable' END,attempt_token=NULL,claim_owner=NULL,claim_until_ms=0,generation=generation+1,retry_at_ms=${wall}
-      WHERE ${keyWhere(task)} AND generation=${task.generation} AND attempt_token=${q(task.attempt_token)} AND state='running';`));
+    // Inspect at most two owners, resuming even past live/unknown claims. The
+    // cursor and dead-owner transitions are one admitted transaction; no claim
+    // is renewed or weakened merely to obtain fair recovery progress.
+    const expired=`source_id='lark.im' AND account_key=${q(account)} AND state='running' AND claim_until_ms<=${wall}`;
+    const stale=query(`SELECT * FROM ${TABLE} WHERE ${expired} AND work_key>${q(scan.recovery_after_work_key)} ORDER BY work_key LIMIT 2;`,'read expired resource claims');
+    if(stale.length<2&&scan.recovery_after_work_key)stale.push(...query(`SELECT * FROM ${TABLE} WHERE ${expired} AND work_key<=${q(scan.recovery_after_work_key)} ORDER BY work_key LIMIT ${2-stale.length};`,'wrap expired resource claims'));
+    if(stale.length) {
+      const dead=stale.filter(task=>(deps.ownerState||defaultOwnerState)(task.claim_owner)==='dead');
+      local(()=>write(`INSERT INTO __resource_fence SELECT CASE WHEN EXISTS(SELECT 1 FROM ${SCAN} WHERE source_id='lark.im' AND generation=${scan.generation}) THEN 1 ELSE 0 END;
+        ${dead.map(task=>`UPDATE ${TABLE} SET state=CASE WHEN attempts>=8 THEN 'exhausted' ELSE 'deferred' END,
+          reason=CASE WHEN attempts>=8 THEN 'retry_exhausted' ELSE 'lease_unavailable' END,attempt_token=NULL,claim_owner=NULL,claim_until_ms=0,generation=generation+1,retry_at_ms=${wall}
+          WHERE ${keyWhere(task)} AND generation=${task.generation} AND attempt_token=${q(task.attempt_token)} AND claim_owner=${q(task.claim_owner)} AND claim_until_ms=${task.claim_until_ms} AND state='running';`).join('\n')}
+        UPDATE ${SCAN} SET recovery_after_work_key=${q(stale.at(-1).work_key)},generation=generation+1 WHERE source_id='lark.im';`));
+      scan=query(`SELECT * FROM ${SCAN} WHERE source_id='lark.im';`,'reread resource recovery cursor')[0];
+    }
     const lane=scan.priority_streak>=2?'fair':'fresh';
     const task=query(`SELECT * FROM ${TABLE} WHERE source_id='lark.im' AND account_key=${q(account)} AND state IN ('pending','deferred') AND retry_at_ms<=${wall} AND attempts<8
       ORDER BY ${lane==='fair'?'enqueued_at_ms,record_id':'record_id DESC,enqueued_at_ms'},work_key LIMIT 1;`,'select resource work')[0];
     if(!task)return finish();
     const row=snapshot([task.record_id])[0],identity=row&&resourceWorkIdentity(options.db,row);
     if(!identity||identity.account_key!==task.account_key||identity.work_key!==task.work_key||identity.binding_key!==task.binding_key||identity.source_fence!==task.source_fence) {
-      local(()=>write(`UPDATE ${TABLE} SET state='blocked',reason='source_changed',generation=generation+1,retry_at_ms=0
+      local(()=>write(`INSERT INTO __resource_fence SELECT CASE WHEN ${observedSourceSql(row,task.record_id)} AND EXISTS(SELECT 1 FROM ${TABLE} WHERE ${keyWhere(task)} AND generation=${task.generation} AND state=${q(task.state)}) THEN 1 ELSE 0 END;
+        UPDATE ${TABLE} SET state='blocked',reason='source_changed',generation=generation+1,retry_at_ms=0
         WHERE ${keyWhere(task)} AND generation=${task.generation} AND state=${q(task.state)};`));
       report.ok=false;report.outcome='source_changed';report.deferred=1;return finish();
     }
@@ -198,9 +216,9 @@ export function executeResourceWork(options,deps={}) {
     const stopped=STOP.has(result.request_budget?.stop_reason)?result.request_budget.stop_reason:null;
     let state='deferred',reason=stopped||'transient_failure',failures=task.failures,deferrals=task.deferrals;
     const confirmedDenial=/** @type {Row|null} */(denial);
-    if(item.state==='available'){state='available';reason=null;report.outcome='processed';report.processed=1;report.available=1;}
-    else if(confirmedDenial&&item.state==='failed'&&item.reason===confirmedDenial.result_kind){state='blocked';reason=confirmedDenial.result_kind;report.ok=false;report.outcome='blocked';report.blocked=1;}
-    else if(!producerStarted&&item.state==='blocked'){state='blocked';reason='resource_invalid';report.ok=false;report.outcome='blocked';report.blocked=1;}
+    if(item.state==='available'){state='available';reason=null;}
+    else if(confirmedDenial&&item.state==='failed'&&item.reason===confirmedDenial.result_kind){state='blocked';reason=confirmedDenial.result_kind;}
+    else if(!producerStarted&&item.state==='blocked'){state='blocked';reason='resource_invalid';}
     else {if(stopped)deferrals=Math.min(8,deferrals+1);else failures=Math.min(3,failures+1);
       state=failures>=3||task.attempts+1>=8?'exhausted':'deferred';reason=state==='exhausted'?'retry_exhausted':reason;
       report.ok=false;report.outcome=state==='exhausted'?'exhausted':'batch_deferred';report.deferred=1;}
@@ -209,12 +227,15 @@ export function executeResourceWork(options,deps={}) {
     ready();
     const current=snapshot([task.record_id])[0];
     if(!current||makeMediaPendingSourceFence(current)!==identity.source_fence){
-      local(()=>write(`UPDATE ${TABLE} SET state='blocked',reason='source_changed',attempt_token=NULL,claim_owner=NULL,claim_until_ms=0,generation=generation+1
+      local(()=>write(`INSERT INTO __resource_fence SELECT CASE WHEN ${observedSourceSql(current,task.record_id)} AND EXISTS(SELECT 1 FROM ${TABLE} WHERE ${keyWhere(task)} AND generation=${task.generation+1} AND attempt_token=${q(token)} AND state='running') THEN 1 ELSE 0 END;
+        UPDATE ${TABLE} SET state='blocked',reason='source_changed',attempt_token=NULL,claim_owner=NULL,claim_until_ms=0,generation=generation+1
         WHERE ${keyWhere(task)} AND generation=${task.generation+1} AND attempt_token=${q(token)} AND state='running';`));
-      report.ok=false;report.outcome='source_changed';return finish();}
+      report.ok=false;report.outcome='source_changed';report.deferred=1;return finish();}
     local(()=>write(`INSERT INTO __resource_fence SELECT CASE WHEN ${sourceSql(row)} AND EXISTS(SELECT 1 FROM ${TABLE} WHERE ${keyWhere(task)} AND generation=${task.generation+1} AND attempt_token=${q(token)} AND state='running') THEN 1 ELSE 0 END;
       UPDATE ${TABLE} SET state=${q(state)},reason=${q(reason)},failures=${failures},deferrals=${deferrals},retry_at_ms=${state==='deferred'?now()+Math.min(3600000,60000*2**Math.min(5,failures+deferrals)):0},
       attempt_token=NULL,claim_owner=NULL,claim_until_ms=0,generation=generation+1 WHERE ${keyWhere(task)};`));
+    if(state==='available'){report.outcome='processed';report.processed=1;report.available=1;}
+    else if(state==='blocked'){report.ok=false;report.outcome='blocked';report.blocked=1;}
     return finish();
   } catch(error) {
     const ended=/** @type {Row|null} */(producerSession);
