@@ -217,3 +217,31 @@ test('simultaneous same-expiry publishers at the record cap add only one final e
   assert.equal(fs.readdirSync(dir).length,128);
   assert.equal(readSharedLarkCooldown({operation,nowMs},deps).untilMs,nowMs+8000);
 });
+
+test('a temporary-directory collision does not clean a directory this writer did not create',t=>{
+  const deps=fixture(t),original=fs.mkdirSync;let collision;
+  fs.mkdirSync=(directory,options)=>{
+    if(!collision&&String(directory).startsWith(deps.directory)&&String(directory).endsWith('.tmp')) {
+      collision=directory;original(directory,{mode:0o700});
+      fs.writeFileSync(join(directory,'value.json'),'synthetic existing owner',{mode:0o600});
+    }
+    return original(directory,options);
+  };
+  syncBuiltinESMExports();
+  try {assert.equal(writeSharedLarkCooldown({operation,nowMs,untilMs:nowMs+1000},deps),false);}
+  finally {fs.mkdirSync=original;syncBuiltinESMExports();}
+  assert(collision);assert.equal(fs.readFileSync(join(collision,'value.json'),'utf8'),'synthetic existing owner');
+});
+
+test('failure cleanup does not follow a substituted temporary-directory symlink',t=>{
+  const deps=fixture(t),outside=join(deps.directory,'synthetic-outside'),held=join(deps.directory,'held-original');
+  fs.mkdirSync(outside,{mode:0o700});fs.writeFileSync(join(outside,'value.json'),'synthetic outside owner',{mode:0o600});
+  let staged;
+  assert.equal(withPublicationHook(deps.directory,(publish,source)=>{
+    staged=source;fs.renameSync(source,held);fs.symlinkSync(outside,source);
+    throw new Error('synthetic pre-publication failure after path replacement');
+  },()=>writeSharedLarkCooldown({operation,nowMs,untilMs:nowMs+1000},deps)),false);
+  assert.equal(fs.readFileSync(join(outside,'value.json'),'utf8'),'synthetic outside owner');
+  assert.equal(fs.lstatSync(staged).isSymbolicLink(),true);
+  assert.equal(fs.lstatSync(held).isDirectory(),true);
+});

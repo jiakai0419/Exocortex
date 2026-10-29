@@ -48,6 +48,8 @@ function readCooldownRecord(file) {
 /** Clean only our known temporary payload, never recursively delete entries.
  * @param {string} directory */
 function removeCooldownTemporary(directory) {
+  try { if (!privateDirectory(directory, false)) return; }
+  catch { return; } // Never follow a substituted alias or clean an unsafe path.
   try { unlinkSync(join(directory, COOLDOWN_VALUE)); } catch { /* Absent or unavailable. */ }
   try { rmdirSync(directory); } catch { /* Do not remove unknown entries. */ }
 }
@@ -144,8 +146,9 @@ function writeSharedLarkCooldown(options, deps = {}) {
     const names = readdirSync(directory).filter((name) => !name.endsWith(".tmp"));
     if (names.length >= MAX_COOLDOWNS) return false;
     const target = join(directory, `${options.operation}-${options.untilMs}.json`);
-    temporary = join(directory, `${randomUUID()}.tmp`);
-    mkdirSync(temporary, { mode: 0o700 });
+    const staging = join(directory, `${randomUUID()}.tmp`);
+    mkdirSync(staging, { mode: 0o700 });
+    temporary = staging; // Cleanup owns this path only after successful creation.
     fd = openSync(join(temporary, COOLDOWN_VALUE), "wx", 0o600);
     writeFileSync(fd, JSON.stringify({ version: 1, operation: options.operation, untilMs: options.untilMs }));
     fsyncSync(fd); closeSync(fd); fd = undefined;
