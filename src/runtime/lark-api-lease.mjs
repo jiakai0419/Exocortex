@@ -20,6 +20,29 @@ const COOLDOWN_OPERATIONS = new Set(["message_history_bundle", "message_search_b
 const MAX_COOLDOWNS = 128;
 const COOLDOWN_NAME = /^([a-z_]+)-(\d+)\.json$/;
 const COOLDOWN_VALUE = "value.json";
+/** @typedef {{directory:import('node:fs').BigIntStats,payload:import('node:fs').BigIntStats|null}} CooldownOwnership */
+
+/** Ownership tolerates our own directory-content/rename metadata changes, but
+ * never a different object, owner or mode. A directory's link count can change
+ * when our own payload is created/deleted (including ordinary files on APFS).
+ * Payloads always retain the single-link contract.
+ * @param {import('node:fs').BigIntStats} current
+ * @param {import('node:fs').BigIntStats} expected
+ * @param {'directory'|'payload'} kind */
+function sameCooldownIdentity(current, expected, kind) {
+  return (kind === 'directory' ? current.isDirectory() : current.isFile() && current.nlink === 1n)
+    && !current.isSymbolicLink() && current.uid === BigInt(process.getuid?.() ?? -1)
+    && (current.mode & 0o077n) === 0n
+    && ['dev','ino','birthtimeNs','uid','mode'].every(key => current[key] === expected[key]);
+}
+
+/** Capture only a successfully created empty private directory.
+ * @param {string} directory @returns {CooldownOwnership} */
+function captureCooldownCreation(directory) {
+  const captured = lstatSync(directory, { bigint: true });
+  if (!sameCooldownIdentity(captured, captured, 'directory') || readdirSync(directory).length) throw new Error('unsafe_cooldown_temporary');
+  return { directory: captured, payload: null };
+}
 
 /** Legacy records are files; atomically published records are nonempty private
  * directories containing one single-link file. Never follow a directory alias
@@ -32,11 +55,14 @@ function readCooldownRecord(file) {
     privateDirectory(file, false);
     const names = readdirSync(file);
     if (names.length !== 1 || names[0] !== COOLDOWN_VALUE) throw new Error("invalid_cooldown_record");
-    const loaded = readStableJsonFile(join(file, COOLDOWN_VALUE), { maxBytes: 512 });
+    const payloadPath = join(file, COOLDOWN_VALUE), payloadBefore = lstatSync(payloadPath, { bigint: true });
+    const loaded = readStableJsonFile(payloadPath, { maxBytes: 512 });
+    const payloadAfter = lstatSync(payloadPath, { bigint: true });
     const after = lstatSync(file, { bigint: true });
     if (loaded.status !== "ready" || !["dev", "ino", "mode", "uid", "nlink", "mtimeNs", "ctimeNs"]
-      .every(key => before[key] === after[key])) throw new Error("unstable_cooldown_record");
-    return loaded;
+      .every(key => before[key] === after[key]) || !sameCooldownIdentity(payloadAfter, payloadBefore, 'payload')
+      || !['size','mtimeNs','ctimeNs'].every(key => payloadBefore[key] === payloadAfter[key])) throw new Error("unstable_cooldown_record");
+    return { ...loaded, ownership: /** @type {CooldownOwnership} */ ({ directory: before, payload: payloadBefore }) };
   } catch (error) {
     if (errorCode(error) === "ENOENT") {
       try { lstatSync(file); } catch (missing) { if (errorCode(missing) === "ENOENT") return { status: "missing", value: null }; }
@@ -45,13 +71,30 @@ function readCooldownRecord(file) {
   }
 }
 
-/** Clean only our known temporary payload, never recursively delete entries.
- * @param {string} directory */
-function removeCooldownTemporary(directory) {
-  try { if (!privateDirectory(directory, false)) return; }
-  catch { return; } // Never follow a substituted alias or clean an unsafe path.
-  try { unlinkSync(join(directory, COOLDOWN_VALUE)); } catch { /* Absent or unavailable. */ }
-  try { rmdirSync(directory); } catch { /* Do not remove unknown entries. */ }
+/** Clean only objects still matching our captured ownership. Retirement accepts
+ * either the created empty destination or the captured expired source now at
+ * that path, including a reported error after a rename actually executed.
+ * Unknown children or replacements block the whole cleanup; never recurse.
+ * @param {string} directory @param {ReadonlyArray<CooldownOwnership>} owners */
+function removeCooldownTemporary(directory, owners) {
+  try {
+    const current = lstatSync(directory, { bigint: true });
+    const owner = owners.find(value => sameCooldownIdentity(current, value.directory, 'directory'));
+    if (!owner) return;
+    const names = readdirSync(directory);
+    if (owner.payload) {
+      if (names.length !== 1 || names[0] !== COOLDOWN_VALUE) return;
+      const payloadPath = join(directory, COOLDOWN_VALUE), payload = lstatSync(payloadPath, { bigint: true });
+      if (!sameCooldownIdentity(payload, owner.payload, 'payload')
+        || !['size','mtimeNs','ctimeNs'].every(key => payload[key] === owner.payload?.[key])
+        || !sameCooldownIdentity(lstatSync(directory, { bigint: true }), owner.directory, 'directory')) return;
+      unlinkSync(payloadPath);
+    } else if (names.length) return;
+    // A replacement after payload unlink must not acquire rmdir ownership.
+    if (!sameCooldownIdentity(lstatSync(directory, { bigint: true }), owner.directory, 'directory')
+      || readdirSync(directory).length) return;
+    rmdirSync(directory);
+  } catch { /* Preserve missing, changed or unavailable objects. */ }
 }
 
 /** @param {string} directory @param {boolean} create */
@@ -116,6 +159,7 @@ function readSharedLarkCooldown(options, deps = {}) {
  * @param {{directory?: string}} [deps] */
 function writeSharedLarkCooldown(options, deps = {}) {
   let temporary = "", fd;
+  /** @type {CooldownOwnership|null} */ let ownership = null;
   try {
     const now = options.nowMs ?? Date.now();
     if (!COOLDOWN_OPERATIONS.has(options.operation) || !Number.isSafeInteger(now) || !Number.isSafeInteger(options.untilMs) || options.untilMs <= now) return false;
@@ -132,10 +176,15 @@ function writeSharedLarkCooldown(options, deps = {}) {
         const expired = join(directory, name);
         try {
           if (lstatSync(expired).isDirectory()) {
-            privateDirectory(expired, false);
+            const captured = readCooldownRecord(expired);
+            if (captured.status !== 'ready' || !('ownership' in captured) || !captured.ownership
+              || captured.value?.version !== 1 || captured.value.operation !== match[1]
+              || captured.value.untilMs !== Number(match[2])) throw new Error('unsafe_expired_cooldown');
             const retired = join(directory, `${randomUUID()}.tmp`);
             mkdirSync(retired, { mode: 0o700 });
-            try { renameSync(expired, retired); } finally { removeCooldownTemporary(retired); }
+            const created = captureCooldownCreation(retired);
+            try { renameSync(expired, retired); }
+            finally { removeCooldownTemporary(retired, [created, captured.ownership]); }
           } else unlinkSync(expired);
         } catch (error) { if (errorCode(error) !== "ENOENT") throw error; }
       }
@@ -149,9 +198,11 @@ function writeSharedLarkCooldown(options, deps = {}) {
     const staging = join(directory, `${randomUUID()}.tmp`);
     mkdirSync(staging, { mode: 0o700 });
     temporary = staging; // Cleanup owns this path only after successful creation.
+    ownership = captureCooldownCreation(temporary);
     fd = openSync(join(temporary, COOLDOWN_VALUE), "wx", 0o600);
+    ownership.payload = fstatSync(fd, { bigint: true });
     writeFileSync(fd, JSON.stringify({ version: 1, operation: options.operation, untilMs: options.untilMs }));
-    fsyncSync(fd); closeSync(fd); fd = undefined;
+    fsyncSync(fd); ownership.payload = fstatSync(fd, { bigint: true }); closeSync(fd); fd = undefined;
     // A hard link/unlink window exposes nlink=2. A complete directory rename
     // instead exposes only a single-link payload. The nonempty target cannot
     // be replaced by another same-expiry publisher; both can validate it.
@@ -163,8 +214,14 @@ function writeSharedLarkCooldown(options, deps = {}) {
     return result.state === "cooldown" && Number(result.untilMs) >= options.untilMs;
   } catch { return false; }
   finally {
+    // If our write failed while the owned descriptor was still open, capture
+    // its resulting partial-file metadata before closing; never adopt a path.
+    try { if (fd !== undefined && ownership?.payload) {
+      const held = fstatSync(fd, { bigint: true });
+      if (sameCooldownIdentity(held, ownership.payload, 'payload')) ownership.payload = held;
+    } } catch { /* An unavailable descriptor cannot grant cleanup ownership. */ }
     try { if (fd !== undefined) closeSync(fd); } catch { /* Closed or unavailable. */ }
-    if (temporary) removeCooldownTemporary(temporary);
+    if (temporary && ownership) removeCooldownTemporary(temporary, [ownership]);
   }
 }
 
