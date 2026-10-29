@@ -83,7 +83,15 @@ function prepareRecipientWork(db, self, deps = {}) {
     clockLast = current; return Math.floor(budgetMs - (current - started));
   };
   const assertReady = () => { if (!(remaining() > 0)) throw new RecipientBudgetError('recipient budget exhausted'); };
-  const query = (sql, label) => { assertReady(); return (deps.readOnlyQuery || readOnlySqliteJson)(db, sql, label, { timeoutMs: Math.max(1, remaining()) }); };
+  const query = (sql, label) => {
+    const budget = remaining();
+    if (!(budget > 0)) throw new RecipientBudgetError('recipient budget exhausted');
+    const rows = (deps.readOnlyQuery || readOnlySqliteJson)(db, sql, label, { timeoutMs: budget });
+    // A read may consume the last allowance. Its result must not authorize a
+    // subsequent request or the commit immediately following admission.
+    assertReady();
+    return rows;
+  };
   let payloadRemaining = PREPARATION_BYTES;
   const readSent = (where, order, limit, index, after = 0) => {
     const page = readRecipientWitnessPage(query,{where,order,limit,index,after,
@@ -256,6 +264,7 @@ function prepareRecipientWork(db, self, deps = {}) {
         };
         const result = (deps.enrichRecipients || enrichRecipients)({ db, recordIds: targets.map(item => item.row.id), dryRun: false },
           { runLark: boundedRun, assertReady, withCommit: action => action(), now,
+            readOnlyQuery: (_db, sql, label) => query(sql, label),
             onRecipientResult: ({ chat_id, outcome }) => outcomes.set(chat_id, outcome) });
         report.attempted = targets.length; report.updated = Number(result.updated || 0);
         const current = query(`SELECT * FROM lark_im_recipient_state WHERE source_id='lark.im' AND account_key=${quoteSql(accountKey)}

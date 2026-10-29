@@ -24,8 +24,11 @@ function enrichRecipients(opts, deps = {}) {
     || new Set(opts.recordIds).size !== opts.recordIds.length) throw new Error('recipient selection requires 1 to 20 unique record IDs');
   const db = resolve(opts.db);
   if (!existsSync(db)) throw new Error('database not found');
-  const admission = captureLarkWriteAdmission(db);
-  const rows = readOnlySqliteJson(db, `SELECT ${REVIEW_RECORD_COLUMNS.join(',')} FROM records
+  // Automatic recovery supplies its enclosing bounded reader. Explicit
+  // maintenance retains the existing default when no reader is injected.
+  const query = deps.readOnlyQuery || readOnlySqliteJson;
+  const admission = captureLarkWriteAdmission(db, {}, { query });
+  const rows = query(db, `SELECT ${REVIEW_RECORD_COLUMNS.join(',')} FROM records
     WHERE id IN (${opts.recordIds.map(quoteSql).join(',')}) ORDER BY id;`, 'read exact recipient targets');
   if (rows.length !== opts.recordIds.length) throw new Error('recipient target unavailable');
   const selected = rows.map(row => {
@@ -41,10 +44,10 @@ function enrichRecipients(opts, deps = {}) {
   });
   if (new Set(selected.map(item => item.account)).size !== 1) throw new Error('recipient target accounts conflict');
   const scopeIds = [...new Set(selected.map(item => item.scopeId))];
-  const scopes = readOnlySqliteJson(db, `SELECT id,source_id,enabled,config_json,updated_at FROM sync_scopes
+  const scopes = query(db, `SELECT id,source_id,enabled,config_json,updated_at FROM sync_scopes
     WHERE id IN (${scopeIds.map(quoteSql).join(',')}) ORDER BY id;`, 'read exact recipient scopes');
   const accountKey = recipientAccountKey(selected[0].account);
-  const states = readOnlySqliteJson(db, `SELECT source_id,account_key,chat_id,evidence_json FROM lark_im_recipient_state
+  const states = query(db, `SELECT source_id,account_key,chat_id,evidence_json FROM lark_im_recipient_state
     WHERE source_id='lark.im' AND account_key=${quoteSql(accountKey)}
       AND chat_id IN (${[...new Set(selected.map(item => item.row.container_id))].map(quoteSql).join(',')});`, 'read exact recipient relationship state');
   const targets = scopeIds.map(scopeId => {

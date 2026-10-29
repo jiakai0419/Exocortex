@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import childProcess from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -509,3 +511,88 @@ test('changed evidence has a fixed queue share even while older due failures occ
   assert.ok(f.selected.filter(id=>id>=21).length>=5);
   assert.ok(f.selected.some(id=>id<21));
 });
+
+
+// Observe the real core's actual sqlite child boundary; do not substitute an
+// enrichment stub or fabricate timeout options in the test's reader.
+function observeRecipientSqlite(f, onSql = () => {}) {
+  const original = childProcess.spawnSync, observed = [];
+  let claimed = false;
+  childProcess.spawnSync = function(command, args, options = {}) {
+    const input = String(options.input || '');
+    if (command !== 'sqlite3') return original.call(this, command, args, options);
+    if (input.includes('recipient-sync-claim')) claimed = true;
+    const event = { readonly: args.includes('-readonly'), claimed, input,
+      timeout: options.timeout, elapsed: f.elapsed };
+    observed.push(event);
+    const result = original.call(this, command, args, options);
+    onSql(event);
+    return result;
+  };
+  syncBuiltinESMExports();
+  return { observed, restore() { childProcess.spawnSync = original; syncBuiltinESMExports(); } };
+}
+
+test('real recipient core SQLite reads share the remaining deadline through result admission', t => {
+  const f = fixture(t, 20), before = records(f);
+  const probe = observeRecipientSqlite(f, event => { if (event.readonly) f.elapsed += 11; });
+  let report;
+  try {
+    report = run(f, {}, { enrichRecipients, runLark: coreApi(f, { onCall: () => { f.elapsed += 23; } }) });
+  } finally { probe.restore(); }
+  assert.equal(report.reason, 'completed');
+  assert.deepEqual([report.updated, report.attempted, report.calls], [20, 20, 4]);
+  assert.equal(retries(f).length, 0);
+  assert.deepEqual(records(f), before);
+  const reads = probe.observed.filter(row => row.readonly), afterClaim = reads.filter(row => row.claimed);
+  assert(afterClaim.length >= 10, 'the actual core and result admission were exercised');
+  assert(afterClaim.some(row => row.input.includes('SELECT enabled,config_json FROM sources')));
+  assert(afterClaim.some(row => row.input.includes('FROM records') && row.input.includes('WHERE id IN')));
+  for (const row of reads) assert.equal(row.timeout, 10000 - row.elapsed,
+    'each actual readonly SQLite child retains the enclosing remaining deadline');
+  assert(afterClaim.every(row => row.timeout < 10000));
+});
+
+for (const point of ['claim_commit', 'core_source', 'core_targets', 'core_scopes', 'core_state',
+  'opening_self', 'closing_self', 'commit_admission']) {
+  test(`real recipient core expiry at ${point} starts no later read, request or evidence publication`, t => {
+    const f = fixture(t), before = records(f); let fired = false, profiles = 0, postClosingReads = 0;
+    const expire = () => { fired = true; f.elapsed = 10000; };
+    const probe = observeRecipientSqlite(f, row => {
+      if (fired || !row.claimed) return;
+      if (point === 'claim_commit' && !row.readonly && row.input.includes('UPDATE lark_im_recipient_state SET last_attempt_at_ms=')) expire();
+      if (!row.readonly) return;
+      if (point === 'core_source' && row.input.includes('SELECT enabled,config_json FROM sources')) expire();
+      if (point === 'core_targets' && row.input.includes('FROM records') && row.input.includes('WHERE id IN')) expire();
+      if (point === 'core_scopes' && row.input.includes('SELECT id,source_id,enabled,config_json,updated_at FROM sync_scopes')) expire();
+      if (point === 'core_state' && row.input.includes('SELECT source_id,account_key,chat_id,evidence_json FROM lark_im_recipient_state')) expire();
+      if (profiles === 2) {
+        postClosingReads += 1;
+        // setSelf, explicit assertCurrent, then the existing commit recheck.
+        if (point === 'commit_admission' && postClosingReads === 3) expire();
+      }
+    });
+    let report;
+    try {
+      report = run(f, {}, { enrichRecipients, runLark: coreApi(f, { onCall(args) {
+        assert(f.elapsed < 10000, 'expired optional tail cannot invoke a remote call');
+        if (args[0] === 'contact' && args[1] === '+get-user') {
+          profiles += 1;
+          if (point === 'opening_self' && profiles === 1 || point === 'closing_self' && profiles === 2) expire();
+        }
+      } }) });
+    } finally { probe.restore(); }
+    assert(fired, 'the intended real core boundary was reached');
+    assert.equal(probe.observed.filter(row => row.readonly && row.elapsed >= 10000).length, 0,
+      'no actual read starts after the same enclosing deadline');
+    assert.notEqual(report.reason, 'completed');
+    assert.equal(report.updated, 0);
+    const saved = states(f);
+    assert.equal(saved.length, 1);assert.equal(saved[0].generation, 1);
+    assert(saved[0].attempt_token, 'the already committed exact claim remains recoverable');
+    assert.equal(saved[0].evidence_json, null);assert.equal(saved[0].failures, 0);
+    assert.equal(saved[0].retry_at_ms, NOW + WAIT);
+    assert.deepEqual(records(f), before);
+    assert(f.calls.length <= 4);
+  });
+}
