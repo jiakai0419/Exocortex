@@ -4,7 +4,7 @@ Base: `5da2f7ca507ad0332949d16e1b681e2b0e5fb2b0`. This is an isolated local cand
 
 ## Observed problem and completion criterion
 
-Read-only production acceptance found newly collected ordinary human-sent p2p text with valid source/account proof but no `chat_partner`, no trusted scope recipient, and no persisted recipient task. These messages remain incomplete. A nonempty chat title is not proof of a person, and the absence of a task is not successful resolution. Why eligible records did not enroll is under investigation; no upstream denial or regression classification is assumed.
+Read-only production acceptance found newly collected ordinary human-sent p2p text with valid source/account proof but no `chat_partner`, no trusted scope recipient, and no persisted recipient task. These messages remain incomplete. A nonempty chat title is not proof of a person, and the absence of a task is not successful resolution. Scheduling input and synthetic execution establish that selection-gated discovery and the omitted recipient fresh position can postpone enrollment indefinitely under name traffic. This is a local scheduling defect; it does not establish upstream visibility of every recipient.
 
 The fix must make exact-account unresolved p2p work reachable through the real successful sync and worker paths. A coordinator may prioritize work, but selection must not be a prerequisite for discovering and durably recording otherwise eligible recovery work. Enrollment, claiming, remote resolution and projection retain their distinct transaction and evidence boundaries. The synthetic counterexample must first fail on the base and then pass through the actual CLI after repair.
 
@@ -12,7 +12,7 @@ The normal path should prepare complete identity before formal readability whene
 
 ## Ownership and scope
 
-Main integration checkout: `/tmp/exocortex-recipient-closure-20261029-k0ia7rdq/repo`.
+The main integrator owns the isolated candidate checkout; its local path is recorded in the private handoff, outside Git.
 
 | Owner | Boundary |
 | --- | --- |
@@ -48,3 +48,16 @@ Local enrollment must survive another role being selected and process restart wi
 Initial implementation now follows that split. The exact base reproduces three failing gates: a sent witness between full received pages, a completed recipient scan followed by now-valid p2p metadata, and a newest p2p target competing with eighty older sender tasks. Five negative controls pass on the base. The candidate passes sixteen new cases, including cross-process enrollment recovery, another role winning without discarding enrollment, one-use continuation, stale row/scope/state/account rejection before requests, and the shared elapsed deadline. The actual public sync/messages paths preserve the complete synthetic record population and terminal projection.
 
 Existing focused validation is 66 recipient/coordinator cases plus 27 public-command/worker/adversarial cases; typecheck and whitespace checks pass. These are focused results, not final full-tree or production acceptance. Full verification and combined-route integration remain required. The tests measure the suffix from local data to the next correct CLI observation, not production source-to-readable latency.
+
+## Integration refinements
+
+An existing queued relationship uses its newest qualified captured sent witness for both priority and its claim fence. The old queue witness cannot hide a newer unresolved message. If another role has been served since the recipient role, the next priority slot protects a fresh eligible recipient batch. Every third shared slot remains the global fair slot. Across all initial slots, a continuously eligible prepared fresh recipient batch receives its first aggregate role reservation within three committed shared opportunities, even with a newer name task on every turn. The subsequent exact claim or API may still fail with zero requests; at most 20 relationships are selected in one batch. This conditional role bound is not a per-record bound for unlimited recipient arrivals, a time SLO, or a promise that an external lookup succeeds. Existing cadence, request count, route admission and the shared elapsed deadline still apply.
+
+Sent discovery reads small ID/byte headers with one-row lookahead, then projects only complete witnesses that fit both a 2 MiB individual/page cap and an 8 MiB total preparation cap. Existing payload row quotas remain 40 newest, 40 historical and 10 queued chats with 8 witnesses each. Header lookahead is counted separately. Oversized rows can advance the scan without becoming identity evidence; a normal row that cannot fit the remaining page is revisited. Byte counts are original SQL column bytes, not JSON escaping, RSS or storage I/O. Preparation and later execution share the original monotonic deadline, including source, account and scope admission reads; filesystem/transaction scheduling is not a hard real-time guarantee. A failed preparation cannot be reported as idle when no other role can run.
+
+The latency route's frozen priority patch contributes its twelve integration tests; its competing `name-sync` implementation is not applied over this unified implementation. The application route's candidate `3426c935660bbf4d2d194817b3812521912f9de7` is being integrated separately: migration 018, bounded generic failure scheduling and explicitly reviewed legacy recovery. No real review sidecar or identity list is part of this candidate or installed by this work. Without a review, old unknown tasks retain their ordinary deadline; no absence of route evidence proves permission. Local holds and reviews are scheduling policy, not authoritative names or remote permission results. Invalid review behavior and combined fairness are explicit integration gates.
+
+The content route's `58f0214` is currently an unmerged diagnostic proposal. Its valid media references remain unverified resources, not ready content. Its two unexplained history-suite failures remain recorded. This integration does not take ownership of that route's product modules or count diagnostic classification as media recovery.
+
+
+The combined recipient and application review path now passes the 76-case recipient set and the 42-case application/review isolation set. Invalid application review files withhold only application work; exact recipient and human-name paths remain usable. Early application conflict/missing-witness commits retain the review file fence. No private review has been installed, no real name has been recovered by this undeployed candidate, and full-tree verification is still required. The separately diagnosed shared-cooldown publication race is under independent review and is not covered by these focused counts.

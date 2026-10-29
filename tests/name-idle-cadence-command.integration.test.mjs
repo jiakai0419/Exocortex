@@ -89,7 +89,7 @@ if (process.argv[2] === '--synthetic-cycle') {
         ...(clockText ? { now: () => Number(clockText) } : {}),
         readOnlyQuery: (path, sql, label, options) => {
           const rows = readOnlySqliteJson(path, sql, label, options);
-          if (mode === 'sent-cas' && label === 'read recipient scheduling horizon') {
+          if (mode === 'sent-cas' && label === 'read exact recipient states') {
             assert(!raceInjected); raceInjected = true;
             sqliteExec(path, `UPDATE lark_im_name_scan SET generation=generation+1,
               schedule_sequence=schedule_sequence+1,next_attempt_at_ms=${Number(clockText) + 60000};`);
@@ -199,7 +199,11 @@ if (process.argv[2] === '--synthetic-cycle') {
     const losing = f.cycle('sent-cas', now + 1); assert(losing.raceInjected);
     assert.equal(losing.tails[0].reason, 'unavailable'); assert.equal(losing.tails[0].calls, 0);
     assert.equal(f.scan().next_attempt_at_ms, now + 60001); assert.equal(f.scan().schedule_sequence, 1);
-    assert.equal(f.query('SELECT COUNT(*) AS n FROM lark_im_recipient_state;')[0].n, 0);
+    // Local enrollment now precedes remote selection. The losing remote CAS
+    // preserves that durable need, but may neither claim it nor start a call.
+    const pending = f.query('SELECT * FROM lark_im_recipient_state;');
+    assert.equal(pending.length, 1); assert.equal(pending[0].attempt_token, null);
+    assert.equal(pending[0].last_attempt_at_ms, 0); assert.equal(pending[0].evidence_json, null);
     assert.notEqual(f.show().rows[0].readiness.state, 'ready');
     const afterDue = f.cycle('sent-empty', now + 60002); assert.equal(afterDue.tails[0].calls, 4);
     assert.equal(f.show().rows[0].readiness.state, 'ready'); assert.equal(f.scan().schedule_sequence, 2);

@@ -430,22 +430,43 @@ test('valid legacy evidence migrates with no network, and later scope cache loss
 test('new and historical lanes enqueue skipped chats and keep strict sent-read and remote quotas', t => {
   const f=fixture(t,0);
   for(let id=1;id<=120;id++) add(f,id,{orphan:true});
-  let scanned=0;
+  let pages=[];
   const reader=(db,statement,label,options)=>{
     const rows=readOnlySqliteJson(db,statement,label,options);
-    if(statement.includes('FROM records INDEXED BY records_recipient')) scanned+=rows.length;
+    if(label==='read recipient witness headers') {
+      const queue=statement.includes('INDEXED BY records_recipient_sent_container_id');
+      const limit=queue?8:40;
+      assert.match(statement,new RegExp(`LIMIT ${limit+1};$`));
+      assert.ok(rows.length<=limit+1,'lookahead reads at most one additional small header');
+      for(const row of rows)assert.deepEqual(Object.keys(row).sort(),['bytes','id'],'lookahead never materializes message payload');
+      pages.push({queue,limit,headers:rows.length,payload:0,payloadReads:0});
+    } else if(label==='read bounded recipient witness payloads') {
+      const page=pages.at(-1);assert.ok(page,'payload belongs to an already bounded header page');
+      assert.equal(page.payloadReads,0,'a page cannot repeatedly rematerialize the same payload outside its quota');page.payloadReads+=1;
+      assert.ok(rows.length<=page.limit,'full payload never inherits the extra lookahead slot');
+      assert.ok(rows.every(row=>row.__recipient_payload_ok===1),'all authored witnesses fit the capacity budget');
+      page.payload=rows.length;
+    }
     return rows;
   };
   const first=run(f,{}, {readOnlyQuery:reader});
   assert.equal(first.attempted,20);
-  assert.equal(scanned,80);
+  assert.equal(first.calls,4);
+  assert.equal(pages.length,2);
+  assert.ok(pages.every(page=>!page.queue));
+  assert.equal(pages.reduce((sum,page)=>sum+page.headers,0),82,'two 40-row pages each inspect one small lookahead header');
+  assert.equal(pages.reduce((sum,page)=>sum+page.payload,0),80,'only the original 80 full witnesses are materialized');
   assert.equal(states(f).length,80,'every valid scanned chat is queued even if this call did not query it');
   assert.equal(query(f,'SELECT after_record_id FROM lark_im_recipient_scan;')[0].after_record_id,40);
   assert.ok(f.selected.some(id=>id<=40) && f.selected.some(id=>id>80));
-  scanned=0;f.selected=[];f.now+=1000;
+  pages=[];f.selected=[];f.now+=1000;
   const second=run(f,{}, {readOnlyQuery:reader});
-  assert.ok(scanned<=160);
+  assert.equal(pages.filter(page=>!page.queue).length,2);
+  assert.ok(pages.filter(page=>page.queue).length<=10,'due witnesses retain their ten-chat quota');
+  assert.ok(pages.reduce((sum,page)=>sum+page.headers,0)<=2*41+10*9);
+  assert.ok(pages.reduce((sum,page)=>sum+page.payload,0)<=2*40+10*8,'the full-payload ceiling remains 160, not the header ceiling');
   assert.equal(second.attempted,20);
+  assert.equal(second.calls,4);
   assert.equal(states(f).length,120);
   assert.equal(query(f,'SELECT after_record_id FROM lark_im_recipient_scan;')[0].after_record_id,80);
   assert.ok(f.selected.some(id=>id>=41&&id<=80),'historical lane advances despite ready queued and latest chats');

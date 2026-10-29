@@ -10,6 +10,7 @@ import { getLarkApiLeaseStdio } from '../../runtime/lark-api-lease.mjs';
 import { chatScopeId } from './core.mjs';
 import { readRecipientEvidence, recipientAccountKey, sentRecipientAccount } from './p2p-recipient.mjs';
 import { runLark } from './transport.mjs';
+import { readRecipientWitnessPage } from './recipient-discovery-page.mjs';
 
 /** @typedef {Record<string,any>} JsonObject */
 /** @typedef {{attempted:number,updated:number,deferred:number,calls:number,reason:string}} RecipientReport */
@@ -17,6 +18,7 @@ import { runLark } from './transport.mjs';
 const MAX_CHATS = 20, SCAN_PAGE = 40, QUEUE_CHATS = 10, WITNESS_PAGE = 8;
 const MAX_CALLS = 4, BUDGET_MS = 10_000, CLAIM_MS = 5 * 60_000, MAX_RETRY_MS = 24 * 60 * 60_000;
 const COMPLETE_RETRY_AT = Number.MAX_SAFE_INTEGER;
+const PAGE_BYTES = 2 * 1024 * 1024, PREPARATION_BYTES = 8 * 1024 * 1024;
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const safeRow = row => Number.isSafeInteger(row.id) && row.id > 0 && typeof row.container_id === 'string' && row.container_id.length > 0
   && (row.occurred_at_ms === null || Number.isSafeInteger(row.occurred_at_ms))
@@ -82,18 +84,25 @@ function prepareRecipientWork(db, self, deps = {}) {
   };
   const assertReady = () => { if (!(remaining() > 0)) throw new RecipientBudgetError('recipient budget exhausted'); };
   const query = (sql, label) => { assertReady(); return (deps.readOnlyQuery || readOnlySqliteJson)(db, sql, label, { timeoutMs: Math.max(1, remaining()) }); };
-  const readSent = (where, order, limit, index) => query(`SELECT ${REVIEW_RECORD_COLUMNS.join(',')} FROM records INDEXED BY ${index}
-    WHERE source_id='lark.im' AND direction='sent' AND record_type='lark.im.message' ${where}
-    ORDER BY id ${order} LIMIT ${limit};`, 'read bounded recipient witnesses');
+  let payloadRemaining = PREPARATION_BYTES;
+  const readSent = (where, order, limit, index, after = 0) => {
+    const page = readRecipientWitnessPage(query,{where,order,limit,index,after,
+      batchBytes:Math.min(PAGE_BYTES,payloadRemaining)});
+    payloadRemaining -= page.bytesRead;
+    return page;
+  };
   const failure = error => ({ ...report, calls, deferred: claimed || report.deferred,
     reason: error instanceof RecipientBudgetError ? 'budget' : claimed ? 'deferred' : 'unavailable' });
   try {
-    const admission = captureLarkWriteAdmission(db, { selfOpenId: self.open_id, requireVerified: true });
+    const admission = captureLarkWriteAdmission(db, { selfOpenId: self.open_id, requireVerified: true },
+      { query: (_db, sql, label) => query(sql, label) });
     const scan = query(`SELECT * FROM lark_im_recipient_scan WHERE account_key=${quoteSql(accountKey)};`, 'read recipient scan cursor')[0];
-    const newest = readSent('', 'DESC', SCAN_PAGE, 'records_recipient_sent_id');
-    let historical = readSent(`AND id>${Number(scan?.after_record_id || 0)}`, 'ASC', SCAN_PAGE, 'records_recipient_sent_id');
-    if (!historical.length && scan?.after_record_id) historical = readSent('', 'ASC', SCAN_PAGE, 'records_recipient_sent_id');
-    const afterRecordId = historical.length ? historical[historical.length - 1].id : 0;
+    const newest = readSent('', 'DESC', SCAN_PAGE, 'records_recipient_sent_id').rows;
+    const scanAfter = Number(scan?.after_record_id || 0);
+    let historicalPage = readSent('', 'ASC', SCAN_PAGE, 'records_recipient_sent_id',scanAfter);
+    if (!historicalPage.rows.length && !historicalPage.hasMore && historicalPage.afterRecordId===scanAfter && scanAfter)
+      historicalPage = readSent('', 'ASC', SCAN_PAGE, 'records_recipient_sent_id');
+    const historical = historicalPage.rows, afterRecordId = historicalPage.afterRecordId;
     if (!Number.isSafeInteger(afterRecordId)) throw new Error('recipient scan cursor unavailable');
     const dueQueue = query(`SELECT * FROM lark_im_recipient_state INDEXED BY lark_im_recipient_state_due
       WHERE source_id='lark.im' AND account_key=${quoteSql(accountKey)} AND retry_at_ms<=${nowMs}
@@ -111,12 +120,12 @@ function prepareRecipientWork(db, self, deps = {}) {
       }
     };
     take(dueQueue, 5); take(changedQueue, 5); take(dueQueue, QUEUE_CHATS); take(changedQueue, QUEUE_CHATS);
-    /** @type {Map<string,JsonObject[]>} */
+    /** @type {Map<string,ReturnType<typeof readRecipientWitnessPage>>} */
     const queueRows = new Map();
     for (const state of queued) {
       if (typeof state.chat_id !== 'string' || !state.chat_id || state.chat_id.includes('\0')) continue;
-      queueRows.set(state.chat_id, readSent(`AND container_id=${quoteSql(state.chat_id)} AND id>${Number(state.record_after_id || 0)}`,
-        'ASC', WITNESS_PAGE, 'records_recipient_sent_container_id'));
+      queueRows.set(state.chat_id, readSent(`AND container_id=${quoteSql(state.chat_id)}`,
+        'ASC', WITNESS_PAGE, 'records_recipient_sent_container_id',Number(state.record_after_id || 0)));
     }
     const validNew = newest.filter(row => witness(row, self.open_id)), validOld = historical.filter(row => witness(row, self.open_id));
     const chats = [...new Set([...validNew, ...validOld].map(row => row.container_id).concat(queued.map(row => row.chat_id)))];
@@ -156,9 +165,15 @@ function prepareRecipientWork(db, self, deps = {}) {
     // Fixed quotas guarantee retries, newly sent chats and historical migration
     // all advance even under continuous incoming sent traffic.
     for (const state of queued) {
-      const rows = queueRows.get(state.chat_id) || [];
-      const row = [...rows, ...validNew, ...validOld].find(value => value.container_id === state.chat_id && witness(value, self.open_id)) || null;
-      add(state.chat_id, row, row ? 0 : rows.length === WITNESS_PAGE ? rows[rows.length - 1].id : 0);
+      const page = queueRows.get(state.chat_id), rows = page?.rows || [];
+      // Use the latest qualified sent witness when available, for both ranking
+      // and the exact claim fence. An old queued witness must not lend an older
+      // position to a newly arrived unresolved message in the same chat.
+      const row = [...validNew, ...rows, ...validOld].find(value => value.container_id === state.chat_id && witness(value, self.open_id)) || null;
+      // A page not read due to the shared byte quota is not a failed witness
+      // search. Do not claim/reset it unless a captured valid row is available.
+      if (!row && page?.exhaustedBudget && page.afterRecordId===Number(state.record_after_id || 0)) continue;
+      add(state.chat_id, row, row ? 0 : page?.hasMore ? page.afterRecordId : 0);
     }
     const addLane = (rows, quota) => {
       let added = 0;
@@ -245,7 +260,8 @@ function prepareRecipientWork(db, self, deps = {}) {
         report.attempted = targets.length; report.updated = Number(result.updated || 0);
         const current = query(`SELECT * FROM lark_im_recipient_state WHERE source_id='lark.im' AND account_key=${quoteSql(accountKey)}
           AND chat_id IN (${targets.map(item => quoteSql(item.chatId)).join(',')});`, 'read completed recipient relationships');
-        const finishAdmission = captureLarkWriteAdmission(db, { selfOpenId: self.open_id, requireVerified: true });
+        const finishAdmission = captureLarkWriteAdmission(db, { selfOpenId: self.open_id, requireVerified: true },
+          { query: (_db, sql, label) => query(sql, label) });
         const finishes = [];
         for (const item of targets) {
           const state = current.find(value => value.chat_id === item.chatId), outcome = outcomes.get(item.chatId);

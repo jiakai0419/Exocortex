@@ -122,13 +122,13 @@ test('successive worker commands share a persisted one-minute opportunity',t=>{
   const second=syncNames(f.db,{open_id:SELF},{now:()=>f.now+1,runLark:()=>assert.fail('cadence must not request')});
   assert.equal(second.reason,'cadence');assert.equal(f.calls.length,calls);assert.deepEqual(readFileSync(f.db),before);
 });
-test('a role result cannot accidentally disable exponential failure backoff',t=>{
+test('generic role failures keep a finite five-minute recovery window',t=>{
   const f=fixture(t);
   const failure={prepareChatWork:()=>({outcome:'failed',retryDelayMs:300000,updates:[]})};
   run(f,failure);assert.equal(tasks(f)[0].failures,1);
   f.now+=300001;run(f,failure);run(f,failure);
   assert.equal(tasks(f)[0].failures,2);
-  assert.equal(tasks(f)[0].retry_at_ms-tasks(f)[0].last_attempt_at_ms,600000);
+  assert.equal(tasks(f)[0].retry_at_ms-tasks(f)[0].last_attempt_at_ms,300000);
 });
 test('historical scan fixes a horizon so new arrivals cannot starve old rows',t=>{
   const f=fixture(t,121);run(f);

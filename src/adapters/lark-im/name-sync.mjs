@@ -18,6 +18,8 @@ import { readNameRecordPage } from './name-projection-progress.mjs';
 import { nameRecordFence, nameEffects, nameFence, nameStateKey, nameRowBytesSql, NAME_RETRY_MS, NAME_REFRESH_MS } from './name-work-common.mjs';
 import { runLark, transportOperation } from './transport.mjs';
 import { selectNameWork } from './name-work-policy.mjs';
+import { readNameRecoveryReview, NameRecoveryReviewError } from './name-recovery-review.mjs';
+import { legacyNameRecoveryDue, legacyNameRoutesAdmit, LEGACY_NAME_RECOVERY_MS } from './name-legacy-recovery.mjs';
 import { nameRouteDescriptor, nextNameRouteState } from './name-route-state.mjs';
 import { readLarkExecutionReceipt, validateLarkExecutionReceipt, formatLarkExecutionReceipt } from './transport-execution.mjs';
 
@@ -25,7 +27,7 @@ const PAGE = 40, MAX_CALLS = 4, BUDGET_MS = 10_000, INTERVAL_MS = 60_000;
 class NameBudgetError extends Error {}
 class NameRouteDeferredError extends Error {}
 
-const PROGRESS_FIELDS = ['latest_record_id','after_record_id','projection_horizon_record_id','projection_deferred',
+const PROGRESS_FIELDS = ['reviewed_retry_at_ms','latest_record_id','after_record_id','projection_horizon_record_id','projection_deferred',
   'witness_after_record_id','witness_horizon_record_id'];
 const progressFence = task => PROGRESS_FIELDS.map(field=>`${field} IS ${quoteSql(task[field]??0)}`).join(' AND ');
 function validNameWitness(row, task, self, accountKey) {
@@ -52,10 +54,24 @@ function syncNames(db, self, deps = {}) {
   if (!deps.runLark && !getLarkApiLeaseStdio()) return { ...report, reason: 'lease_unavailable' };
   const now = deps.now || Date.now, monotonic = deps.monotonicNow || (() => performance.now());
   const started = monotonic(), nowMs = now(), accountKey = recipientAccountKey(self?.open_id);
-  if (!accountKey || !Number.isSafeInteger(nowMs) || nowMs < 0 || !Number.isFinite(started)) return report;
+  if (!accountKey || !Number.isSafeInteger(nowMs) || nowMs < 0 || nowMs > Number.MAX_SAFE_INTEGER-NAME_REFRESH_MS || !Number.isFinite(started)) return report;
   let lastClock = started, calls = 0, activeTask = null;
   const routeReads = new Map(), routeWrites = new Map();
-  let routeDeferred = false, recoveryProbe = false;
+  let routeDeferred = false, recoveryProbe = false, acceleratedTask = false, recoveryReview = null, reviewUnavailable = false;
+  const applicationTask = task => task?.kind==='sender' && task?.namespace==='app_id';
+  const reviewValue = (read, fallback) => {
+    if(reviewUnavailable)return fallback;
+    try { return read(); } catch(error) {
+      if(!(error instanceof NameRecoveryReviewError))throw error;
+      reviewUnavailable=true; return fallback;
+    }
+  };
+  // A bad application policy grants no application requests, but is not an
+  // account or recipient failure. Keep its local error out of route evidence.
+  const reviewPolicy = {
+    canAccelerate:(task,at)=>applicationTask(task)&&reviewValue(()=>recoveryReview?.canAccelerate(task,at)||false,false),
+    isHeld:(task,at)=>applicationTask(task)&&reviewValue(()=>recoveryReview?.isHeld(task,at)||false,true),
+  };
   const remaining = () => {
     const value = monotonic();
     if (!Number.isFinite(value) || value < lastClock) throw new NameBudgetError('name clock unavailable');
@@ -92,6 +108,28 @@ function syncNames(db, self, deps = {}) {
   };
   const boundedRun = (args, options = {}, reserve = 0) => {
     remaining();
+    if(applicationTask(activeTask)) {
+      if(reviewUnavailable) {routeDeferred=true;throw new NameRouteDeferredError('application review unavailable');}
+      try { recoveryReview?.assertCurrent(now()); } catch(error) {
+        if(!(error instanceof NameRecoveryReviewError))throw error;
+        reviewUnavailable=true;routeDeferred=true;
+        throw new NameRouteDeferredError('application review unavailable');
+      }
+    }
+    if (activeTask && (reviewPolicy.isHeld(activeTask,now())
+      || acceleratedTask && transportOperation(args)!=='self_profile' && !reviewPolicy.canAccelerate(activeTask, now())))
+      {routeDeferred=true;throw new NameRouteDeferredError('reviewed name work deferred');}
+    if (acceleratedTask && transportOperation(args)!=='self_profile') {
+      const entries=['application_info','chat_bots'].map(operation=>routeFor(operation)).filter(entry=>entry!==null);
+      if (!legacyNameRoutesAdmit(activeTask,entries.map(entry=>entry.row).filter(Boolean),now()))
+        {routeDeferred=true;throw new NameRouteDeferredError('reviewed name routes deferred');}
+      const unchanged=entries.every(entry=>{
+        const previous=routeReads.get(entry.route.route_key);
+        const current=query(`SELECT * FROM lark_im_name_routes WHERE ${routeKeySql(entry.route)};`,'recheck reviewed name route')[0]||null;
+        return JSON.stringify(previous)===JSON.stringify(current);
+      });
+      if(!unchanged){routeDeferred=true;throw new NameRouteDeferredError('reviewed name route changed');}
+    }
     const entry = routeFor(transportOperation(args),true);
     if (entry?.row && (entry.row.blocked || entry.row.failures >= 3 || entry.row.retry_at_ms > nowMs)) {
       routeDeferred = true;
@@ -126,11 +164,19 @@ function syncNames(db, self, deps = {}) {
     }
   };
   try {
-    const admission = captureLarkWriteAdmission(db,{selfOpenId:self.open_id,requireVerified:true});
+    recoveryReview=reviewValue(()=>readNameRecoveryReview(db,accountKey,nowMs),null);
+    const admission = captureLarkWriteAdmission(db,{selfOpenId:self.open_id,requireVerified:true},
+      {query:(_db,sql,label)=>query(sql,label)});
     const commit = (updates, reason) => {
       remaining();
       return commitEnrichmentUpdates(db,updates,{dryRun:false,reason,label:'commit bounded name work',
-        writeAdmission:admission.fence,admissionBeforeCommit:admission.assertCurrent,withCommit: action => action()});
+        writeAdmission:admission.fence,admissionBeforeCommit:()=>{
+          admission.assertCurrent();
+          if(applicationTask(activeTask)||reason==='name-work-reviewed-scan') {
+            if(reviewUnavailable)throw new NameRecoveryReviewError('unavailable');
+            recoveryReview?.assertCurrent(now());
+          }
+        },withCommit: action => action()});
     };
     let scan = query(`SELECT * FROM lark_im_name_scan WHERE account_key=${quoteSql(accountKey)};`,'read name scan cursor')[0];
     if(Number(scan?.next_attempt_at_ms||0)>nowMs) return {...report,reason:'cadence'};
@@ -193,15 +239,52 @@ function syncNames(db, self, deps = {}) {
     commit(updates,'name-work-scan');
     // Fetch independent priority and global-oldest lanes. A failed sender
     // population cannot hide chat work; no empty recipient role consumes a turn.
-    const dueWhere=`source_id='lark.im' AND account_key=${quoteSql(accountKey)} AND blocked_reason IS NULL AND retry_at_ms<=${nowMs}`;
+    const heldActors=recoveryReview?.heldActors||[];
+    let allowedActors=(recoveryReview?.retryUnknownActors||[]).filter(actor_id=>reviewPolicy.canAccelerate({source_id:'lark.im',account_key:accountKey,kind:'sender',namespace:'app_id',actor_id},now()));
+    if(reviewUnavailable)allowedActors=[];
+    const holdWhere=reviewUnavailable?` AND NOT (kind='sender' AND namespace='app_id')`
+      :heldActors.length?` AND NOT (kind='sender' AND namespace='app_id' AND actor_id IN (${heldActors.map(quoteSql).join(',')}))`:'';
+    const reviewedWhere=allowedActors.length?`kind='sender' AND namespace='app_id' AND actor_id IN (${allowedActors.map(quoteSql).join(',')})`:'0';
+    const resumeWhere=` AND reviewed_retry_at_ms<=${nowMs}`;
+    const legacyWhere=allowedActors.length?`kind='sender' AND namespace='app_id' AND actor_id IN (${allowedActors.map(quoteSql).join(',')})
+      AND outcome IN ('failed','unresolved') AND failures>0 AND schedule_failures=0 AND attempt_token IS NULL
+      AND last_attempt_at_ms>0 AND last_attempt_at_ms<=${nowMs-LEGACY_NAME_RECOVERY_MS}`:'0';
+    const dueWhere=`source_id='lark.im' AND account_key=${quoteSql(accountKey)} AND blocked_reason IS NULL${holdWhere}
+      AND retry_at_ms<=${nowMs}${resumeWhere}`;
     const fairDue=query(`SELECT * FROM lark_im_name_tasks INDEXED BY lark_im_name_tasks_fair WHERE ${dueWhere}
       ORDER BY last_served_sequence,enqueued_sequence,task_key LIMIT 64;`,'read fair name work');
     const freshDue=query(`SELECT * FROM lark_im_name_tasks INDEXED BY lark_im_name_tasks_fresh WHERE ${dueWhere}
       AND latest_record_id>serviced_record_id ORDER BY fresh_required_record_id DESC,last_served_sequence,task_key LIMIT 32;`,'read fresh name work');
     const blockedDue=query(`SELECT * FROM lark_im_name_tasks INDEXED BY lark_im_name_tasks_blocked_due WHERE source_id='lark.im'
-      AND account_key=${quoteSql(accountKey)} AND blocked_reason IS NOT NULL AND retry_at_ms<=${nowMs}
+      AND account_key=${quoteSql(accountKey)} AND blocked_reason IS NOT NULL${holdWhere} AND retry_at_ms<=${nowMs}${resumeWhere}
       ORDER BY last_served_sequence,enqueued_sequence,task_key LIMIT 16;`,'read quarantined recovery probes');
-    const due=[...new Map([...freshDue,...fairDue,...blockedDue].map(task=>[task.task_key,task])).values()];
+    const recoveryScan=allowedActors.length?query(`SELECT * FROM lark_im_name_recovery_scan WHERE account_key=${quoteSql(accountKey)};`,'read reviewed name cursor')[0]||null:null;
+    if(recoveryScan&&(!Number.isSafeInteger(recoveryScan.generation)||recoveryScan.generation<0||recoveryScan.generation>=Number.MAX_SAFE_INTEGER
+      ||typeof recoveryScan.after_task_key!=='string'||!/^([a-f0-9]{64})?$/.test(recoveryScan.after_task_key)))return {...report,reason:'unavailable'};
+    const recoveryPage=after=>query(`SELECT * FROM lark_im_name_tasks WHERE source_id='lark.im' AND account_key=${quoteSql(accountKey)}
+      AND blocked_reason IS NULL${holdWhere} AND ((retry_at_ms>${nowMs} AND (${legacyWhere}))
+        OR (reviewed_retry_at_ms>${nowMs} AND retry_at_ms<=${nowMs} AND (${reviewedWhere}))) AND task_key>${quoteSql(after)}
+      ORDER BY task_key LIMIT 64;`,'read reviewed legacy name work');
+    let legacyCandidates=allowedActors.length?recoveryPage(recoveryScan?.after_task_key||''):[];
+    if(!legacyCandidates.length&&recoveryScan?.after_task_key)legacyCandidates=recoveryPage('');
+    const legacyDescriptors=legacyCandidates.flatMap(task=>['application_info','chat_bots'].map(operation=>nameRouteDescriptor(task,operation))).filter(route=>route!==null);
+    const legacyRoutes=legacyDescriptors.length?query(`SELECT * FROM lark_im_name_routes WHERE source_id='lark.im'
+      AND account_key=${quoteSql(accountKey)} AND route_key IN (${[...new Set(legacyDescriptors.map(route=>route.route_key))].map(quoteSql).join(',')});`,'read reviewed name routes'):[];
+    const eligibleLegacy=legacyCandidates.filter(task=>{
+      const at=legacyNameRecoveryDue(task,now(),reviewPolicy);
+      return at!==null&&at<=nowMs&&legacyNameRoutesAdmit(task,legacyRoutes,nowMs);
+    }).sort((a,b)=>a.last_served_sequence-b.last_served_sequence||a.enqueued_sequence-b.enqueued_sequence||a.task_key.localeCompare(b.task_key));
+    const legacySelected=eligibleLegacy[0];
+    const recoveryAdvance=after=>`${nameFence(recoveryScan?`EXISTS(SELECT 1 FROM lark_im_name_recovery_scan WHERE account_key=${quoteSql(accountKey)}
+      AND after_task_key=${quoteSql(recoveryScan.after_task_key)} AND generation=${recoveryScan.generation})`
+      :`NOT EXISTS(SELECT 1 FROM lark_im_name_recovery_scan WHERE account_key=${quoteSql(accountKey)})`)}
+      INSERT INTO lark_im_name_recovery_scan(account_key,after_task_key,generation) VALUES(${quoteSql(accountKey)},${quoteSql(after)},${(recoveryScan?.generation||0)+1})
+      ON CONFLICT(account_key) DO UPDATE SET after_task_key=excluded.after_task_key,generation=excluded.generation;`;
+    if(!reviewUnavailable&&!legacySelected&&legacyCandidates.length)commit([nameEffects(recoveryAdvance(legacyCandidates.at(-1).task_key))],'name-work-reviewed-scan');
+    const acceleratedKeys=new Set(legacySelected?[legacySelected.task_key]:[]);
+    const due=[...new Map([...freshDue,...fairDue,...blockedDue,...(legacySelected?[legacySelected]:[])].map(task=>[task.task_key,task])).values()]
+      .filter(task=>!reviewPolicy.isHeld(task,now())&&(task.reviewed_retry_at_ms<=nowMs||acceleratedKeys.has(task.task_key)))
+      .filter(task=>!reviewUnavailable||!applicationTask(task));
     // Local recipient discovery cannot depend on winning a remote role or on
     // the mixed-direction name page. Preserve its own bounded sent cursor and
     // enqueue exact unresolved relationships before choosing remote work.
@@ -212,14 +295,24 @@ function syncNames(db, self, deps = {}) {
     const recipientFresh = recipientFreshOrder > 0;
     const state=/** @type {import('./name-work-policy.mjs').SelectionState} */ ({schema:'name_work_selection/v1',sequence:Number(scan?.schedule_sequence||0),slot:Number(scan?.schedule_slot||0)});
     const candidates=/** @type {import('./name-work-policy.mjs').WorkCandidate[]} */ (due.map(task=>({key:task.task_key,
-      tier:task.blocked_reason?'history':task.fresh_required_record_id>task.serviced_record_id?'fresh':['pending','applying','page_limit'].includes(task.outcome)?'continuation':'history',
+      tier:task.blocked_reason||acceleratedKeys.has(task.task_key)?'history':task.fresh_required_record_id>task.serviced_record_id?'fresh':['pending','applying','page_limit'].includes(task.outcome)?'continuation':'history',
       operation:task.kind==='chat'?'other':task.namespace==='app_id'?'application_info':'contact_search',
-      enqueuedSequence:task.enqueued_sequence,lastServedSequence:task.last_served_sequence,dueAtMs:task.retry_at_ms,
+      enqueuedSequence:task.enqueued_sequence,lastServedSequence:task.last_served_sequence,dueAtMs:acceleratedKeys.has(task.task_key)&&task.retry_at_ms>nowMs?legacyNameRecoveryDue(task,now(),reviewPolicy):task.retry_at_ms,
       claimedUntilMs:task.attempt_token?task.retry_at_ms:0,blocked:false,freshOrder:task.fresh_required_record_id})));
     if(recipientDue)candidates.push({key:'recipient',tier:recipientFresh?'fresh':'history',operation:'other',
       enqueuedSequence:0,lastServedSequence:Number(scan?.recipient_last_served_sequence||0),dueAtMs:0,claimedUntilMs:0,blocked:false,freshOrder:recipientFreshOrder});
-    const choice=selectNameWork(candidates,state,{nowMs,resource:'remote'});
-    if(!choice)return report;
+    // A fresh recipient may lose the first priority comparison to newer name
+    // work, but not every subsequent one. Protect its next priority turn after
+    // another role was served, while preserving every third global fair turn.
+    // Thus continuous newer names cannot delay this fresh batch's first role
+    // reservation beyond three admitted opportunities. Its separate claim or
+    // API may still fail; this is not a per-record or wall-clock promise.
+    const protectRecipient = recipientFresh && state.slot !== 2
+      && state.sequence > Number(scan?.recipient_last_served_sequence || 0);
+    const choice=selectNameWork(protectRecipient ? candidates.filter(candidate=>candidate.key==='recipient') : candidates,
+      state,{nowMs,resource:'remote'});
+    if(!choice)return !('run' in recipientWork) ? {...report,reason:recipientWork.reason}
+      : reviewUnavailable ? {...report,reason:'review_unavailable'} : report;
     // Reserve the shared opportunity only when there is selected work. An idle
     // discovery must not block a later fresh message, while a real claim and
     // its cadence remain one CAS so separate commands cannot add budgets.
@@ -238,9 +331,13 @@ function syncNames(db, self, deps = {}) {
     }
     const task=due.find(value=>value.task_key===choice.candidate.key);
     if(!task)return report;
+    // Local app dispositions also use the captured review: a stale witness
+    // must not bypass its file fence before the eventual remote claim.
+    activeTask=task;
     const selectedPredicate=`${nameStateKey(accountKey,task.task_key)} AND generation=${task.generation} AND ${progressFence(task)}
       AND evidence_json IS ${quoteSql(task.evidence_json)} AND attempt_token IS ${quoteSql(task.attempt_token)}
-      AND last_served_sequence=${task.last_served_sequence} AND schedule_failures=${task.schedule_failures} AND blocked_reason IS ${quoteSql(task.blocked_reason)}`;
+      AND last_served_sequence=${task.last_served_sequence} AND schedule_failures=${task.schedule_failures} AND blocked_reason IS ${quoteSql(task.blocked_reason)}
+      AND retry_at_ms=${task.retry_at_ms} AND last_attempt_at_ms=${task.last_attempt_at_ms} AND failures=${task.failures}`;
     const deferInvalid=reason=>{
       commit([nameEffects(`${rotate} ${nameFence(`EXISTS(SELECT 1 FROM lark_im_name_tasks WHERE ${selectedPredicate})`)} UPDATE lark_im_name_tasks SET outcome='conflict',retry_at_ms=${nowMs+NAME_RETRY_MS},attempt_token=NULL,generation=generation+1,
         last_served_sequence=${choice.nextState.sequence} WHERE ${selectedPredicate}`)],'name-work-conflict');
@@ -287,13 +384,25 @@ function syncNames(db, self, deps = {}) {
     }
     const scopeAbsent=exactScope?`EXISTS(SELECT 1 FROM sync_scopes WHERE ${['id','source_id','enabled','config_json','updated_at'].map(key=>`${key} IS ${quoteSql(exactScope[key])}`).join(' AND ')})`
       :`NOT EXISTS(SELECT 1 FROM sync_scopes WHERE id=${quoteSql(chatScopeId(task.chat_id))})`;
+    acceleratedTask=acceleratedKeys.has(task.task_key);
+    activeTask=task;
+    if(acceleratedTask) {
+      if(!reviewPolicy.canAccelerate(task,now())||task.reviewed_retry_at_ms<=nowMs&&legacyNameRecoveryDue(task,now(),reviewPolicy)===null)return {...report,reason:'review_expired'};
+      const entries=['application_info','chat_bots'].map(operation=>routeFor(operation)).filter(entry=>entry!==null);
+      if(!legacyNameRoutesAdmit(task,entries.map(entry=>entry.row).filter(Boolean),now()))return {...report,reason:'routes_deferred'};
+    }
     const token=randomUUID(), key=nameStateKey(accountKey,task.task_key);
     const taskPredicate=`${key} AND generation=${task.generation} AND ${progressFence(task)}
       AND evidence_json IS ${quoteSql(task.evidence_json)} AND attempt_token IS ${quoteSql(task.attempt_token)}
-      AND last_served_sequence=${task.last_served_sequence} AND schedule_failures=${task.schedule_failures} AND blocked_reason IS ${quoteSql(task.blocked_reason)}`;
-    commit([nameEffects(`${rotate} ${nameFence(`${nameRecordFence(witness)} AND ${scopeAbsent} AND EXISTS(SELECT 1 FROM lark_im_name_tasks WHERE ${taskPredicate})`)}
+      AND last_served_sequence=${task.last_served_sequence} AND schedule_failures=${task.schedule_failures} AND blocked_reason IS ${quoteSql(task.blocked_reason)}
+      AND retry_at_ms=${task.retry_at_ms} AND last_attempt_at_ms=${task.last_attempt_at_ms} AND failures=${task.failures}`;
+    const acceleratedRouteFences=acceleratedTask?[...routeReads].map(([routeKey,previous])=>nameFence(previous
+      ?`EXISTS(SELECT 1 FROM lark_im_name_routes WHERE ${routeKeySql({account_key:accountKey,route_key:routeKey})} AND ${Object.keys(previous).map(column=>`${column} IS ${quoteSql(previous[column])}`).join(' AND ')})`
+      :`NOT EXISTS(SELECT 1 FROM lark_im_name_routes WHERE ${routeKeySql({account_key:accountKey,route_key:routeKey})})`)).join(' '):'';
+    commit([nameEffects(`${rotate} ${acceleratedRouteFences} ${legacySelected?.task_key===task.task_key?recoveryAdvance(task.task_key):''} ${nameFence(`${nameRecordFence(witness)} AND ${scopeAbsent} AND EXISTS(SELECT 1 FROM lark_im_name_tasks WHERE ${taskPredicate})`)}
       UPDATE lark_im_name_tasks SET attempt_token=${quoteSql(token)},generation=generation+1,
-      retry_at_ms=${nowMs+NAME_RETRY_MS},last_attempt_at_ms=${nowMs},last_served_sequence=${choice.nextState.sequence} WHERE ${taskPredicate}`)],'name-work-claim');
+      retry_at_ms=${nowMs+NAME_RETRY_MS},reviewed_retry_at_ms=${acceleratedTask?Math.max(task.reviewed_retry_at_ms||0,task.retry_at_ms):0},last_attempt_at_ms=${nowMs},last_served_sequence=${choice.nextState.sequence} WHERE ${taskPredicate}`)],'name-work-claim');
+    task.reviewed_retry_at_ms=acceleratedTask?Math.max(task.reviewed_retry_at_ms||0,task.retry_at_ms):0;
     activeTask=task; recoveryProbe=task.blocked_reason!==null&&task.retry_at_ms<=nowMs;
     let result;
     try {
@@ -314,22 +423,28 @@ function syncNames(db, self, deps = {}) {
     }
     const outcome=['resolved','applying','pending','unresolved','failed','deferred','conflict','page_limit','invalid_target','capacity_deferred'].includes(result.outcome)?result.outcome:'unresolved';
     const complete=outcome==='resolved', progress=['applying','page_limit','pending'].includes(outcome);
-    const failures=complete?0:Math.min(16,Number(task.failures||0)+(progress||outcome==='deferred'||routeDeferred?0:1));
-    const scheduleFailures=complete||progress?0:Math.min(3,task.schedule_failures+(outcome==='deferred'||routeDeferred?0:1));
+    // A later sibling admission stop cannot erase an actual failed lookup that
+    // already occurred in this turn. Pure no-request interruptions stay free.
+    const hadLookupFailure=[...routeWrites.values()].some(row=>row?.failures>0);
+    const admissionOnly=(outcome==='deferred'||routeDeferred)&&!hadLookupFailure;
+    const failures=complete?0:Math.min(16,Number(task.failures||0)+(progress||admissionOnly?0:1));
+    const scheduleFailures=complete||progress?0:Math.min(3,task.schedule_failures+(admissionOnly?0:1));
     const witnessTarget=task.kind==='sender'?senderNameTarget(witness):null;
     const native=witnessTarget?.raw?.raw_api||witnessTarget?.raw;
     const privateHuman=task.namespace==='open_id'&&[witnessTarget?.canonical?.chat_type,witnessTarget?.raw?.chat_type,
       native?.chat_type,native?.chat?.chat_type].includes('p2p');
     const operations=task.kind==='chat'?['other']:task.namespace==='app_id'?['application_info','chat_bots']
       :privateHuman?['contact_search']:['contact_search','chat_members'];
-    const routes=operations.map(operation=>routeFor(operation)).filter(Boolean);
+    const routes=operations.map(operation=>routeFor(operation)).filter(entry=>entry!==null);
     const terminal=routes.length>0&&routes.every(entry=>entry?.row&&(entry.row.blocked||entry.row.failures>=3));
     const reasons=new Set(routes.map(entry=>entry?.row?.failure_kind));
     const blockedReason=complete||progress?null:terminal?(reasons.size===1&&['permission_denied','command_unavailable'].includes([...reasons][0])?[...reasons][0]:'routes_blocked')
       :scheduleFailures>=3?'retry_exhausted':null;
     const requestedDelay=Number.isSafeInteger(result.retryDelayMs)&&result.retryDelayMs>=0?result.retryDelayMs:0;
-    const delay=Math.min(NAME_REFRESH_MS,complete||progress?requestedDelay
-      :Math.max(requestedDelay,NAME_RETRY_MS*2**Math.max(0,failures-1)));
+    const deniedRoute=task.namespace==='app_id'&&routes.some(entry=>entry?.row?.blocked===1);
+    const delay=complete||progress?Math.min(NAME_REFRESH_MS,requestedDelay)
+      :deniedRoute?NAME_REFRESH_MS:Math.min(NAME_RETRY_MS,Math.max(requestedDelay,
+        scheduleFailures===1?5000:30000));
     const terminalDue=routes.filter(entry=>entry?.row&&(entry.row.blocked||entry.row.failures>=3)).map(entry=>entry?.row.retry_at_ms).filter(value=>value>nowMs);
     const nextRetry=blockedReason?(terminal&&terminalDue.length?Math.min(...terminalDue):nowMs+NAME_RETRY_MS):nowMs+delay;
     const guard=`EXISTS(SELECT 1 FROM lark_im_name_tasks WHERE ${key} AND generation=${task.generation+1} AND attempt_token=${quoteSql(token)}
@@ -339,7 +454,7 @@ function syncNames(db, self, deps = {}) {
       evidence_json=${quoteSql(result.evidenceJson===undefined?task.evidence_json:result.evidenceJson)},after_record_id=${Number(result.afterRecordId??task.after_record_id)},
       projection_horizon_record_id=${Number(result.horizonRecordId??task.projection_horizon_record_id??0)},
       projection_deferred=${Number(result.projectionDeferred??task.projection_deferred??0)},
-      retry_at_ms=${nextRetry},failures=${failures},schedule_failures=${scheduleFailures},blocked_reason=${quoteSql(blockedReason)},
+      retry_at_ms=${nextRetry},reviewed_retry_at_ms=${routeWrites.size>0?0:task.reviewed_retry_at_ms||0},failures=${failures},schedule_failures=${scheduleFailures},blocked_reason=${quoteSql(blockedReason)},
       serviced_record_id=MAX(serviced_record_id,${task.latest_record_id}),attempt_token=NULL WHERE ${key} AND generation=${task.generation+1} AND attempt_token=${quoteSql(token)}`),
       ...(result.updates||[]).map(sql=>`${sql}; ${nameFence('changes()=1')} INSERT INTO __enrichment_effects(updated) VALUES(1);`)];
     // Terminal eligibility also depends on routes that were read but skipped.

@@ -74,7 +74,11 @@ Private prose never becomes a permission classification or persisted error text.
 
 A real transport success clears a nonterminal route failure; it does not establish
 name authority. Exact producer validation must still produce adopted evidence.
-Actual nondeferred task failure uses existing five-minute exponential backoff.
+Actual nondeferred generic task failure has a maximum five-minute retry delay;
+precise permission/command blocks keep their separate recovery policy. Legacy
+24-hour generic debt can receive an earlier derived opportunity only through the
+[explicit local review protocol](name-legacy-recovery.md); absent route evidence
+is not permission to reopen a historically denied target.
 Three failed task attempts or three consecutive route failures isolate the episode
 from fresh/continuation lanes. Unknown failure remains distinct from permission.
 Successful pagination counts as progress, not a failed lookup. Budget, shared
