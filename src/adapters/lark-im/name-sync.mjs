@@ -10,7 +10,7 @@ import { chatScopeId } from './core.mjs';
 import { chatTitle, chatNameCleared, titleMessageMatches } from './chat-title.mjs';
 import { nameTaskKey, senderNameTarget } from './name-evidence.mjs';
 import { recipientAccountKey, sentRecipientAccount } from './p2p-recipient.mjs';
-import { syncRecipients } from './recipient-sync.mjs';
+import { prepareRecipientWork } from './recipient-sync.mjs';
 import { prepareSenderWork } from './sender-name-work.mjs';
 import { senderNeedsAuthorityRepair } from './sender-authority-repair.mjs';
 import { prepareChatWork } from './chat-name-work.mjs';
@@ -202,19 +202,14 @@ function syncNames(db, self, deps = {}) {
       AND account_key=${quoteSql(accountKey)} AND blocked_reason IS NOT NULL AND retry_at_ms<=${nowMs}
       ORDER BY last_served_sequence,enqueued_sequence,task_key LIMIT 16;`,'read quarantined recovery probes');
     const due=[...new Map([...freshDue,...fairDue,...blockedDue].map(task=>[task.task_key,task])).values()];
-    const recipientScan=query(`SELECT after_record_id FROM lark_im_recipient_scan WHERE account_key=${quoteSql(accountKey)};`,'read recipient scheduling progress')[0];
-    const recipientTop=query("SELECT MAX(id) AS id FROM records INDEXED BY records_recipient_sent_id WHERE source_id='lark.im' AND direction='sent' AND record_type='lark.im.message';",'read recipient scheduling horizon')[0]?.id||0;
-    const recipientFresh=recipientTop>Number(recipientScan?.after_record_id||0)&&witnesses.some(row=>{
-      if(row.direction!=='sent'||row.id<=Number(recipientScan?.after_record_id||0))return false;
-      try {
-        const canonical=JSON.parse(row.canonical_json),raw=JSON.parse(row.raw_json);
-        const declarations=[canonical,raw,raw.chat,raw.raw_api,raw.raw_api?.chat];
-        return sentRecipientAccount(row,canonical,raw)===self.open_id&&titleMessageMatches(row,canonical,raw)
-          && !declarations.some(value=>['group','topic'].includes(value?.chat_type)||['group','topic'].includes(value?.chat_mode));
-      } catch {return false;}
-    });
-    const recipientDue=recipientFresh||query(`SELECT 1 AS due FROM lark_im_recipient_state WHERE source_id='lark.im' AND account_key=${quoteSql(accountKey)}
-      AND (retry_at_ms<=${nowMs} OR attempt_evidence_json IS NOT evidence_json) LIMIT 1;`,'read recipient due indicator').length>0;
+    // Local recipient discovery cannot depend on winning a remote role or on
+    // the mixed-direction name page. Preserve its own bounded sent cursor and
+    // enqueue exact unresolved relationships before choosing remote work.
+    const recipientWork = prepareRecipientWork(db,self,{runLark:boundedRun,now,monotonicNow:monotonic,
+      budgetMs:remaining(),readOnlyQuery:deps.readOnlyQuery});
+    const recipientDue = 'pending' in recipientWork && recipientWork.pending;
+    const recipientFreshOrder = 'freshOrder' in recipientWork ? recipientWork.freshOrder : 0;
+    const recipientFresh = recipientFreshOrder > 0;
     const state=/** @type {import('./name-work-policy.mjs').SelectionState} */ ({schema:'name_work_selection/v1',sequence:Number(scan?.schedule_sequence||0),slot:Number(scan?.schedule_slot||0)});
     const candidates=/** @type {import('./name-work-policy.mjs').WorkCandidate[]} */ (due.map(task=>({key:task.task_key,
       tier:task.blocked_reason?'history':task.fresh_required_record_id>task.serviced_record_id?'fresh':['pending','applying','page_limit'].includes(task.outcome)?'continuation':'history',
@@ -222,7 +217,7 @@ function syncNames(db, self, deps = {}) {
       enqueuedSequence:task.enqueued_sequence,lastServedSequence:task.last_served_sequence,dueAtMs:task.retry_at_ms,
       claimedUntilMs:task.attempt_token?task.retry_at_ms:0,blocked:false,freshOrder:task.fresh_required_record_id})));
     if(recipientDue)candidates.push({key:'recipient',tier:recipientFresh?'fresh':'history',operation:'other',
-      enqueuedSequence:0,lastServedSequence:Number(scan?.recipient_last_served_sequence||0),dueAtMs:0,claimedUntilMs:0,blocked:false});
+      enqueuedSequence:0,lastServedSequence:Number(scan?.recipient_last_served_sequence||0),dueAtMs:0,claimedUntilMs:0,blocked:false,freshOrder:recipientFreshOrder});
     const choice=selectNameWork(candidates,state,{nowMs,resource:'remote'});
     if(!choice)return report;
     // Reserve the shared opportunity only when there is selected work. An idle
@@ -237,7 +232,8 @@ function syncNames(db, self, deps = {}) {
       WHERE account_key=${quoteSql(accountKey)} AND generation=${Number(scan?.generation||0)+1} AND next_attempt_at_ms<=${nowMs};`;
     if(choice.candidate.key==='recipient') {
       commit([nameEffects(rotate)],'name-work-recipient-turn');
-      const recipient=(deps.syncRecipients||syncRecipients)(db,self,{runLark:boundedRun,now,monotonicNow:monotonic,budgetMs:remaining()});
+      const recipient=deps.syncRecipients ? deps.syncRecipients(db,self,{runLark:boundedRun,now,monotonicNow:monotonic,budgetMs:remaining()})
+        : 'run' in recipientWork ? recipientWork.run() : recipientWork;
       return {...report,attempted:recipient.attempted||0,updated:recipient.updated||0,calls,reason:recipient.reason};
     }
     const task=due.find(value=>value.task_key===choice.candidate.key);

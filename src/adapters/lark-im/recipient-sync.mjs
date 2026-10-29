@@ -12,6 +12,8 @@ import { readRecipientEvidence, recipientAccountKey, sentRecipientAccount } from
 import { runLark } from './transport.mjs';
 
 /** @typedef {Record<string,any>} JsonObject */
+/** @typedef {{attempted:number,updated:number,deferred:number,calls:number,reason:string}} RecipientReport */
+/** @typedef {RecipientReport & {pending:boolean,freshOrder:number,run:()=>RecipientReport}} PreparedRecipientWork */
 const MAX_CHATS = 20, SCAN_PAGE = 40, QUEUE_CHATS = 10, WITNESS_PAGE = 8;
 const MAX_CALLS = 4, BUDGET_MS = 10_000, CLAIM_MS = 5 * 60_000, MAX_RETRY_MS = 24 * 60 * 60_000;
 const COMPLETE_RETRY_AT = Number.MAX_SAFE_INTEGER;
@@ -61,8 +63,11 @@ const fence = predicate => `CREATE TEMP TABLE IF NOT EXISTS __recipient_state_fe
 /** The successful sent/all tail retains its sync API lease. Fixed quotas bound
  * discovery to 40 newest + 40 historical sent rows and queue witnesses to
  * 10 chats x 8 rows. No scope, message, history context or status is written.
- * @param {string} db @param {JsonObject} self @param {JsonObject} [deps] */
-function syncRecipients(db, self, deps = {}) {
+ * Preparation enrolls locally; a one-use continuation claims and resolves only
+ * if selected by the shared coordinator, within the same elapsed budget.
+ * @param {string} db @param {JsonObject} self @param {JsonObject} [deps]
+ * @returns {RecipientReport | PreparedRecipientWork} */
+function prepareRecipientWork(db, self, deps = {}) {
   const now = deps.now || Date.now, monotonic = deps.monotonicNow || (() => performance.now());
   const started = monotonic(), nowMs = now(), accountKey = recipientAccountKey(self?.open_id);
   const budgetMs = Number.isSafeInteger(deps.budgetMs) && deps.budgetMs > 0 ? Math.min(BUDGET_MS,deps.budgetMs) : BUDGET_MS;
@@ -80,6 +85,8 @@ function syncRecipients(db, self, deps = {}) {
   const readSent = (where, order, limit, index) => query(`SELECT ${REVIEW_RECORD_COLUMNS.join(',')} FROM records INDEXED BY ${index}
     WHERE source_id='lark.im' AND direction='sent' AND record_type='lark.im.message' ${where}
     ORDER BY id ${order} LIMIT ${limit};`, 'read bounded recipient witnesses');
+  const failure = error => ({ ...report, calls, deferred: claimed || report.deferred,
+    reason: error instanceof RecipientBudgetError ? 'budget' : claimed ? 'deferred' : 'unavailable' });
   try {
     const admission = captureLarkWriteAdmission(db, { selfOpenId: self.open_id, requireVerified: true });
     const scan = query(`SELECT * FROM lark_im_recipient_scan WHERE account_key=${quoteSql(accountKey)};`, 'read recipient scan cursor')[0];
@@ -165,7 +172,7 @@ function syncRecipients(db, self, deps = {}) {
     addLane(validNew, MAX_CHATS); addLane(validOld, MAX_CHATS);
     const boundScopes = [...enroll.values(), ...selected].flatMap(item => item.scope?.source_id === 'lark.im' ? [item.scope.id] : []);
     admission.bindScopes(boundScopes);
-    const token = randomUUID(), updates = [];
+    const updates = [];
     if ((scan?.after_record_id || 0) !== afterRecordId || !scan && historical.length) {
       updates.push(effects(`${fence(scan ? `EXISTS(SELECT 1 FROM lark_im_recipient_scan WHERE account_key=${quoteSql(accountKey)}
         AND after_record_id=${scan.after_record_id} AND generation=${scan.generation})`
@@ -187,63 +194,84 @@ function syncRecipients(db, self, deps = {}) {
         WHERE ${stateKey(state.chat_id, accountKey)} AND evidence_json IS ${quoteSql(state.evidence_json)}
           AND generation=${state.generation} AND attempt_token IS ${quoteSql(state.attempt_token)}`));
     }
-    for (const item of selected) {
-      const { state, row, scope, chatId, afterId } = item, generation = Number(state?.generation || 0);
-      const statePredicate = state ? `generation=${generation} AND evidence_json IS ${quoteSql(state.evidence_json)}
-        AND attempt_token IS ${quoteSql(state.attempt_token)} AND retry_at_ms=${state.retry_at_ms}`
-        : `generation=0 AND attempt_token IS NULL AND evidence_json IS ${quoteSql(enroll.get(chatId)?.evidenceJson ?? null)}`;
-      updates.push(effects(`${fence(`${scopeFence(scope, chatId)} ${row ? `AND ${recordFence(row)}` : ''}
-          AND EXISTS(SELECT 1 FROM lark_im_recipient_state WHERE ${stateKey(chatId, accountKey)} AND ${statePredicate})`)}
-        UPDATE lark_im_recipient_state SET last_attempt_at_ms=${nowMs},retry_at_ms=${nowMs + CLAIM_MS},
-          record_after_id=${afterId},generation=${generation + 1},attempt_token=${quoteSql(token)},attempt_evidence_json=evidence_json
-          WHERE ${stateKey(chatId, accountKey)}`));
-    }
+    // Enrollment is durable local work, independent of which remote role wins.
+    // Keep the captured selection for a single exact claim; do not rescan and
+    // double the per-opportunity discovery quota when the role is selected.
     assertReady();
-    commitEnrichmentUpdates(db, updates, { dryRun: false, reason: 'recipient-sync-claim', label: 'claim recipient relationships',
+    commitEnrichmentUpdates(db, updates, { dryRun: false, reason: 'recipient-sync-enroll', label: 'enroll recipient relationships',
       writeAdmission: admission.fence, admissionBeforeCommit: admission.assertCurrent, withCommit: action => action() });
-    claimed = selected.length;
-    const targets = selected.filter(item => item.row !== null).map(item => ({ ...item, row: /** @type {JsonObject} */ (item.row) }));
-    report.deferred = selected.length - targets.length;
-    if (!targets.length) return { ...report, reason: selected.length ? 'witness_unavailable' : 'idle' };
-    /** @type {Map<string,string>} */
-    const outcomes = new Map();
-    const boundedRun = (args, options = {}) => {
-      assertReady();
-      if (calls >= MAX_CALLS) throw new RecipientBudgetError('recipient request limit reached');
-      const budget = remaining(); if (budget <= 0) throw new RecipientBudgetError('recipient budget exhausted');
-      calls += 1;
-      try { return (deps.runLark || runLark)(args, { ...options, retries: 0, timeoutMs: Math.min(5000, budget), retryBudgetMs: budget, maxBufferBytes: 2 * 1024 * 1024 }); }
-      catch (error) {
-        if (error instanceof Error && /retry_after_source=shared|reason=shared_cooldown_unavailable|reason=sync_busy/.test(error.message)) deferredTransport = true;
-        throw error;
-      }
+    const freshOrder = selected.reduce((latest, item) => item.row && !item.state?.last_attempt_at_ms
+      ? Math.max(latest, item.row.id) : latest, 0);
+    let consumed = false;
+    const run = () => {
+      if (consumed) return { ...report, reason: 'already_consumed' };
+      consumed = true;
+      try {
+        const token = randomUUID(), claims = [];
+        for (const item of selected) {
+          const { state, row, scope, chatId, afterId } = item, generation = Number(state?.generation || 0);
+          const statePredicate = state ? `generation=${generation} AND evidence_json IS ${quoteSql(state.evidence_json)}
+            AND attempt_token IS ${quoteSql(state.attempt_token)} AND retry_at_ms=${state.retry_at_ms}`
+            : `generation=0 AND attempt_token IS NULL AND retry_at_ms=${nowMs} AND enqueued_at_ms=${nowMs} AND evidence_json IS ${quoteSql(enroll.get(chatId)?.evidenceJson ?? null)}`;
+          claims.push(effects(`${fence(`${scopeFence(scope, chatId)} ${row ? `AND ${recordFence(row)}` : ''}
+              AND EXISTS(SELECT 1 FROM lark_im_recipient_state WHERE ${stateKey(chatId, accountKey)} AND ${statePredicate})`)}
+            UPDATE lark_im_recipient_state SET last_attempt_at_ms=${nowMs},retry_at_ms=${nowMs + CLAIM_MS},
+              record_after_id=${afterId},generation=${generation + 1},attempt_token=${quoteSql(token)},attempt_evidence_json=evidence_json
+              WHERE ${stateKey(chatId, accountKey)}`));
+        }
+        assertReady();
+        commitEnrichmentUpdates(db, claims, { dryRun: false, reason: 'recipient-sync-claim', label: 'claim recipient relationships',
+          writeAdmission: admission.fence, admissionBeforeCommit: admission.assertCurrent, withCommit: action => action() });
+        claimed = selected.length;
+        const targets = selected.filter(item => item.row !== null).map(item => ({ ...item, row: /** @type {JsonObject} */ (item.row) }));
+        report.deferred = selected.length - targets.length;
+        if (!targets.length) return { ...report, reason: selected.length ? 'witness_unavailable' : 'idle' };
+        /** @type {Map<string,string>} */
+        const outcomes = new Map();
+        const boundedRun = (args, options = {}) => {
+          assertReady();
+          if (calls >= MAX_CALLS) throw new RecipientBudgetError('recipient request limit reached');
+          const budget = remaining(); if (budget <= 0) throw new RecipientBudgetError('recipient budget exhausted');
+          calls += 1;
+          try { return (deps.runLark || runLark)(args, { ...options, retries: 0, timeoutMs: Math.min(5000, budget), retryBudgetMs: budget, maxBufferBytes: 2 * 1024 * 1024 }); }
+          catch (error) {
+            if (error instanceof Error && /retry_after_source=shared|reason=shared_cooldown_unavailable|reason=sync_busy/.test(error.message)) deferredTransport = true;
+            throw error;
+          }
+        };
+        const result = (deps.enrichRecipients || enrichRecipients)({ db, recordIds: targets.map(item => item.row.id), dryRun: false },
+          { runLark: boundedRun, assertReady, withCommit: action => action(), now,
+            onRecipientResult: ({ chat_id, outcome }) => outcomes.set(chat_id, outcome) });
+        report.attempted = targets.length; report.updated = Number(result.updated || 0);
+        const current = query(`SELECT * FROM lark_im_recipient_state WHERE source_id='lark.im' AND account_key=${quoteSql(accountKey)}
+          AND chat_id IN (${targets.map(item => quoteSql(item.chatId)).join(',')});`, 'read completed recipient relationships');
+        const finishAdmission = captureLarkWriteAdmission(db, { selfOpenId: self.open_id, requireVerified: true });
+        const finishes = [];
+        for (const item of targets) {
+          const state = current.find(value => value.chat_id === item.chatId), outcome = outcomes.get(item.chatId);
+          if (!state || !outcome || !['resolved', 'name_missing', 'unresolved', 'conflict', 'failed'].includes(outcome)) continue;
+          const complete = outcome === 'resolved' && Boolean(savedEvidence(state, self.open_id, now())?.name);
+          const failures = complete ? 0 : Math.min(16, Number(item.state?.failures || 0) + (deferredTransport ? 0 : 1));
+          const delay = deferredTransport ? CLAIM_MS : Math.min(MAX_RETRY_MS, CLAIM_MS * 2 ** Math.max(0, failures - 1));
+          finishes.push(effects(`UPDATE lark_im_recipient_state SET failures=${failures},retry_at_ms=${complete ? COMPLETE_RETRY_AT : nowMs + delay},
+            attempt_evidence_json=evidence_json WHERE ${stateKey(item.chatId, accountKey)} AND attempt_token=${quoteSql(token)}
+            AND generation=${Number(item.state?.generation || 0) + 1} AND evidence_json IS ${quoteSql(state.evidence_json)} AND ${recordFence(item.row)}`));
+        }
+        assertReady();
+        commitEnrichmentUpdates(db, finishes, { dryRun: false, reason: 'recipient-sync-result', label: 'finish recipient relationships',
+          writeAdmission: finishAdmission.fence, admissionBeforeCommit: finishAdmission.assertCurrent, withCommit: action => action() });
+        return { ...report, calls, reason: deferredTransport ? 'deferred' : 'completed' };
+      } catch (error) { return failure(error); }
     };
-    const result = (deps.enrichRecipients || enrichRecipients)({ db, recordIds: targets.map(item => item.row.id), dryRun: false },
-      { runLark: boundedRun, assertReady, withCommit: action => action(), now,
-        onRecipientResult: ({ chat_id, outcome }) => outcomes.set(chat_id, outcome) });
-    report.attempted = targets.length; report.updated = Number(result.updated || 0);
-    const current = query(`SELECT * FROM lark_im_recipient_state WHERE source_id='lark.im' AND account_key=${quoteSql(accountKey)}
-      AND chat_id IN (${targets.map(item => quoteSql(item.chatId)).join(',')});`, 'read completed recipient relationships');
-    const finishAdmission = captureLarkWriteAdmission(db, { selfOpenId: self.open_id, requireVerified: true });
-    const finishes = [];
-    for (const item of targets) {
-      const state = current.find(value => value.chat_id === item.chatId), outcome = outcomes.get(item.chatId);
-      if (!state || !outcome || !['resolved', 'name_missing', 'unresolved', 'conflict', 'failed'].includes(outcome)) continue;
-      const complete = outcome === 'resolved' && Boolean(savedEvidence(state, self.open_id, now())?.name);
-      const failures = complete ? 0 : Math.min(16, Number(item.state?.failures || 0) + (deferredTransport ? 0 : 1));
-      const delay = deferredTransport ? CLAIM_MS : Math.min(MAX_RETRY_MS, CLAIM_MS * 2 ** Math.max(0, failures - 1));
-      finishes.push(effects(`UPDATE lark_im_recipient_state SET failures=${failures},retry_at_ms=${complete ? COMPLETE_RETRY_AT : nowMs + delay},
-        attempt_evidence_json=evidence_json WHERE ${stateKey(item.chatId, accountKey)} AND attempt_token=${quoteSql(token)}
-        AND generation=${Number(item.state?.generation || 0) + 1} AND evidence_json IS ${quoteSql(state.evidence_json)} AND ${recordFence(item.row)}`));
-    }
-    assertReady();
-    commitEnrichmentUpdates(db, finishes, { dryRun: false, reason: 'recipient-sync-result', label: 'finish recipient relationships',
-      writeAdmission: finishAdmission.fence, admissionBeforeCommit: finishAdmission.assertCurrent, withCommit: action => action() });
-    return { ...report, calls, reason: deferredTransport ? 'deferred' : 'completed' };
-  } catch (error) {
-    return { ...report, calls, deferred: claimed || report.deferred,
-      reason: error instanceof RecipientBudgetError ? 'budget' : claimed ? 'deferred' : 'unavailable' };
-  }
+    return { ...report, pending: selected.length > 0, freshOrder, run };
+  } catch (error) { return failure(error); }
 }
 
-export { syncRecipients };
+/** Existing direct caller: one preparation and one bounded execution.
+ * @param {string} db @param {JsonObject} self @param {JsonObject} [deps] */
+function syncRecipients(db, self, deps = {}) {
+  const work = prepareRecipientWork(db, self, deps);
+  return 'run' in work ? work.run() : work;
+}
+
+export { syncRecipients, prepareRecipientWork };
