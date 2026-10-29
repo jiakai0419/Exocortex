@@ -14,6 +14,10 @@ import { writeRemoteSampleState, remoteSamplePaths } from '../src/runtime/worker
 import { executeLarkImHistory } from '../src/maintenance/history.mjs';
 import { readMessageAccountEvidence } from '../src/adapters/lark-im/message-account-evidence.mjs';
 import { loadHistoryDebtHints, mergeHistoryDebtHints, readHistoryDebtSchedule, readHistoryFairRound } from '../src/maintenance/history-debt.mjs';
+import childProcess from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
+import { compactHistorySummary } from '../dist/runtime/worker/lark-im-worker-core.js';
+import { SqliteReadError } from '../src/storage/sqlite/readonly-query.mjs';
 
 const SELF = { open_id: 'ou_synthetic_debt_observer', name: 'Synthetic observer' };
 const hash = text => createHash('sha256').update(text).digest('hex');
@@ -112,8 +116,9 @@ test('two bounded native mget groups process twelve ordinary rows with four self
 
 test('cross-chat pool uses actual fair selection and preserves every independent scope checkpoint',t=>{
   const f=fixture(t,[2,2,2,2,2,2]),r=f.run();
-  assert.equal(r.processed,12);assert.equal(r.request_budget.cli_attempts,6);
-  assert.deepEqual(f.query('SELECT completed_sweeps FROM lark_im_history_progress').map(x=>x.completed_sweeps),Array(6).fill(1));
+  const receipt=JSON.stringify(compactHistorySummary(r));
+  assert.equal(r.processed,12,receipt);assert.equal(r.request_budget.cli_attempts,6,receipt);
+  assert.deepEqual(f.query('SELECT completed_sweeps FROM lark_im_history_progress').map(x=>x.completed_sweeps),Array(6).fill(1),receipt);
 });
 
 test('pool is only a hint: exact two-priority one-fair commit order and separate progress survive',t=>{
@@ -151,6 +156,7 @@ test('metadata generation changed during the request cannot be refreshed from th
   const f=fixture(t);f.onMget=()=>{store.sqliteExec(f.db,"UPDATE records SET received_at='2099-01-01' WHERE id=1;");};
   const r=f.run();assert.equal(r.processed,0);assert.equal(r.failed,0);
   assert.equal(f.query('SELECT * FROM lark_im_history_progress').length,0);
+  assert.deepEqual(r.selection_stop_counts,{source_changed:1});
 });
 
 test('committed prefix remains exact when a later per-record CAS fails',t=>{
@@ -185,6 +191,7 @@ test('a deadline reached during one local commit cannot start another row from t
   }});
   assert.equal(commits,1);assert.equal(r.processed,1);assert.equal(r.failed,0);
   assert.equal(r.request_budget.stop_reason,'time_budget');
+  assert.equal(r.failure_diagnostic,undefined);
   assert.equal(f.query('SELECT after_id FROM lark_im_history_progress')[0].after_id,1);
   assert.equal(f.query('SELECT generation FROM lark_im_history_scheduler')[0].generation,1);
 });
@@ -326,4 +333,78 @@ test('an unrelated acquisition error keeps the finite fetch-unavailable history 
   assert.equal(f.query('SELECT history_error FROM record_observation_state WHERE record_id=1')[0].history_error,'fetch_unavailable');
   assert.equal(f.query('SELECT raw_json FROM records WHERE id=1')[0].raw_json,before);
   assert.equal(f.query('SELECT candidate_json FROM record_observation_state WHERE record_id=1')[0].candidate_json,null);
+});
+
+for(const kind of ['read_timeout','read_failed','invalid_response','dependency_unavailable'])
+test(`local ${kind} after three cross-chat commits retains the exact prefix and finite selection failure`,t=>{
+  const f=fixture(t,[2,2,2,2,2,2]),before=f.query('SELECT id,raw_json,external_version FROM records ORDER BY id');
+  const sentinel='INVENTED_PRIVATE_SQL_PATH_TOKEN';
+  let commits=0,injected=0;
+  const original=childProcess.spawnSync;
+  childProcess.spawnSync=(command,args,options)=>{
+    if(commits===3 && command==='sqlite3' && options?.input?.includes('SELECT * FROM lark_im_history_scheduler WHERE id=1;')) {
+      injected++;assert.equal(options.timeout,1000,'the existing query deadline stays unchanged');
+      if(kind==='invalid_response')return {status:0,stdout:sentinel,stderr:''};
+      if(kind==='read_failed')return {status:1,stdout:'',stderr:sentinel};
+      return {status:null,stdout:'',stderr:sentinel,signal:kind==='read_timeout'?'SIGKILL':null,
+        error:Object.assign(new Error(sentinel),{code:kind==='read_timeout'?'ETIMEDOUT':'ENOENT'})};
+    }
+    return original(command,args,options);
+  };
+  syncBuiltinESMExports();
+  let result;
+  try {result=f.run({}, {commit:(db,options)=>{const effects=store.commitBoundedReplayRecords(db,options);commits++;return effects;}});}
+  finally {childProcess.spawnSync=original;syncBuiltinESMExports();}
+  assert.equal(injected,1);assert.equal(commits,3);assert.equal(result.processed,3);
+  assert.equal(result.ok,false);assert.equal(result.outcome,'batch_interrupted');assert.equal(result.failed,0);
+  assert.equal(result.request_budget.stop_reason,null);assert.equal(result.request_budget.cli_attempts,3);assert.equal(result.request_budget.self_attempts,2);
+  assert.deepEqual(result.failure_diagnostic,{version:1,stage:'batch_select',kind});
+  assert.deepEqual(f.query('SELECT id,raw_json,external_version FROM records ORDER BY id'),before);
+  assert.equal(f.query('SELECT SUM(generation) AS n FROM lark_im_history_progress')[0].n,3);
+  assert.equal(f.query('SELECT generation FROM lark_im_history_scheduler')[0].generation,3);
+  assert.equal(f.query('SELECT COUNT(*) AS n FROM bounded_replay_runs')[0].n,3);
+  const safe=compactHistorySummary(result);
+  assert.deepEqual(safe.failure_diagnostic,result.failure_diagnostic);
+  assert.doesNotMatch(JSON.stringify(safe),/INVENTED_PRIVATE|sqlite3|SELECT|scope_id|record_id/);
+});
+
+test('unknown commit exception after three rows is observable without adopting private error fields',t=>{
+  const f=fixture(t,[2,2,2,2,2,2]);let commits=0;
+  const result=f.run({}, {commit:(db,options)=>{
+    if(commits===3)throw Object.assign(new Error('INVENTED_PRIVATE_COMMIT_PATH'),{name:'SqliteReadError',reason:'read_timeout',sql:'INVENTED_PRIVATE_SQL'});
+    const effects=store.commitBoundedReplayRecords(db,options);commits++;return effects;
+  }});
+  assert.equal(result.processed,3);assert.equal(result.outcome,'batch_interrupted');assert.equal(result.request_budget.stop_reason,null);
+  assert.deepEqual(result.failure_diagnostic,{version:1,stage:'batch_commit',kind:'unknown'});
+  assert.equal(f.query('SELECT generation FROM lark_im_history_scheduler')[0].generation,3);
+  assert.equal(f.query('SELECT COUNT(*) AS n FROM bounded_replay_runs')[0].n,3);
+  assert.doesNotMatch(JSON.stringify(compactHistorySummary(result)),/INVENTED_PRIVATE|SqliteReadError|sql|stack|message/);
+});
+
+test('a zero-prefix commit error retains its actual inner stage and single-target throw semantics',t=>{
+  const f=fixture(t),error=new SqliteReadError('read_failed','INVENTED_PRIVATE_ZERO_COMMIT');
+  const deps={commit:()=>{throw error;}};
+  const result=f.run({},deps);
+  assert.equal(result.processed,0);assert.equal(result.outcome,'batch_interrupted');assert.equal(result.request_budget.stop_reason,null);
+  assert.deepEqual(result.failure_diagnostic,{version:1,stage:'batch_commit',kind:'read_failed'});
+  assert.equal(f.query('SELECT COUNT(*) AS n FROM bounded_replay_runs')[0].n,0);
+  assert.throws(()=>f.run({maxRecords:1,maxCliAttempts:4},deps),cause=>cause===error,'the existing single-target error must remain the same thrown object');
+});
+
+test('a zero-prefix live-selection timeout is distinct from batch preparation',t=>{
+  const f=fixture(t);let selections=0;
+  const original=childProcess.spawnSync;
+  childProcess.spawnSync=(command,args,options)=>{
+    if(command==='sqlite3' && options?.input?.includes('SELECT * FROM lark_im_history_scheduler WHERE id=1;') && ++selections===2) {
+      assert.equal(options.timeout,1000);
+      return {status:null,stdout:'',stderr:'INVENTED_PRIVATE_ZERO_SELECT',signal:'SIGKILL',
+        error:Object.assign(new Error('INVENTED_PRIVATE_ZERO_SELECT'),{code:'ETIMEDOUT'})};
+    }
+    return original(command,args,options);
+  };
+  syncBuiltinESMExports();let result;
+  try {result=f.run();} finally {childProcess.spawnSync=original;syncBuiltinESMExports();}
+  assert.equal(selections,2);assert.equal(result.processed,0);assert.equal(result.outcome,'batch_interrupted');
+  assert.deepEqual(result.failure_diagnostic,{version:1,stage:'batch_select',kind:'read_timeout'});
+  assert.equal(result.request_budget.stop_reason,null);assert.equal(f.query('SELECT COUNT(*) AS n FROM bounded_replay_runs')[0].n,0);
 });

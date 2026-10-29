@@ -29,7 +29,12 @@ export function messageContentEvidence(row, canonical, raw, display) {
   const native = object(raw.raw_api) ? raw.raw_api : raw;
   if (canonical.deleted === true || raw.deleted === true || native.deleted === true)
     return { state: 'recalled', source: 'native_tombstone', reason: null };
-  const rendering = display.card || display.system || canonical.content_rendering || raw.content_rendering;
+  const rendering = display.media || display.card || display.system || canonical.content_rendering || raw.content_rendering;
+  // A legacy 'rendered' claim is not downloaded-media evidence. Even a
+  // malformed wrapper or missing native type cannot borrow that claim.
+  if (!display.media && rendering?.status === 'rendered'
+    && [canonical.msg_type, raw.msg_type, raw.message_type, native.msg_type, native.message_type]
+      .some(type => ['image', 'sticker'].includes(type))) return evidence('invalid');
   if (rendering) return fromRendering(rendering);
   const type = canonical.msg_type || native.msg_type || native.message_type;
   let item = native;

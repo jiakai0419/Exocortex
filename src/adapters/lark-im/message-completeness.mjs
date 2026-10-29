@@ -14,6 +14,7 @@ export const MESSAGE_COMPLETENESS_REASONS = Object.freeze([
   'sender_identity_conflict', 'sender_name_missing', 'sender_name_unverified',
   'recipient_identity_unknown', 'recipient_identity_conflict', 'recipient_name_missing',
   'name_explicitly_cleared', 'content_pending', 'content_partial', 'content_invalid',
+  'content_resource_unavailable', 'content_resource_unsupported', 'content_resource_invalid', 'content_reference_missing', 'content_reference_invalid',
   'content_unsupported', 'permission_denied', 'unsupported_identity',
 ]);
 const PERSON = new Set(['open_id', 'user_id', 'union_id']);
@@ -196,11 +197,16 @@ function contentRequirement(canonical, raw, native, display, evidence) {
   if (content.state === 'recalled' && [canonical, raw, native].some(value => value.deleted === true)) {
     return satisfied('content', 'source_tombstone');
   }
+  const mediaReasons = { media_resource_unavailable: 'content_resource_unavailable',
+    media_resource_unsupported:'content_resource_unsupported',media_resource_invalid:'content_resource_invalid',
+    media_reference_missing: 'content_reference_missing', media_reference_invalid: 'content_reference_invalid' };
+  if (content.state === 'partial' && Object.hasOwn(mediaReasons, content.reason))
+    return requirement('content', 'blocked', mediaReasons[content.reason], 'media_reference');
   if (['partial', 'unsupported'].includes(content.state) && UNSUPPORTED_CONTENT.has(content.reason))
     return requirement('content', 'blocked', 'content_unsupported', 'renderer');
   // Read-time renderers use the current raw snapshot. A successfully rebuilt
   // card/system projection supersedes an older stored renderer diagnosis.
-  const renderings = [display.card || display.system || canonical.content_rendering || raw.content_rendering].filter(object);
+  const renderings = [display.media || display.card || display.system || canonical.content_rendering || raw.content_rendering].filter(object);
   const unsupported = renderings.find(value => value.status !== 'rendered' && UNSUPPORTED_CONTENT.has(value.reason));
   if (unsupported) return requirement('content', 'blocked', 'content_unsupported', 'renderer');
   if (renderings.some(value => ['partial', 'structured_fallback'].includes(value.status))) return missing('content', 'content_partial');
@@ -285,7 +291,8 @@ export function evaluateMessageCompleteness(input = {}) {
     : reasons.includes('account_conflict') || requirements.some(item => item.state === 'conflict') ? 'review_identity'
     : reasons.includes('permission_denied') ? 'review_permissions'
     : reasons.includes('name_explicitly_cleared') ? 'review_explicit_clear'
-    : reasons.includes('content_unsupported') ? 'review_content'
+    : reasons.some(reason => ['content_unsupported', 'content_resource_unavailable', 'content_resource_unsupported', 'content_resource_invalid',
+      'content_reference_missing', 'content_reference_invalid'].includes(reason || '')) ? 'review_content'
     : `resolve_${requirements.find(item => item.state === 'missing')?.field || 'content'}`;
   return { version: 1, state, requirements, reasons, next_action };
 }

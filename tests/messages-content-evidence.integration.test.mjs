@@ -106,8 +106,8 @@ function fixtures() {
   add('forward detail route cannot be invented', 'merge_forward', {}, { body: 'Invented unsupported detail.',
     mutate: raw => { raw.raw_api_expansions = { merge_forward: { source_api: 'invented.route', items: [] } }; },
     state: 'enriching', reason: 'content_invalid' });
-  add('unsupported media is not invented prose support', 'sticker', { file_key: 'synthetic_sticker_key' },
-    { state: 'blocked', reason: 'content_unsupported' });
+  add('media reference is not invented prose support', 'sticker', { file_key: 'synthetic_sticker_key' },
+    { state: 'blocked', reason: 'content_resource_unsupported' });
   add('legacy canonical text supplies only the absent source type', 'text', { text: 'Invented legacy typed text.' },
     { body: 'Invented legacy typed text.', mutate: raw => { delete raw.msg_type; } });
   add('legacy canonical text still resolves exact mentions', 'text', { text: 'Hello @_user_1.' },
@@ -180,7 +180,7 @@ function run(f, args) {
 }
 const messages = (f, format, limit = 100) => run(f, [join(ROOT, 'bin/exocortex.mjs'), 'messages', '--db', f.db, '--limit', String(limit), '--format', format]);
 const header = row => `RECEIVED ${new Date(row.occurred_at).toLocaleString('en-US', { timeZone: 'UTC' })}  ${row.external_id.slice(0, 8)}...  群聊`;
-const reasonLabels = { content_invalid: '消息内容需核验', content_pending: '消息详情待补全', content_partial: '消息内容未完整解析', content_unsupported: '消息类型尚未完整支持' };
+const reasonLabels = { content_invalid: '消息内容需核验', content_pending: '消息详情待补全', content_partial: '消息内容未完整解析', content_unsupported: '消息类型尚未完整支持', content_resource_unavailable: '消息资源尚无可用证据', content_resource_unsupported:'来源接口不支持读取此类资源' };
 
 test('real CLI and quality verify legacy content against its exact source without changing storage, order or neighbors', t => {
   const cases = fixtures(), f = fixture(t, cases), before = snapshot(f), ordered = [...cases].reverse();
@@ -199,7 +199,7 @@ test('real CLI and quality verify legacy content against its exact source withou
     const start = text.indexOf(header(stored)), end = index + 1 < ordered.length ? text.indexOf(header(ordered[index + 1].row)) : text.length;
     assert(start >= 0 && end > start, `${expected.label}: exact text header and unchanged position`);
     const block = text.slice(start, end).trimEnd();
-    if (expected.reason) assert.equal(block, `${header(stored)}\n  状态    ${expected.state === 'blocked' ? '准备受阻' : '等待完整信息'}\n  原因    ${reasonLabels[expected.reason]}\n  查看    messages --format json 可检查已保存内容与原因`, expected.label);
+    if (expected.reason) assert.equal(block, `${header(stored)}\n  状态    ${expected.state === 'blocked' ? '准备受阻' : '等待完整信息'}\n  原因    ${reasonLabels[expected.reason]}${expected.reason === 'content_resource_unsupported' ? '\n  类型    贴纸\n  资源    [贴纸] 已保存资源引用；飞书消息资源接口不支持读取贴纸' : ''}\n  查看    messages --format json 可检查已保存内容与原因`, expected.label);
     else {
       assert(block.includes(`\n  发送人  ${NAME}\n  群      ${TITLE}\n`), expected.label);
       if (expected.shown) assert(block.includes(expected.shown), `${expected.label}: unchanged supported display: ${block}`);

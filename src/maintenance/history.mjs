@@ -11,6 +11,7 @@ import { captureLarkWriteAdmission } from '../diagnostics/lark-write-admission.m
 import { commitBoundedReplayRecords, quoteSql, normalizeBoundedReplayRecords } from '../../dist/storage/sqlite/ingestion-store.js';
 import { scopeObservationContext } from './scope-config-policy.mjs';
 import { loadHistoryDebtHints, readHistoryDebtSchedule, selectHistoryDebtTarget, readHistoryFairRound, readHistoryCandidatePool } from './history-debt.mjs';
+import { historyFailureDiagnostic } from './history-diagnostics.mjs';
 
 const sha = text => createHash('sha256').update(text).digest('hex');
 const PROFILE = 'known_record_history/v1';
@@ -188,12 +189,13 @@ function commitHistoryTarget(options, deps, session, input) {
   const effects = session.withCommit ? session.withCommit(commit, { allowStoppedForFailure: error !== null && records.length === 0 }) : commit();
   return { ok: error === null, profile: PROFILE, outcome: error || (effects.conflicts ? 'pending_observation' : 'processed'),
     ...effects, request_budget: requestBudget, cursor_policy: 'unchanged', coverage: 'known_rows_only',
-    ...(schedule ? { lane: priority ? 'priority' : 'fair', priority_hint_reason: schedule.reason, fair_round_reason: schedule.fairRound.reason } : {}) };
+    ...(schedule ? { lane: priority ? 'priority' : 'fair', priority_hint_reason: schedule.reason, fair_round_reason: schedule.fairRound.reason,
+      ...(schedule.diagnostic ? { priority_hint_diagnostic: schedule.diagnostic } : {}) } : {}) };
 }
 
 /** Bounded speculative reads do not grant a turn. Only the original live
  * scheduler can select a row from this acquisition for its single-row CAS. */
-function executeHistoryGroup(options, deps, session, initialTarget, capacity) {
+function executeHistoryGroup(options, deps, session, initialTarget, capacity, diagnosticContext) {
   const db=options.db,now=deps.now || Date.now,startedAtMs=now(),attemptsBefore=session.summary().cli_attempts;
   const binding=captureRemoteAccountBinding({db});
   if(!binding || binding.conflict) throw new Error('history account binding unavailable');
@@ -268,29 +270,38 @@ function executeHistoryGroup(options, deps, session, initialTarget, capacity) {
   if(after?.open_id!==self.open_id)throw new Error('history account identity changed');
   admission.assertCurrent();session.assertReady();
   const results=[],consumed=new Set(),group=randomUUID();
+  let stage = 'batch_select', selectionStop = null;
   try {
   for(let index=0;index<capacity;index++) {
+    stage = 'batch_select';
     session.assertReady();
     const live=selectScheduledTarget(db,options,binding,accountKey,deps,startedAtMs);
-    if(!live)break;
+    if(!live) { selectionStop='no_target'; break; }
     const fixed=pool.find(item=>item.record.id===live.target.record.id);
-    if(!fixed || consumed.has(fixed.record.id))break;
+    if(!fixed) { selectionStop='outside_pool'; break; }
+    if(consumed.has(fixed.record.id)) { selectionStop='already_consumed'; break; }
     if(fixed.observationGeneration!==live.target.observationGeneration || JSON.stringify(fixed.record)!==JSON.stringify(live.target.record) ||
        fixed.sourceConfigJson!==live.target.sourceConfigJson || JSON.stringify(fixed.scope)!==JSON.stringify(live.target.scope) ||
-       JSON.stringify(fixed.checkpoint.detailTask)!==JSON.stringify(live.target.checkpoint.detailTask))break;
+       JSON.stringify(fixed.checkpoint.detailTask)!==JSON.stringify(live.target.checkpoint.detailTask)) { selectionStop='source_changed'; break; }
     const row=fixed.record,scope=fixed.scope,records=preparedRecords.get(row.id);
     // Refresh only scheduler/checkpoint fences. Never recapture the row basis
     // after remote acquisition or turn this response into a second observation.
     const target={...fixed,checkpoint:{...live.target.checkpoint,detailTask:fixed.checkpoint.detailTask}};
     const writeAdmission={...admission,fence:{...admission.fence,scopes:admission.fence.scopes.filter(s=>s.id===scope.id)}};
     session.assertReady();
+    stage = 'batch_commit';
     const result=commitHistoryTarget(options,deps,session,{target,schedule:live.schedule,priority:live.priority,binding,self,accountKey,
       startedAtMs,attemptId:`${group}:${row.id}`,records,pages:1,fetchedCount:1,error:null,writeAdmission,
       acquisitionMode:'targeted_native_ids',batchTargets:pool.length});
     results.push(result);consumed.add(row.id);
   }
-  } catch(error) { if(!results.length)throw error;return {results,error}; }
-  return {results};
+  } catch(error) {
+    const diagnostic=historyFailureDiagnostic(error,stage,'failure');
+    diagnosticContext.failure=diagnostic;
+    if(!results.length)throw error;
+    return {results,error,diagnostic};
+  }
+  return {results,selectionStop};
 }
 
 /** Defaults preserve the single-record public contract. A batch owns one
@@ -313,6 +324,10 @@ function executeLarkImHistory(options, deps = {}) {
     { env: deps.env, ...deps.requestSessionDeps });
   const results = [];
   let stopReason = null, interrupted = false, legacyRequired = false, bulkUnavailable = false;
+  let failureDiagnostic = null, stage = 'batch_prepare';
+  const selectionStops = {};
+  /** @type {{failure:Record<string,any>|null}} */
+  const diagnosticContext={failure:null};
   const configured={...options,maxRecords,maxCliAttempts,maxSelfAttempts};
   while(results.length<maxRecords) {
     target=selectHistoryTarget(options.db);if(!target)break;
@@ -321,15 +336,19 @@ function executeLarkImHistory(options, deps = {}) {
     if(remaining<2){stopReason='cli_budget';break;}
     if(selfRemaining<1){stopReason='self_budget';break;}
     try {
+      diagnosticContext.failure=null;
       session.assertReady();
       if(maxRecords===1 || bulkUnavailable || remaining<3 || selfRemaining<2) {
+        stage = 'single_target';
         const result=executeHistoryTarget(configured,deps,session,target);
         if(result)results.push(result);else break;
       } else {
-        const group=executeHistoryGroup(configured,deps,session,target,Math.min(6,maxRecords-results.length));
+        stage = 'batch_prepare';
+        const group=executeHistoryGroup(configured,deps,session,target,Math.min(6,maxRecords-results.length),diagnosticContext);
         results.push(...group.results);
+        if(group.selectionStop) selectionStops[group.selectionStop]=(selectionStops[group.selectionStop] || 0)+1;
         bulkUnavailable ||= group.bulkUnavailable===true;
-        if(group.error){stopReason=session.summary().stop_reason;interrupted=!stopReason;break;}
+        if(group.error){stopReason=session.summary().stop_reason;interrupted=!stopReason;failureDiagnostic=group.diagnostic;break;}
         if(group.legacyRequired){legacyRequired=true;break;}
         if(!group.results.length)break;
       }
@@ -337,6 +356,7 @@ function executeLarkImHistory(options, deps = {}) {
       stopReason=session.summary().stop_reason;
       if(!stopReason) {if(maxRecords===1)throw error;interrupted=true;}
       if(maxRecords===1)throw error;
+      failureDiagnostic=diagnosticContext.failure || historyFailureDiagnostic(error,stage,'failure');
       break;
     }
   }
@@ -352,6 +372,9 @@ function executeLarkImHistory(options, deps = {}) {
     conflicts: results.reduce((sum,result) => sum + result.conflicts, 0),
     failed: results.filter(result => !result.ok).length,
     priority_hint_reason: results.at(-1)?.priority_hint_reason || 'not_attempted',
+    ...(results.at(-1)?.priority_hint_diagnostic ? { priority_hint_diagnostic: results.at(-1).priority_hint_diagnostic } : {}),
+    ...(interrupted && failureDiagnostic ? { failure_diagnostic: failureDiagnostic } : {}),
+    ...(Object.keys(selectionStops).length ? { selection_stop_counts: selectionStops } : {}),
     ...(results.length ? { fair_round_reason: results.at(-1).fair_round_reason } : {}),
     request_budget: budget, cursor_policy: 'unchanged', coverage: 'known_rows_only' };
 }

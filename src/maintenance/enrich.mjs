@@ -4,21 +4,52 @@ import { NAME_LOOKUP_RETRY_BUDGET_MS } from "../adapters/lark-im/name-resolver.m
 import { enrichRecords } from "./enrich-records.mjs";
 import { enrichScopes } from "./enrich-scopes.mjs";
 import { enrichRecipients } from "./enrich-recipients.mjs";
+import { enrichResources } from "./enrich-resources.mjs";
 import { createMaintenanceRequestSession } from "./request-session.mjs";
 import { validateReviewOptions } from "./review-artifact.mjs";
 
 class EnrichmentInputError extends Error {}
 
+/** @param {Record<string, any>} options */
+function validateRequestBudget(options) {
+  for (const [field, flag, maximum] of [["maxCliAttempts", "--max-cli-attempts", 1000], ["maxSeconds", "--max-seconds", 180]]) {
+    const value = options[field];
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < 1 || value > maximum)) {
+      throw new EnrichmentInputError(`${flag} must be an integer from 1 to ${maximum}`);
+    }
+  }
+}
+
 /** One workflow entrance; target-specific planning and CAS remain separate.
  * @param {Record<string, any>} options @param {Record<string, any>} [deps] */
 function executeEnrichment(options, deps = {}) {
+  if (options.target === 'resources') {
+    if (options.probeApps || options.unsafeDetails || options.senderOnly || options.namesOnly
+      || options.senderId !== undefined || options.limit !== undefined
+      || options.reviewOut !== undefined || options.reviewIn !== undefined || options.reviewSha256 !== undefined) {
+      throw new EnrichmentInputError('--target resources accepts only exact --record-id targets, request budgets and --resource-dir');
+    }
+    if (!Array.isArray(options.recordIds) || options.recordIds.length < 1 || options.recordIds.length > 20
+      || options.recordIds.some(id => !Number.isSafeInteger(id) || id < 1)
+      || new Set(options.recordIds).size !== options.recordIds.length) {
+      throw new EnrichmentInputError('--target resources requires 1 to 20 unique positive --record-id values');
+    }
+    if (options.resourceDir !== undefined && (typeof options.resourceDir !== 'string' || !options.resourceDir)) {
+      throw new EnrichmentInputError('--resource-dir requires a non-empty path');
+    }
+    validateRequestBudget(options);
+    // Resources own their session: an offline preview must not create the
+    // names session or inherit its default scan limit and transport wrapper.
+    return (deps.enrichResources || enrichResources)({ ...options, dryRun: options.apply !== true }, deps);
+  }
+  if (options.resourceDir !== undefined) throw new EnrichmentInputError('--resource-dir requires --target resources');
   const recipients = options.target === 'recipients';
   if (recipients && (options.probeApps || options.unsafeDetails || options.senderOnly || options.senderId || options.namesOnly
     || options.limit !== undefined || options.reviewOut !== undefined || options.reviewIn !== undefined || options.reviewSha256 !== undefined)) {
     throw new EnrichmentInputError('--target recipients accepts only exact --record-id targets and request budgets');
   }
   validateReviewOptions(options, 'names');
-  if (!["records", "scopes", "recipients"].includes(options.target)) throw new EnrichmentInputError("--target must be records, scopes or recipients");
+  if (!["records", "scopes", "recipients"].includes(options.target)) throw new EnrichmentInputError("--target must be records, scopes, recipients or resources");
   if (options.recordIds !== undefined && !Array.isArray(options.recordIds)) throw new EnrichmentInputError("--record-id requires an integer selection");
   const hasRecordIds = Array.isArray(options.recordIds) && options.recordIds.length > 0;
   if (options.target === "scopes" && (options.probeApps || options.unsafeDetails || options.senderOnly || options.senderId || options.namesOnly || hasRecordIds)) {
@@ -41,12 +72,7 @@ function executeEnrichment(options, deps = {}) {
       throw new EnrichmentInputError("--names-only cannot be combined with --sender-only, --probe-apps or --limit");
     }
   }
-  for (const [field, flag, maximum] of [["maxCliAttempts", "--max-cli-attempts", 1000], ["maxSeconds", "--max-seconds", 180]]) {
-    const value = options[field];
-    if (value !== undefined && (!Number.isSafeInteger(value) || value < 1 || value > maximum)) {
-      throw new EnrichmentInputError(`${flag} must be an integer from 1 to ${maximum}`);
-    }
-  }
+  validateRequestBudget(options);
   /** @type {Record<string, any>} */
   const opts = { ...options, dryRun: options.apply !== true,
     limit: options.limit ?? (options.senderOnly ? 50 : options.target === "records" ? 1000 : 50) };

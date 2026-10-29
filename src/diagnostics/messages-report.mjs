@@ -1,5 +1,7 @@
 // @ts-check
 
+import { renderMediaProjection } from "../adapters/lark-im/media-content.mjs";
+import { projectMediaResource } from "../adapters/lark-im/media-resource-projection.mjs";
 import { readOnlySqliteJson } from "../storage/sqlite/readonly-query.mjs";
 import { renderSystemProjection } from "../adapters/lark-im/system-content.mjs";
 import { renderCardContent } from "../adapters/lark-im/card-content.mjs";
@@ -28,6 +30,7 @@ const projectionEvidence = new WeakMap();
  * @property {number} limit
  * @property {string} search
  * @property {number[]=} recordIds Internal bounded observer selection; never a public CLI flag.
+ * @property {string=} resourceDir Explicit private media store; never triggers downloads.
  *
  * @typedef {Record<string, any>} Row
  *
@@ -46,6 +49,7 @@ const projectionEvidence = new WeakMap();
  *     recipient: string | null,
  *     chat: string | null,
  *     body: unknown,
+ *     media?: NonNullable<ReturnType<typeof renderMediaProjection>>,
  *     card?: import("../adapters/lark-im/raw-message.mjs").RenderResult,
  *     system?: NonNullable<ReturnType<typeof renderSystemProjection>>
  *   }
@@ -149,7 +153,7 @@ function loadMessages(dbPath, opts, deps = {}) {
       && typeof row.container_id==='string' && type_scope_id===chatScopeId(row.container_id),
       account?recipients.get(`${recipientAccountKey(account)}:${row.container_id}`):undefined,
       nameAccount?titles.get(`${nameAccount}:${row.container_id}`):undefined,saved,true,
-      readSavedSenderRouteEvidence(row,canonical,raw,owner,snapshot.nameRoutes));
+      readSavedSenderRouteEvidence(row,canonical,raw,owner,snapshot.nameRoutes),{db:dbPath,resourceDir:opts.resourceDir});
   });
   messageReadMetadata.set(messages,{population:snapshot.population,as_of:snapshot.as_of,
     observations:snapshot.observations,
@@ -381,7 +385,7 @@ function conversationType(row, canonical, raw, config, currentChat, recipientCon
  * @param {{blockers:Row[]}} [routeEvidence]
  * @returns {EnrichedMessage}
  */
-function enrichRow(row, currentChat, scopeSourceMatches = true, recipientConfig, currentName, savedSender = null, includeReadiness = false, routeEvidence = undefined) {
+function enrichRow(row, currentChat, scopeSourceMatches = true, recipientConfig, currentName, savedSender = null, includeReadiness = false, routeEvidence = undefined, /** @type {{db:string,resourceDir?:string}|undefined} */ resourceContext = undefined) {
   const canonical = parseMaybeJson(row.canonical_json) || {};
   const raw = parseMaybeJson(row.raw_json) || {};
   const config = parseMaybeJson(row.scope_config_json) || {};
@@ -399,6 +403,8 @@ function enrichRow(row, currentChat, scopeSourceMatches = true, recipientConfig,
   const isP2p = chatType === "p2p";
   const isGroupLike = !isP2p;
   const system = messageType === "system" ? displaySystem(row.body, canonical, raw, systemContext(row, canonical, raw, config)) : null;
+  const sourceMedia = renderMediaProjection(row, canonical, raw);
+  const media = resourceContext ? projectMediaResource(resourceContext.db,resourceContext.resourceDir,row,canonical,raw,sourceMedia) : sourceMedia;
   /** @type {EnrichedMessage} */
   const result = {
     ...row,
@@ -418,6 +424,7 @@ function enrichRow(row, currentChat, scopeSourceMatches = true, recipientConfig,
       chat: isGroupLike ? nameOrId(chatName, chatId) : null,
       body: system?.text || displayBody(row.body, canonical, raw),
       ...(system ? { system } : {}),
+      ...(media ? { media } : {}),
       ...(messageType === "interactive" ? { card: displayCard(raw) } : {}),
     },
   };

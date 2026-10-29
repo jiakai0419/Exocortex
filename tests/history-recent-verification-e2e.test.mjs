@@ -14,6 +14,8 @@ import { writeRemoteSampleState, remoteSamplePaths } from '../src/runtime/worker
 import { executeLarkImHistory } from '../src/maintenance/history.mjs';
 import { collectRemoteSample } from '../src/diagnostics/remote-sample.mjs';
 import { loadPendingHistoryVerifications } from '../src/diagnostics/remote-sample-history.mjs';
+import { compactHistorySummary } from '../dist/runtime/worker/lark-im-worker-core.js';
+import { readOnlySqliteJson, SqliteReadError } from '../src/storage/sqlite/readonly-query.mjs';
 
 // Real SQLite writer transaction and final Python coverage/verification snapshot.
 // Only remote responses and writer request-session transport are synthetic.
@@ -23,7 +25,7 @@ const CHAT = 'oc_synthetic_recent_interleave', SCOPE = chatScopeId(CHAT), q = st
 const sha = value => createHash('sha256').update(value).digest('hex');
 const pause = () => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
 
-function fixture(t, ageHours) {
+function fixture(t, ageHours, initialDeps = {}) {
   const directory = realpathSync(mkdtempSync(join(tmpdir(), 'recent-verification-snapshot-')));
   chmodSync(directory, 0o700);
   t.after(() => rmSync(directory, { recursive: true, force: true }));
@@ -54,22 +56,24 @@ function fixture(t, ageHours) {
       failures: 0, rotation: 0, observations, last_outcome: 'ok', cooldowns: {}, blocked_reason: null }, observed);
   const query = sql => store.sqliteQuery(db, sql);
   const debt = () => query('SELECT * FROM lark_im_history_debt')[0];
-  const runWriter = remote => {
+  const runWriter = (remote, writerDeps = {}) => {
     let calls = 0;
     return executeLarkImHistory({ db, logDir: directory, maxRecords: 1, maxCliAttempts: 4, maxSeconds: 30 }, {
       createRequestSession: () => ({ runLark() { throw Error('unexpected synthetic transport'); }, assertReady() {},
         summary: () => ({ cli_attempts: calls, max_cli_attempts: 4, max_seconds: 30, elapsed_ms: 1, stop_reason: null }) }),
       getSelfProfile: () => { calls++; return SELF; },
       fetchChatMessageList: () => { calls++; return { messages: [normalizeApiMessage(remote)], pages: 1 }; },
+      ...writerDeps,
     });
   };
-  runWriter(initial); // A legitimate equivalent acquisition creates the first bound ticket.
-  assert.equal(debt().status, 'awaiting_verification');
-  return { db, directory, key, initial, fresh, observations, binding, query, debt, runWriter };
+  const initialWriter=runWriter(initial,initialDeps); // A legitimate equivalent acquisition creates the first bound ticket.
+  return { db, directory, key, initial, fresh, observations, binding, query, debt, runWriter, initialWriter };
 }
 
 for (const ageHours of [1, 72]) for (const equalResponse of [false, true]) test(`${ageHours}h target, ${equalResponse ? 'positive-equal' : 'older'} response: acquisition before a new ticket cannot retire any debt in the real final snapshot`, t => {
-  const f = fixture(t, ageHours), firstTicket = f.debt().verification_requested_at_ms;
+  const f = fixture(t, ageHours);
+  assert.equal(f.debt()?.status, 'awaiting_verification', JSON.stringify(compactHistorySummary(f.initialWriter)));
+  const firstTicket = f.debt().verification_requested_at_ms;
   let calls = 0, identities = 0, acquiredAt, acceptedAt, latestTicket;
   const started = Date.now(), callsSeen = [];
   const result = collectRemoteSample(f.db, { previousObservations: f.observations,
@@ -111,4 +115,54 @@ for (const ageHours of [1, 72]) for (const equalResponse of [false, true]) test(
   assert.ok(loadPendingHistoryVerifications(f.db, result.observations, f.binding, Date.now()).includes(f.key));
   assert.equal(result.pendingVerification, true);
   assert.equal(f.query('SELECT external_version FROM records')[0].external_version, f.fresh.update_time);
+});
+
+const PRIVATE_SENTINEL='INVENTED_PRIVATE_HISTORY_PATH_SQL_TOKEN';
+const hintFaults = [
+  { label:'missing state', reason:'state_missing', stage:'state_read', kind:'state_missing',
+    deps:{readState:()=>({status:'missing'})} },
+  { label:'invalid state', reason:'state_invalid', stage:'state_read', kind:'state_invalid',
+    deps:{readState:()=>({status:'invalid'})} },
+  { label:'unexpected state-reader exception', reason:'mapping_unavailable', stage:'state_read', kind:'unknown',
+    deps:{readState:()=>{throw new Error(PRIVATE_SENTINEL);}} },
+  { label:'invalid policy JSON', reason:'mapping_unavailable', stage:'source_policy_decode', kind:'invalid_policy',
+    deps:{sqliteJson:(_db,_sql,label)=>{assert.equal(label,'read history debt policy');return [{enabled:1,config_json:PRIVATE_SENTINEL}];}} },
+  { label:'malformed mapped metadata', reason:'mapping_unavailable', stage:'metadata_map', kind:'unknown',
+    deps:{sqliteJson:(db,sql,label,options)=>label==='map history debt metadata'?[null]:readOnlySqliteJson(db,sql,label,options)} },
+  { label:'forged error category remains unknown', reason:'mapping_unavailable', stage:'source_policy_read', kind:'unknown',
+    deps:{sqliteJson:()=>{throw Object.assign(new Error(PRIVATE_SENTINEL),{name:'SqliteReadError',reason:'read_timeout'});}} },
+  ...['source_policy_read','metadata_read'].flatMap(stage=>
+    ['read_timeout','read_failed','invalid_response','dependency_unavailable'].map(kind=>({
+      label:`${stage} ${kind}`,reason:'mapping_unavailable',stage,kind,
+      deps:{sqliteJson:(db,sql,label,options)=>{
+        if(label===(stage==='source_policy_read'?'read history debt policy':'map history debt metadata')) {
+          assert.equal(options.timeoutMs,1000,'the original one-second read budget remains');
+          throw new SqliteReadError(kind,PRIVATE_SENTINEL);
+        }
+        return readOnlySqliteJson(db,sql,label,options);
+      }},
+    }))),
+];
+
+for(const fault of hintFaults)test(`initial writer ${fault.label} preserves fair work and explains the missing priority ticket`,t=>{
+  const f=fixture(t,1,{debtDeps:fault.deps}),result=f.initialWriter;
+  assert.equal(result.ok,true);assert.equal(result.lane,'fair');assert.equal(result.priority_hint_reason,fault.reason);
+  assert.deepEqual(result.priority_hint_diagnostic,{version:1,stage:fault.stage,kind:fault.kind});
+  assert.equal(result.request_budget.cli_attempts,2);assert.equal(result.request_budget.stop_reason,null);
+  assert.equal(f.debt(),undefined,'no priority ticket may be invented without valid hints');
+  assert.deepEqual(JSON.parse(f.query('SELECT raw_json FROM records')[0].raw_json),f.initial);
+  assert.equal(f.query('SELECT generation FROM lark_im_history_scheduler')[0].generation,1);
+  const progress=f.query('SELECT after_id,completed_sweeps FROM lark_im_history_progress')[0];
+  assert.deepEqual(progress,{after_id:1,completed_sweeps:1});
+  const safe=compactHistorySummary(result);
+  assert.deepEqual(safe.priority_hint_diagnostic,result.priority_hint_diagnostic);
+  assert.doesNotMatch(JSON.stringify(safe),/INVENTED_PRIVATE|SELECT|record_id|scope_id|stack|message/);
+});
+
+test('healthy initial writer still creates the priority ticket without failure diagnostics',t=>{
+  const f=fixture(t,1),result=f.initialWriter;
+  assert.equal(result.ok,true);assert.equal(result.lane,'priority');assert.equal(result.priority_hint_reason,'ready');
+  assert.equal(result.priority_hint_diagnostic,undefined);assert.equal(result.failure_diagnostic,undefined);
+  assert.equal(f.debt()?.status,'awaiting_verification',JSON.stringify(compactHistorySummary(result)));
+  assert.equal(result.request_budget.cli_attempts,2);assert.equal(result.request_budget.stop_reason,null);
 });

@@ -6,6 +6,7 @@ import { readRemoteSampleState, remoteSamplePaths } from '../runtime/worker/remo
 import { digest, sampleScopeHash } from '../diagnostics/remote-sample-core.mjs';
 import { chatScopeId } from '../adapters/lark-im/core.mjs';
 import { scopeObservationContext } from './scope-config-policy.mjs';
+import { historyFailureDiagnostic } from './history-diagnostics.mjs';
 
 const sha = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const MAX_METADATA = 20000;
@@ -16,19 +17,26 @@ const MAX_METADATA = 20000;
 export function loadHistoryDebtHints(db, logDir, binding, now, deps = {}) {
   const fallback = reason => ({ reason, hints: null });
   if (!logDir) return fallback('not_configured');
+  let stage = 'state_read';
   try {
     const loaded = (deps.readState || readRemoteSampleState)(remoteSamplePaths(logDir, binding.database_key).state, binding.database_key, now);
-    if (loaded.status !== 'ready') return fallback(loaded.status === 'missing' ? 'state_missing' : 'state_invalid');
+    if (loaded.status !== 'ready') {
+      const reason = loaded.status === 'missing' ? 'state_missing' : 'state_invalid';
+      return { ...fallback(reason), diagnostic: { version: 1, stage, kind: reason } };
+    }
     const state = loaded.state;
     if (!state || state.account_key !== binding.account_key) return fallback('account_mismatch');
     const observations = Object.entries(state.observations);
     if (!observations.length) return { reason: 'ready', hints: [] };
     const query = deps.sqliteJson || readOnlySqliteJson;
+    stage = 'source_policy_read';
     const source = query(db, "SELECT enabled,config_json FROM sources WHERE id='lark.im';", 'read history debt policy', { timeoutMs: 1000 })[0];
     if (source?.enabled !== 1) return fallback('source_disabled');
+    stage = 'source_policy_decode';
     const baseline = JSON.parse(source.config_json).initial_sync_start_ms;
     if (!Number.isSafeInteger(baseline) || baseline < 100_000_000_000) return fallback('policy_unavailable');
     const targets = [...new Set(observations.map(([, value]) => value.target))];
+    stage = 'metadata_read';
     const rows = query(db, `SELECT r.id,r.external_id,r.external_version,r.container_id,r.occurred_at_ms,
       s.id AS scope_id,s.config_json FROM records r INDEXED BY idx_records_container_time
       JOIN sync_scopes s ON s.source_id='lark.im' AND s.enabled=1
@@ -40,6 +48,7 @@ export function loadHistoryDebtHints(db, logDir, binding, now, deps = {}) {
         AND CASE WHEN json_valid(r.canonical_json) THEN json_extract(r.canonical_json,'$.source_api')='im.v1.messages' ELSE 0 END
       LIMIT ${MAX_METADATA + 1};`, 'map history debt metadata', { timeoutMs: 1000 });
     if (rows.length > MAX_METADATA) return fallback('metadata_budget');
+    stage = 'metadata_map';
     const byKey = new Map();
     for (const row of rows) {
       if (typeof row.container_id !== 'string' || typeof row.external_id !== 'string' ||
@@ -63,7 +72,7 @@ export function loadHistoryDebtHints(db, logDir, binding, now, deps = {}) {
         enqueued_at_ms: observation.first_seen, sample_checked_at_ms: observation.last_checked || observation.last_seen });
     }
     return { reason: 'ready', hints };
-  } catch { return fallback('mapping_unavailable'); }
+  } catch (error) { return { ...fallback('mapping_unavailable'), diagnostic: historyFailureDiagnostic(error, stage, 'hint') }; }
 }
 
 /** Pure reconciliation; the only persisted mutation occurs with the record's
@@ -88,6 +97,7 @@ export function mergeHistoryDebtHints(hints, previous) {
   });
 }
 
+/** @returns {Record<string, any>} */
 export function readHistoryDebtSchedule(db, loaded, now, deps = {}) {
   const query = deps.sqliteJson || readOnlySqliteJson;
   const scheduler = query(db, 'SELECT * FROM lark_im_history_scheduler WHERE id=1;', 'read history scheduler', { timeoutMs: 1000 })[0] ||
@@ -98,7 +108,7 @@ export function readHistoryDebtSchedule(db, loaded, now, deps = {}) {
   const due = queue.filter(row => row.status === 'ready' && row.next_due_at_ms <= now)
     .sort((a,b) => (a.last_attempt_at_ms || a.enqueued_at_ms) - (b.last_attempt_at_ms || b.enqueued_at_ms) || a.enqueued_at_ms - b.enqueued_at_ms || a.record_id - b.record_id);
   return { scheduler, queue, previous, due, selected: scheduler.priority_streak < 2 ? due[0] || null : null,
-    hints: loaded.hints, reason: loaded.reason };
+    hints: loaded.hints, reason: loaded.reason, ...(loaded.diagnostic ? { diagnostic: loaded.diagnostic } : {}) };
 }
 
 /** Read the existing fair checkpoint but select one separately routed priority

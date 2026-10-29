@@ -11,7 +11,7 @@
 <!-- BEGIN GENERATED routes -->
 | 命令 | 能力 | 默认效果 | 默认输出级别 |
 | --- | --- | --- | --- |
-| `messages` | Read local messages newest message time first, including original private JSON. Cards are captured API snapshots and may differ from the current client state. JSON retains card rendering status and diagnostics. | local-read | `private` |
+| `messages` | Read local messages newest message time first, including original private JSON and verified local image resources. Never downloads missing resources. Cards are captured API snapshots and may differ from the current client state. JSON retains card rendering status and diagnostics. | local-read | `private` |
 | `status` | Observe service, health, activity and freshness without live requests. | local-read | `public-safe` |
 | `check` | Collect database, sync and quality evidence and requested extensions. | local-read | `public-safe` |
 | `sync` | Run one bounded pass, preserving message and detail-debt contracts. | remote-read, database-write, activity-write | `private` |
@@ -22,7 +22,7 @@
 | `service uninstall` | Stop and remove the installed service configuration. | service-lifecycle | `public-safe` |
 | `maintenance init` | Initialize schema with its independent initialization lock. | database-write, permissions-write | `public-safe` |
 | `maintenance backup` | Create and verify a private backup before publishing it. | backup-write, same-source-backup-cleanup | `public-safe` |
-| `maintenance enrich` | Preview enrichment of one target; apply commits through its own CAS. | local-read, remote-read | `public-safe` |
+| `maintenance enrich` | Preview enrichment of one target. Resources preview is offline; resources apply only writes a private sidecar and is never scheduled automatically. Other targets apply through their own database CAS. | local-read | `public-safe` |
 | `maintenance preview` | Preview independent exact-target units with durable private reviews and locally validated resume. | local-read, remote-read, private-review-file-write, private-progress-file-write | `public-safe` |
 | `maintenance history` | Recheck a bounded batch of known historical records with durable debt and scan checkpoints. | local-read, remote-read, database-write | `public-safe` |
 | `maintenance repair` | Preview structural recovery; apply uses existing fences. | local-read | `public-safe` |
@@ -48,7 +48,7 @@ node bin/exocortex.mjs --help --all --format json
 <!-- BEGIN GENERATED options -->
 ### messages
 
-Read local messages newest message time first, including original private JSON. Cards are captured API snapshots and may differ from the current client state. JSON retains card rendering status and diagnostics.
+Read local messages newest message time first, including original private JSON and verified local image resources. Never downloads missing resources. Cards are captured API snapshots and may differ from the current client state. JSON retains card rendering status and diagnostics.
 
 默认效果：`local-read`；输出：`private`。
 
@@ -56,6 +56,7 @@ Read local messages newest message time first, including original private JSON. 
 | --- | --- | --- | --- | --- |
 | `--db` | path | `data/exocortex.sqlite` | — | Database; default relative to installation root, explicit relative paths to cwd. |
 | `--format` | text/json | `text` | — | Output format. |
+| `--resource-dir` | path | — | — | Private resource sidecar directory; defaults to the resolved database path plus .resources. Explicit relative paths use cwd. |
 | `--direction` | all/sent/received | `all` | — | Message direction. |
 | `--limit` | integer | `30` | ≥ 1 | Maximum messages. |
 | `--search` | string | `空字符串` | — | Search stored body with SQLite LIKE: % matches any sequence; _ matches one character. Input is wrapped in %; backslash is literal. |
@@ -238,13 +239,15 @@ Create and verify a private backup before publishing it.
 
 ### maintenance enrich
 
-Preview enrichment of one target; apply commits through its own CAS.
+Preview enrichment of one target. Resources preview is offline; resources apply only writes a private sidecar and is never scheduled automatically. Other targets apply through their own database CAS.
 
-默认效果：`local-read, remote-read`；输出：`public-safe`。
+默认效果：`local-read`；输出：`public-safe`。
 
 | 显式模式 | 附加效果或输出级别 |
 | --- | --- |
-| `--apply` | database-write |
+| `--target records\|scopes\|recipients` | remote-read |
+| `--apply with --target records\|scopes\|recipients` | database-write |
+| `--apply with --target resources` | remote-read, private-resource-write |
 | `--unsafe-details` | private |
 | `--review-out` | private-review-file-write |
 
@@ -253,14 +256,15 @@ Preview enrichment of one target; apply commits through its own CAS.
 | `--db` | path | `data/exocortex.sqlite` | — | Database; default relative to installation root, explicit relative paths to cwd. |
 | `--format` | text/json | `text` | — | Output format. |
 | `--apply` | boolean | `false` | — | Commit the planned change; otherwise preview. |
-| `--target` | records/scopes/recipients | — | 必填 | Explicit target; recipients verifies exact sent private-chat targets and stores independent account-bound relationship evidence. |
-| `--limit` | integer | — | ≥ 1 | Records: 1000; scopes: 50; sender-only: 50 (maximum 100); unavailable for recipients. |
+| `--target` | records/scopes/recipients/resources | — | 必填 | Explicit target. Recipients verifies exact sent private-chat targets. Resources verifies exact image targets with account and source fences; no SQLite writes. |
+| `--limit` | integer | — | ≥ 1 | Records: 1000; scopes: 50; sender-only: 50 (maximum 100); unavailable for recipients or resources. |
 | `--probe-apps` | boolean | `false` | — | Force application-name probes; records only. |
 | `--unsafe-details` | boolean | `false` | — | Include private lookup details; records only. |
 | `--sender-only` | boolean | `false` | — | Bounded lookup of one exact sender; requires --sender-id. |
 | `--sender-id` | string | — | — | Exact sender for --sender-only. |
-| `--record-id` | integer | — | 可重复；≥ 1 | Repeat for exact stored records: 1–100 with records --names-only, or 1–20 sent private-chat records with recipients; excludes --limit. |
+| `--record-id` | integer | — | 可重复；≥ 1 | Repeat unique exact stored record IDs: 1–100 with records --names-only, or 1–20 with recipients/resources; excludes --limit. |
 | `--names-only` | boolean | `false` | — | Fill missing sender names only for exact --record-id targets; excludes --sender-only and --probe-apps. |
+| `--resource-dir` | path | — | — | Private resource sidecar directory; defaults to the resolved database path plus .resources. Explicit relative paths use cwd. Resources target only; rejects name, sender, probe, unsafe-detail and review options. |
 | `--max-cli-attempts` | integer | `12` | ≥ 1；≤ 1000 | Hard command-wide lark-cli process-attempt cap, including pages and fallbacks; not an HTTP request count. |
 | `--max-seconds` | integer | `30` | ≥ 1；≤ 180 | Command-wide remote-work deadline; stops without committing a budget-interrupted lookup. |
 | `--review-out` | path | — | — | Publish a private exact-target review file; dry-run only, with explicit request budgets. |

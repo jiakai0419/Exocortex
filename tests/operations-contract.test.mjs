@@ -48,9 +48,15 @@ test("maintenance catalog distinguishes database writes, file writes and support
   assert.ok(preview.effects.includes("private-progress-file-write"));
   for (const id of ["maintenance.enrich", "maintenance.replay"]) {
     const entry = commands.find(command => command.id === id);
-    assert.ok(entry.effects.includes("remote-read"));
     assert.ok(entry.modes.some(({ when, effects }) => when === "--review-out" && effects.includes("private-review-file-write")));
   }
+  assert.ok(commands.find(({ id }) => id === "maintenance.replay").effects.includes("remote-read"));
+  const enrich = commands.find(({ id }) => id === "maintenance.enrich");
+  assert.deepEqual(enrich.effects, ["local-read"], "resource preview must not imply remote reads");
+  assert.deepEqual(enrich.modes.find(({ when }) => when === "--target records|scopes|recipients").effects, ["remote-read"]);
+  assert.deepEqual(enrich.modes.find(({ when }) => when === "--apply with --target records|scopes|recipients").effects, ["database-write"]);
+  assert.deepEqual(enrich.modes.find(({ when }) => when === "--apply with --target resources").effects, ["remote-read", "private-resource-write"]);
+  assert.ok(!enrich.modes.some(({ when }) => when === "--apply"), "writes require explicit target conditions");
   assert.throws(() => parseRouteOptions("maintenance.history", ["--db", "/tmp/synthetic-not-opened.sqlite", "--apply"]), /unknown/i);
 });
 

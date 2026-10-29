@@ -8,6 +8,7 @@ export { parseOptions } from "./parse-options.mjs";
 
 const option = (flag, key, type, description, extra = {}) => ({ flag, key, type, description, ...extra });
 const db = option("--db", "db", "path", "Database; default relative to installation root, explicit relative paths to cwd.", { default: WORKER_DEFAULTS.db });
+const resourceDir = option("--resource-dir", "resourceDir", "path", "Private resource sidecar directory; defaults to the resolved database path plus .resources. Explicit relative paths use cwd.");
 const format = option("--format", "format", "enum", "Output format.", { default: "text", choices: ["text", "json"] });
 const apply = option("--apply", "apply", "boolean", "Commit the planned change; otherwise preview.", { default: false });
 const backupDir = option("--backup-dir", "backupDir", "path", "Private backup directory.", { default: "backups/private" });
@@ -39,7 +40,7 @@ export const GROUPS = Object.freeze([
 ]);
 
 export const COMMANDS = Object.freeze([
-  route("messages", "Read local messages newest message time first, including original private JSON. Cards are captured API snapshots and may differ from the current client state. JSON retains card rendering status and diagnostics.", [db, format,
+  route("messages", "Read local messages newest message time first, including original private JSON and verified local image resources. Never downloads missing resources. Cards are captured API snapshots and may differ from the current client state. JSON retains card rendering status and diagnostics.", [db, format, resourceDir,
     option("--direction", "direction", "enum", "Message direction.", { choices: ["all", "sent", "received"], default: "all" }),
     positive("--limit", "limit", 30, "Maximum messages."), text("--search", "search", "Search stored body with SQLite LIKE: % matches any sequence; _ matches one character. Input is wrapped in %; backslash is literal.", { default: "" }),
   ], ["local-read"], "private"),
@@ -83,19 +84,23 @@ export const COMMANDS = Object.freeze([
     positive("--backup-keep-count", "backupKeepCount", 7, "Same-source backup count to retain."),
     positive("--backup-keep-days", "backupKeepDays", 30, "Same-source backup retention days."),
   ], ["backup-write", "same-source-backup-cleanup"]),
-  route("maintenance.enrich", "Preview enrichment of one target; apply commits through its own CAS.", [db, format, apply,
-    option("--target", "target", "enum", "Explicit target; recipients verifies exact sent private-chat targets and stores independent account-bound relationship evidence.", { choices: ["records", "scopes", "recipients"], required: true }),
-    option("--limit", "limit", "integer", "Records: 1000; scopes: 50; sender-only: 50 (maximum 100); unavailable for recipients.", { min: 1 }),
+  route("maintenance.enrich", "Preview enrichment of one target. Resources preview is offline; resources apply only writes a private sidecar and is never scheduled automatically. Other targets apply through their own database CAS.", [db, format, apply,
+    option("--target", "target", "enum", "Explicit target. Recipients verifies exact sent private-chat targets. Resources verifies exact image targets with account and source fences; no SQLite writes.", { choices: ["records", "scopes", "recipients", "resources"], required: true }),
+    option("--limit", "limit", "integer", "Records: 1000; scopes: 50; sender-only: 50 (maximum 100); unavailable for recipients or resources.", { min: 1 }),
     bool("--probe-apps", "probeApps", "Force application-name probes; records only."),
     bool("--unsafe-details", "unsafeDetails", "Include private lookup details; records only."),
     bool("--sender-only", "senderOnly", "Bounded lookup of one exact sender; requires --sender-id."),
     text("--sender-id", "senderId", "Exact sender for --sender-only."),
-    option("--record-id", "recordIds", "integer", "Repeat for exact stored records: 1–100 with records --names-only, or 1–20 sent private-chat records with recipients; excludes --limit.", { repeat: true, min: 1 }),
+    option("--record-id", "recordIds", "integer", "Repeat unique exact stored record IDs: 1–100 with records --names-only, or 1–20 with recipients/resources; excludes --limit.", { repeat: true, min: 1 }),
     bool("--names-only", "namesOnly", "Fill missing sender names only for exact --record-id targets; excludes --sender-only and --probe-apps."),
+    { ...resourceDir, description: `${resourceDir.description} Resources target only; rejects name, sender, probe, unsafe-detail and review options.` },
     ...maintenanceBudget,
     ...maintenanceReview,
-  ], ["local-read", "remote-read"], "public-safe", [
-    { when: "--apply", effects: ["database-write"] }, { when: "--unsafe-details", privacy: "private" },
+  ], ["local-read"], "public-safe", [
+    { when: "--target records|scopes|recipients", effects: ["remote-read"] },
+    { when: "--apply with --target records|scopes|recipients", effects: ["database-write"] },
+    { when: "--apply with --target resources", effects: ["remote-read", "private-resource-write"] },
+    { when: "--unsafe-details", privacy: "private" },
     { when: '--review-out', effects: ['private-review-file-write'] },
   ]),
   route("maintenance.preview", "Preview independent exact-target units with durable private reviews and locally validated resume.", [

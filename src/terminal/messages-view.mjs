@@ -100,10 +100,17 @@ function renderMessagesText(messages, options = {}) {
         recipient_identity_unknown:'接收人身份待核验',recipient_identity_conflict:'接收人身份冲突',
         recipient_name_missing:'接收人名称待补全',name_explicitly_cleared:'来源已清除名称',
         content_pending:'消息详情待补全',content_partial:'消息内容未完整解析',content_invalid:'消息内容需核验',
+        content_resource_unavailable:'消息资源尚无可用证据',content_reference_missing:'消息资源引用缺失',
+        content_resource_unsupported:'来源接口不支持读取此类资源',content_resource_invalid:'本地资源未通过验证',
+        content_reference_invalid:'消息资源引用无效',
         content_unsupported:'消息类型尚未完整支持',permission_denied:'来源权限不足',unsupported_identity:'身份类型暂不支持',
       };
       field('状态',message.readiness.state==='blocked'?'准备受阻':'等待完整信息',4);
       field('原因',[...new Set((message.readiness.reasons||[]).map(reason=>reasons[reason]||'信息待核验'))].join('；'),4);
+      if (message.display.media) {
+        field('类型',message.display.media.type === 'image' ? '图片' : '贴纸',4);
+        field('资源',message.display.media.text,4);
+      }
       field('查看','messages --format json 可检查已保存内容与原因',4);
       lines.push('');
       continue;
@@ -118,7 +125,13 @@ function renderMessagesText(messages, options = {}) {
       field("当前本地标题来源", "会话配置；观察时间未知", 2);
     }
     field("类型", `${message.display.sender_type} / ${message.display.message_type}`, 4);
-    if (message.display.card) {
+    if (message.display.media) {
+      field('资源',message.display.media.text,4);
+      if(message.display.media.resource.availability==='available') {
+        field('文件',message.display.media.resource.path,4);
+        field('格式',`${message.display.media.resource.mime_type} · ${message.display.media.resource.size_bytes} bytes`,4);
+      }
+    } else if (message.display.card) {
       // Never feed a failed card projection back into the legacy raw-JSON body
       // fallback. Preserve lines, sanitize before indentation, and keep styling
       // restricted to trusted labels.

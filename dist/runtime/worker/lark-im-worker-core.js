@@ -1,6 +1,7 @@
 import { WORKER_DEFAULTS } from "./options.mjs";
 import { REQUIRED_CYCLE_STEPS } from "./step-vocabulary.mjs";
 import { parseWorkerEventTimestamp } from "../../diagnostics/worker-event-time.mjs";
+import { sanitizeHistoryDiagnostic, sanitizeHistorySelectionStops } from "../../core/history-diagnostics.js";
 const TRANSPORT_COUNTERS = [
     "calls", "attempts", "retries", "rate_limits", "timeouts", "wait_ms",
     "max_retry_after_ms", "cooldown_until_ms", "exhausted",
@@ -370,6 +371,15 @@ function compactHistorySummary(summary) {
         result.coverage = "known_rows_only";
     if (HISTORY_HINT_REASONS.has(String(summary.priority_hint_reason)))
         result.priority_hint_reason = summary.priority_hint_reason;
+    const failureDiagnostic = sanitizeHistoryDiagnostic(summary.failure_diagnostic, 'failure');
+    const hintDiagnostic = sanitizeHistoryDiagnostic(summary.priority_hint_diagnostic, 'hint');
+    const selectionStops = sanitizeHistorySelectionStops(summary.selection_stop_counts);
+    if (failureDiagnostic)
+        result.failure_diagnostic = failureDiagnostic;
+    if (hintDiagnostic)
+        result.priority_hint_diagnostic = hintDiagnostic;
+    if (selectionStops)
+        result.selection_stop_counts = selectionStops;
     if (["ready", "scope_budget"].includes(String(summary.fair_round_reason)))
         result.fair_round_reason = summary.fair_round_reason;
     const error = summary.error;

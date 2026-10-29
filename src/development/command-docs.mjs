@@ -6,11 +6,13 @@ export function maintenanceEffectDocumentation(catalog) {
   const commands = catalog.commands.filter(({ group }) => group === "maintenance");
   const writers = commands.filter(({ effects }) => effects.includes("database-write"));
   const rows = commands.map((entry) => {
+    const applyModes = entry.modes.filter(({ when }) => when === "--apply" || when.startsWith("--apply with "));
     const apply = entry.options.some(({ flag }) => flag === "--apply")
-      ? entry.modes.find(({ when }) => when === "--apply").effects.join(", ") : "不支持";
-    const other = entry.modes.filter(({ when, effects }) => when !== "--apply" && effects?.length)
+      ? applyModes.map(({ when, effects }) => when === "--apply" ? cell(effects.join(", "))
+        : `${code(when)}：${cell(effects.join(", "))}`).join("；") : "不支持";
+    const other = entry.modes.filter(mode => !applyModes.includes(mode) && mode.effects?.length)
       .map(({ when, effects }) => `${code(when)}：${cell(effects.join(", "))}`).join("；") || "—";
-    return `| ${code(entry.path.join(" "))} | ${cell(entry.effects.join(", "))} | ${cell(apply)} | ${other} |`;
+    return `| ${code(entry.path.join(" "))} | ${cell(entry.effects.join(", "))} | ${apply} | ${other} |`;
   });
   return [
     `默认可能写数据库：${writers.map(({ path }) => code(path.join(" "))).join("、")}。\`--apply\` 不是维护命令的统一写入开关。`,

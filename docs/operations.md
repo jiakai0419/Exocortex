@@ -346,7 +346,7 @@ node bin/exocortex.mjs check --live
 | --- | --- | --- | --- |
 | `maintenance init` | database-write, permissions-write | 不支持 | — |
 | `maintenance backup` | backup-write, same-source-backup-cleanup | 不支持 | — |
-| `maintenance enrich` | local-read, remote-read | database-write | `--review-out`：private-review-file-write |
+| `maintenance enrich` | local-read | `--apply with --target records\|scopes\|recipients`：database-write；`--apply with --target resources`：remote-read, private-resource-write | `--target records\|scopes\|recipients`：remote-read；`--review-out`：private-review-file-write |
 | `maintenance preview` | local-read, remote-read, private-review-file-write, private-progress-file-write | 不支持 | — |
 | `maintenance history` | local-read, remote-read, database-write | 不支持 | — |
 | `maintenance repair` | local-read | database-write | — |
@@ -355,7 +355,13 @@ node bin/exocortex.mjs check --live
 | `maintenance compact` | local-read | database-write | — |
 <!-- END GENERATED maintenance-effects -->
 
-记录和 scope 补全必须明确目标，没有隐式 all；enrich/replay 默认预览，审阅后加 `--apply` 才提交数据库变更：
+记录和 scope 补全必须明确目标，没有隐式 all；enrich/replay 默认预览，审阅后加 `--apply` 才提交数据库变更。
+资源补抓 `maintenance enrich --target resources` 是单独的手动精确目标模式：预览不联网，
+`--apply` 仅写私有资源侧车，不写 SQLite，不加入自动调度。它要求 1–20 个不重复的
+`--record-id`，支持同一请求预算及 `--resource-dir`，拒绝 limit、姓名、发送者、探测和
+review 参数；`messages --resource-dir` 只读取已验证资源。完整边界及合成示例见
+[手动补齐图片资源](resource-enrichment.md)。表中 enrich 的远端读取和写入效果按目标
+分别列出，不能把某个目标的副作用套用于其他目标。下面是记录和 scope 示例：
 
 ```bash
 node bin/exocortex.mjs maintenance enrich --target scopes --limit 50
