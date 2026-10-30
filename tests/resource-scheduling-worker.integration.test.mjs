@@ -150,25 +150,42 @@ function fixture(t, light = false, deep = false) {
   ensureInitialized(db); ensureSourceInitialSyncStart(db, 'lark.im', base - 600000, { explicit: true, endMs: base });
   sqliteExec(db, `INSERT INTO sync_scopes(id,source_id,name,config_json) VALUES(${quoteSql(chatScopeId(GROUP))},'lark.im','Synthetic group',${quoteSql(JSON.stringify({ chat_id: GROUP, chat_type: 'group', chat_name: TITLE }))});`);
   assert.equal(sqliteQuery(db, 'SELECT COUNT(*) n FROM records;')[0].n, 0);
+  if (deep) seedDeepHistory(dir, db, 'older');
   return { dir, db, base, initial };
 }
-// Seed only authored historical rows after the first real forward commit, so
-// the four resource candidates precede 5500 unrelated, gapped database IDs.
-function seedDeepHistory(dir, db) {
-  if (existsSync(join(dir, 'deep-seeded'))) return;
-  assert.equal(sqliteQuery(db,'SELECT COUNT(*) n FROM records;')[0].n,6);
+// Make both legacy discovery windows miss the six worker-collected images:
+// 5000 earlier text rows exist before acquisition; 500 later text rows are
+// appended after the forward commit, before its first resource opportunity.
+function seedDeepHistory(dir, db, phase = 'newer') {
+  const marker = join(dir, `deep-seeded-${phase}`);
+  if (existsSync(marker)) return;
+  const earlier = phase === 'older', count = earlier ? 5000 : 500;
+  const initial = read(join(dir, 'publisher.json')).entries.filter(x => x.kind === 'image');
+  assert.equal(initial.length, 6);
+  const current = sqliteQuery(db, 'SELECT id,external_id FROM records ORDER BY id;');
+  assert.equal(current.length, earlier ? 0 : 5006);
+  const images = current.filter(row => initial.some(source => source.message.message_id === row.external_id));
+  if (!earlier) {
+    assert.equal(images.length, 6, 'images must traverse real worker collection before the later text seed');
+    assert(images.every(row => row.id > 14998));
+  }
   const at = now(dir), scope = chatScopeId(GROUP);
-  const records = Array.from({length:5500}, (_,i) => {
-    const source=entry(`b${String(i).padStart(4,'0')}`,at-10000+i,'text');
-    source.message.sender={id:SELF.open_id,id_type:'open_id',sender_type:'user',name:SELF.name};
-    const row=recordFromMessage(source.message,scope,'sent',{self:SELF},{chat_id:GROUP,chat_type:'group',chat_name:TITLE});
-    return {...bindAcquiredMessageAccounts([row],SELF,{acquiredAt:new Date(at).toISOString()})[0],id:100+i*3};
+  const sourceStart = earlier ? Math.min(...initial.map(x => x.sourceAtMs)) - 90000
+    : Math.max(...initial.map(x => x.sourceAtMs)) + 10000;
+  const idStart = earlier ? 1 : current.at(-1).id + 100;
+  const records = Array.from({ length: count }, (_, i) => {
+    const source = entry(`${earlier ? 'b' : 'c'}${String(i).padStart(4, '0')}`, sourceStart + i, 'text');
+    source.message.sender = { id: SELF.open_id, id_type: 'open_id', sender_type: 'user', name: SELF.name };
+    const row = recordFromMessage(source.message, scope, 'sent', { self: SELF }, { chat_id: GROUP, chat_type: 'group', chat_name: TITLE });
+    return { ...bindAcquiredMessageAccounts([row], SELF, { acquiredAt: new Date(at).toISOString() })[0], id: idStart + i * 3 };
   });
-  const keys=Object.keys(records[0]);
-  sqliteExec(db,`BEGIN IMMEDIATE; INSERT INTO records(${keys.join(',')}) VALUES ${records.map(row=>'('+keys.map(key=>quoteSql(row[key])).join(',')+')').join(',')}; COMMIT;`);
-  writeFileSync(join(dir,'deep-seeded'),'authored 5500 unrelated records');
-  log(dir,{type:'deep_history_seed',rows:5500,highestId:records.at(-1).id});
+  const keys = Object.keys(records[0]);
+  sqliteExec(db, `BEGIN IMMEDIATE; INSERT INTO records(${keys.join(',')}) VALUES ${records.map(row => '(' + keys.map(key => quoteSql(row[key])).join(',') + ')').join(',')}; COMMIT;`);
+  writeFileSync(marker, `authored ${count} ${phase} text records`);
+  log(dir, { type: 'deep_history_seed', phase, rows: count, lowestId: records[0].id, highestId: records.at(-1).id,
+    imageRecordIds: images.map(row => row.id) });
 }
+
 function worker(dir) {
   const child = spawnSync(process.execPath, [HERE, '--worker'], { cwd: dir, encoding: 'utf8', timeout: 180000, maxBuffer: 3 * 1024 * 1024,
     env: { ...process.env, SYNTHETIC_RESOURCE_WORKER_ROOT: dir, LARK_CLI: join(dir, 'fake-lark'), NO_COLOR: '1' } });
@@ -256,7 +273,10 @@ if (process.argv[2] === '--remote') {
         nowMs: () => now(dir), monotonicNowMs: () => performance.now() });
       assert.deepEqual(sqliteQuery(db, 'SELECT * FROM records ORDER BY id;'), before,
         'resource work preserves every source column, including version, hash, raw, body, account evidence and clocks');
-      log(dir, { type: 'resource_step', step }); observe(dir, 'after_resource'); return step;
+      log(dir, { type: 'resource_step', step });
+      if (deep) log(dir, { type: 'deep_resource_checkpoint', tasks: sqliteQuery(db,
+        'SELECT record_id,state FROM lark_im_resource_work ORDER BY record_id;') });
+      observe(dir, 'after_resource'); return step;
     },
     // This counterpart uses the real request session and private executable,
     // consumes the full sample grant, and reports its measured attempts. It is
@@ -378,7 +398,17 @@ if (process.argv[2] === '--remote') {
     const {dir,db,initial}=fixture(t,false,true);
     worker(dir);
     const firstTasks=sqliteQuery(db,'SELECT record_id,state FROM lark_im_resource_work ORDER BY record_id;');
-    assert.deepEqual(firstTasks.map(x=>x.record_id),[1,2,3,4,5,6]);
+    const imageRows=sqliteQuery(db,"SELECT id,external_id FROM records WHERE direction='received' ORDER BY id;");
+    const imageRecordIds=imageRows.filter(row=>initial.some(source=>source.message.message_id===row.external_id)).map(row=>row.id);
+    assert.equal(imageRecordIds.length,6);
+    assert(imageRecordIds.every(id=>id>14998),'5000 gapped older text IDs must precede every worker-collected image');
+    const firstCheckpoint=events(dir).find(x=>x.type==='deep_resource_checkpoint');assert(firstCheckpoint);
+    t.diagnostic(JSON.stringify({scenario:'old5000-images6-new500',olderRows:5000,newerRows:500,
+      firstOpportunityEnrolled:firstCheckpoint.tasks.length,firstOpportunityAvailable:firstCheckpoint.tasks.filter(x=>x.state==='available').length,
+      imageRecordIds,firstOpportunityTaskIds:firstCheckpoint.tasks.map(x=>x.record_id)}));
+    assert.deepEqual(firstCheckpoint.tasks.map(x=>x.record_id),imageRecordIds,'first actual opportunity must enroll all six images');
+    assert.equal(firstCheckpoint.tasks.filter(x=>x.state==='available').length,1);
+    assert.deepEqual(firstTasks.map(x=>x.record_id),imageRecordIds);
     assert.equal(firstTasks.filter(x=>x.state==='available').length,2);
     worker(dir);worker(dir);
     const journal=events(dir), final=observe(dir,'deep_final');
@@ -389,7 +419,12 @@ if (process.argv[2] === '--remote') {
     assert(resourceSteps.every(x=>x.step.ok && !x.step.guardian_diagnostic && x.step.summary.available===1));
     assert(resourceSteps.every(x=>x.step.summary.request_budget.cli_attempts===3 && x.step.summary.request_budget.self_attempts===2));
     const imageIds=initial.map(x=>x.message.message_id).sort(), originalIds=initial.slice(0,4).map(x=>x.message.message_id);
-    assert.deepEqual(firstTasks.slice(0,4).map(x=>x.record_id),[1,2,3,4]); // newest-image ranks 6,5,4,3
+    assert.deepEqual(firstTasks.slice(0,4).map(x=>x.record_id),imageRecordIds.slice(0,4)); // newest-image ranks 6,5,4,3
+    const seeds=journal.filter(x=>x.type==='deep_history_seed');
+    assert.deepEqual(seeds.map(x=>[x.phase,x.rows]),[['older',5000],['newer',500]]);
+    assert(seeds[0].highestId<imageRecordIds[0]);assert(seeds[1].lowestId>imageRecordIds.at(-1));
+    const firstCommit=journal.find(x=>x.type==='collection_commit'&&originalIds.some(id=>x.ids.includes(id)));
+    assert(seeds[0].atMs<=firstCommit.atMs&&firstCommit.atMs<=seeds[1].atMs&&seeds[1].atMs<=firstCheckpoint.atMs);
     assert.deepEqual(journal.filter(x=>x.type==='api'&&x.route==='download').map(x=>x.id).sort(),imageIds);
     const observations=journal.filter(x=>x.type==='messages_observation');
     assert(observations.every(x=>originalIds.every(id=>x.rows.some(row=>row.externalId===id))),'all four unresolved images remain in every received cohort');

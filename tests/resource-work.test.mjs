@@ -267,24 +267,31 @@ test('confirmed denial task CAS failure does not publish a blocked task counter'
 
 
 test('5500 unrelated gapped history rows cannot consume the image discovery page or hide four images',t=>{
-  const f=fixture(t,4), template=f.add('text');
-  sqliteExec(f.db,`WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<5500)
+  const f=fixture(t,0),template=f.add('text');
+  // Five thousand earlier rows hide the images from the old first historical
+  // page; five hundred later rows also hide them from the old newest page.
+  const texts=(count,idStart,label)=>sqliteExec(f.db,`WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<${count-1})
     INSERT INTO records(id,source_id,record_type,external_id,external_version,first_seen_scope_id,
       actor_id,container_id,direction,occurred_at,occurred_at_ms,raw_json,canonical_json,content_hash,body)
-    SELECT ${template}+x*3,r.source_id,r.record_type,'om_synthetic_deep_text_'||x,r.external_version,r.first_seen_scope_id,
+    SELECT ${idStart}+x*3,r.source_id,r.record_type,'om_synthetic_deep_${label}_'||x,r.external_version,r.first_seen_scope_id,
       r.actor_id,r.container_id,r.direction,r.occurred_at,r.occurred_at_ms,r.raw_json,r.canonical_json,r.content_hash,r.body
     FROM n JOIN records r ON r.id=${template};`);
+  texts(4999,4,'older');f.nextId=14999;
+  const images=Array.from({length:4},()=>f.add());
+  texts(500,15102,'newer');f.nextId=16600;
+  assert.equal(sqliteQuery(f.db,'SELECT COUNT(*) n FROM records;')[0].n,5504);
+  assert.equal(sqliteQuery(f.db,`SELECT COUNT(*) n FROM records WHERE id<${images[0]};`)[0].n,5000);
+  assert.equal(sqliteQuery(f.db,`SELECT COUNT(*) n FROM records WHERE id>${images.at(-1)};`)[0].n,500);
   const before=sqliteQuery(f.db,'SELECT * FROM records ORDER BY id;');
-  f.nextId=16506;
   const plan=sqliteQuery(f.db,`.explain off\nEXPLAIN QUERY PLAN SELECT id FROM records INDEXED BY ${RESOURCE_CANDIDATE_INDEX}
     WHERE ${RESOURCE_CANDIDATE_WHERE} AND id>0 AND id<=20000 ORDER BY id LIMIT 20;`);
   assert(plan.some(row=>row.detail.includes(RESOURCE_CANDIDATE_INDEX)),JSON.stringify(plan));
   const first=f.run();assert.equal(first.available,1,JSON.stringify(first));
-  assert.deepEqual(f.tasks().map(row=>row.record_id),[1,2,3,4]);
+  assert.deepEqual(f.tasks().map(row=>row.record_id),images);
   for(let n=0;n<3;n++) {f.add('text');f.advance(61000);assert.equal(f.run().available,1);}
   assert.deepEqual(f.tasks().map(row=>row.state),['available','available','available','available']);
   assert.equal(downloads(f).length,4);
-  assert.deepEqual(sqliteQuery(f.db,'SELECT * FROM records WHERE id<=16505 ORDER BY id;'),before);
+  assert.deepEqual(sqliteQuery(f.db,'SELECT * FROM records WHERE id<16600 ORDER BY id;'),before);
 });
 
 test('candidate index tolerates invalid JSON and conflicting type evidence without authorizing a resource',t=>{
