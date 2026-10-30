@@ -1,5 +1,5 @@
 // @ts-check
-import { readOnlySqliteJson, SqliteReadError } from '../storage/sqlite/readonly-query.mjs';
+import { readOnlySqliteJson, readOnlySqliteJsonLines, SqliteReadError } from '../storage/sqlite/readonly-query.mjs';
 import { sqliteReadDiagnostic } from './sqlite-read-diagnostic.mjs';
 import { READINESS_CONTRACT_VERSION } from './message-readiness-ledger.mjs';
 import { MESSAGE_READINESS_OBSERVATION_FIELDS, selectMessageReadinessObservations } from './message-completeness-summary.mjs';
@@ -39,14 +39,23 @@ const donorCandidate = `CASE WHEN json_valid(d.canonical_json) AND json_valid(d.
   ELSE 1 END`;
 const quote = value => `'${String(value).replaceAll("'", "''")}'`;
 const jsonObject = (columns, alias) => `json_object(${columns.flatMap(key => [quote(key), `${alias}.${key}`]).join(',')})`;
-// Keep each wire value bounded by one source row. A giant aggregate JSON TEXT
-// makes the SQLite CLI re-escape the whole page as one string, which is
-// disproportionately expensive on supported SQLite shells. All branches still
-// execute in one statement/snapshot; TEXT source tokens are never parsed here.
+// Keep each payload bounded by one source row. The final SQL JSON encoding
+// and framed list-mode reader avoid the SQLite CLI re-escaping payload TEXT.
+// All branches still execute in one statement/snapshot; source TEXT tokens
+// remain opaque strings and are never parsed or normalized by this wire.
 const rowQuery = (kind, columns, query, order) => `SELECT ${quote(kind)} AS kind,
   ROW_NUMBER() OVER (ORDER BY ${order}) AS position,${jsonObject(columns, 'item')} AS payload,
   NULL AS total,NULL AS evaluated,NULL AS not_evaluated,NULL AS source_max_record_id,
   NULL AS read_at,NULL AS schema_consistent FROM (${query}) item`;
+// This encoding keeps the previous internal row shape, including payload TEXT.
+// Concatenation strips any JSON subtype so a SQL optimizer cannot turn payload
+// into a nested object. SQL escapes literal newlines/NUL; source bytes cannot
+// masquerade as CLI framing lines. No page-wide aggregate JSON value is built.
+const WIRE_COLUMNS = ['kind','position','payload','total','evaluated','not_evaluated',
+  'source_max_record_id','read_at','schema_consistent'];
+const snapshotWireSql = sql => `SELECT json_object(${WIRE_COLUMNS.flatMap(key => [quote(key),
+  key === 'payload' ? "wire.payload || ''" : `wire.${key}`]).join(',')}) AS encoded_row
+  FROM (${sql.trim().replace(/;$/, '')}) wire ORDER BY wire.kind,wire.position;`;
 const existsTable = table => `EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=${quote(table)})`;
 const routeIndexColumns = `(SELECT group_concat(name,',') FROM pragma_index_info(${quote(ROUTE_INDEX)}))='source_id,account_key,route_key'`;
 const existsRouteIndex = `EXISTS(SELECT 1 FROM sqlite_schema WHERE type='index' AND name=${quote(ROUTE_INDEX)} AND ${routeIndexColumns})`;
@@ -196,7 +205,8 @@ function readMessageSnapshot(db, options = {}, deps = {}) {
       WHERE s.source_id='lark.im' AND CASE WHEN json_valid(s.config_json)
         THEN json_extract(s.config_json,'$.chat_id') END IN (SELECT container_id FROM containers)`, 'id'),
     names, recipients, observations, donorRows, donorGroups, routeRows, routeGroups].filter(Boolean).join('\nUNION ALL\n');
-  const result = query(db, `WITH
+  const snapshotQuery = deps.sqliteJson || ((path, sql, label) => readOnlySqliteJsonLines(path, snapshotWireSql(sql), label));
+  const result = snapshotQuery(db, `WITH
     matched AS MATERIALIZED (
       SELECT r.id,r.occurred_at_ms,r.external_id FROM records r WHERE ${filters.join(' AND ')}
     ), selected_ids AS MATERIALIZED (

@@ -132,8 +132,7 @@ function runProgress(run) {
  * byte budget also return NULL, never a truncated array or false zero-debt proof.
  * @param {string} where @param {{limit?: number, cutoffSql?: string}} [options] */
 function runEvidenceSql(where, { limit, cutoffSql = "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)" } = {}) {
-  const budget = `r.id IN (SELECT r.id FROM sync_runs r WHERE (${where}) AND ${LEGACY_TRANSITION_SQL}
-    ORDER BY r.id DESC LIMIT ${TRANSITION_LIMIT})`;
+  const budget = "r.id IN (SELECT id FROM proof_runs)";
   // Preserve the old error projection for raw classification. Proof payloads have
   // a separate row/size budget; excess history stays unknown and actionable.
   const columns = RUN_EVIDENCE_COLUMNS.map((name) => {
@@ -147,29 +146,44 @@ function runEvidenceSql(where, { limit, cutoffSql = "CAST((julianday('now') - 24
       ELSE '!unavailable!' END AS ${name}`;
     return `r.${name}`;
   }).join(", ");
-  const json = RUN_EVIDENCE_COLUMNS.filter((name) => !["error_type", "error_message", "scanned_count", "inserted_count", "updated_count", "duplicate_count"].includes(name))
-    .map((name) => `'${name}', ${["metadata_json", "cursor_before_json", "cursor_after_json"].includes(name)
+  const proofColumns = RUN_EVIDENCE_COLUMNS.filter((name) => !["error_type", "error_message", "scanned_count", "inserted_count", "updated_count", "duplicate_count"].includes(name));
+  const json = proofColumns.map((name) => `'${name}', ${["metadata_json", "cursor_before_json", "cursor_after_json"].includes(name)
       ? `CASE WHEN c.${name} IS NULL THEN NULL WHEN length(c.${name})<=16384 THEN c.${name}
           ELSE ${name === "metadata_json" ? "NULL" : "'!unavailable!'"} END` : `c.${name}`}`).join(", ");
-  // Keep this correlated lookup scoped: the global status index can otherwise
-  // rescan unrelated successful history for every retained failure. Unary +
-  // disqualifies only that index term; TEXT status compared with the fixed
-  // nonnumeric literal keeps the same accepted values. All proof fences remain.
-  return `SELECT ${columns}, ${cutoffSql} AS evidence_cutoff_ms,
+  const proof = `json_group_array(json_object(${json})) FILTER (WHERE c.candidate_count<=${CLOSURE_LIMIT})`;
+  // Materialize the shared budget and narrow endpoint/time relation once. The
+  // pool's JSON classification must not repeat per failed run, and no cursor or
+  // metadata payload is retained before the per-run 101-ID selection.
+  // Unary + preserves the existing TEXT status semantics and scoped access.
+  return `WITH proof_runs AS MATERIALIZED (
+      SELECT r.id,r.source_id,r.scope_id FROM sync_runs r WHERE (${where}) AND ${LEGACY_TRANSITION_SQL}
+      ORDER BY r.id DESC LIMIT ${TRANSITION_LIMIT}
+    ), proof_scopes AS MATERIALIZED (
+      SELECT DISTINCT source_id,scope_id FROM proof_runs
+    ), closure_pool AS MATERIALIZED (
+      SELECT c.id,c.source_id,c.scope_id,julianday(c.started_at) AS started_jd,julianday(c.finished_at) AS finished_jd
+      FROM proof_scopes s CROSS JOIN sync_runs c
+      WHERE c.source_id=s.source_id AND c.scope_id=s.scope_id
+        AND +c.status='succeeded' AND CASE WHEN json_valid(c.metadata_json) THEN
+        json_extract(c.metadata_json,'$.adapter')='lark.im.details'
+        OR json_extract(c.metadata_json,'$.lark_progress.phase')='details' ELSE 0 END
+    ) SELECT ${columns}, ${cutoffSql} AS evidence_cutoff_ms,
     CASE WHEN ${LEGACY_TRANSITION_SQL} THEN
-      CASE WHEN ${budget} THEN (WITH candidates AS MATERIALIZED (
-        SELECT c.* FROM sync_runs c WHERE c.source_id=r.source_id AND c.scope_id=r.scope_id
-          AND c.id > r.id AND +c.status='succeeded' AND julianday(c.started_at) >= julianday(r.finished_at)
-          AND julianday(c.finished_at) <= julianday((${cutoffSql}) / 1000.0, 'unixepoch')
-          AND CASE WHEN json_valid(c.metadata_json) THEN
-            json_extract(c.metadata_json,'$.adapter')='lark.im.details'
-            OR json_extract(c.metadata_json,'$.lark_progress.phase')='details' ELSE 0 END
-        ORDER BY c.id LIMIT ${CLOSURE_LIMIT + 1}
-      ), proof AS MATERIALIZED (
-        SELECT json_group_array(json_object(${json})) AS value FROM candidates c
-        WHERE (SELECT COUNT(*) FROM candidates) <= ${CLOSURE_LIMIT}
-      ) SELECT CASE WHEN (SELECT COUNT(*) FROM candidates) > ${CLOSURE_LIMIT}
-          OR length(CAST(value AS BLOB)) > ${CLOSURE_BYTE_LIMIT} THEN NULL ELSE value END FROM proof
+      CASE WHEN ${budget} THEN (
+        SELECT CASE WHEN MAX(c.candidate_count)>${CLOSURE_LIMIT}
+          OR length(CAST(${proof} AS BLOB))>${CLOSURE_BYTE_LIMIT} THEN NULL ELSE ${proof} END
+        FROM (
+          SELECT selected.candidate_count,${proofColumns.map((name) => `c.${name}`).join(",")}
+          FROM (
+            SELECT id,COUNT(*) OVER () AS candidate_count FROM (
+              SELECT p.id FROM closure_pool p WHERE p.source_id=r.source_id AND p.scope_id=r.scope_id
+                AND p.id>r.id AND p.started_jd>=julianday(r.finished_at)
+                AND p.finished_jd<=julianday((${cutoffSql}) / 1000.0, 'unixepoch')
+              ORDER BY p.id LIMIT ${CLOSURE_LIMIT + 1}
+            )
+          ) selected LEFT JOIN sync_runs c ON selected.candidate_count<=${CLOSURE_LIMIT} AND c.id=selected.id
+          ORDER BY selected.id
+        ) c
       ) ELSE NULL END ELSE '[]' END AS closure_candidates_json
     FROM sync_runs r WHERE ${where} ORDER BY r.id DESC${limit ? ` LIMIT ${limit}` : ""}`;
 }

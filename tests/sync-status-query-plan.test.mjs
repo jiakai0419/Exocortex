@@ -100,18 +100,25 @@ connection.execute('PRAGMA query_only=ON')
 connection.execute('BEGIN')
 results=[]
 for item in request:
+    compile_start=time.perf_counter()
+    opcodes=0
+    for unused in connection.execute('EXPLAIN '+item['sql']):
+        opcodes+=1
+        if opcodes>25000: raise RuntimeError('compiled_opcode_budget')
+    compile_ms=(time.perf_counter()-compile_start)*1000
     ticks=[0]
+    started=time.perf_counter()
     def progress():
         ticks[0]+=1
-        return ticks[0]>100000
+        return ticks[0]>100000 or time.perf_counter()-started>9
     connection.set_progress_handler(progress,1000)
-    started=time.perf_counter()
     rows=[dict(row) for row in connection.execute(item['sql'])]
     elapsed_ms=(time.perf_counter()-started)*1000
     connection.set_progress_handler(None,0)
     payload=json.dumps(rows,sort_keys=True,separators=(',',':')).encode()
     results.append({'label':item['label'],'elapsed_ms':elapsed_ms,
-        'vm_steps':ticks[0]*1000,'rows':len(rows),'sha256':hashlib.sha256(payload).hexdigest()})
+        'vm_steps':ticks[0]*1000,'rows':len(rows),'sha256':hashlib.sha256(payload).hexdigest(),
+        'compiled_opcodes':opcodes,'compile_ms':compile_ms,'sql_bytes':len(item['sql'].encode())})
 connection.rollback()
 connection.close()
 print(json.dumps(results))
@@ -186,4 +193,106 @@ test("scoped closure predicate preserves TEXT status comparisons and works witho
   const sql = runEvidenceSql(LEGACY_TRANSITION_SQL, { limit: 200, cutoffSql: String(CUTOFF) });
   assert.deepEqual(readOnlySqliteJson(db, `${sql};`, "synthetic no scope index"),
     readOnlySqliteJson(db, `${previousAccessPredicate(sql)};`, "synthetic previous no scope index"));
+});
+
+
+function captureSnapshotSql(db) {
+  let sql;
+  const captured = new Error('synthetic query captured');
+  try {
+    buildStatus(db, { sqliteJson(path, statement, label) {
+      if (label === 'read sync status snapshot') {
+        sql = statement.replaceAll("CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)", String(CUTOFF));
+        throw captured;
+      }
+      return readOnlySqliteJson(path, statement, label);
+    } });
+  } catch (error) { if (error !== captured) throw error; }
+  assert(sql, 'capture the actual complete snapshot without executing it outside the bounded profiler');
+  return sql;
+}
+
+function addOrdinarySuccesses(db, failedRuns, from, to) {
+  // Ordinary successful list records are not candidate detail closures. The
+  // same source/scope still makes them costly for a correlated per-failure scan.
+  sqliteExec(db, `WITH RECURSIVE ids(n) AS (VALUES(${from + 1}) UNION ALL SELECT n+1 FROM ids WHERE n<${to})
+    INSERT INTO sync_runs(id,source_id,scope_id,status,started_at,finished_at,cursor_before_json,cursor_after_json,metadata_json)
+    SELECT ${failedRuns + 1}+n,r.source_id,r.scope_id,r.status,r.started_at,r.finished_at,
+      r.cursor_before_json,r.cursor_after_json,json_set(r.metadata_json,'$.adapter','lark.im.sent_by_me','$.detail_retry',json('false'))
+    FROM ids CROSS JOIN sync_runs r WHERE r.id=${failedRuns + 1};`);
+}
+
+test('two hundred retained failures classify same-scope nonclosure history once within a bounded VM budget', (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'synthetic-status-same-scope-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const db = join(directory, 'synthetic.sqlite'), failedRuns = 200;
+  seed(db, failedRuns);
+  const sql = runEvidenceSql(LEGACY_TRANSITION_SQL, { limit: 200, cutoffSql: String(CUTOFF) });
+  const snapshotSql = captureSnapshotSql(db);
+  const [small, smallSnapshot] = profileQueries(db, [{label:'small proof',sql}, {label:'small snapshot',sql:snapshotSql}]);
+  let prior = 0;
+  for (const count of [1000, 5000, 20000]) {
+    addOrdinarySuccesses(db, failedRuns, prior, count); prior = count;
+    const [proof, snapshot] = profileQueries(db, [{label:`same scope ${count} proof`,sql}, {label:`same scope ${count} snapshot`,sql:snapshotSql}]);
+    assert.equal(proof.rows, failedRuns);assert.equal(proof.sha256, small.sha256, 'ordinary successes cannot change complete closure proof values or order');
+    // Structural limits scale with input history once, not failures * history.
+    // The original query exceeds this gate already at 1,000 ordinary successes.
+    assert(proof.vm_steps <= small.vm_steps + count * 50 + 100000,
+      `same-scope proof must avoid per-failure history scans: ${small.vm_steps} -> ${proof.vm_steps} at ${count}`);
+    assert(snapshot.vm_steps <= smallSnapshot.vm_steps + count * 100 + 200000,
+      `the complete snapshot must share bounded closure work: ${smallSnapshot.vm_steps} -> ${snapshot.vm_steps}`);
+    assert(proof.compiled_opcodes <= 5000, `closure compilation must remain finite: ${proof.compiled_opcodes}`);
+    assert(snapshot.compiled_opcodes <= 15000, `full snapshot compilation must not amplify: ${snapshot.compiled_opcodes}`);
+    t.diagnostic(JSON.stringify({fixture:'same_scope',count,small,smallSnapshot,proof,snapshot}));
+  }
+  const report = buildStatus(db);
+  assert.deepEqual(report.runs.transitions, {resolved:200,unresolved:0,unknown:0});
+  assert.equal(report.runs.by_status.failed,200);assert.equal(report.runs.actionable_failed_runs,0);
+});
+
+test('highest-200 proof membership is materialized once with a large authored failed-run population', (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'synthetic-status-many-failures-'));
+  t.after(() => rmSync(directory, {recursive:true,force:true}));
+  const db = join(directory, 'synthetic.sqlite');
+  seed(db, 12000);
+  const sql = runEvidenceSql(LEGACY_TRANSITION_SQL, {limit:200,cutoffSql:String(CUTOFF)});
+  const snapshotSql = captureSnapshotSql(db);
+  const [proof,snapshot] = profileQueries(db,[{label:'12000 failures proof',sql},{label:'12000 failures snapshot',sql:snapshotSql}]);
+  assert.equal(proof.rows,200);
+  // A one-pass classification of 12,000 legacy failures measured 2.726M
+  // instructions; the original repeated query measured 47.662M on this exact
+  // authored input. Leave planner margin without permitting that amplification.
+  assert(proof.vm_steps<=4000000,`membership must not repeatedly rescan every failure: ${proof.vm_steps}`);
+  assert(snapshot.vm_steps<=8000000,`complete snapshot must bound repeated membership: ${snapshot.vm_steps}`);
+  assert(proof.compiled_opcodes<=5000);assert(snapshot.compiled_opcodes<=15000);
+  const report=buildStatus(db);
+  assert.equal(report.runs.by_status.failed,12000,'raw failure denominator is preserved');
+  assert.deepEqual(report.runs.transitions,{resolved:200,unresolved:0,unknown:11800});
+  assert.equal(report.runs.actionable_failed_runs,11800,'unexamined history remains actionable');
+  const rows=readOnlySqliteJson(db,sql+";","synthetic budget rows");
+  assert.deepEqual(rows.map(row=>row.id),Array.from({length:200},(_,i)=>12000-i));
+  t.diagnostic(JSON.stringify({fixture:'large_failed_population',proof,snapshot}));
+});
+
+test('wide detail payloads stay outside the narrow pool and candidate overflow stays unknown', (t) => {
+  const directory=mkdtempSync(join(tmpdir(),'synthetic-status-wide-pool-'));
+  t.after(()=>rmSync(directory,{recursive:true,force:true}));
+  const db=join(directory,'synthetic.sqlite');seed(db,200);
+  // Both cursor/error fields exceed any useful proof payload. The pool needs
+  // neither; JSON classification reads metadata once and retains no wide TEXT.
+  const padding='界'.repeat(8000),wideCursor=JSON.stringify({synthetic_padding:'x'.repeat(20000)});
+  sqliteExec(db,`WITH RECURSIVE ids(id) AS (VALUES(202) UNION ALL SELECT id+1 FROM ids WHERE id<328)
+    INSERT INTO sync_runs(id,source_id,scope_id,status,started_at,finished_at,cursor_before_json,cursor_after_json,metadata_json,error_message)
+    SELECT ids.id,r.source_id,r.scope_id,r.status,r.started_at,r.finished_at,
+      ${quote(wideCursor)},r.cursor_after_json,json_set(r.metadata_json,'$.synthetic_padding',${quote(padding)}),${quote('x'.repeat(65536))}
+    FROM ids CROSS JOIN sync_runs r WHERE r.id=201;`);
+  const sql=runEvidenceSql(LEGACY_TRANSITION_SQL,{limit:200,cutoffSql:String(CUTOFF)}),snapshotSql=captureSnapshotSql(db);
+  const [proof,snapshot]=profileQueries(db,[{label:'wide overflow proof',sql},{label:'wide overflow snapshot',sql:snapshotSql}]);
+  assert.equal(proof.rows,200);assert(proof.vm_steps<=2000000);assert(snapshot.vm_steps<=4000000);
+  assert(proof.compiled_opcodes<=5000);assert(snapshot.compiled_opcodes<=15000);
+  const rows=readOnlySqliteJson(db,sql+';','synthetic wide overflow');
+  assert(rows.every(row=>row.closure_candidates_json===null),'101-count overflow must not publish a partial or truncated proof');
+  const report=buildStatus(db);assert.deepEqual(report.runs.transitions,{resolved:0,unresolved:0,unknown:200});
+  assert.equal(report.runs.actionable_failed_runs,200);
+  t.diagnostic(JSON.stringify({fixture:'wide_details_overflow',proof,snapshot}));
 });

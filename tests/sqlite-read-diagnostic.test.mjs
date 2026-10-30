@@ -151,7 +151,9 @@ test('actual messages bin reports schema and data failures while preserving sour
   writeFileSync(db, '', { mode: 0o600 });
   for (const stage of ['schema_query', 'snapshot_query']) {
     writeFileSync(sqlite, `#!${process.execPath}\nimport{readFileSync}from'node:fs';import{spawnSync}from'node:child_process';
-const sql=readFileSync(0,'utf8'),args=process.argv.slice(2);if(args[0]!=='-readonly'||args[1]!=='-json')process.exit(9);
+const sql=readFileSync(0,'utf8'),args=process.argv.slice(2),schema=sql.includes('SELECT name FROM sqlite_schema');
+const flags=schema?['-readonly','-json']:['-readonly','-batch','-init','/dev/null','-noheader','-list'];
+if(JSON.stringify(args.slice(0,-1))!==JSON.stringify(flags))process.exit(9);
 if(${JSON.stringify(stage)}==='snapshot_query'&&sql.includes('SELECT name FROM sqlite_schema')){const r=spawnSync('/usr/bin/sqlite3',args,{input:sql,encoding:'utf8'});process.stdout.write(r.stdout||'');process.stderr.write(r.stderr||'');process.exit(r.status??9);}
 process.stderr.write('Runtime error near line 5: database is locked (5)\\n${PRIVATE}');process.exit(5);\n`);
     chmodSync(sqlite, 0o700);

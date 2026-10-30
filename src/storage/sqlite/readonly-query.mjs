@@ -29,9 +29,9 @@ export function readSqliteReadDiagnostic(error) {
  * @param {string} sql
  * @param {string} label
  * @param {{spawnSync?: typeof spawnSync, timeoutMs?:number, monotonicNowMs?:()=>number}} [deps]
- * @returns {Record<string, any>[]}
+ * @param {boolean} [lines]
  */
-function readOnlySqliteJson(dbPath, sql, label, deps = {}) {
+function executeReadOnly(dbPath, sql, label, deps = {}, lines = false) {
   const run = deps.spawnSync || spawnSync;
   const now = deps.monotonicNowMs || (() => performance.now());
   const observe = () => { try { return now(); } catch { return NaN; } };
@@ -39,8 +39,8 @@ function readOnlySqliteJson(dbPath, sql, label, deps = {}) {
   const timeoutMs = Number.isSafeInteger(deps.timeoutMs) && Number(deps.timeoutMs) > 0 ? Math.min(30_000, Number(deps.timeoutMs)) : 30_000;
   const maxBufferBytes = 50 * 1024 * 1024;
   let result;
-  try { result = run("sqlite3", ["-readonly", "-json", resolve(dbPath)], {
-    input: `.bail on\n.timeout 5000\nPRAGMA query_only=ON;\nBEGIN;\n${sql}\nCOMMIT;\n`,
+  try { result = run("sqlite3", ["-readonly", ...(lines ? ["-batch", "-init", "/dev/null", "-noheader", "-list"] : ["-json"]), resolve(dbPath)], {
+    input: `.bail on\n.timeout 5000\nPRAGMA query_only=ON;\nBEGIN;\n${lines ? `.print ${JSON_LINES_BEGIN}\n` : ""}${sql}\nCOMMIT;\n${lines ? `.print ${JSON_LINES_END}\n` : ""}`,
     encoding: "utf8",
     maxBuffer: maxBufferBytes,
     timeout: timeoutMs,
@@ -59,7 +59,18 @@ function readOnlySqliteJson(dbPath, sql, label, deps = {}) {
     throw new SqliteReadError("read_failed", `${label} failed`, diagnostic(error ? 'spawn_error' : result?.signal ? 'process_signal'
       : typeof status === 'number' && Number.isInteger(status) && status > 0 && status <= 255 ? 'process_exit' : 'unknown'));
   }
-  const output = String(result.stdout || "").trim();
+  return { output: String(result.stdout || ""), diagnostic };
+}
+
+const JSON_LINES_BEGIN = "__EXOCORTEX_JSON_LINES_BEGIN_V1__";
+const JSON_LINES_END = "__EXOCORTEX_JSON_LINES_END_V1__";
+
+/** @param {string} dbPath @param {string} sql @param {string} label
+ * @param {{spawnSync?: typeof spawnSync, timeoutMs?:number, monotonicNowMs?:()=>number}} [deps]
+ * @returns {Record<string, any>[]} */
+function readOnlySqliteJson(dbPath, sql, label, deps = {}) {
+  const { output: raw, diagnostic } = executeReadOnly(dbPath, sql, label, deps);
+  const output = raw.trim();
   if (!output) return [];
   try {
     const rows = JSON.parse(output);
@@ -68,4 +79,29 @@ function readOnlySqliteJson(dbPath, sql, label, deps = {}) {
   throw new SqliteReadError("invalid_response", `${label} returned invalid JSON`, diagnostic('invalid_shape'));
 }
 
-export { readOnlySqliteJson };
+/** Read one SQL-encoded JSON object column per row without CLI JSON re-escaping.
+ * The fixed frame is emitted only by trusted CLI directives; END follows a
+ * successful COMMIT and is never inferred from parseable row prefixes. Source
+ * TEXT belongs inside SQL json_object strings, never interpolated into framing.
+ * @param {string} dbPath @param {string} sql @param {string} label
+ * @param {{spawnSync?: typeof spawnSync, timeoutMs?:number, monotonicNowMs?:()=>number}} [deps]
+ * @returns {Record<string, any>[]} */
+function readOnlySqliteJsonLines(dbPath, sql, label, deps = {}) {
+  const { output, diagnostic } = executeReadOnly(dbPath, sql, label, deps, true);
+  const lines = output.split(/\r?\n/);
+  if (lines.at(-1) === "") lines.pop();
+  if (output.includes("\0") || lines.length < 2 || lines.shift() !== JSON_LINES_BEGIN || lines.pop() !== JSON_LINES_END) {
+    throw new SqliteReadError("invalid_response", `${label} returned invalid JSON`, diagnostic('invalid_shape'));
+  }
+  return lines.map(line => {
+    let row;
+    try { row = JSON.parse(line); }
+    catch { throw new SqliteReadError("invalid_response", `${label} returned invalid JSON`, diagnostic('invalid_json')); }
+    if (!row || typeof row !== "object" || Array.isArray(row)) {
+      throw new SqliteReadError("invalid_response", `${label} returned invalid JSON`, diagnostic('invalid_shape'));
+    }
+    return row;
+  });
+}
+
+export { readOnlySqliteJson, readOnlySqliteJsonLines };
