@@ -64,8 +64,12 @@ test('real selectors use decreasing SQLite deadlines and successful history incl
 
 test('remote deadline after actual responses keeps exact attempt counts and does not advance history',t=>{
   const f=fixture(t),spawn=f.deps.requestSessionDeps.spawnSync;
-  f.deps.requestSessionDeps.spawnSync=(...args)=>{const response=spawn(...args);if(f.state.calls.length===2)f.state.tick=29500;return response;};
+  let reads=0,readsAtResponse,commits=0;
+  f.deps.sqliteJson=(...args)=>{reads++;return readOnlySqliteJson(...args);};
+  f.deps.commit=()=>{commits++;assert.fail('no failure-checkpoint commit after direct time stop');};
+  f.deps.requestSessionDeps.spawnSync=(...args)=>{const response=spawn(...args);if(f.state.calls.length===2){readsAtResponse=reads;f.state.tick=29500;}return response;};
   const result=executeLarkImHistory({db:f.db},f.deps);
+  assert.equal(reads,readsAtResponse,'no subsequent binding/SQLite read after direct time stop');assert.equal(commits,0);
   assert.equal(result.outcome,'batch_deferred');assert.equal(result.processed,0);
   assert.equal(result.request_budget.cli_attempts,2);assert.equal(result.request_budget.self_attempts,1);
   assert.equal(result.request_budget.stop_reason,'time_budget');assert.equal(f.state.held,false);

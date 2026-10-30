@@ -4,7 +4,7 @@ import { createLarkImAdapter, MessageScopeError } from '../adapters/lark-im/adap
 import { messageId, chatId, chatScopeId } from '../adapters/lark-im/core.mjs';
 import { prepareChatWindowRecords } from '../adapters/lark-im/sync-runner.mjs';
 import { bindAcquiredMessageAccounts } from '../adapters/lark-im/message-account-evidence.mjs';
-import { createMaintenanceRequestSession } from './request-session.mjs';
+import { createMaintenanceRequestSession, MaintenanceRequestError } from './request-session.mjs';
 import { createHistoryCommandBudget, isHistoryCommandBudget, HistoryCommandBudgetError } from './history-command-budget.mjs';
 import { readOnlySqliteJson } from '../storage/sqlite/readonly-query.mjs';
 import { captureRemoteAccountBinding, readRemoteAccountBinding, accountBindingAdmissionError } from '../diagnostics/remote-account-binding.mjs';
@@ -17,6 +17,25 @@ import { historyFailureDiagnostic } from './history-diagnostics.mjs';
 
 const sha = text => createHash('sha256').update(text).digest('hex');
 const PROFILE = 'known_record_history/v1';
+
+// A global stop reason prevents later work; it does not classify an operation
+// that already failed. Only an unwrapped local admission exception may defer.
+/** @param {unknown} error @returns {error is HistoryCommandBudgetError | MaintenanceRequestError} */
+function isDirectBudgetAdmissionStop(error) {
+  if (!error || typeof error !== 'object' || 'cause' in error || 'errors' in error) return false;
+  return error instanceof HistoryCommandBudgetError && error.reason === 'time_budget'
+    || error instanceof MaintenanceRequestError && ['time_budget','cli_budget','self_budget','sync_busy'].includes(error.reason);
+}
+function historyRead(deps, work) { return deps.historyReadBoundary ? deps.historyReadBoundary(work) : work(); }
+function withFailureCause(report, cause) {
+  if (cause != null) Object.defineProperty(report, 'cause', { value: cause, enumerable: false });
+  return report;
+}
+function preserveFailureAtCutoff(error, budget) {
+  if (isDirectBudgetAdmissionStop(error)) return;
+  try { budget?.assertReady(); }
+  catch (stop) { throw new AggregateError([error, stop], 'history operation failed and command stopped', { cause: error }); }
+}
 
 /** Read-only selection. A discovered chat routes all its known native records;
  * first-seen scope is immutable provenance, including sent-first ingestion.
@@ -73,7 +92,7 @@ function selectHistoryTarget(db, deps = {}) { return selectHistoryTargets(db, de
 
 function selectScheduledTarget(db, options, binding, accountKey, deps, startedAtMs) {
   const now=deps.now || Date.now;
-    const loaded = loadHistoryDebtHints(db, options.logDir, { database_key: binding.database_key, account_key: accountKey }, now(), deps.debtDeps);
+    const loaded = historyRead(deps, () => loadHistoryDebtHints(db, options.logDir, { database_key: binding.database_key, account_key: accountKey }, now(), deps.debtDeps));
     const schedule = readHistoryDebtSchedule(db, loaded, now(), { sqliteJson: deps.sqliteJson });
     const fair = readHistoryFairRound(db, schedule.scheduler, { now: () => startedAtMs, sqliteJson: deps.sqliteJson });
     schedule.fairRound = fair;
@@ -91,7 +110,7 @@ function selectScheduledTarget(db, options, binding, accountKey, deps, startedAt
 function executeHistoryTarget(options, deps, session, initialTarget, prepared = /** @type {Record<string,any>|null} */ (null)) {
   const db = options.db, now = deps.now || Date.now, startedAtMs = prepared?.startedAtMs ?? now(), attemptId = randomUUID();
   let target = initialTarget, schedule = null, priority = false;
-  const binding = prepared?.binding || captureRemoteAccountBinding({ db }, { query: deps.sqliteJson });
+  const binding = prepared?.binding || historyRead(deps, () => captureRemoteAccountBinding({ db }, { query: deps.sqliteJson }));
   if (!binding || binding.conflict) throw new Error('history account binding unavailable');
   const attemptsBefore = prepared?.attemptsBefore ?? session.summary().cli_attempts;
   const targetSession = { ...session, runLark(...args) {
@@ -102,7 +121,7 @@ function executeHistoryTarget(options, deps, session, initialTarget, prepared = 
   const fetchOptions = { pageSize: 50, chatPageSize: 100, maxPages: 2, retries: 0, retryDelayMs: 0 };
   // Account failures do not advance a selected scope or publish a candidate.
   const self = prepared?.self || (deps.getSelfProfile || adapter.getSelfProfile)(fetchOptions);
-  const admission = readRemoteAccountBinding({ db, selfOpenId: self?.open_id }, { query: deps.sqliteJson });
+  const admission = historyRead(deps, () => readRemoteAccountBinding({ db, selfOpenId: self?.open_id }, { query: deps.sqliteJson }));
   const accountKey = 'account_key' in admission ? admission.account_key : null;
   if (typeof self?.open_id !== 'string' || !self.open_id.startsWith('ou_') || admission.state !== 'verified' || !/^[a-f0-9]{64}$/.test(accountKey || '') || accountBindingAdmissionError(admission)) {
     throw new Error('history account identity unavailable');
@@ -111,7 +130,7 @@ function executeHistoryTarget(options, deps, session, initialTarget, prepared = 
   if (!selection) return null;
   ({target,schedule,priority}=selection);
   const row = target.record, scope = target.scope, config = JSON.parse(scope.config_json);
-  const writeAdmission = captureLarkWriteAdmission(db, { selfOpenId: self.open_id, requireVerified: true, scopeIds: [scope.id] }, { query: deps.sqliteJson });
+  const writeAdmission = historyRead(deps, () => captureLarkWriteAdmission(db, { selfOpenId: self.open_id, requireVerified: true, scopeIds: [scope.id] }, { query: deps.sqliteJson }));
   const startMs = Math.max(target.baseline, Math.floor(row.occurred_at_ms / 1000) * 1000);
   const endMs = Math.floor(row.occurred_at_ms / 1000) * 1000 + 1000;
   let records = [], pages = 1, fetchedCount = 0, error = null;
@@ -143,6 +162,10 @@ function executeHistoryTarget(options, deps, session, initialTarget, prepared = 
     records = records.map(record => ({ ...record, expected_external_version: row.external_version }));
     session.assertReady();
   } catch (cause) {
+    // No local failure checkpoint may begin after direct time admission stops.
+    // Preserve that exact stop before account readers can reduce it to unknown.
+    if (isDirectBudgetAdmissionStop(cause) && cause.reason === 'time_budget') throw cause;
+    preserveFailureAtCutoff(cause, deps.historyCommandBudget);
     // Never infer deletion from absence or transport failure. Finite, private-
     // content-free error rotates this row; the next sweep can retry it.
     error = cause instanceof MessageScopeError ? 'identity'
@@ -164,9 +187,9 @@ function commitHistoryTarget(options, deps, session, input) {
   const {policy:scopePolicy,configJson:scopeConfig}=scopeObservationContext(scope.config_json);
   const startMs=Math.max(target.baseline,Math.floor(row.occurred_at_ms/1000)*1000),endMs=Math.floor(row.occurred_at_ms/1000)*1000+1000;
   const checkBinding = () => {
-    writeAdmission.assertCurrent();
-    if (JSON.stringify(captureRemoteAccountBinding({ db }, { query: deps.sqliteJson })) !== JSON.stringify(binding)
-      || accountBindingAdmissionError(readRemoteAccountBinding({ db, selfOpenId: self.open_id }, { query: deps.sqliteJson }))) throw new Error('history account binding changed');
+    historyRead(deps, () => writeAdmission.assertCurrent());
+    if (JSON.stringify(historyRead(deps, () => captureRemoteAccountBinding({ db }, { query: deps.sqliteJson }))) !== JSON.stringify(binding)
+      || accountBindingAdmissionError(historyRead(deps, () => readRemoteAccountBinding({ db, selfOpenId: self.open_id }, { query: deps.sqliteJson })))) throw new Error('history account binding changed');
   };
   checkBinding();
   const requestBudget = { ...session.summary(), ...(input.acquisitionMode ? {acquisition_mode:input.acquisitionMode,batch_targets:input.batchTargets} : {}) };
@@ -189,30 +212,30 @@ function commitHistoryTarget(options, deps, session, input) {
       sourceConfigJson: target.sourceConfigJson, sentActor: binding.sent_actor || null, records: [row],
       scopes: [{ id: scope.id, source_id: scope.source_id, enabled: scope.enabled, config_json: scope.config_json }] },
   });
-  let effects, cleanupFailed = false;
+  let effects, cleanupFailed = false, cleanupCause = null;
   try { effects = session.withCommit ? session.withCommit(commit, { allowStoppedForFailure: error !== null && records.length === 0 }) : commit(); }
   catch (failure) {
     // Only storage's validated completed-transaction receipt may preserve known
     // effects through a cleanup failure. Arbitrary exception properties cannot.
     if (!(failure instanceof BoundedReplayCleanupError)) throw failure;
-    effects = failure.committedEffects; cleanupFailed = true;
+    effects = failure.committedEffects; cleanupFailed = true; cleanupCause = failure;
   }
-  return { ok: error === null && !cleanupFailed, profile: PROFILE, outcome: cleanupFailed ? 'commit_cleanup_failed' : error || (effects.conflicts ? 'pending_observation' : 'processed'),
+  return withFailureCause({ ok: error === null && !cleanupFailed, profile: PROFILE, outcome: cleanupFailed ? 'commit_cleanup_failed' : error || (effects.conflicts ? 'pending_observation' : 'processed'),
     ...(cleanupFailed ? { commit_state: 'committed', cleanup_state: 'failed' } : {}),
     ...effects, request_budget: requestBudget, cursor_policy: 'unchanged', coverage: 'known_rows_only',
     ...(schedule ? { lane: priority ? 'priority' : 'fair', priority_hint_reason: schedule.reason, fair_round_reason: schedule.fairRound.reason,
-      ...(schedule.diagnostic ? { priority_hint_diagnostic: schedule.diagnostic } : {}) } : {}) };
+      ...(schedule.diagnostic ? { priority_hint_diagnostic: schedule.diagnostic } : {}) } : {}) }, cleanupCause);
 }
 
 /** Bounded speculative reads do not grant a turn. Only the original live
  * scheduler can select a row from this acquisition for its single-row CAS. */
 function executeHistoryGroup(options, deps, session, initialTarget, capacity, diagnosticContext) {
   const db=options.db,now=deps.now || Date.now,startedAtMs=now(),attemptsBefore=session.summary().cli_attempts;
-  const binding=captureRemoteAccountBinding({db}, { query: deps.sqliteJson });
+  const binding=historyRead(deps, () => captureRemoteAccountBinding({db}, { query: deps.sqliteJson }));
   if(!binding || binding.conflict) throw new Error('history account binding unavailable');
   const adapter=createLarkImAdapter({run:session.runLark});
   const self=(deps.getSelfProfile || adapter.getSelfProfile)({retries:0,retryDelayMs:0});
-  const admitted=readRemoteAccountBinding({db,selfOpenId:self?.open_id}, { query: deps.sqliteJson });
+  const admitted=historyRead(deps, () => readRemoteAccountBinding({db,selfOpenId:self?.open_id}, { query: deps.sqliteJson }));
   const accountKey='account_key' in admitted ? admitted.account_key : null;
   if(typeof self?.open_id!=='string' || !self.open_id.startsWith('ou_') || admitted.state!=='verified' ||
       !/^[a-f0-9]{64}$/.test(accountKey || '') || accountBindingAdmissionError(admitted)) throw new Error('history account identity unavailable');
@@ -239,10 +262,11 @@ function executeHistoryGroup(options, deps, session, initialTarget, capacity, di
     const result=executeHistoryTarget(options,deps,session,initialTarget,prepared);
     return {results:result?[result]:[]};
   }
-  const admission=captureLarkWriteAdmission(db,{selfOpenId:self.open_id,requireVerified:true,scopeIds:[...new Set(pool.map(t=>t.scope.id))]}, { query: deps.sqliteJson });
+  const admission=historyRead(deps, () => captureLarkWriteAdmission(db,{selfOpenId:self.open_id,requireVerified:true,scopeIds:[...new Set(pool.map(t=>t.scope.id))]}, { query: deps.sqliteJson }));
   let fetched;
   try { fetched=(deps.fetchKnownMessageList || adapter.fetchKnownMessageList)(pool.map(t=>t.record.external_id),{retries:0,retryDelayMs:0}); }
   catch(error) {
+    preserveFailureAtCutoff(error, deps.historyCommandBudget);
     if(session.summary().stop_reason)throw error;
     // A bad identity in a batch must not pin healthy fair frontiers forever.
     // The original route acquires its own evidence and alone may rotate a row.
@@ -272,6 +296,7 @@ function executeHistoryGroup(options, deps, session, initialTarget, capacity, di
     preparedRecords.set(row.id,records);
   }
   } catch(error) {
+    preserveFailureAtCutoff(error, deps.historyCommandBudget);
     if(session.summary().stop_reason)throw error;
     // Discard the whole response before any write. A new legacy acquisition
     // rechecks this row's identity and can record only its own bounded failure.
@@ -279,7 +304,7 @@ function executeHistoryGroup(options, deps, session, initialTarget, capacity, di
   }
   const after=(deps.getSelfProfile || adapter.getSelfProfile)({retries:0,retryDelayMs:0});
   if(after?.open_id!==self.open_id)throw new Error('history account identity changed');
-  admission.assertCurrent();session.assertReady();
+  historyRead(deps, () => admission.assertCurrent());session.assertReady();
   const results=[],consumed=new Set(),group=randomUUID();
   let stage = 'batch_select', selectionStop = null;
   try {
@@ -337,15 +362,25 @@ function executeHistoryWithinBudget(options, deps = {}, execution = { session: n
   execution.session = session;
   const results = [];
   let stopReason = null, interrupted = false, legacyRequired = false, bulkUnavailable = false;
-  let failureDiagnostic = null, stage = 'batch_prepare';
+  let failureDiagnostic = null, failureCause = null, stage = 'batch_prepare';
+  const recordFailure = (error, errorStage, diagnostic = /** @type {Record<string,any>|null} */ (null)) => {
+    const directStop = isDirectBudgetAdmissionStop(error);
+    stopReason = session.summary().stop_reason || (directStop ? error.reason : null);
+    interrupted = !directStop;
+    if (interrupted) {
+      failureCause = error;
+      failureDiagnostic = diagnostic || historyFailureDiagnostic(error, errorStage, 'failure');
+    }
+  };
   const selectionStops = {};
   /** @type {{failure:Record<string,any>|null}} */
   const diagnosticContext={failure:null};
   const configured={...options,maxRecords,maxCliAttempts,maxSelfAttempts};
   while(results.length<maxRecords) {
     try { target=selectHistoryTarget(options.db, deps); } catch (error) {
-      if (!(error instanceof HistoryCommandBudgetError)) throw error;
-      stopReason=error.reason;interrupted=error.reason!=='time_budget';break;
+      recordFailure(error, 'batch_select');
+      if (maxRecords === 1 && interrupted && !stopReason) throw error;
+      break;
     }
     if(!target)break;
     const summary=session.summary(),remaining=maxCliAttempts-summary.cli_attempts;
@@ -359,29 +394,28 @@ function executeHistoryWithinBudget(options, deps = {}, execution = { session: n
         stage = 'single_target';
         const result=executeHistoryTarget(configured,deps,session,target);
         if(result)results.push(result);else break;
-        if(result.cleanup_state === 'failed') {interrupted=true;break;}
+        if(result.cleanup_state === 'failed') {interrupted=true;failureCause=result.cause;break;}
       } else {
         stage = 'batch_prepare';
         const group=executeHistoryGroup(configured,deps,session,target,Math.min(6,maxRecords-results.length),diagnosticContext);
         results.push(...group.results);
-        if(group.results.some(result=>result.cleanup_state==='failed')) {interrupted=true;break;}
+        const cleanupFailure=group.results.find(result=>result.cleanup_state==='failed');
+        if(cleanupFailure) {interrupted=true;failureCause=cleanupFailure.cause;break;}
         if(group.selectionStop) selectionStops[group.selectionStop]=(selectionStops[group.selectionStop] || 0)+1;
         bulkUnavailable ||= group.bulkUnavailable===true;
-        if(group.error){stopReason=session.summary().stop_reason;interrupted=!stopReason;failureDiagnostic=group.diagnostic;break;}
+        if(group.error){recordFailure(group.error, 'batch_commit', group.diagnostic);break;}
         if(group.legacyRequired){legacyRequired=true;break;}
         if(!group.results.length)break;
       }
     } catch(error) {
-      stopReason=session.summary().stop_reason;
-      if(!stopReason) {if(maxRecords===1)throw error;interrupted=true;}
-      if(maxRecords===1 && !stopReason)throw error;
-      failureDiagnostic=diagnosticContext.failure || historyFailureDiagnostic(error,stage,'failure');
+      recordFailure(error, stage, diagnosticContext.failure);
+      if(maxRecords===1 && interrupted && !stopReason)throw error;
       break;
     }
   }
   if (maxRecords === 1 && results.length) return results[0];
   const budget = { ...session.summary(), stop_reason: stopReason || session.summary().stop_reason };
-  return { ok: !interrupted && results.every(result => result.ok) && !['rate_limited','rate_cooldown','lease_unavailable','shared_cooldown_unavailable','clock_unavailable'].includes(budget.stop_reason),
+  return withFailureCause({ ok: !interrupted && results.every(result => result.ok) && !['rate_limited','rate_cooldown','lease_unavailable','shared_cooldown_unavailable','clock_unavailable'].includes(budget.stop_reason),
     profile: PROFILE, outcome: legacyRequired ? 'legacy_required' : interrupted ? 'batch_interrupted' : results.length ? 'batch_processed' : 'batch_deferred',
     processed: results.length, priority_processed: results.filter(result => result.lane === 'priority').length,
     fair_processed: results.filter(result => result.lane !== 'priority').length,
@@ -396,7 +430,7 @@ function executeHistoryWithinBudget(options, deps = {}, execution = { session: n
     ...(interrupted && failureDiagnostic ? { failure_diagnostic: failureDiagnostic } : {}),
     ...(Object.keys(selectionStops).length ? { selection_stop_counts: selectionStops } : {}),
     ...(results.length ? { fair_round_reason: results.at(-1).fair_round_reason } : {}),
-    request_budget: budget, cursor_policy: 'unchanged', coverage: 'known_rows_only' };
+    request_budget: budget, cursor_policy: 'unchanged', coverage: 'known_rows_only' }, failureCause);
 }
 
 /** Start the whole-command clock before any actual selector, including when
@@ -411,18 +445,33 @@ function executeLarkImHistory(options, deps = {}) {
     monotonicClock: deps.monotonicClock || deps.requestSessionDeps?.monotonicClock,
   });
   if (!isHistoryCommandBudget(budget) || budget.summary().max_ms > maxSeconds * 1000) throw new TypeError('invalid internal history command budget');
+  // Some existing readonly helpers intentionally collapse ordinary read errors.
+  // Keep terminal command errors exact across those helper returns, without
+  // changing their normal optional-hint/account policies for other callers.
+  /** @type {unknown} */ let terminalQueryError = null;
+  const historyReadBoundary = work => {
+    let value;
+    try { value = work(); } catch (error) { throw terminalQueryError || error; }
+    if (terminalQueryError) throw terminalQueryError;
+    return value;
+  };
   const wrapQuery = query => (db, sql, label, queryDeps = {}) => {
-    const timeoutMs = budget.timeoutMs(queryDeps.timeoutMs || 30000);
-    try {
-      const rows = query(db, sql, label, { ...queryDeps, timeoutMs });
-      budget.assertReady();
-      return rows;
-    } catch (error) {
-      // Exhausting this command's remaining read time is an ordinary stop;
-      // an earlier SQLite failure keeps its original finite classification.
-      budget.assertReady();
+    if (terminalQueryError) throw terminalQueryError;
+    let timeoutMs;
+    try { timeoutMs = budget.timeoutMs(queryDeps.timeoutMs || 30000); }
+    catch (error) { terminalQueryError = error; throw error; }
+    let rows;
+    try { rows = query(db, sql, label, { ...queryDeps, timeoutMs }); }
+    catch (error) {
+      if (isDirectBudgetAdmissionStop(error)) { terminalQueryError = error; throw error; }
+      // A failed operation is not a successful read followed by admission stop.
+      // Retain both facts if its failure and the command cutoff coincide.
+      try { preserveFailureAtCutoff(error, budget); }
+      catch (failure) { terminalQueryError = failure; throw failure; }
       throw error;
     }
+    try { budget.assertReady(); } catch (error) { terminalQueryError = error; throw error; }
+    return rows;
   };
   const sqliteJson = wrapQuery(deps.sqliteJson || readOnlySqliteJson);
   // The optional hint mapper owns a narrower dependency seam. Bound that
@@ -432,12 +481,12 @@ function executeLarkImHistory(options, deps = {}) {
   const execution = { session: null };
   try {
     budget.assertReady();
-    report = executeHistoryWithinBudget(options, { ...deps, historyCommandBudget: budget, sqliteJson,
+    report = executeHistoryWithinBudget(options, { ...deps, historyCommandBudget: budget, sqliteJson, historyReadBoundary,
       debtDeps: { ...deps.debtDeps, sqliteJson: debtSqliteJson } }, execution);
   } catch (error) {
     // Only pre-session failure can truthfully report zero remote attempts.
     // Later failures retain the session's accounting or propagate as unknown.
-    if (!(error instanceof HistoryCommandBudgetError) || execution.session) throw error;
+    if (!isDirectBudgetAdmissionStop(error) || execution.session) throw error;
     report = { ok: error.reason === 'time_budget', profile: PROFILE, outcome: 'batch_deferred',
       cursor_policy: 'unchanged', coverage: 'known_rows_only', processed: 0,
       request_budget: { cli_attempts: 0, self_attempts: 0, max_cli_attempts: maxCliAttempts,
@@ -454,10 +503,11 @@ function executeLarkImHistory(options, deps = {}) {
   const commandBudget = budget.summary();
   // The committed request-budget object is part of the durable historyKey.
   // Reporting later elapsed time must not mutate that acquisition/replay input.
-  return { ...report, command_budget: commandBudget,
+  return withFailureCause({ ...report, command_budget: commandBudget,
     ...(report.request_budget ? { request_budget: { ...report.request_budget,
       elapsed_ms: commandBudget.elapsed_ms,
-      stop_reason: report.request_budget.stop_reason || commandBudget.stop_reason } } : {}) };
+      stop_reason: report.request_budget.stop_reason || commandBudget.stop_reason } } : {}) },
+    Object.getOwnPropertyDescriptor(report, 'cause')?.value);
 }
 
 export { executeLarkImHistory, selectHistoryTarget };

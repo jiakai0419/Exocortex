@@ -117,14 +117,16 @@ test('an expired domain receipt is inspectable but is not eligible for CLI publi
   assert.throws(budget.assertOutputReady,isReason('time_budget'),'the CLI publication boundary must reject this receipt');
 });
 
-test('a failing read at the work cutoff is time exhaustion; an earlier error keeps its actual identity', () => {
+test('a failed read remains failure when cutoff follows; an earlier error keeps its actual identity', () => {
   for(const exhausted of [false,true]) {
     let tick=0;
     const original=new Error('synthetic read failure');
     const budget=createHistoryCommandBudget({maxSeconds:2},{monotonicClock:()=>tick});
     const call=()=>executeLarkImHistory({db:'/synthetic/never-opened',maxSeconds:2},{historyCommandBudget:budget,
       sqliteJson(){tick=exhausted?1600:10;throw original;},createRequestSession(){assert.fail('no session');}});
-    if(exhausted){const result=call();assert.equal(result.request_budget.stop_reason,'time_budget');assert.equal(result.processed,0);}
+    if(exhausted){assert.throws(call,error=>error instanceof AggregateError&&error.cause===original
+      &&error.errors[0]===original&&error.errors[1] instanceof HistoryCommandBudgetError);
+      assert.equal(budget.summary().stop_reason,'time_budget');}
     else assert.throws(call,error=>error===original);
   }
 });
@@ -160,4 +162,25 @@ test('an earlier same-process invocation origin includes actual startup in elaps
 
 for(const start of [null,'0',NaN,Infinity,101]) test(`invalid invocation clock origin ${start} cannot grant more work`, () => {
   assert.throws(()=>createHistoryCommandBudget({maxSeconds:3},{startedMonotonicMs:start,monotonicClock:()=>100}),isReason('clock_unavailable'));
+});
+
+for(const scenario of ['guard_before_spawn','actual_failed_spawn'])test(`transport cutoff retains actual execution distinction: ${scenario}`,()=>{
+  let tick=0,held=false,spawns=0,releases=0;
+  const budget=createHistoryCommandBudget({maxSeconds:4},{monotonicClock:()=>tick});
+  const session=createMaintenanceRequestSession({maxSeconds:4,maxCliAttempts:4},{commandBudget:budget,
+    monotonicClock:()=>tick,now:()=>{if(held&&scenario==='guard_before_spawn')tick=3100;return 2_000_000_000_000;},
+    env:{LARK_CLI:'synthetic-never-spawned'},sleep(){assert.fail('no wait expected');},
+    tryAcquireLease(){held=true;return {state:'acquired',release(){held=false;releases++;}};},
+    readSharedCooldown:()=>({state:'ready'}),writeSharedCooldown:()=>true,
+    spawnSync(){spawns++;tick=3100;return {status:null,signal:'SIGKILL',error:Object.assign(new Error('INVENTED_PRIVATE_TRANSPORT'),{code:'ETIMEDOUT'}),stdout:'',stderr:''};},
+  });
+  let caught;try{session.runLark(args);}catch(error){caught=error;}
+  if(scenario==='guard_before_spawn'){
+    assert.ok(caught instanceof MaintenanceRequestError);assert.equal(caught.reason,'time_budget');assert.equal(spawns,0);
+  }else{
+    assert.ok(caught instanceof AggregateError);assert.equal(caught.errors.length,2);assert.equal(caught.cause,caught.errors[0]);
+    assert.ok(caught.errors[1] instanceof MaintenanceRequestError);assert.equal(caught.errors[1].reason,'time_budget');assert.equal(spawns,1);
+  }
+  assert.equal(session.summary().stop_reason,'time_budget');assert.equal(session.summary().cli_attempts,spawns);
+  assert.equal(releases,1);assert.equal(held,false);
 });

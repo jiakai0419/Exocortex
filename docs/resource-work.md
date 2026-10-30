@@ -13,17 +13,23 @@ The runtime exports `resourceWorkAvailable(db,deps)` and
 `executeResourceWork(options,deps)` from `src/maintenance/resource-work.mjs`.
 Availability is a cheap bounded read-only hint; it grants no lock or authority
 and may be true when only local scanning is due. It does not initialize or
-migrate the database. The command requires migration 019 already installed.
+migrate the database. The command requires migrations 019 and 021 already installed.
 
 ## Discovery and durable selection
 
 Migration 019 defines `lark_im_resource_work` and `lark_im_resource_scan`.
-Each scan inspects the newest 20 known source records and 20 records from an
-ascending, fixed historical ID horizon. There is no direction, received-time
-or current-name mask. The historical cursor advances across all inspected
-records, including text, invalid evidence and oversized records. New arrivals
-cannot extend that sweep's fixed horizon. Existing queued work may run between
-scans; a new source head or a 60-second local scan deadline permits another
+Migration 021 adds a conservative image-candidate index on `records(source_id,id)`.
+Each scan inspects the newest 20 image candidates and 20 candidates from an
+ascending, fixed historical ID horizon. Type declarations are combined by OR,
+with guarded JSON parsing; conflicting, invalid and oversized candidates still
+require the exact identity validator before enrollment. The index grants no
+resource or account authority. There is no direction, received-time or
+current-name mask. The historical cursor advances across inspected candidates,
+including rejected and oversized evidence; unrelated text does not consume its
+page. New arrivals cannot extend that sweep's fixed horizon. An older text row
+updated into an image becomes an indexed candidate and is revisited when the
+fixed sweep wraps; existing scan cursors and task state are not reset by 021.
+Existing queued work may run between scans; a new source head or a 60-second local scan deadline permits another
 scan. Discovery is not proof of coverage of unseen upstream messages.
 
 Record source fields have a combined 128 KiB automatic-work limit, measured in
@@ -44,8 +50,17 @@ source/version/hash/chat/database binding and exact original row fields remain
 separate publication and claim/result fences.
 
 At most two newest eligible selections precede an oldest eligible selection.
-That streak is durable. Failed attempts and new arrivals do not reset old
-enqueue age. This is a queue opportunity rule, not a source-to-ready time bound;
+That streak is durable. A proved source mismatch that successfully commits its
+`blocked/source_changed` transition also consumes the selected turn. Its task
+transition and streak/scan-generation update commit together under the observed
+scan generation, exact task generation/state and observed current source fence.
+This local rejection does not increment attempts, start a producer, create a
+claim token, or count a resource as processed/available. A failed guard rolls
+back that transaction. An unknown write outcome is reported as failure, without
+an extra advancement or retry: the next invocation reads the actual durable
+state, which may already include a commit whose acknowledgement was lost.
+Failed attempts and new arrivals do not reset old enqueue age. This is a queue
+opportunity rule, not a source-to-ready time bound;
 the worker separately controls service among resource/history/sample lanes.
 
 Every enrollment, claim and result transaction takes the existing normal probe

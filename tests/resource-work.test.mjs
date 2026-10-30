@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
+import {spawnSync} from 'node:child_process';
 import {mkdtempSync,rmSync,writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -199,7 +200,9 @@ for(const outsidePayload of [false,true])test(`changed-source observation CAS re
   sqliteExec(f.db,outsidePayload?`UPDATE records SET body=${q('x'.repeat(128*1024))} WHERE id=1;`:`UPDATE records SET canonical_json=json_set(canonical_json,'$.chat_name','Synthetic temporary source') WHERE id=1;`);
   const lease=f.deps.tryAcquireLease;let restored=false;
   f.deps.tryAcquireLease=args=>{if(!restored){restored=true;sqliteExec(f.db,`UPDATE records SET canonical_json=${q(original.canonical_json)},body=${q(original.body)} WHERE id=1;`);}return lease(args);};
+  const scanBefore=sqliteQuery(f.db,'SELECT * FROM lark_im_resource_scan;')[0];
   const rejected=f.run();assert.equal(rejected.ok,false);assert.equal(rejected.outcome,'execution_failed');
+  assert.deepEqual(sqliteQuery(f.db,'SELECT * FROM lark_im_resource_scan;')[0],scanBefore,'restored source rejects the entire selection-turn transaction');
   assert.equal(rejected.processed,0);assert.equal(rejected.available,0);assert.equal(rejected.blocked,0);
   assert.equal(f.tasks()[0].state,'pending');assert.equal(f.tasks()[0].attempts,0);
   assert.equal(f.run().available,1,'restored original source remains normally serviceable');
@@ -303,10 +306,14 @@ test('candidate index tolerates invalid JSON and conflicting type evidence witho
   // Corrupt JSON is deliberately injected past the schema constraint only to
   // exercise the conservative index. It is not admitted to the producer.
   const conflicting=sqliteQuery(f.db,`SELECT * FROM records WHERE id=${conflict};`)[0];
-  assert.equal(resourceWorkIdentity(conflicting),null);
+  assert.equal(resourceWorkIdentity(f.db,conflicting),null);
   assert.equal(downloads(f).length,0);
   assert.deepEqual(sqliteQuery(f.db,`SELECT id FROM records INDEXED BY ${RESOURCE_CANDIDATE_INDEX}
     WHERE ${RESOURCE_CANDIDATE_WHERE} ORDER BY id;`).map(row=>row.id),[conflict,nested]);
+  const validId=f.add(),valid=sqliteQuery(f.db,`SELECT * FROM records WHERE id=${validId};`)[0];
+  const identity=resourceWorkIdentity(f.db,valid);
+  assert(identity,'the two-argument validator must accept exact valid image evidence');
+  assert.equal(identity.record_id,validId);
 });
 
 
@@ -335,4 +342,103 @@ test('invalid image prefixes advance bounded discovery and cannot permanently hi
   f.advance(61000);const second=f.run();assert.equal(second.available,1,JSON.stringify(second));
   assert.deepEqual(f.tasks().map(x=>x.record_id),[target]);assert.equal(downloads(f).length,1);
   assert.deepEqual(sqliteQuery(f.db,'SELECT * FROM records ORDER BY id;'),before);
+});
+
+
+// A new Node process on every turn proves that no in-memory cursor repairs the
+// queue. Only the acquisition boundary is stubbed: this is not download/readiness
+// evidence, and all lease/clock/SQLite inputs belong to this synthetic fixture.
+function restartedSourceChangeTurn(f,stableOldest) {
+  const code=`
+    import {executeResourceWork,resourceWorkIdentity} from ${JSON.stringify(new URL('../src/maintenance/resource-work.mjs',import.meta.url).href)};
+    import {sqliteExec,sqliteQuery,quoteSql as q} from ${JSON.stringify(new URL('../dist/storage/sqlite/ingestion-store.js',import.meta.url).href)};
+    const db=${JSON.stringify(f.db)},oldest=${stableOldest},wall=${f.wall},selected=[];
+    const result=executeResourceWork({db,maxCliAttempts:3,maxSelfAttempts:2,maxSeconds:30},{
+      now:()=>wall,monotonicClock:()=>1,tryAcquireLease:()=>({state:'acquired',release(){}}),
+      sqliteJson(db,sql,label){
+        const rows=sqliteQuery(db,sql,label);
+        if(label==='select resource work'&&rows[0]&&rows[0].record_id!==oldest){
+          const task=rows[0];
+          sqliteExec(db,\`UPDATE records SET canonical_json=json_set(canonical_json,'$.chat_name',\${q('Synthetic concurrent name '+task.record_id+' turn ${f.nextId}')}) WHERE id=\${task.record_id};\`);
+          const current=resourceWorkIdentity(db,sqliteQuery(db,\`SELECT * FROM records WHERE id=\${task.record_id};\`)[0]);
+          if(!current||current.work_key!==task.work_key||current.binding_key!==task.binding_key||current.source_fence===task.source_fence)throw Error('synthetic source-churn setup failed');
+        }
+        return rows;
+      },
+      enrichResources(options){selected.push(options.recordIds[0]);return {request_budget:null,results:[{record_id:options.recordIds[0],state:'available'}]};}
+    });
+    process.stdout.write(JSON.stringify({pid:process.pid,result,selected,scan:sqliteQuery(db,'SELECT * FROM lark_im_resource_scan;')[0]}));
+  `;
+  const child=spawnSync(process.execPath,['--input-type=module','-e',code],{encoding:'utf8',timeout:15000});
+  assert.equal(child.status,0,JSON.stringify({status:child.status,signal:child.signal,error:child.error?.message,stdout:child.stdout,stderr:child.stderr}));
+  return JSON.parse(child.stdout);
+}
+
+test('source-change transitions consume durable fresh turns so stable oldest is attempted on turn three across restarts',t=>{
+  const f=fixture(t),oldest=1,original=sqliteQuery(f.db,'SELECT * FROM records WHERE id=1;')[0],turns=[];
+  for(let i=0;i<9;i++){f.add();turns.push(restartedSourceChangeTurn(f,oldest));}
+  assert.equal(new Set(turns.map(x=>x.pid)).size,9,'nine independent processes, one durable queue');
+  assert.deepEqual(turns.map(x=>x.scan.priority_streak),[1,2,0,1,2,0,1,2,0]);
+  assert.deepEqual(turns.map(x=>x.selected),[[],[],[oldest],[],[],[],[],[],[]],
+    'stable oldest must receive the third service opportunity despite ongoing newer source changes');
+  assert.deepEqual(turns.map(x=>x.result.outcome),['source_changed','source_changed','processed',...Array(6).fill('source_changed')]);
+  for(const turn of turns){
+    assert.equal(turn.result.request_budget.cli_attempts,0);assert.equal(turn.result.request_budget.self_attempts,0);
+    assert.equal(turn.result.request_budget.max_cli_attempts,3);assert.equal(turn.result.request_budget.max_self_attempts,2);assert.equal(turn.result.request_budget.max_seconds,30);
+  }
+  const tasks=f.tasks(),stable=tasks.find(x=>x.record_id===oldest);
+  assert.equal(stable.attempts,1);assert.equal(stable.state,'available');
+  for(const task of tasks.filter(x=>x.reason==='source_changed')){
+    assert.equal(task.attempts,0);assert.equal(task.failures,0);assert.equal(task.deferrals,0);assert.equal(task.last_attempt_at_ms,0);
+    assert.equal(task.attempt_token,null);assert.equal(task.claim_owner,null);assert.equal(task.claim_until_ms,0);
+  }
+  assert.equal(stable.enqueued_at_ms,f.wall);assert.deepEqual(sqliteQuery(f.db,'SELECT * FROM records WHERE id=1;')[0],original);
+  t.diagnostic(JSON.stringify({opportunities:turns.length,processes:new Set(turns.map(x=>x.pid)).size,firstStableAttempt:turns.findIndex(x=>x.selected.includes(oldest))+1,streaks:turns.map(x=>x.scan.priority_streak)}));
+});
+
+for(const replacement of ['scan generation','task generation','running owner'])test(`source-change turn CAS rejects concurrent ${replacement} without touching its replacement`,t=>{
+  const f=fixture(t,2);assert.equal(f.run().available,1);
+  sqliteExec(f.db,"UPDATE records SET canonical_json=json_set(canonical_json,'$.chat_name','Synthetic changed before selection') WHERE id=1;");
+  const calls=f.calls.length;let expectedTask,expectedScan,transitions=0;
+  f.deps.sqliteWrite=(db,sql,label)=>{
+    if(sql.includes("SET state='blocked',reason='source_changed'")){
+      transitions++;
+      if(replacement==='scan generation')sqliteExec(db,'UPDATE lark_im_resource_scan SET generation=generation+1,priority_streak=2;');
+      else if(replacement==='task generation')sqliteExec(db,'UPDATE lark_im_resource_work SET generation=generation+1 WHERE record_id=1;');
+      else sqliteExec(db,`UPDATE lark_im_resource_work SET state='running',attempt_token='synthetic-new-owner-token',claim_owner='synthetic-new-owner',claim_until_ms=${f.wall+120000} WHERE record_id=1;`);
+      expectedTask=f.tasks()[0];expectedScan=sqliteQuery(db,'SELECT * FROM lark_im_resource_scan;')[0];
+    }
+    return sqliteQuery(db,sql,label);
+  };
+  const result=f.run();assert.equal(transitions,1);assert.equal(result.ok,false);assert.equal(result.outcome,'execution_failed');
+  assert.equal(result.processed,0);assert.equal(result.available,0);assert.equal(result.blocked,0);assert.equal(f.calls.length,calls);
+  assert.deepEqual(f.tasks()[0],expectedTask);assert.deepEqual(sqliteQuery(f.db,'SELECT * FROM lark_im_resource_scan;')[0],expectedScan);
+});
+
+for(const actualCommit of [false,true])test(`unknown source-change write acknowledgement reports failure without replay (actual commit ${actualCommit})`,t=>{
+  const f=fixture(t,2);assert.equal(f.run().available,1);
+  sqliteExec(f.db,"UPDATE records SET canonical_json=json_set(canonical_json,'$.chat_name','Synthetic changed before unknown write') WHERE id=1;");
+  const beforeTask=f.tasks()[0],beforeScan=sqliteQuery(f.db,'SELECT * FROM lark_im_resource_scan;')[0],calls=f.calls.length;let writes=0;
+  f.deps.sqliteWrite=(db,sql,label)=>{
+    if(sql.includes("SET state='blocked',reason='source_changed'")){
+      writes++;if(actualCommit)sqliteQuery(db,sql,label);
+      throw Object.assign(new Error('synthetic unknown SQLite process outcome'),{status:null,signal:'SIGKILL'});
+    }
+    return sqliteQuery(db,sql,label);
+  };
+  const result=f.run(),afterTask=f.tasks()[0],afterScan=sqliteQuery(f.db,'SELECT * FROM lark_im_resource_scan;')[0];
+  assert.equal(writes,1,'unknown transaction is not retried');assert.equal(result.ok,false);assert.equal(result.outcome,'execution_failed');
+  assert.equal(result.processed,0);assert.equal(result.available,0);assert.equal(result.blocked,0);assert.equal(f.calls.length,calls);
+  if(actualCommit){
+    assert.equal(afterTask.state,'blocked');assert.equal(afterTask.reason,'source_changed');assert.equal(afterTask.generation,beforeTask.generation+1);
+    assert.equal(afterScan.generation,beforeScan.generation+1);assert.equal(afterScan.priority_streak,2);
+  }else{assert.deepEqual(afterTask,beforeTask);assert.deepEqual(afterScan,beforeScan);}
+  assert.equal(afterTask.attempts,beforeTask.attempts);assert.equal(afterTask.attempt_token,beforeTask.attempt_token);
+  // A subsequent invocation resumes from durable state. It does not repeat the
+  // uncertain transaction and is allowed to see the commit if it actually ran.
+  delete f.deps.sqliteWrite;
+  const next=f.run();
+  assert.equal(next.outcome,actualCommit?'no_eligible_known_resource':'source_changed');
+  assert.equal(sqliteQuery(f.db,'SELECT * FROM lark_im_resource_scan;')[0].priority_streak,2);
+  assert.equal(f.tasks()[0].generation,beforeTask.generation+1);
 });

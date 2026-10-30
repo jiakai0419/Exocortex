@@ -1,6 +1,6 @@
 # Bounded resource discovery and whole-command history time
 
-Implemented contract v0.2, base `f70690473df591b0e4035fd7d3bc108131726173`. This is an
+Implemented contract v0.3, base `f70690473df591b0e4035fd7d3bc108131726173`. This is an
 isolated local candidate. Production, account permissions and real data are not
 modified. Main owns integration and any later release; no real target IDs or
 private evidence become fixtures. Source dates and acceptance observation dates
@@ -276,3 +276,86 @@ and selection evidence, a source-to-acquisition delay remains unattributed;
 neither a fast local INSERT nor successful resource discovery proves that stage
 has been fixed. This change does not increase budgets, change the stability
 window or claim a universal seconds/minutes SLO.
+
+## Independent review closure contract (v0.3, implemented)
+
+The frozen 6d1849e review demonstrated two distinct failures. The new isolated
+candidate addresses them without changing the reviewed tree, production, API
+budgets, source/account fences, or the existing guarded process boundary.
+
+An actual history exception and the reason to stop admitting more work are
+independent observations. A later time cutoff must not erase an earlier unknown
+SQLite/process/commit outcome. Only an explicitly recognized direct budget
+admission stop may produce ordinary deferral. Aggregate/wrapped errors that
+contain an unknown or non-budget failure remain unsuccessful with finite safe
+diagnostics, even when session stop_reason is time_budget. The same rule applies
+to a returned group.error and a thrown exception. A verified committed prefix is
+retained; an uncertain suffix is neither declared rolled back nor promoted to
+committed, and is not automatically replayed. Regression controls use the actual
+CLI/storage path for no actual commit, hidden real commit, and verified prefix
+followed by an unknown commit, plus pure budget and known-commit controls.
+
+A successfully fenced source_changed terminal transition consumes a resource
+selection turn. Its task transition and priority_streak/generation change must
+commit atomically under the current scan generation and exact task/source
+conditions. Failed or uncertain CAS does not report a consumed turn or mutate a
+replacement owner. New source churn may therefore consume at most the existing
+two priority turns before a stable oldest eligible task gets a fair turn. The
+transaction does not authorize resource acquisition or weaken source identity;
+confirmed denials, request limits and task-attempt semantics remain unchanged.
+
+The corrected identity predicate test must call resourceWorkIdentity(db,row)
+and prove a valid positive control alongside rejected conflicting evidence.
+Resource-work documentation must describe the conservative image index and 021,
+not all-row scanning. The continued-arrival worker oracle must distinguish a
+resource service opportunity from a due scan; retain all source, queued,
+unfinished and uncollected denominators and the original failed oracle logs.
+No synthetic service-opportunity result establishes production first-ready time.
+
+Ownership: history route proposes only history error reduction and its tests;
+resource route proposes source-change fair-turn transaction, identity test and
+resource-work documentation; scheduling-test route owns the continuous-arrival
+integration test. Main owns this contract, integration, full checks and frozen
+handoff. All routes use separate copies and do not edit the frozen 6d workspace.
+
+The second independent review adds a third closure gate: a source policy can
+change after the list transaction and scope-lock release while account/database
+admission still passes. Post-release old-detail-backoff proof must compare the
+current exact source config with the captured admission sourceConfigJson, along
+with the existing source-enabled and scope checks, in bounded metadata reads.
+Changed or unreadable source policy withholds the exception; it does not erase
+committed list progress, reset queues, start legacy history, or retry upstream.
+The real SQLite/list commit/release regression includes one counted synthetic
+list request in each unchanged/source-policy/account/disabled/scope case; only
+the unchanged control may mint the resource-only proof. Main assigns this narrow
+sync-runner proof and its test to the source-admission route, separately from
+history, resource selection and continuous-arrival tests.
+
+
+The implementation keeps an invocation-local terminal read error across the
+existing hint, account capture/read, write-admission capture and assertCurrent
+helpers, whose normal policies may otherwise reduce read failures. Successful
+reads followed by a genuine direct time stop remain ordinary deferral; actual
+query failure followed by cutoff retains both errors and remains unsuccessful.
+Hint failures before the cutoff retain their existing fair fallback. A direct
+time stop during target acquisition returns before starting a failure checkpoint.
+Request-session tracking distinguishes its own pre-spawn admission exception
+from a real transport failure observed before the budget stops. No remote error
+string or plain reason field acquires admission authority. Aggregate/cause
+chains remain non-enumerable domain evidence; public diagnostics stay finite.
+
+The source-policy check captures the original sourceConfigJson bytes at list
+entry and returns only a scalar source-current boolean from the existing 500 ms
+metadata query. Exact bytes intentionally reject formatting-only edits. This is
+a bounded post-release observation, not an atomic promise about later changes;
+the resource command retains its fresh admission. The source-change queue fix
+advances only the selected durable streak and generation in the same guarded
+transaction; it does not increment an API attempt or claim resource completion.
+
+The integrated continuous-image tests distinguish immutable entry wall/head
+from post-service time. They combine a fixed old cohort, a new burst, continued
+arrivals, optional invalid candidates and process restarts. They retain the
+entire source, queued, incomplete and uncollected denominators, and verify actual
+CLI output. A resource service turn is not necessarily a due discovery scan;
+confirmed queue order or discovery continuation does not establish production
+latency or completion when arrivals exceed one-resource-per-turn capacity.

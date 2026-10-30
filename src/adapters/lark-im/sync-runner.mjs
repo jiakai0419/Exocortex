@@ -494,6 +494,7 @@ function retryScopeDetails(dbPath, opts, scope, selfProfile, deps, limit = 5,
  * @param {SyncRunnerDeps} deps @returns {RunResult}
  */
 function syncListedScope(dbPath, opts, scopeId, selfProfile, direction, deps) {
+  const sourceConfigJson = opts.writeAdmission?.fence.sourceConfigJson;
   // Private candidate, never copied from remote/API data or persisted error text.
   // Only the post-release path below may publish the finite idle proof.
   let backoffBasis = null;
@@ -568,6 +569,7 @@ function syncListedScope(dbPath, opts, scopeId, selfProfile, direction, deps) {
       (listed.conflicts === undefined || listed.conflicts === 0) &&
       retry.ok === false && retry.skipped === true && retry.reason === "details_not_due" && retry.detail_attempts === 0 &&
       opts.writeAdmission?.fence.selfOpenId === selfProfile.open_id && opts.writeAdmission.fence.accountKey &&
+      typeof sourceConfigJson === "string" &&
       scopeBasis(retryScope) === backoffBasis) {
     // A concurrent local source/account change cannot inherit the prior proof.
     // Admission failure only withholds this optional-work exception; it does not
@@ -576,14 +578,18 @@ function syncListedScope(dbPath, opts, scopeId, selfProfile, direction, deps) {
       const observedAt = new Date(deps.nowIso()).toISOString();
       // The due reader can also return [] after a concurrent generation change.
       // A bounded metadata-only snapshot must affirm that EVERY remaining task
-      // is previously attempted debt with a future retry time; no blobs/IDs leave it.
+      // is previously attempted debt with a future retry time. Account admission
+      // alone does not detect source-policy edits after release; compare its
+      // exact captured source bytes in this same bounded read. No config leaves it.
       const debt = deps.readOnlySqliteJson(dbPath, `SELECT COUNT(*) AS pending,
         SUM(CASE WHEN attempt_count > 0 AND descriptor_generation >= 0 AND evidence_generation >= 0
-          AND julianday(retry_at) > julianday(${deps.quoteSql(observedAt)}) THEN 1 ELSE 0 END) AS backed_off
+          AND julianday(retry_at) > julianday(${deps.quoteSql(observedAt)}) THEN 1 ELSE 0 END) AS backed_off,
+        EXISTS(SELECT 1 FROM sources WHERE id = ${deps.quoteSql(SOURCE_ID)} AND enabled = 1
+          AND CAST(config_json AS BLOB) = CAST(${deps.quoteSql(sourceConfigJson)} AS BLOB)) AS source_current
         FROM lark_im_detail_tasks WHERE scope_id = ${deps.quoteSql(scopeId)} AND status = 'pending';`,
         "read idle detail backoff admission", { timeoutMs: 500 })[0];
       opts.writeAdmission.assertCurrent();
-      if (debt && debt.pending === pending && debt.backed_off === pending &&
+      if (debt && debt.source_current === 1 && debt.pending === pending && debt.backed_off === pending &&
           scopeBasis(deps.readScope(dbPath, scopeId)) === backoffBasis) idleProof = {
         version: 1, kind: "saved_list_backoff", pending_details: pending, detail_attempts: 0,
       };

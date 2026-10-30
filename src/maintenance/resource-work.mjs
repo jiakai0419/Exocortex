@@ -171,9 +171,14 @@ export function executeResourceWork(options,deps={}) {
     if(!task)return finish();
     const row=snapshot([task.record_id])[0],identity=row&&resourceWorkIdentity(options.db,row);
     if(!identity||identity.account_key!==task.account_key||identity.work_key!==task.work_key||identity.binding_key!==task.binding_key||identity.source_fence!==task.source_fence) {
-      local(()=>write(`INSERT INTO __resource_fence SELECT CASE WHEN ${observedSourceSql(row,task.record_id)} AND EXISTS(SELECT 1 FROM ${TABLE} WHERE ${keyWhere(task)} AND generation=${task.generation} AND state=${q(task.state)}) THEN 1 ELSE 0 END;
+      // A proved obsolete selection consumes the same fair turn as a claim.
+      // Couple both changes to the observed scan/task/source so churn cannot
+      // keep selecting the fresh lane, and a failed CAS advances neither.
+      local(()=>write(`INSERT INTO __resource_fence SELECT CASE WHEN ${observedSourceSql(row,task.record_id)} AND EXISTS(SELECT 1 FROM ${TABLE} WHERE ${keyWhere(task)} AND generation=${task.generation} AND state=${q(task.state)})
+        AND EXISTS(SELECT 1 FROM ${SCAN} WHERE source_id='lark.im' AND generation=${scan.generation}) THEN 1 ELSE 0 END;
         UPDATE ${TABLE} SET state='blocked',reason='source_changed',generation=generation+1,retry_at_ms=0
-        WHERE ${keyWhere(task)} AND generation=${task.generation} AND state=${q(task.state)};`));
+        WHERE ${keyWhere(task)} AND generation=${task.generation} AND state=${q(task.state)};
+        UPDATE ${SCAN} SET priority_streak=${lane==='fair'?0:Math.min(2,scan.priority_streak+1)},generation=generation+1 WHERE source_id='lark.im';`));
       report.ok=false;report.outcome='source_changed';report.deferred=1;return finish();
     }
     const token=randomUUID();

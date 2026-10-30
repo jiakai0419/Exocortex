@@ -12,7 +12,7 @@ import { activityDatabaseKey } from '../src/diagnostics/lark-im-activity-evidenc
 import { digest, sampleScopeHash } from '../src/diagnostics/remote-sample-core.mjs';
 import { writeRemoteSampleState, remoteSamplePaths } from '../src/runtime/worker/remote-sample-scheduler.mjs';
 import { executeLarkImHistory } from '../src/maintenance/history.mjs';
-import { createHistoryCommandBudget, HistoryCommandBudgetError } from '../src/maintenance/history-command-budget.mjs';
+import { createHistoryCommandBudget } from '../src/maintenance/history-command-budget.mjs';
 import { collectRemoteSample } from '../src/diagnostics/remote-sample.mjs';
 import { loadPendingHistoryVerifications } from '../src/diagnostics/remote-sample-history.mjs';
 import { compactHistorySummary } from '../dist/runtime/worker/lark-im-worker-core.js';
@@ -174,7 +174,7 @@ test('custom debt query keeps its seam and receives the shared shrinking remaind
   let tick=0,seenDb;
   const calls=[];
   const budget=createHistoryCommandBudget({maxSeconds:30},{monotonicClock:()=>tick});
-  assert.throws(()=>fixture(t,1,{
+  const result=fixture(t,1,{
     historyCommandBudget:budget,
     sqliteJson(db,sql,label,options){
       assert.ok(tick<29000,'no general query starts after the shared work deadline');
@@ -186,7 +186,14 @@ test('custom debt query keeps its seam and receives the shared shrinking remaind
       tick=label==='read history debt policy'?28500:29100;
       return rows;
     }},
-  }),error=>error instanceof HistoryCommandBudgetError&&error.reason==='time_budget');
+  }).initialWriter;
+  assert.equal(result.ok,true);
+  assert.equal(result.outcome,'batch_deferred');
+  assert.equal(result.request_budget.stop_reason,'time_budget');
+  assert.equal(result.request_budget.cli_attempts,1);
+  assert.equal(result.processed,0);
+  assert.equal(result.failure_diagnostic,undefined);
+  assert.equal(Object.getOwnPropertyDescriptor(result,'cause'),undefined);
   assert.deepEqual(calls,[{label:'read history debt policy',timeoutMs:1000},{label:'map history debt metadata',timeoutMs:500}]);
   assert.deepEqual(store.sqliteQuery(seenDb,'SELECT * FROM lark_im_history_debt;'),[]);
   assert.deepEqual(store.sqliteQuery(seenDb,'SELECT * FROM lark_im_history_progress;'),[]);

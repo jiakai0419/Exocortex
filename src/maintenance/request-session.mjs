@@ -60,10 +60,13 @@ function createMaintenanceRequestSession(options = {}, deps = {}) {
   let stopped = null;
   /** @type {Record<string, any> | null} */
   let heldLease = null;
+  let insideTransport = false;
+  /** @type {MaintenanceRequestError | null} */ let transportAdmissionStop = null;
   /** @param {string} reason @returns {never} */
   function stop(reason) {
     stopped ||= new MaintenanceRequestError(reason);
     stopped.requestBudget = summary();
+    if (insideTransport) transportAdmissionStop ||= stopped;
     throw stopped;
   }
   function elapsedNow() {
@@ -162,8 +165,11 @@ function createMaintenanceRequestSession(options = {}, deps = {}) {
       const remaining = Math.floor(commandRemaining(deadline - elapsedNow()));
       if (remaining < 1) stop("time_budget");
       const perRequest = Math.min(NAME_LOOKUP_RETRY_BUDGET_MS, remaining);
-      const result = transport(args, { ...settings, retries: 0, retryDelayMs: 0,
-        timeoutMs: cap(settings.timeoutMs, perRequest), retryBudgetMs: cap(settings.retryBudgetMs, perRequest) });
+      let result;
+      transportAdmissionStop = null; insideTransport = true;
+      try { result = transport(args, { ...settings, retries: 0, retryDelayMs: 0,
+        timeoutMs: cap(settings.timeoutMs, perRequest), retryBudgetMs: cap(settings.retryBudgetMs, perRequest) }); }
+      finally { insideTransport = false; }
       assertReady();
       return result;
     } catch (error) {
@@ -172,9 +178,14 @@ function createMaintenanceRequestSession(options = {}, deps = {}) {
       if (classifyLarkFailure(error instanceof Error ? error.message : error).kind === "rate_limited") {
         stopped ||= new MaintenanceRequestError("rate_limited");
       }
-      // The transport sanitizes thrown executor errors. Preserve the stronger
-      // local admission reason if its spawn boundary rejected this attempt.
-      assertReady();
+      // The transport sanitizes a local pre-spawn guard exception. Preserve
+      // that exact known admission stop, not a later global budget observation.
+      if (commandBudget) {
+        if (transportAdmissionStop) throw transportAdmissionStop;
+        if (error instanceof MaintenanceRequestError || error instanceof HistoryCommandBudgetError) throw error;
+        try { assertReady(); }
+        catch (stop) { throw new AggregateError([error, stop], 'maintenance request failed and command stopped', { cause: error }); }
+      } else assertReady();
       throw error;
     } finally {
       heldLease = null;

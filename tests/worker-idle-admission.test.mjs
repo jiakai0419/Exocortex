@@ -49,8 +49,9 @@ function producer(overrides = {}) {
       assert.equal(options.timeoutMs, 500);
       assert.match(sql, /attempt_count > 0/);
       assert.match(sql, /julianday\(retry_at\) > julianday/);
+      assert.match(sql, /CAST\(config_json AS BLOB\)/);
       assert.doesNotMatch(sql, /raw_root_json/);
-      calls.push('backoff'); return [{ pending: 2, backed_off: 2 }];
+      calls.push('backoff'); return [{ pending: 2, backed_off: 2, source_current: 1 }];
     },
     fetchMessageDetails: () => { throw new Error('no detail request admitted by this fixture'); },
     ...overrides,
@@ -59,7 +60,7 @@ function producer(overrides = {}) {
     chatPageSize: 100, maxChatPages: 1, discoveryPagesPerRun: 1, receivedScopesPerRun: 1,
     discoveryMode: 'cursor', reconcileIntervalHours: 24, receivedMode: 'all', chatTypes: 'group,p2p',
     stableHorizonSeconds: 0, endExplicit: true, lockTtlSeconds: 600, retries: 0, retryDelayMs: 0,
-    writeAdmission: { fence: { selfOpenId: 'ou_synthetic_self', accountKey: 'synthetic-account' },
+    writeAdmission: { fence: { selfOpenId: 'ou_synthetic_self', accountKey: 'synthetic-account', sourceConfigJson: '{}' },
       assertCurrent: () => calls.push('admission') } };
   return { calls, opts, scope, setClock: value => { clock = value; },
     run: () => createSyncRunner(deps).syncSent('synthetic-unopened.sqlite', opts,
@@ -81,11 +82,14 @@ for (const [name, alter] of [
   ['scope release failure', () => producer({ releaseLock: () => { throw new Error('synthetic release failed'); } })],
   ['source conflict', () => producer({ commitLarkListRun: () => ({ pending_details: 2, conflicts: 1 }) })],
   ['fresh detail roots', () => producer({ fetchSentMessageList: () => ({ messages: [], detailRoots: [{}], pages: 1 }) })],
-  ['due reader empty after generation race', () => producer({ readOnlySqliteJson: () => [{ pending: 2, backed_off: 1 }] })],
-  ['backoff count changed', () => producer({ readOnlySqliteJson: () => [{ pending: 3, backed_off: 3 }] })],
+  ['due reader empty after generation race', () => producer({ readOnlySqliteJson: () => [{ pending: 2, backed_off: 1, source_current: 1 }] })],
+  ['backoff count changed', () => producer({ readOnlySqliteJson: () => [{ pending: 3, backed_off: 3, source_current: 1 }] })],
   ['backoff metadata timeout', () => producer({ readOnlySqliteJson: () => { throw new Error('synthetic metadata timeout'); } })],
-  ['malformed backoff metadata', () => producer({ readOnlySqliteJson: () => [{ pending: '2', backed_off: '2' }] })],
+  ['malformed backoff metadata', () => producer({ readOnlySqliteJson: () => [{ pending: '2', backed_off: '2', source_current: 1 }] })],
   ['missing account admission', () => { const f = producer(); delete f.opts.writeAdmission; return f; }],
+  ['missing source admission', () => { const f = producer(); delete f.opts.writeAdmission.fence.sourceConfigJson; return f; }],
+  ['unknown current source', () => producer({ readOnlySqliteJson: () => [{ pending: 2, backed_off: 2 }] })],
+  ['changed current source', () => producer({ readOnlySqliteJson: () => [{ pending: 2, backed_off: 2, source_current: 0 }] })],
   ['changed account', () => { const f = producer(); f.opts.writeAdmission.assertCurrent = () => { throw new Error('synthetic account changed'); }; return f; }],
   ['mismatched self', () => { const f = producer(); f.opts.writeAdmission.fence.selfOpenId = 'ou_synthetic_other'; return f; }],
   ['scope config changed', () => { let reads = 0; return producer({ readScope: () => ({ id: 'lark.im.sent_by_me', source_id: 'lark.im', enabled: 1,
@@ -204,7 +208,9 @@ test('backoff proof SQL distinguishes old future debt from due, fresh, invalid a
     assert.equal(result.status, 0, result.stderr);
   };
   try {
-    sql(`CREATE TABLE lark_im_detail_tasks (scope_id TEXT, status TEXT, attempt_count INTEGER,
+    sql(`CREATE TABLE sources (id TEXT PRIMARY KEY, enabled INTEGER, config_json TEXT);
+      INSERT INTO sources VALUES ('lark.im',1,'{}');
+      CREATE TABLE lark_im_detail_tasks (scope_id TEXT, status TEXT, attempt_count INTEGER,
       descriptor_generation INTEGER, evidence_generation INTEGER, retry_at TEXT);
       INSERT INTO lark_im_detail_tasks VALUES
         ('lark.im.sent_by_me','pending',1,0,0,'2026-01-01T01:00:00.000Z'),
