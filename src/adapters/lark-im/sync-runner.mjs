@@ -9,6 +9,7 @@ import {
   isBotUserOutOfChatError,
   isRestrictedModeError,
 } from "./adapter.mjs";
+import { readOnlySqliteJson } from "../../storage/sqlite/readonly-query.mjs";
 import { captureLarkWriteAdmission } from "../../diagnostics/lark-write-admission.mjs";
 import { activityDatabaseKey } from "../../diagnostics/lark-im-activity-evidence.mjs";
 import { pendingDetailContextKey } from "../../../dist/storage/sqlite/pending-detail-observation.js";
@@ -148,6 +149,7 @@ const defaultDeps = {
   commitLarkListRun,
   readLarkListProgress,
   readPendingLarkDetails,
+  readOnlySqliteJson,
   finishLarkDetailRun,
   fetchChatDiscoveryPage,
   fetchChatMessageList,
@@ -492,6 +494,11 @@ function retryScopeDetails(dbPath, opts, scope, selfProfile, deps, limit = 5,
  * @param {SyncRunnerDeps} deps @returns {RunResult}
  */
 function syncListedScope(dbPath, opts, scopeId, selfProfile, direction, deps) {
+  // Private candidate, never copied from remote/API data or persisted error text.
+  // Only the post-release path below may publish the finite idle proof.
+  let backoffBasis = null;
+  const scopeBasis = scope => JSON.stringify([scope.id, scope.source_id, scope.enabled,
+    scope.source_enabled, scope.config_json ?? scope.config]);
   const listed = syncScope(dbPath, scopeId, opts, (scope, runId) => {
     const progress = deps.readLarkListProgress(dbPath, scope);
     const listScope = { ...scope, cursor: progress?.cursor ?? scope.cursor };
@@ -543,6 +550,8 @@ function syncListedScope(dbPath, opts, scopeId, selfProfile, direction, deps) {
       fetched_count: scanned, stored_candidate_count: records.length,
     });
     const pending = Number(effects.pending_details || 0);
+    if (roots.length === 0 && Number.isSafeInteger(pending) && pending > 0 &&
+        (effects.conflicts === undefined || effects.conflicts === 0)) backoffBasis = scopeBasis(scope);
     return { ok: pending === 0, list_complete: true, details_complete: pending === 0,
       ...(pending > 0 ? { incomplete: true, error: "list saved; message details remain pending and retryable" } : {}),
       scanned, records: records.length, ...effects };
@@ -550,9 +559,37 @@ function syncListedScope(dbPath, opts, scopeId, selfProfile, direction, deps) {
   if (!listed.list_complete || !listed.pending_details) return listed;
   // Up to five due roots share the existing 30-second automatic retry budget.
   // Failures retain backoff; explicit details-only work has its own batch limit.
-  const retry = retryScopeDetails(dbPath, opts, deps.readScope(dbPath, scopeId), selfProfile, deps);
+  const retryScope = deps.readScope(dbPath, scopeId);
+  const retry = retryScopeDetails(dbPath, opts, retryScope, selfProfile, deps);
   const pending = retry.pending_details ?? listed.pending_details;
-  return { ...listed, ok: pending === 0, details_complete: pending === 0, incomplete: pending > 0,
+  let idleProof = null;
+  if (backoffBasis !== null && !listed.lock_release_error && !listed.fail_run_error &&
+      listed.ok === false && listed.incomplete === true && listed.details_complete === false &&
+      (listed.conflicts === undefined || listed.conflicts === 0) &&
+      retry.ok === false && retry.skipped === true && retry.reason === "details_not_due" && retry.detail_attempts === 0 &&
+      opts.writeAdmission?.fence.selfOpenId === selfProfile.open_id && opts.writeAdmission.fence.accountKey &&
+      scopeBasis(retryScope) === backoffBasis) {
+    // A concurrent local source/account change cannot inherit the prior proof.
+    // Admission failure only withholds this optional-work exception; it does not
+    // rewrite the already committed list receipt or its established health.
+    try {
+      const observedAt = new Date(deps.nowIso()).toISOString();
+      // The due reader can also return [] after a concurrent generation change.
+      // A bounded metadata-only snapshot must affirm that EVERY remaining task
+      // is previously attempted debt with a future retry time; no blobs/IDs leave it.
+      const debt = deps.readOnlySqliteJson(dbPath, `SELECT COUNT(*) AS pending,
+        SUM(CASE WHEN attempt_count > 0 AND descriptor_generation >= 0 AND evidence_generation >= 0
+          AND julianday(retry_at) > julianday(${deps.quoteSql(observedAt)}) THEN 1 ELSE 0 END) AS backed_off
+        FROM lark_im_detail_tasks WHERE scope_id = ${deps.quoteSql(scopeId)} AND status = 'pending';`,
+        "read idle detail backoff admission", { timeoutMs: 500 })[0];
+      opts.writeAdmission.assertCurrent();
+      if (debt && debt.pending === pending && debt.backed_off === pending &&
+          scopeBasis(deps.readScope(dbPath, scopeId)) === backoffBasis) idleProof = {
+        version: 1, kind: "saved_list_backoff", pending_details: pending, detail_attempts: 0,
+      };
+    } catch { /* Unknown current admission remains ineligible for optional work. */ }
+  }
+  return { ...listed, ...(idleProof ? { idle_detail_backoff: idleProof } : {}), ok: pending === 0, details_complete: pending === 0, incomplete: pending > 0,
     error: pending > 0 ? "list saved; message details remain pending and retryable" : undefined,
     pending_details: pending, detail_retry: retry,
     inserted: Number(listed.inserted || 0) + Number(retry.inserted || 0),

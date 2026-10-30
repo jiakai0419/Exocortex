@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import type { OwnerState, RecoveryOptions, MaintenanceLockOptions, MaintenanceLockResult } from "./ingestion-types.js";
+import type { ExecutionBudget, OwnerState, RecoveryOptions, MaintenanceLockOptions, MaintenanceLockResult } from "./ingestion-types.js";
 import { sqliteExec, sqliteQuery, quoteSql } from "./sqlite-executor.js";
 import { DEFAULT_HARD_LEASE_SECONDS, RUN_FENCE_METADATA_KEY } from "./sync-run-fence.js";
 const PROCESS_STARTED_AT_MS = Math.max(0, Math.floor(Date.now() - process.uptime() * 1000));
@@ -227,8 +227,15 @@ SELECT
 COMMIT;
 `,
     "acquire maintenance lock",
+    options.executionBudget,
   );
   const row = rows[0] || {};
+  if (options.executionBudget && (rows.length !== 1 || ![0, 1].includes(row.changed) ||
+      !Number.isSafeInteger(row.active_sync_locks) || row.active_sync_locks < 0 ||
+      !(row.lock_owner === null || typeof row.lock_owner === "string") ||
+      row.changed === 1 && (row.lock_owner !== owner || row.active_sync_locks !== 0))) {
+    throw new Error("acquire maintenance lock returned invalid evidence");
+  }
   if (Number(row.changed || 0) > 0) return { acquired: true };
   const activeSyncLocks = Number(row.active_sync_locks || 0);
   if (activeSyncLocks > 0) {
@@ -242,13 +249,14 @@ COMMIT;
   };
 }
 
-function releaseMaintenanceLock(dbPath: string, owner = `pid:${process.pid}`) {
+function releaseMaintenanceLock(dbPath: string, owner = `pid:${process.pid}`, executionBudget?: ExecutionBudget) {
   sqliteExec(
     dbPath,
     `DELETE FROM maintenance_locks
      WHERE name = 'global'
        AND owner = ${quoteSql(owner)};`,
     "release maintenance lock",
+    executionBudget,
   );
 }
 

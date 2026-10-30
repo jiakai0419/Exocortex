@@ -90,7 +90,14 @@ export type HistoryDebtRow = {
     last_attempt_id: string | null;
     last_result_json: string | null;
 };
+/** One caller-owned deadline shared by work and its reserved cleanup interval. */
+export type ExecutionBudget = {
+    timeoutMs(capMs?: number): number;
+    assertReady(): void;
+    runCleanup<T>(work: () => T): T;
+};
 export type BoundedReplayOptions = {
+    executionBudget?: ExecutionBudget;
     scope: SyncScope;
     initialSyncStartMs: number;
     startMs: number;
@@ -169,6 +176,7 @@ export type BoundedReplayOptions = {
     }>;
 };
 export type MaintenanceLockOptions = {
+    executionBudget?: ExecutionBudget;
     owner?: string;
     ttlSeconds?: number;
     reason?: string;

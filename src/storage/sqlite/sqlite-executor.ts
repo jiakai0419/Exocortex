@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import type { SqliteRow } from "./ingestion-types.js";
+import type { ExecutionBudget, SqliteRow } from "./ingestion-types.js";
 const PRIVATE_DIRECTORY_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 
@@ -59,30 +59,36 @@ function sqliteFailure(result: ReturnType<typeof spawnSync>, label: string) {
   return new Error(`${label} failed: ${detail}`);
 }
 
-function sqliteRun(dbPath: string, sql: string, label: string, json = false) {
+function sqliteRun(dbPath: string, sql: string, label: string, json = false, executionBudget?: ExecutionBudget) {
+  executionBudget?.assertReady();
   const resolvedDbPath = prepareWritableDatabasePaths(dbPath);
   let result;
   try {
+    const timeout = executionBudget?.timeoutMs();
+    if (executionBudget && (!Number.isSafeInteger(timeout) || Number(timeout) <= 0)) {
+      throw new RangeError("SQLite execution budget must provide a positive integer timeout");
+    }
     result = withPrivateUmask(() =>
       spawnSync("sqlite3", [...(json ? ["-json"] : []), resolvedDbPath], {
-        input: `.bail on\n.timeout 5000\nPRAGMA foreign_keys = ON;\n${sql}`,
+        input: `.bail on\n.timeout ${timeout === undefined ? 5000 : Math.min(5000, timeout)}\nPRAGMA foreign_keys = ON;\n${sql}`,
         encoding: "utf8",
         maxBuffer: 50 * 1024 * 1024,
+        ...(timeout === undefined ? {} : { timeout, killSignal: "SIGKILL" as const }),
       }),
     );
   } finally {
     prepareWritableDatabasePaths(resolvedDbPath);
   }
-  if (result.status !== 0 || result.error) throw sqliteFailure(result, label);
+  if (result.status !== 0 || result.error || executionBudget && result.signal) throw sqliteFailure(result, label);
   return String(result.stdout || "");
 }
 
-function sqliteExec(dbPath: string, sql: string, label: string) {
-  return sqliteRun(dbPath, sql, label);
+function sqliteExec(dbPath: string, sql: string, label: string, executionBudget?: ExecutionBudget) {
+  return sqliteRun(dbPath, sql, label, false, executionBudget);
 }
 
-function sqliteQuery(dbPath: string, sql: string, label: string): SqliteRow[] {
-  const trimmed = sqliteRun(dbPath, sql, label, true).trim();
+function sqliteQuery(dbPath: string, sql: string, label: string, executionBudget?: ExecutionBudget): SqliteRow[] {
+  const trimmed = sqliteRun(dbPath, sql, label, true, executionBudget).trim();
   return trimmed ? JSON.parse(trimmed) : [];
 }
 

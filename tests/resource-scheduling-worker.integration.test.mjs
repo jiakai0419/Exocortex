@@ -12,7 +12,8 @@ import { deflateSync } from 'node:zlib';
 import { runCli } from '../bin/exocortex.mjs';
 import { commitLarkListRun, ensureInitialized, ensureSourceInitialSyncStart, quoteSql, sqliteExec, sqliteQuery } from '../dist/storage/sqlite/ingestion-store.js';
 import { createLarkImAdapter } from '../src/adapters/lark-im/adapter.mjs';
-import { chatScopeId } from '../src/adapters/lark-im/core.mjs';
+import { bindAcquiredMessageAccounts } from '../src/adapters/lark-im/message-account-evidence.mjs';
+import { chatScopeId, recordFromMessage } from '../src/adapters/lark-im/core.mjs';
 import { syncNames } from '../src/adapters/lark-im/name-sync.mjs';
 import { createLarkCliRunner, createTransportState, getTransportStats, resetTransportStats } from '../src/adapters/lark-im/transport.mjs';
 import { createMaintenanceRequestSession } from '../src/maintenance/request-session.mjs';
@@ -62,7 +63,7 @@ function entry(label, atMs, kind = 'image') {
 }
 function publishTraffic(dir, cycle) {
   const manifest = read(join(dir, 'publisher.json')), atMs = now(dir);
-  const fresh = entry(`r${String(cycle).padStart(4, '0')}`, atMs, 'recipient');
+  const fresh = entry(`r${String(cycle).padStart(4, '0')}`, atMs, manifest.deep ? 'text' : 'recipient');
   manifest.entries.push(fresh); writeFileSync(join(dir, 'publisher.json'), JSON.stringify(manifest));
   log(dir, { type: 'source_publication', labels: [fresh.label], sourceAtMs: atMs, availableAtMs: atMs });
 }
@@ -91,6 +92,7 @@ function sessionDeps(dir, { closedPending = false } = {}) {
 }
 function observe(dir, context) {
   const db = join(dir, 'synthetic.sqlite'), before = sqliteQuery(db, 'SELECT * FROM records ORDER BY id;');
+  const manifest = read(join(dir, 'publisher.json'));
   // Producers and observations share the fixture's wall clock. The stress case
   // advances idle sleeps virtually; real Date.now() would reject later valid
   // recipient evidence as future-dated. Freeze only the reader's validation
@@ -99,13 +101,14 @@ function observe(dir, context) {
   writeFileSync(observationClock, `Date.now = () => ${now(dir)};\n`);
   const invoke = format => {
     const child = spawnSync(process.execPath, ['--import', join(dir, 'deny-network.mjs'), '--import', observationClock, join(ROOT, 'bin/exocortex.mjs'),
-      'messages', '--db', db, '--limit', '100', '--format', format], { cwd: dir, encoding: 'utf8', timeout: 15000,
+      'messages', '--db', db, '--limit', '100', ...(manifest.deep ? ['--direction', 'received'] : []), '--format', format], { cwd: dir, encoding: 'utf8', timeout: 15000,
       env: { ...process.env, LARK_CLI: join(dir, 'reject-lark'), NO_COLOR: '1', TZ: 'UTC' } });
     assert.equal(child.status, 0, child.stderr || child.stdout); assert.equal(child.stderr, '');
     return { text: child.stdout, atMs: now(dir) };
   };
   const json = invoke('json'), rows = JSON.parse(json.text), terminal = invoke('text');
-  const sorted = [...before].sort((a, b) => b.occurred_at_ms - a.occurred_at_ms || b.external_id.localeCompare(a.external_id));
+  const cohort = manifest.deep ? before.filter(row => row.direction === 'received') : before;
+  const sorted = [...cohort].sort((a, b) => b.occurred_at_ms - a.occurred_at_ms || b.external_id.localeCompare(a.external_id));
   assert.deepEqual(rows.map(row => row.external_id), sorted.map(row => row.external_id));
   const ids = [...terminal.text.matchAll(/om_[a-z0-9]{5}\b/g)];
   assert.deepEqual(ids.map(match => match[0]), rows.map(row => row.external_id), 'text preserves all stored rows and their order');
@@ -131,15 +134,16 @@ function observe(dir, context) {
     rows: rows.map(row => ({ externalId: row.external_id, state: row.readiness.state, reasons: row.readiness.reasons })),
     jsonAtMs: json.atMs, textAtMs: terminal.atMs }); return rows;
 }
-function fixture(t, light = false) {
+function fixture(t, light = false, deep = false) {
   const dir = mkdtempSync(join(tmpdir(), 'exocortex-resource-worker-synthetic-')), db = join(dir, 'synthetic.sqlite');
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const base = Date.now(); writeFileSync(join(dir, 'clock.json'), JSON.stringify({ epochMs: base, anchorNs: String(process.hrtime.bigint()) }));
   writeFileSync(join(dir, 'events.jsonl'), '');
-  const initial = light ? [entry('light', base - 30000)] : [
+  const initial = deep ? [...Array.from({length:4}, (_,i) => entry(`d000${i}`, base - 30000 + i)),
+    entry('x0000',base-29990),entry('x0001',base-29989)] : light ? [entry('light', base - 30000)] : [
     ...Array.from({ length: 4 }, (_, i) => entry(`a${String(i).padStart(4, '0')}`, base - 180000 + i, 'app')),
     entry('img00', base - 1000), entry('deny0', base - 999), entry('img01', base - 998), entry('r0000', base - 997, 'recipient')];
-  writeFileSync(join(dir, 'publisher.json'), JSON.stringify({ light, entries: initial }));
+  writeFileSync(join(dir, 'publisher.json'), JSON.stringify({ light, deep, entries: initial }));
   writeFileSync(join(dir, 'fake-lark'), `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(HERE)} --remote "$@"\n`, { mode: 0o700 });
   writeFileSync(join(dir, 'reject-lark'), '#!/bin/sh\nexit 97\n', { mode: 0o700 });
   writeFileSync(join(dir, 'deny-network.mjs'), "import{Socket}from'node:net';const deny=()=>{throw new Error('synthetic read forbids network')};globalThis.fetch=deny;Socket.prototype.connect=deny;Object.defineProperty(process.stdout,'columns',{value:160});\n");
@@ -147,6 +151,23 @@ function fixture(t, light = false) {
   sqliteExec(db, `INSERT INTO sync_scopes(id,source_id,name,config_json) VALUES(${quoteSql(chatScopeId(GROUP))},'lark.im','Synthetic group',${quoteSql(JSON.stringify({ chat_id: GROUP, chat_type: 'group', chat_name: TITLE }))});`);
   assert.equal(sqliteQuery(db, 'SELECT COUNT(*) n FROM records;')[0].n, 0);
   return { dir, db, base, initial };
+}
+// Seed only authored historical rows after the first real forward commit, so
+// the four resource candidates precede 5500 unrelated, gapped database IDs.
+function seedDeepHistory(dir, db) {
+  if (existsSync(join(dir, 'deep-seeded'))) return;
+  assert.equal(sqliteQuery(db,'SELECT COUNT(*) n FROM records;')[0].n,6);
+  const at = now(dir), scope = chatScopeId(GROUP);
+  const records = Array.from({length:5500}, (_,i) => {
+    const source=entry(`b${String(i).padStart(4,'0')}`,at-10000+i,'text');
+    source.message.sender={id:SELF.open_id,id_type:'open_id',sender_type:'user',name:SELF.name};
+    const row=recordFromMessage(source.message,scope,'sent',{self:SELF},{chat_id:GROUP,chat_type:'group',chat_name:TITLE});
+    return {...bindAcquiredMessageAccounts([row],SELF,{acquiredAt:new Date(at).toISOString()})[0],id:100+i*3};
+  });
+  const keys=Object.keys(records[0]);
+  sqliteExec(db,`BEGIN IMMEDIATE; INSERT INTO records(${keys.join(',')}) VALUES ${records.map(row=>'('+keys.map(key=>quoteSql(row[key])).join(',')+')').join(',')}; COMMIT;`);
+  writeFileSync(join(dir,'deep-seeded'),'authored 5500 unrelated records');
+  log(dir,{type:'deep_history_seed',rows:5500,highestId:records.at(-1).id});
 }
 function worker(dir) {
   const child = spawnSync(process.execPath, [HERE, '--worker'], { cwd: dir, encoding: 'utf8', timeout: 180000, maxBuffer: 3 * 1024 * 1024,
@@ -194,14 +215,14 @@ if (process.argv[2] === '--remote') {
     readSharedCooldown: o => readSharedLarkCooldown(o, { directory }), writeSharedCooldown: o => writeSharedLarkCooldown(o, { directory }) });
   const adapter = createLarkImAdapter({ run: remote });
   log(dir, { type: 'cli_start', command: args[0], operation: args[1], args });
-  const code = await runCli(args, { now: args[0] === 'sync' || args[1] === 'resources' ? () => now(dir) : Date.now, deps: {
+  const code = await runCli(args, { monotonicNow: () => process.uptime() * 1000, startedMonotonicMs: 0, now: args[0] === 'sync' || args[1] === 'resources' ? () => now(dir) : Date.now, deps: {
     getSelfProfile: args[0] === 'sync' ? adapter.getSelfProfile : undefined,
     getTransportStats: () => getTransportStats(state), resetTransportStats: () => resetTransportStats(state),
     tryAcquireLarkApiLease: o => tryAcquireLarkApiLease(o, { directory }),
     // Queue metadata uses its real monotonic clock. Only the producer request
     // session elides gaps; crossing those clocks would fabricate lease expiry.
     tryAcquireLease: o => tryAcquireLarkApiLease(o, { directory, monotonicClock: () => performance.now() }),
-    requestSessionDeps: sessionDeps(dir, { closedPending: args[1] === 'resources' && !read(join(dir, 'publisher.json')).light }),
+    requestSessionDeps: sessionDeps(dir, { closedPending: args[1] === 'resources' && !read(join(dir, 'publisher.json')).light && !read(join(dir, 'publisher.json')).deep }),
     syncRunnerDeps: { ...adapter, nowIso: () => new Date(now(dir)).toISOString(),
       commitLarkListRun(...parameters) {
         log(dir, { type: 'identity_prepared', ids: parameters[3].filter(x => {
@@ -217,12 +238,12 @@ if (process.argv[2] === '--remote') {
   log(dir, { type: 'worker_started' });
   const { resourceWorkAvailable } = await import('../src/maintenance/resource-work.mjs');
   const { readIdleFairState, claimIdleLane } = await import('../src/runtime/worker/idle-fair-state.mjs');
-  const light = read(join(dir, 'publisher.json')).light;
-  const opts = parseArgs(['--max-cycles', light ? '1' : '4', '--db', db, '--log-dir', join(dir, 'logs'), ...(light ? ['--remote-sample-interval-seconds', '0'] : [])]);
+  const {light, deep} = read(join(dir, 'publisher.json'));
+  const opts = parseArgs(['--max-cycles', light ? '1' : deep ? '2' : '4', '--db', db, '--log-dir', join(dir, 'logs'), ...(light || deep ? ['--remote-sample-interval-seconds', '0'] : [])]);
   const helperDeps = deps => ({ ...deps, tryAcquireLease: (o, leaseDeps) => tryAcquireLarkApiLease(o, { ...leaseDeps, directory: join(dir, 'api-state') }) });
   const result = runWorker(opts, { nowMs: () => now(dir), monotonicNowMs: () => performance.now(),
     sleepSeconds: s => { advance(dir, s * 1000); }, writeScheduler() {},
-    ...(light ? { hasHistoryWork: () => false } : {}),
+    ...(light || deep ? { hasHistoryWork: () => false } : {}),
     hasResourceWork: o => { const available = resourceWorkAvailable(o.db, { now: () => now(dir) }); log(dir, { type: 'resource_hint', available }); return available; },
     readIdleFairState: (path, deps) => { const state = readIdleFairState(path, helperDeps(deps)); log(dir, { type: 'fair_read', state }); return state; },
     claimIdleLane: (path, state, lane, eligible, deps) => {
@@ -253,7 +274,8 @@ if (process.argv[2] === '--remote') {
         max_cli_attempts: options.maxApiCalls, max_self_attempts: options.maxSelfCalls,
         cli_attempts: receipt.cli_attempts, self_attempts: receipt.self_attempts } };
     },
-    runCycle: (options, cycle, deps) => runCycle(options, cycle, { ...deps, runStep: { scriptPath: HERE }, writeLog: { stdout: { write() {} } },
+    runCycle: (options, cycle, deps) => runCycle(options, cycle, { ...deps,
+      beforeHistory: (steps, history) => { if (deep) seedDeepHistory(dir, db); return deps.beforeHistory(steps, history); }, runStep: { scriptPath: HERE }, writeLog: { stdout: { write() {} } },
       onComplete: (steps, payload) => { deps.onComplete?.(steps, payload); log(dir, { type: 'cycle', cycle, ok: payload.ok, steps }); observe(dir, 'cycle'); if (!light) publishTraffic(dir, events(dir).filter(x => x.type === 'cycle').length); } }),
   });
   process.stdout.write(JSON.stringify({ ok: result }));
@@ -351,6 +373,35 @@ if (process.argv[2] === '--remote') {
       sourceDenominator: cohort.length, storedDenominator: final.length,
       complete: cohort.filter(x => !x.censored).length, unresolved: cohort.filter(x => x.censored).length, cohort,
       limit: 'synthetic service opportunities; no production percentile or unconditional source-to-ready bound' }));
+  });
+  test('deep sparse history: real worker and CLI discover four old images in the first opportunity and complete across restart',t=>{
+    const {dir,db,initial}=fixture(t,false,true);
+    worker(dir);
+    const firstTasks=sqliteQuery(db,'SELECT record_id,state FROM lark_im_resource_work ORDER BY record_id;');
+    assert.deepEqual(firstTasks.map(x=>x.record_id),[1,2,3,4,5,6]);
+    assert.equal(firstTasks.filter(x=>x.state==='available').length,2);
+    worker(dir);worker(dir);
+    const journal=events(dir), final=observe(dir,'deep_final');
+    assert.equal(final.length,11);assert(final.every(row=>row.readiness.state==='ready'));
+    assert.equal(sqliteQuery(db,'SELECT COUNT(*) n FROM records;')[0].n,5511);
+    assert(journal.filter(x=>x.type==='worker_started').length===3);
+    const resourceSteps=journal.filter(x=>x.type==='resource_step');assert.equal(resourceSteps.length,6);
+    assert(resourceSteps.every(x=>x.step.ok && !x.step.guardian_diagnostic && x.step.summary.available===1));
+    assert(resourceSteps.every(x=>x.step.summary.request_budget.cli_attempts===3 && x.step.summary.request_budget.self_attempts===2));
+    const imageIds=initial.map(x=>x.message.message_id).sort(), originalIds=initial.slice(0,4).map(x=>x.message.message_id);
+    assert.deepEqual(firstTasks.slice(0,4).map(x=>x.record_id),[1,2,3,4]); // newest-image ranks 6,5,4,3
+    assert.deepEqual(journal.filter(x=>x.type==='api'&&x.route==='download').map(x=>x.id).sort(),imageIds);
+    const observations=journal.filter(x=>x.type==='messages_observation');
+    assert(observations.every(x=>originalIds.every(id=>x.rows.some(row=>row.externalId===id))),'all four unresolved images remain in every received cohort');
+    assert.equal(observations[0].rows.filter(x=>x.state==='ready').length,1);
+    const fresh=read(join(dir,'publisher.json')).entries.filter(x=>x.kind==='text');
+    const stored=sqliteQuery(db,"SELECT external_id FROM records WHERE external_id LIKE 'om_r%';");
+    assert.equal(stored.length,5);assert.equal(fresh.length,6,'last post-cycle publication waits for next forward cycle');
+    const commits=journal.filter(x=>x.type==='collection_commit');
+    assert(stored.every(x=>commits.some(c=>c.ids.includes(x.external_id))),'fresh traffic still traverses real forward commit');
+    t.diagnostic(JSON.stringify({unrelatedHistory:5500,originalImageDenominator:4,available:4,
+      additionalNewerImages:2,resourceOpportunities:6,restarts:2,freshCollected:5,freshAwaitingNextCycle:1,
+      bound:'six valid image candidates including four fixed targets at newest ranks 3-6; no external denial/contention, resource eligible on each of six idle slices; not a production latency percentile'}));
   });
   test('one light-load source image becomes readable in the first real worker resource opportunity', t => {
     const { dir, initial } = fixture(t, true), result = worker(dir), journal = events(dir), source = initial[0];

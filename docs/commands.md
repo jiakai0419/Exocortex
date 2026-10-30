@@ -302,7 +302,7 @@ Recheck a bounded batch of known historical records with durable debt and scan c
 | `--max-records` | integer | `1` | ≥ 1；≤ 12 | Maximum selected records; bounded acquisitions retain identity and per-record fences. |
 | `--max-cli-attempts` | integer | `4` | ≥ 2；≤ 12 | Shared actual CLI budget for the entire batch, including identity, pages and detail. |
 | `--max-self-attempts` | integer | `6` | ≥ 0；≤ 6 | Shared actual self-profile attempt cap, including failed requests. |
-| `--max-seconds` | integer | `30` | ≥ 1；≤ 30 | Remote-work budget, 1 to 30 seconds; not the whole subprocess wall time. |
+| `--max-seconds` | integer | `30` | ≥ 1；≤ 30 | Whole history command budget, 1 to 30 seconds, including startup, local work, cleanup and output. |
 
 ### maintenance resources
 

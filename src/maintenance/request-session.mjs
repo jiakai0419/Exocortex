@@ -1,6 +1,7 @@
 // @ts-check
 import { spawnSync } from "node:child_process";
 import { performance } from "node:perf_hooks";
+import { isHistoryCommandBudget, HistoryCommandBudgetError } from "./history-command-budget.mjs";
 import { classifyLarkFailure, createLarkCliRunner, createTransportState, transportOperation } from "../adapters/lark-im/transport.mjs";
 import { NAME_LOOKUP_RETRY_BUDGET_MS } from "../adapters/lark-im/name-resolver.mjs";
 import { tryAcquireLarkApiLease, readSharedLarkCooldown, writeSharedLarkCooldown } from "../runtime/lark-api-lease.mjs";
@@ -49,6 +50,8 @@ function createMaintenanceRequestSession(options = {}, deps = {}) {
   const writeCooldown = deps.writeSharedCooldown || writeSharedLarkCooldown;
   const spawn = deps.spawnSync || spawnSync;
   const sleep = deps.sleep || ((/** @type {number} */ ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms));
+  const commandBudget = deps.commandBudget || null;
+  if (commandBudget && !isHistoryCommandBudget(commandBudget)) throw new TypeError("invalid internal command budget");
   const started = monotonicClock();
   const deadline = started + maxSeconds * 1000;
   let attempts = 0, selfAttempts = 0;
@@ -68,9 +71,16 @@ function createMaintenanceRequestSession(options = {}, deps = {}) {
     if (!Number.isFinite(started) || !Number.isFinite(value) || value < started) stop("clock_unavailable");
     return value;
   }
+  function commandRemaining(capMs) {
+    if (capMs <= 0) stop("time_budget");
+    if (!commandBudget) return capMs;
+    try { return commandBudget.timeoutMs(capMs); }
+    catch (error) { if (error instanceof HistoryCommandBudgetError) stop(error.reason); throw error; }
+  }
   function assertReady() {
     if (stopped) stop(stopped.reason);
     if (elapsedNow() >= deadline) stop("time_budget");
+    commandRemaining(Math.max(1, deadline - elapsedNow()));
   }
   /** @param {number | undefined} value @param {number} fallback */
   const cap = (value, fallback) => Number.isFinite(value) && Number(value) > 0 ? Math.min(fallback, Math.floor(Number(value))) : fallback;
@@ -99,7 +109,7 @@ function createMaintenanceRequestSession(options = {}, deps = {}) {
       assertReady();
       if (attempts >= maxCliAttempts) stop("cli_budget");
       if (!heldLease) stop("lease_unavailable");
-      const remaining = Math.floor(deadline - elapsedNow());
+      const remaining = Math.floor(commandRemaining(deadline - elapsedNow()));
       if (remaining < 1) stop("time_budget");
       const isSelf = transportOperation(args) === "self_profile";
       if (isSelf && selfAttempts >= maxSelfAttempts) stop("self_budget");
@@ -137,19 +147,19 @@ function createMaintenanceRequestSession(options = {}, deps = {}) {
       const before = elapsedNow();
       const wait = Math.max(0, lastFinished + MAINTENANCE_REQUEST_GAP_MS - before);
       if (!wait) break;
-      if (wait + 1 >= deadline - before) stop("time_budget");
+      if (wait + 1 >= commandRemaining(deadline - before)) stop("time_budget");
       sleep(wait);
       assertReady();
       if (elapsedNow() <= before) stop("clock_unavailable");
     }
     let lease;
-    try { lease = acquire({ db: options.db, role: "probe", monotonicDeadlineMs: deadline }); }
+    try { lease = acquire({ db: options.db, role: "probe", monotonicDeadlineMs: Math.min(deadline, elapsedNow() + commandRemaining(deadline - elapsedNow())) }); }
     catch { stop("lease_unavailable"); }
     if (lease?.state !== "acquired") stop(lease?.state === "busy" ? "sync_busy" : "lease_unavailable");
     heldLease = lease;
     try {
       assertReady();
-      const remaining = Math.floor(deadline - elapsedNow());
+      const remaining = Math.floor(commandRemaining(deadline - elapsedNow()));
       if (remaining < 1) stop("time_budget");
       const perRequest = Math.min(NAME_LOOKUP_RETRY_BUDGET_MS, remaining);
       const result = transport(args, { ...settings, retries: 0, retryDelayMs: 0,
@@ -173,24 +183,32 @@ function createMaintenanceRequestSession(options = {}, deps = {}) {
     }
   }
   function summary() {
-    const elapsed = monotonicClock() - started;
+    const command = commandBudget?.summary();
+    const elapsed = command ? command.elapsed_ms : monotonicClock() - started;
     return { max_cli_attempts: maxCliAttempts, cli_attempts: attempts, max_seconds: maxSeconds,
       ...(options.maxSelfAttempts !== undefined ? { max_self_attempts: maxSelfAttempts, self_attempts: selfAttempts } : {}),
       min_interval_ms: MAINTENANCE_REQUEST_GAP_MS,
-      elapsed_ms: Number.isFinite(elapsed) ? Math.max(0, Math.floor(elapsed)) : null,
-      stop_reason: stopped?.reason || null };
+      elapsed_ms: typeof elapsed === "number" && Number.isFinite(elapsed) ? Math.max(0, Math.floor(elapsed)) : null,
+      stop_reason: stopped?.reason || command?.stop_reason || null };
   }
   /** Keep cooperating sync/sidecar publishers out of the local admission and
    * transaction interval. No CLI is spawned or charged by this local lease. */
   function withCommit(action, { allowStoppedForFailure = false } = {}) {
-    // Remote deadlines forbid more remote work, not completing already fetched
-    // local transactions. The lease helper itself remains bounded to 2 seconds.
+    // Legacy callers retain their remote-only clock. Whole-command history
+    // must also admit and finish local transactions within its work remainder;
+    // its storage owner uses the reserved cleanup phase for lock release.
     if (stopped && !allowStoppedForFailure) stop(stopped.reason);
+    const commitStarted = elapsedNow();
+    const commitRemaining = commandRemaining(2000);
     let lease;
-    try { lease = acquire({ db: options.db, role: "probe", monotonicDeadlineMs: elapsedNow() + 2000 }); }
+    try { lease = acquire({ db: options.db, role: "probe", monotonicDeadlineMs: commitStarted + commitRemaining }); }
     catch { stop("lease_unavailable"); }
     if (lease?.state !== "acquired") stop(lease?.state === "busy" ? "sync_busy" : "lease_unavailable");
+    // A successful storage response is a committed receipt. A later clock
+    // observation must stop new work, not erase those already durable effects.
     try { return action(); }
+    // This release only closes our already-owned descriptor; it never starts
+    // another process or write. Always close it even when the clock has expired.
     finally { lease.release(); }
   }
   return { runLark, assertReady, summary, withCommit };

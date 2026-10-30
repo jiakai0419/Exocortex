@@ -10,6 +10,7 @@ import {SENT_SCOPE_ID} from '../src/adapters/lark-im/core.mjs';
 import {readMessageSnapshot} from '../src/diagnostics/message-read-snapshot.mjs';
 import {executeResourceWork,resourceWorkAvailable,resourceWorkIdentity} from '../src/maintenance/resource-work.mjs';
 import {loadMessages} from '../src/diagnostics/messages-report.mjs';
+import {RESOURCE_CANDIDATE_WHERE,RESOURCE_CANDIDATE_INDEX} from '../src/maintenance/resource-candidates.mjs';
 import {enrichResources} from '../src/maintenance/enrich-resources.mjs';
 
 const SELF='ou_synthetic_resource_work_owner',AT=Date.UTC(2025,1,3),sha=x=>createHash('sha256').update(x).digest('hex');
@@ -92,7 +93,7 @@ test('large plain text and oversized raw pages advance while valid images remain
   const f=fixture(t,0);f.add('text',{large:'x'.repeat(2*1024*1024)});f.add('image',{large:'y'.repeat(2*1024*1024)});
   f.add();for(let i=0;i<25;i++)f.add('text',{text:'Synthetic later text'});
   const result=f.run();assert.equal(result.available,1,JSON.stringify(result));assert(downloads(f)[0][2].includes('/om_synthetic_queue_3/'));
-  assert.equal(sqliteQuery(f.db,'SELECT after_id FROM lark_im_resource_scan;')[0].after_id,20);
+  assert.equal(sqliteQuery(f.db,'SELECT after_id FROM lark_im_resource_scan;')[0].after_id,3,'cursor advances over indexed image candidates including oversized images');
 });
 
 test('obsolete queued image becoming text is terminal and cannot pin the next unit',t=>{
@@ -262,4 +263,69 @@ test('recovery cannot clear a changed owner or expiry even with the same task to
 test('confirmed denial task CAS failure does not publish a blocked task counter',t=>{
   const f=fixture(t);f.settings.denied=true;f.settings.onProfile=n=>{if(n===2)sqliteExec(f.db,'UPDATE lark_im_resource_work SET generation=generation+1;');};
   const r=f.run();assert.equal(r.ok,false);assert.equal(r.outcome,'execution_failed');assert.equal(r.blocked,0);assert.equal(r.processed,0);assert.equal(r.available,0);assert.equal(f.tasks()[0].state,'running');
+});
+
+
+test('5500 unrelated gapped history rows cannot consume the image discovery page or hide four images',t=>{
+  const f=fixture(t,4), template=f.add('text');
+  sqliteExec(f.db,`WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<5500)
+    INSERT INTO records(id,source_id,record_type,external_id,external_version,first_seen_scope_id,
+      actor_id,container_id,direction,occurred_at,occurred_at_ms,raw_json,canonical_json,content_hash,body)
+    SELECT ${template}+x*3,r.source_id,r.record_type,'om_synthetic_deep_text_'||x,r.external_version,r.first_seen_scope_id,
+      r.actor_id,r.container_id,r.direction,r.occurred_at,r.occurred_at_ms,r.raw_json,r.canonical_json,r.content_hash,r.body
+    FROM n JOIN records r ON r.id=${template};`);
+  const before=sqliteQuery(f.db,'SELECT * FROM records ORDER BY id;');
+  f.nextId=16506;
+  const plan=sqliteQuery(f.db,`.explain off\nEXPLAIN QUERY PLAN SELECT id FROM records INDEXED BY ${RESOURCE_CANDIDATE_INDEX}
+    WHERE ${RESOURCE_CANDIDATE_WHERE} AND id>0 AND id<=20000 ORDER BY id LIMIT 20;`);
+  assert(plan.some(row=>row.detail.includes(RESOURCE_CANDIDATE_INDEX)),JSON.stringify(plan));
+  const first=f.run();assert.equal(first.available,1,JSON.stringify(first));
+  assert.deepEqual(f.tasks().map(row=>row.record_id),[1,2,3,4]);
+  for(let n=0;n<3;n++) {f.add('text');f.advance(61000);assert.equal(f.run().available,1);}
+  assert.deepEqual(f.tasks().map(row=>row.state),['available','available','available','available']);
+  assert.equal(downloads(f).length,4);
+  assert.deepEqual(sqliteQuery(f.db,'SELECT * FROM records WHERE id<=16505 ORDER BY id;'),before);
+});
+
+test('candidate index tolerates invalid JSON and conflicting type evidence without authorizing a resource',t=>{
+  const f=fixture(t,0);const invalid=f.add(),conflict=f.add('text',{msg_type:'image'}),nested=f.add();
+  sqliteExec(f.db,`PRAGMA ignore_check_constraints=ON;
+    UPDATE records SET raw_json='not JSON',canonical_json='not JSON' WHERE id=${invalid};
+    UPDATE records SET raw_json=json_object('raw_api',json(raw_json)),canonical_json=json_remove(canonical_json,'$.msg_type') WHERE id=${nested};
+    PRAGMA ignore_check_constraints=OFF;`);
+  // Corrupt JSON is deliberately injected past the schema constraint only to
+  // exercise the conservative index. It is not admitted to the producer.
+  const conflicting=sqliteQuery(f.db,`SELECT * FROM records WHERE id=${conflict};`)[0];
+  assert.equal(resourceWorkIdentity(conflicting),null);
+  assert.equal(downloads(f).length,0);
+  assert.deepEqual(sqliteQuery(f.db,`SELECT id FROM records INDEXED BY ${RESOURCE_CANDIDATE_INDEX}
+    WHERE ${RESOURCE_CANDIDATE_WHERE} ORDER BY id;`).map(row=>row.id),[conflict,nested]);
+});
+
+
+test('021 upgrade preserves nonzero scan and task generations and resumes remaining image work',t=>{
+  const f=fixture(t,3);assert.equal(f.run().available,1);
+  // Use the actual existing scheduler tables, not a replacement schema.
+  const names=sqliteQuery(f.db,"SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'lark_im_resource%';").map(x=>x.name);
+  const snapshots=names.map(name=>[name,sqliteQuery(f.db,`SELECT * FROM ${name};`)]);
+  sqliteExec(f.db,`DROP INDEX ${RESOURCE_CANDIDATE_INDEX}; DELETE FROM schema_migrations WHERE version='021';`);
+  ensureInitialized(f.db);
+  for(const [name,before] of snapshots)assert.deepEqual(sqliteQuery(f.db,`SELECT * FROM ${name};`),before);
+  assert.equal(sqliteQuery(f.db,"SELECT count(*) n FROM schema_migrations WHERE version='021';")[0].n,1);
+  assert.equal(f.run().available,1);assert.equal(f.run().available,1);
+  assert.equal(downloads(f).length,3);
+});
+
+
+test('invalid image prefixes advance bounded discovery and cannot permanently hide a middle valid image',t=>{
+  const f=fixture(t,0);
+  for(let i=0;i<25;i++)f.add('image',{body:{content:'{"image_key":""}'}});
+  const target=f.add();
+  for(let i=0;i<25;i++)f.add('image',{body:{content:'{"image_key":""}'}});
+  const before=sqliteQuery(f.db,'SELECT * FROM records ORDER BY id;');
+  const first=f.run();assert.equal(first.processed,0);assert.equal(f.tasks().length,0);assert.equal(downloads(f).length,0);
+  assert.equal(sqliteQuery(f.db,'SELECT after_id FROM lark_im_resource_scan;')[0].after_id,20);
+  f.advance(61000);const second=f.run();assert.equal(second.available,1,JSON.stringify(second));
+  assert.deepEqual(f.tasks().map(x=>x.record_id),[target]);assert.equal(downloads(f).length,1);
+  assert.deepEqual(sqliteQuery(f.db,'SELECT * FROM records ORDER BY id;'),before);
 });

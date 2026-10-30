@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { performance } from "node:perf_hooks";
 import { copySqliteReadDiagnostic, renderSqliteReadDiagnostic } from "../diagnostics/sqlite-read-diagnostic.mjs";
 
 export const PROJECT_ROOT = fileURLToPath(new URL("../../", import.meta.url));
@@ -37,9 +38,12 @@ export function createCommandContext(overrides = {}) {
   const cwd = resolve(overrides.cwd || process.cwd());
   const root = resolve(overrides.root || PROJECT_ROOT);
   const now = overrides.now || Date.now;
+  const monotonicNow = overrides.monotonicNow || (() => performance.now());
   return {
     ...overrides, cwd, root, now,
     startedAtMs: overrides.startedAtMs ?? now(),
+    monotonicNow,
+    startedMonotonicMs: overrides.startedMonotonicMs ?? monotonicNow(),
     env: overrides.env || process.env,
     stdout: overrides.stdout || process.stdout,
     stderr: overrides.stderr || process.stderr,

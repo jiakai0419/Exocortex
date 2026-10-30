@@ -6,6 +6,22 @@
 ## 绑定与接口
 
 `resourceStorePath(db, override?)` 默认返回 `resolve(db) + '.resources'`。
+默认位置继续保留在数据库文件旁，不迁移、改名或重新下载已有资源；数据库是否使用
+`.sqlite`、`.sqlite3`、`.db` 或无后缀都不改变这个规则。
+
+仓库的 `.gitignore` 使用 `*.resources/` 忽略任意层级的整个默认资源目录，而不是
+只忽略图片扩展名或某一种数据库文件名。范围包括 blob、manifest、发布临时文件、
+`pending-v1` 中的未完成及隔离证据，以及目录下的其他文件。原有
+`lark-im-resources/` 规则继续保留。显式 override 可以指向其他目录；若该目录位于
+仓库内且不匹配这些规则，必须在放入真实资源前另行确认其 Git 排除规则，不能假定
+默认规则会覆盖任意 override，也不自动安装个人配置。
+
+Git 忽略规则只防止通常的未跟踪文件添加，不会撤销已经跟踪或暂存的文件，
+也不阻止 `git add -f`。发布前必须同时检查工作树、索引及待发布提交；发现资源已被
+跟踪、暂存或进入提交时必须明确报警并停止发布，不能把 `git check-ignore --no-index`
+的匹配当作安全证明。不要自动删除资源或以取消跟踪代替检查已有历史；已进入远端
+的内容需要单独处理。隐私验收只用从零生成的合成资源与隔离 Git 仓库。
+
 `makeMediaResourceBinding(db,row,accountKey,media)` 只接受 lark.im 的 image 消息，
 资源投影必须有合法 image_key。绑定包括数据库真实路径和 dev/ino（不以数据库
 大小、mtime、ctime 作为版本）、source_id、external_id、external_version（可 null）、

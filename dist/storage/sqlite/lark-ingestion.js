@@ -11,6 +11,15 @@ import { reviewFenceSql } from "./maintenance-review.js";
 import { sourceProof } from "../../core/lark-observation.js";
 import { prepareObservationRecords, observationEvidenceSql, observationGuardSql } from "./observation-store.js";
 import { pendingDetailGuardSql, preparePendingDetailObservation } from "./pending-detail-observation.js";
+/** A successful, validated transaction receipt survives a later cleanup failure. */
+class BoundedReplayCleanupError extends Error {
+    committedEffects;
+    constructor(effects, cause) {
+        super("bounded replay committed but maintenance lock cleanup failed", { cause });
+        this.name = "BoundedReplayCleanupError";
+        this.committedEffects = Object.freeze({ ...effects });
+    }
+}
 /** A historical acceptance may supersede a queued root, but never supplies
  * forward-window coverage. Rebase only the descriptor selected before fetching;
  * leave a concurrently changed task/list generation untouched. A normal detail
@@ -139,6 +148,8 @@ function validateHistoryScheduling(history) {
  * normal runs, scope cursors, or freshness markers. Remote work belongs outside
  * this method; only this short transaction holds a maintenance lease. */
 function commitBoundedReplayRecords(dbPath, options) {
+    const executionBudget = options.executionBudget;
+    executionBudget?.assertReady();
     const { scope, initialSyncStartMs, startMs, endMs, planId, attemptId, selfIdHash, pages, fetchedCount } = options;
     for (const time of [initialSyncStartMs, startMs, endMs]) {
         if (!Number.isSafeInteger(time) || time < 100_000_000_000 || time > 253_402_300_799_999) {
@@ -193,7 +204,7 @@ function commitBoundedReplayRecords(dbPath, options) {
       WHERE id=1 AND last_attempt_id=${quoteSql(attemptId)} UNION ALL
       SELECT last_attempt_id,last_result_json FROM lark_im_history_debt WHERE record_id=${history.selectedId} AND last_attempt_id=${quoteSql(attemptId)}
       UNION ALL SELECT last_attempt_id,last_result_json FROM lark_im_history_progress WHERE scope_id=${quoteSql(scope.id)} AND last_attempt_id=${quoteSql(attemptId)};`
-            : `SELECT last_attempt_id,last_result_json FROM lark_im_history_progress WHERE scope_id=${quoteSql(scope.id)};`, "read history receipt")[0];
+            : `SELECT last_attempt_id,last_result_json FROM lark_im_history_progress WHERE scope_id=${quoteSql(scope.id)};`, "read history receipt", executionBudget)[0];
         if (receipt?.last_attempt_id === attemptId) {
             const saved = JSON.parse(receipt.last_result_json);
             if (saved.history_key !== historyKey)
@@ -201,7 +212,7 @@ function commitBoundedReplayRecords(dbPath, options) {
             return saved.effects;
         }
     }
-    const records = prepareObservationRecords(dbPath, normalizeBoundedReplayRecords(options.records, scope.source_id), options.observationAcquisition);
+    const records = prepareObservationRecords(dbPath, normalizeBoundedReplayRecords(options.records, scope.source_id), options.observationAcquisition, executionBudget);
     if (options.reviewFence?.mode === "names")
         throw new Error("bounded replay rejects a names review fence");
     const reviewFence = options.reviewFence === undefined ? "" : reviewFenceSql(options.reviewFence);
@@ -229,18 +240,41 @@ function commitBoundedReplayRecords(dbPath, options) {
         throw new Error("invalid exact replay target fence");
     }
     // Never create or migrate a missing database as a side effect of a repair.
+    executionBudget?.assertReady();
+    const preflightTimeout = executionBudget ? executionBudget.timeoutMs(5000) : 5000;
+    if (!Number.isSafeInteger(preflightTimeout) || preflightTimeout <= 0)
+        throw new RangeError("invalid bounded replay preflight budget");
     const preflight = spawnSync("sqlite3", ["-readonly", resolve(dbPath)], {
         input: ".bail on\nPRAGMA query_only=ON;\nSELECT id FROM bounded_replay_runs LIMIT 0;\n",
-        encoding: "utf8", timeout: 5000,
+        encoding: "utf8", timeout: Math.min(5000, preflightTimeout),
+        ...(executionBudget ? { killSignal: "SIGKILL" } : {}),
     });
-    if (preflight.status !== 0 || preflight.error)
+    if (preflight.status !== 0 || preflight.error || executionBudget && preflight.signal) {
+        if (executionBudget)
+            throw new Error(preflight.error?.code === "ETIMEDOUT"
+                ? "bounded replay audit preflight timed out" : "bounded replay audit preflight failed", { cause: preflight.error });
         throw new Error("bounded replay audit schema unavailable; migrate the existing database first");
+    }
+    executionBudget?.assertReady();
     const auditId = randomUUID();
     const owner = `pid:${process.pid}:bounded-replay:${auditId}`;
-    const lock = acquireMaintenanceLock(dbPath, { owner, ttlSeconds: 60, reason: "bounded Lark replay commit" });
-    if (!lock.acquired)
+    const acquire = () => acquireMaintenanceLock(dbPath, { owner, ttlSeconds: 60, reason: "bounded Lark replay commit", executionBudget });
+    // Keep legacy acquisition/release behavior; a budgeted acquisition may commit
+    // before its process outcome becomes unknown, so its own owner needs cleanup.
+    if (!executionBudget && !acquire().acquired)
         throw new Error("bounded replay commit blocked by active locks");
+    let acquisitionAttempted = false, failed = false;
+    let primaryError;
+    let committedEffects;
     try {
+        if (executionBudget) {
+            executionBudget.assertReady();
+            acquisitionAttempted = true;
+            if (!acquire().acquired) {
+                acquisitionAttempted = false;
+                throw new Error("bounded replay commit blocked by active locks");
+            }
+        }
         const statements = records.map((record) => `
       DELETE FROM __replay_before;
       INSERT INTO __replay_before (existed, same_fact)
@@ -328,14 +362,42 @@ function commitBoundedReplayRecords(dbPath, options) {
       SELECT id AS audit_id,inserted_count AS inserted,updated_count AS updated,
         duplicate_count AS duplicate,conflict_count AS conflicts FROM bounded_replay_runs WHERE id=${quoteSql(auditId)};
       COMMIT;
-    `, "commit bounded replay");
+    `, "commit bounded replay", executionBudget);
         if (!rows[0])
             throw new Error("bounded replay commit returned no evidence");
-        return { audit_id: String(rows[0].audit_id), inserted: Number(rows[0].inserted), updated: Number(rows[0].updated),
+        const effects = { audit_id: String(rows[0].audit_id), inserted: Number(rows[0].inserted), updated: Number(rows[0].updated),
             duplicate: Number(rows[0].duplicate), conflicts: Number(rows[0].conflicts) };
+        if (executionBudget) {
+            const counts = [rows[0].inserted, rows[0].updated, rows[0].duplicate, rows[0].conflicts];
+            if (rows.length !== 1 || rows[0].audit_id !== auditId ||
+                !counts.every(value => typeof value === "number" && Number.isSafeInteger(value) && value >= 0) ||
+                counts.reduce((sum, value) => sum + value, 0) !== records.length) {
+                throw new Error("bounded replay commit returned invalid evidence");
+            }
+            committedEffects = effects;
+        }
+        return effects;
+    }
+    catch (error) {
+        failed = true;
+        primaryError = error;
+        throw error;
     }
     finally {
-        releaseMaintenanceLock(dbPath, owner);
+        if (!executionBudget)
+            releaseMaintenanceLock(dbPath, owner);
+        else if (acquisitionAttempted) {
+            try {
+                executionBudget.runCleanup(() => releaseMaintenanceLock(dbPath, owner, executionBudget));
+            }
+            catch (cleanupError) {
+                if (failed)
+                    throw new AggregateError([primaryError, cleanupError], "bounded replay failed and maintenance lock cleanup failed", { cause: primaryError });
+                if (committedEffects)
+                    throw new BoundedReplayCleanupError(committedEffects, cleanupError);
+                throw cleanupError;
+            }
+        }
     }
 }
 function requireLarkScope(scope) {
@@ -686,4 +748,4 @@ function larkRunMetadataEntriesSql() {
     return `, '$.${RUN_FENCE_METADATA_KEY}.list_generation', COALESCE((SELECT generation FROM lark_im_list_progress WHERE scope_id = s.id), 0),
     '$.${RUN_FENCE_METADATA_KEY}.scope_config', json_object('chat_id', json_extract(s.config_json, '$.chat_id'))`;
 }
-export { larkRunMetadataEntriesSql, commitBoundedReplayRecords, commitLarkListRun, finishLarkDetailRun, readLarkListProgress, readPendingLarkDetails };
+export { BoundedReplayCleanupError, larkRunMetadataEntriesSql, commitBoundedReplayRecords, commitLarkListRun, finishLarkDetailRun, readLarkListProgress, readPendingLarkDetails };

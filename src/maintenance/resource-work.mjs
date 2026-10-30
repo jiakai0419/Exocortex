@@ -16,6 +16,7 @@ import { transportOperation } from '../adapters/lark-im/transport.mjs';
 import { tryAcquireLarkApiLease } from '../runtime/lark-api-lease.mjs';
 import { createMaintenanceRequestSession } from './request-session.mjs';
 import { enrichResources } from './enrich-resources.mjs';
+import { RESOURCE_CANDIDATE_INDEX, RESOURCE_CANDIDATE_WHERE } from './resource-candidates.mjs';
 
 /** @typedef {Record<string,any>} Row */
 const PROFILE='known_record_resources/v1', TABLE='lark_im_resource_work', SCAN='lark_im_resource_scan';
@@ -25,7 +26,8 @@ const DENIAL=new Map([[210508,'permission_denied'],[231203,'restricted_mode'],[2
 const PERMANENT="('permission_denied','restricted_mode','bot_user_out_of_chat')";
 const sha=value=>createHash('sha256').update(value).digest('hex');
 const integer=n=>Number.isSafeInteger(n)&&n>=0;
-const sourceWhere="source_id='lark.im' AND record_type='lark.im.message'";
+const sourceWhere=RESOURCE_CANDIDATE_WHERE;
+const sourceFrom=`records INDEXED BY ${RESOURCE_CANDIDATE_INDEX}`;
 const sourceBytes=MEDIA_RESOURCE_SOURCE_FIELDS.map(k=>`COALESCE(length(CAST(${k} AS BLOB)),0)`).join('+');
 const pageColumns=`id,(${sourceBytes}) AS source_bytes`;
 const keyWhere=t=>`source_id='lark.im' AND account_key=${q(t.account_key)} AND work_key=${q(t.work_key)}`;
@@ -61,7 +63,7 @@ export function resourceWorkAvailable(db,deps={}) {
       EXISTS(SELECT 1 FROM ${TABLE} WHERE state IN ('pending','deferred') AND retry_at_ms<=${now}) OR
       EXISTS(SELECT 1 FROM ${TABLE} WHERE state='running' AND claim_until_ms<=${now}) OR
       EXISTS(SELECT 1 FROM ${SCAN} WHERE source_id='lark.im' AND next_scan_at_ms<=${now}) OR
-      (SELECT COALESCE(MAX(id),0) FROM records WHERE ${sourceWhere})>(SELECT last_head_id FROM ${SCAN} WHERE source_id='lark.im'))
+      (SELECT COALESCE(MAX(id),0) FROM ${sourceFrom} WHERE ${sourceWhere})>(SELECT last_head_id FROM ${SCAN} WHERE source_id='lark.im'))
       THEN 1 ELSE 0 END AS available;`,'resource work availability',{timeoutMs:1000});
     return rows.length===1&&rows[0].available===1;
   } catch {return false;}
@@ -115,13 +117,14 @@ export function executeResourceWork(options,deps={}) {
       ${sql}\nCOMMIT;`,'commit resource work');};
     let scan=query(`SELECT * FROM ${SCAN} WHERE source_id='lark.im';`,'read resource scan')[0];
     if(!scan||!integer(scan.generation)||!integer(scan.after_id)||!integer(scan.horizon_id)||!/^([a-f0-9]{64})?$/.test(scan.recovery_after_work_key??'invalid'))throw new Error('resource schema unavailable');
-    const head=query(`SELECT COALESCE(MAX(id),0) AS id FROM records WHERE ${sourceWhere};`,'read resource head')[0].id;
+    const head=query(`SELECT COALESCE(MAX(id),0) AS id FROM ${sourceFrom} WHERE ${sourceWhere};`,'read resource head')[0].id;
     if(scan.next_scan_at_ms<=wall||head>scan.last_head_id) {
       const horizon=scan.horizon_id>scan.after_id?scan.horizon_id:head,after=scan.horizon_id>scan.after_id?scan.after_id:0;
-      // Measure before fetching bodies. Cursor advances across every inspected
-      // row, including oversized/non-image rows, so a large text cannot pin it.
-      const latest=query(`SELECT ${pageColumns} FROM records WHERE ${sourceWhere} ORDER BY id DESC LIMIT ${PAGE};`,'read newest resource page');
-      const history=query(`SELECT ${pageColumns} FROM records WHERE ${sourceWhere} AND id>${after} AND id<=${horizon} ORDER BY id LIMIT ${PAGE};`,'read historical resource page');
+      // Measure before fetching bodies. The maintained conservative type index
+      // skips unrelated text without moving any source/queue authority. Every
+      // inspected candidate advances, including oversized/invalid images.
+      const latest=query(`SELECT ${pageColumns} FROM ${sourceFrom} WHERE ${sourceWhere} ORDER BY id DESC LIMIT ${PAGE};`,'read newest resource page');
+      const history=query(`SELECT ${pageColumns} FROM ${sourceFrom} WHERE ${sourceWhere} AND id>${after} AND id<=${horizon} ORDER BY id LIMIT ${PAGE};`,'read historical resource page');
       const ids=[...new Set([...latest,...history].filter(x=>integer(x.source_bytes)&&x.source_bytes<=MAX_ROW_BYTES).map(x=>x.id))];
       const rows=ids.length?snapshot(ids):[];
       if(rows.reduce((n,r)=>n+Buffer.byteLength(r.raw_json||'')+Buffer.byteLength(r.canonical_json||''),0)>MAX_PAGE_BYTES)throw new Error('resource page limit');

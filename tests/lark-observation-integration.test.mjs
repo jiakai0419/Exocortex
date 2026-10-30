@@ -491,6 +491,7 @@ test('private rejection evidence is bounded and cannot be used as approval input
 
 for(const mode of ['complete','cli_budget','deadline','rate_limit'])test(`history uses the real shared request session with ${mode}, no lookup fanout or uncounted retries`,t=>{
   const f=fixture(t), before=rows(f), calls=[];
+  const beforeState=mode==='deadline'?state(f):null;
   let tick=0, held=false, releases=0, cooldownWrites=0;
   const leases=[];
   const result=executeLarkImHistory({db:f.db,maxCliAttempts:mode==='cli_budget'?2:4,maxSeconds:30},{requestSessionDeps:{
@@ -512,6 +513,23 @@ for(const mode of ['complete','cli_budget','deadline','rate_limit'])test(`histor
       return {status:0,stdout:JSON.stringify({code:0,data:{items:f.messages,has_more:mode==='cli_budget',page_token:mode==='cli_budget'?'invented-next':''}}),stderr:''};
     }
   }});
+  if(mode==='deadline') {
+    // A whole-command deadline cannot open the old remote-only post-deadline
+    // commit lease or record a failure checkpoint. This object is an internal
+    // expired receipt; the CLI publication owner must still reject its output.
+    assert.equal(result.ok,true);assert.equal(result.outcome,'batch_deferred');assert.equal(result.processed,0);
+    assert.equal(result.request_budget.stop_reason,'time_budget');assert.equal(result.request_budget.cli_attempts,2);
+    assert.equal(result.request_budget.self_attempts,1);assert.equal(result.command_budget.elapsed_ms,30001);
+    assert.deepEqual(leases.map(lease=>lease.spawns),[1,1],'no business commit lease after whole-command expiry');
+    assert.equal(releases,2);assert.ok(leases.every(lease=>lease.released));assert.equal(held,false);
+    assert.equal(calls.length,2);assert.deepEqual(rows(f),before);assert.deepEqual(state(f),beforeState);assert.equal(cooldownWrites,0);
+    for(const field of ['inserted','updated','duplicate','conflicts'])assert.equal(result[field],0);
+    assert.doesNotMatch(JSON.stringify(result),/secret|oc_invented|om_invented/);
+    assert.deepEqual(store.sqliteQuery(f.db,'SELECT * FROM lark_im_history_progress;'),[]);
+    assert.deepEqual(store.sqliteQuery(f.db,'SELECT * FROM bounded_replay_runs;'),[]);
+    assert.deepEqual(store.sqliteQuery(f.db,'SELECT * FROM maintenance_locks;'),[]);
+    return;
+  }
   assert.equal(result.ok,mode==='complete',JSON.stringify(result));
   assert.equal(calls.length,2,'self and history list remain the only API attempts');
   assert.deepEqual(leases.map(lease=>lease.spawns),[1,1,0],'two API leases followed by one local commit lease');

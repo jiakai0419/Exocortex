@@ -21,6 +21,8 @@ data/*.db-*
 data/*.bak
 logs/
 lark-im-resources/
+# Private resourceStorePath(db) directories, including manifests and pending/quarantine evidence.
+*.resources/
 backups/private/
 
 *.remote-account-binding.json

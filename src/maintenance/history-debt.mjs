@@ -183,7 +183,7 @@ export function readHistoryFairRound(db, scheduler, deps = {}) {
  * before every commit; a miss discards the remaining in-memory acquisition.
  * No predicted result advances a queue or a fair checkpoint.
  */
-export function readHistoryCandidatePool(db, selection, limit, readFairTargets) {
+export function readHistoryCandidatePool(db, selection, limit, readFairTargets, deps = {}) {
   const {target,schedule}=selection;
   const ordinary = item => {
     if (!item || item.checkpoint.detailTask) return false;
@@ -194,7 +194,7 @@ export function readHistoryCandidatePool(db, selection, limit, readFairTargets) 
   const add=item=>{if(pool.length<limit && ordinary(item) && !seen.has(item.record.id)) {seen.add(item.record.id);pool.push(item);}};
   add(target);
   const priority=schedule.due.slice(0,Math.min(4,Math.ceil(limit*2/3)));
-  for(const hint of priority) add(selectHistoryDebtTarget(db,hint));
+  for(const hint of priority) add(selectHistoryDebtTarget(db,hint,deps));
   const scopes=schedule.fairRound.eligibleScopeIds?.slice(0,limit) || [null];
   const frontiers=scopes.map(scope=>readFairTargets(scope,limit));
   // One head per eligible scope first; additional rows let a single long scope

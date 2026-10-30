@@ -69,14 +69,14 @@ function evaluateObservation(before, incoming, state, acquisition) {
 }
 /** Read outside the transaction, then bind the complete local row and its ABA
  * generation inside it. The result is internal data, never approval input. */
-function prepareObservationRecords(dbPath, records, acquisition) {
+function prepareObservationRecords(dbPath, records, acquisition, executionBudget) {
     const native = records.filter(isNativeRecord);
     if (!native.length)
         return records;
     const rows = sqliteQuery(dbPath, `SELECT r.*, s.generation AS observation_generation,s.evidence_generation,
     s.candidate_json, s.candidate_generation, s.candidate_attempt, s.candidate_policy, s.candidate_context, s.candidate_observed_at_ms
     FROM records r JOIN record_observation_state s ON s.record_id=r.id
-    WHERE r.source_id='lark.im' AND r.external_id IN (${native.map(r => quoteSql(r.external_id)).join(",")});`, "read observation basis");
+    WHERE r.source_id='lark.im' AND r.external_id IN (${native.map(r => quoteSql(r.external_id)).join(",")});`, "read observation basis", executionBudget);
     const byId = new Map(rows.map(({ observation_generation, evidence_generation, candidate_json, candidate_generation, candidate_attempt, candidate_policy, candidate_context, candidate_observed_at_ms, ...before }) => [before.external_id, { before, generation: Number(observation_generation), evidenceGeneration: Number(evidence_generation), candidate_json, candidate_generation, candidate_attempt, candidate_policy, candidate_context, candidate_observed_at_ms }]));
     const attempt = acquisition?.attempt || randomUUID(), observedAtMs = Date.now();
     const selectedAcquisition = { ...acquisition, attempt, startedAtMs: acquisition?.startedAtMs ?? observedAtMs };

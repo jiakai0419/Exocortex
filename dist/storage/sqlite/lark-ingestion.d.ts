@@ -1,5 +1,17 @@
 import type { JsonObject, SyncScope, StoredRecord, WriteEffects, BoundedReplayOptions } from "./ingestion-types.js";
 import { type PendingDetailAcquisition } from "./pending-detail-observation.js";
+type BoundedReplayEffects = {
+    audit_id: string;
+    inserted: number;
+    updated: number;
+    duplicate: number;
+    conflicts: number;
+};
+/** A successful, validated transaction receipt survives a later cleanup failure. */
+declare class BoundedReplayCleanupError extends Error {
+    readonly committedEffects: Readonly<BoundedReplayEffects>;
+    constructor(effects: BoundedReplayEffects, cause: unknown);
+}
 /** Commit one completely fetched, explicitly bounded repair without touching
  * normal runs, scope cursors, or freshness markers. Remote work belongs outside
  * this method; only this short transaction holds a maintenance lease. */
@@ -37,4 +49,4 @@ declare function commitLarkListRun(dbPath: string, scope: SyncScope, runId: numb
 /** A complete detail response replaces content; failed attempts only reschedule debt. */
 declare function finishLarkDetailRun(dbPath: string, scope: SyncScope, runId: number, outcomes: LarkDetailOutcome[], metadata?: JsonObject): LarkProgressEffects;
 declare function larkRunMetadataEntriesSql(): string;
-export { larkRunMetadataEntriesSql, commitBoundedReplayRecords, commitLarkListRun, finishLarkDetailRun, readLarkListProgress, readPendingLarkDetails };
+export { BoundedReplayCleanupError, larkRunMetadataEntriesSql, commitBoundedReplayRecords, commitLarkListRun, finishLarkDetailRun, readLarkListProgress, readPendingLarkDetails };

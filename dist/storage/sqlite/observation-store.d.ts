@@ -1,4 +1,4 @@
-import type { StoredRecord } from "./ingestion-types.js";
+import type { ExecutionBudget, StoredRecord } from "./ingestion-types.js";
 type Acquisition = {
     attempt: string;
     startedAtMs: number;
@@ -33,7 +33,7 @@ declare function evaluateObservation(before: StoredRecord | null, incoming: Stor
 };
 /** Read outside the transaction, then bind the complete local row and its ABA
  * generation inside it. The result is internal data, never approval input. */
-declare function prepareObservationRecords(dbPath: string, records: StoredRecord[], acquisition?: Acquisition): StoredRecord[];
+declare function prepareObservationRecords(dbPath: string, records: StoredRecord[], acquisition?: Acquisition, executionBudget?: ExecutionBudget): StoredRecord[];
 /** The preparation basis is checked even for a no-op, so preview and commit
  * cannot silently decide against different local facts. */
 declare function observationGuardSql(records: StoredRecord[]): string;

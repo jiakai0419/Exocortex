@@ -12,6 +12,7 @@ import { activityDatabaseKey } from '../src/diagnostics/lark-im-activity-evidenc
 import { digest, sampleScopeHash } from '../src/diagnostics/remote-sample-core.mjs';
 import { writeRemoteSampleState, remoteSamplePaths } from '../src/runtime/worker/remote-sample-scheduler.mjs';
 import { executeLarkImHistory } from '../src/maintenance/history.mjs';
+import { createHistoryCommandBudget, HistoryCommandBudgetError } from '../src/maintenance/history-command-budget.mjs';
 import { collectRemoteSample } from '../src/diagnostics/remote-sample.mjs';
 import { loadPendingHistoryVerifications } from '../src/diagnostics/remote-sample-history.mjs';
 import { compactHistorySummary } from '../dist/runtime/worker/lark-im-worker-core.js';
@@ -165,4 +166,29 @@ test('healthy initial writer still creates the priority ticket without failure d
   assert.equal(result.priority_hint_diagnostic,undefined);assert.equal(result.failure_diagnostic,undefined);
   assert.equal(f.debt()?.status,'awaiting_verification',JSON.stringify(compactHistorySummary(result)));
   assert.equal(result.request_budget.cli_attempts,2);assert.equal(result.request_budget.stop_reason,null);
+});
+
+// Controlled-clock arithmetic plus real authored SQLite: this verifies dependency
+// ownership and budget propagation, not wall-clock performance or an API SLO.
+test('custom debt query keeps its seam and receives the shared shrinking remainder before no further work',t=>{
+  let tick=0,seenDb;
+  const calls=[];
+  const budget=createHistoryCommandBudget({maxSeconds:30},{monotonicClock:()=>tick});
+  assert.throws(()=>fixture(t,1,{
+    historyCommandBudget:budget,
+    sqliteJson(db,sql,label,options){
+      assert.ok(tick<29000,'no general query starts after the shared work deadline');
+      return readOnlySqliteJson(db,sql,label,options);
+    },
+    debtDeps:{sqliteJson(db,sql,label,options){
+      seenDb=db;calls.push({label,timeoutMs:options.timeoutMs});
+      const rows=readOnlySqliteJson(db,sql,label,options);
+      tick=label==='read history debt policy'?28500:29100;
+      return rows;
+    }},
+  }),error=>error instanceof HistoryCommandBudgetError&&error.reason==='time_budget');
+  assert.deepEqual(calls,[{label:'read history debt policy',timeoutMs:1000},{label:'map history debt metadata',timeoutMs:500}]);
+  assert.deepEqual(store.sqliteQuery(seenDb,'SELECT * FROM lark_im_history_debt;'),[]);
+  assert.deepEqual(store.sqliteQuery(seenDb,'SELECT * FROM lark_im_history_progress;'),[]);
+  assert.deepEqual(store.sqliteQuery(seenDb,'SELECT * FROM bounded_replay_runs;'),[]);
 });

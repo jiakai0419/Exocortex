@@ -193,6 +193,10 @@ declare function compactSummary(summary: SyncSummary | null | undefined): {
     } | null)[] | undefined;
     incomplete?: boolean | undefined;
     partial?: boolean | undefined;
+    idle_evidence?: {
+        version: number;
+        transport_clean: boolean;
+    } | undefined;
     ok: boolean | undefined;
 } | null;
 /** Strict public projection: never copy record IDs, raw/error payloads, arbitrary

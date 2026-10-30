@@ -202,8 +202,14 @@ SELECT
   (SELECT COUNT(*) FROM sync_locks) AS active_sync_locks,
   (SELECT owner FROM maintenance_locks WHERE name = 'global') AS lock_owner;
 COMMIT;
-`, "acquire maintenance lock");
+`, "acquire maintenance lock", options.executionBudget);
     const row = rows[0] || {};
+    if (options.executionBudget && (rows.length !== 1 || ![0, 1].includes(row.changed) ||
+        !Number.isSafeInteger(row.active_sync_locks) || row.active_sync_locks < 0 ||
+        !(row.lock_owner === null || typeof row.lock_owner === "string") ||
+        row.changed === 1 && (row.lock_owner !== owner || row.active_sync_locks !== 0))) {
+        throw new Error("acquire maintenance lock returned invalid evidence");
+    }
     if (Number(row.changed || 0) > 0)
         return { acquired: true };
     const activeSyncLocks = Number(row.active_sync_locks || 0);
@@ -217,10 +223,10 @@ COMMIT;
         lock_owner: row.lock_owner || null,
     };
 }
-function releaseMaintenanceLock(dbPath, owner = `pid:${process.pid}`) {
+function releaseMaintenanceLock(dbPath, owner = `pid:${process.pid}`, executionBudget) {
     sqliteExec(dbPath, `DELETE FROM maintenance_locks
      WHERE name = 'global'
-       AND owner = ${quoteSql(owner)};`, "release maintenance lock");
+       AND owner = ${quoteSql(owner)};`, "release maintenance lock", executionBudget);
 }
 function acquireLock(dbPath, scopeId, ttlSeconds, owner = DEFAULT_SYNC_LOCK_OWNER) {
     if (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0) {

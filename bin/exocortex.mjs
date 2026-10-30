@@ -45,5 +45,9 @@ function isMainModule() {
 }
 
 if (isMainModule()) {
-  process.exitCode = await runCli(process.argv.slice(2));
+  // The process clock includes static imports; a programmatic invocation instead
+  // starts at createCommandContext, so an older host process gets no stale age.
+  process.exitCode = await runCli(process.argv.slice(2), {
+    monotonicNow: () => process.uptime() * 1000, startedMonotonicMs: 0,
+  });
 }

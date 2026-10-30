@@ -12,6 +12,7 @@ import { readScheduledRemoteSampleAdmission, readScheduledRemoteCooldowns, runSc
 import { selectHistoryTarget } from "../../maintenance/history.mjs";
 import { resourceWorkAvailable } from "../../maintenance/resource-work.mjs";
 import { readIdleFairState, claimIdleLane } from "./idle-fair-state.mjs";
+import { idleAdmission } from "./idle-admission.mjs";
 import { readOnlySqliteJson } from "../../storage/sqlite/readonly-query.mjs";
 import {
   adaptiveFairDecision,
@@ -35,6 +36,9 @@ const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../.."
 const CLI_PATH = resolve(PROJECT_ROOT, "bin/exocortex.mjs");
 // Existing runGuardedWorkerStep outer cleanup allowance; reserve it inside idle work.
 const IDLE_CHILD_CLEANUP_MS = 2000;
+// The history command counts its Node startup. This separate contained margin
+// covers the outer Python/anchor handoff; the unchanged guardian remains final.
+const HISTORY_CHILD_HANDOFF_MS = 1000;
 const IDLE_LANES = ["sample", "history", "resources"];
 const STEP_OPERATIONS = {
   sent: "message_search_bundle",
@@ -163,7 +167,18 @@ function runStep(name, args, deps = {}) {
   const configuredTimeout = Number(deps.timeoutMs ?? Number(deps.timeoutSeconds || WORKER_DEFAULTS.stepTimeoutSeconds) * 1000);
   const liveRemaining = deps.remainingTimeMs ? deps.remainingTimeMs() : Infinity;
   const timeout = Math.min(configuredTimeout, liveRemaining - (deps.remainingTimeMs ? IDLE_CHILD_CLEANUP_MS : 0));
-  const result = Number.isFinite(timeout) && timeout > 0 ? run(execPath, [deps.scriptPath || CLI_PATH, deps.command || "sync", ...args], {
+  let launchArgs = args, historyGrantValid = true;
+  if (name === "history" && deps.command === "maintenance" && deps.remainingTimeMs) {
+    // Activity/lock/local work may have consumed time since the shared scheduler
+    // built these arguments. Shrink the child grant together with its guardian,
+    // never leave a stale longer inner deadline underneath a shorter outer one.
+    const at = args.indexOf("--max-seconds"), requested = Number(args[at + 1]);
+    const available = Math.floor((timeout - HISTORY_CHILD_HANDOFF_MS) / 1000);
+    historyGrantValid = at >= 0 && Number.isSafeInteger(requested) && requested > 0 &&
+      Number.isSafeInteger(available) && available > 0;
+    if (historyGrantValid) { launchArgs = args.slice(); launchArgs[at + 1] = String(Math.min(requested, available)); }
+  }
+  const result = Number.isFinite(timeout) && timeout > 0 && historyGrantValid ? run(execPath, [deps.scriptPath || CLI_PATH, deps.command || "sync", ...launchArgs], {
     maxBuffer: 100 * 1024 * 1024,
     timeout: Math.floor(timeout),
     ...(deps.cooldownsByOperation !== undefined || deps.activityEnv ? { env: {
@@ -447,7 +462,7 @@ function runSharedIdleWork(opts, cycle, runHistory, deps) {
       if (!["ok", "not_due", "disabled"].includes(sampled.outcome)) break;
     } else {
       const timeoutMs = availableMs - IDLE_CHILD_CLEANUP_MS;
-      const seconds = Math.min(30, Math.floor(timeoutMs / 1000));
+      const seconds = Math.min(30, Math.floor((timeoutMs - (name === "history" ? HISTORY_CHILD_HANDOFF_MS : 0)) / 1000));
       if (seconds < 1) break;
       const limits = { timeoutMs, remainingTimeMs: remaining };
       let step;
@@ -567,10 +582,30 @@ function runWorker(opts, deps = {}) {
       onComplete: (steps) => { observedSteps = steps; },
       beforeHistory: (steps, runHistory) => {
         sampleAttempted = true;
-        if (!runHistory || !cycleHealthyWithoutHistory(steps, false)) return null;
+        const admission = idleAdmission(steps);
+        if (!runHistory || admission.mode === "none") {
+          // A truthy event prevents the core's legacy fallback from starting an
+          // unbounded history command after a failed forward step.
+          const startedMs = nowMs(), at = new Date(startedMs).toISOString();
+          const activeCooldowns = mergeTransportCooldowns(cooldowns, {}, startedMs);
+          const operation = STEP_OPERATIONS.history;
+          if (activeCooldowns[operation] > startedMs) return {
+            name: "history", ok: false, started_at: at, finished_at: at, elapsed_ms: 0,
+            summary: { ok: false,
+              deferred: { reason: "operation_cooldown", operation, retry_at_ms: activeCooldowns[operation] },
+              transport: compactTransportStats({ cooldowns_by_operation: activeCooldowns }) },
+            stderr: "worker step deferred until its operation cooldown expires",
+          };
+          return { name: "history", ok: true, exit_code: 0, stderr: "",
+            summary: { ok: true, profile: "known_record_history/v1", outcome: "batch_deferred", processed: 0,
+              cursor_policy: "unchanged", coverage: "known_rows_only", idle_outcome: "forward_not_ready" },
+            started_at: at, finished_at: at, elapsed_ms: 0 };
+        }
         return runSharedIdleWork(opts, cycle, runHistory, { nowMs, monotonicNowMs: monotonicNow,
-          hasHistoryWork, hasResourceWork, runResources, readFair, claimFair,
-          remoteSampleAdmission, sample, cooldowns, onSample, sleepSeconds: sleep });
+          hasHistoryWork: admission.mode === "resources_only" ? () => false : hasHistoryWork,
+          hasResourceWork, runResources, readFair, claimFair,
+          remoteSampleAdmission, sample: admission.mode === "resources_only" ? null : sample,
+          cooldowns, onSample, sleepSeconds: sleep });
       },
     }) === true;
     ok = cycleOk && ok;

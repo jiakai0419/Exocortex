@@ -5,6 +5,8 @@ export function parseOptions(argv: any, specs: any, { context, allowAll, resolve
         root: string;
         now: any;
         startedAtMs: any;
+        monotonicNow: any;
+        startedMonotonicMs: any;
         env: any;
         stdout: any;
         stderr: any;

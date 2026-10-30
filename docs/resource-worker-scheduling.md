@@ -130,3 +130,17 @@ existing worker/core/sample cases pass; the independent persisted-state suite
 passes 24/24. These include real guarded-child timeout and actual request-session
 fixed-gap tests with synthetic inputs. They do not replace the separately owned
 real worker/CLI resource-chain acceptance or production latency observations.
+
+
+## Whole-command history and indexed discovery follow-up
+
+The integrated follow-up is specified in [minute completion closure](minute-completion-closure.md).
+Migration 021 removes unrelated text from resource discovery pages without
+changing source/account validation. History now includes startup, selection,
+local work, cleanup and publication in its command budget, still within the
+existing shared slice and guardian reservation. A narrowly proved old-detail
+backoff can admit resources alone; unknown forward failures admit no optional
+work, while known operation cooldowns retain their exact deferred classification.
+Cycle health, permanent denial isolation and all existing API allowances remain
+unchanged. The conditional lane opportunity bound above is not a successful
+resource or end-to-end latency guarantee.

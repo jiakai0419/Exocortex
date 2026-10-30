@@ -7,6 +7,7 @@ import { executeEnrichment, EnrichmentInputError } from "../maintenance/enrich.m
 import { executeSyncRepair } from "../maintenance/repair.mjs";
 import { executeLarkImReplay, validateReplayOptions, safeReplayError, ReplayInputError } from "../maintenance/replay.mjs";
 import { executeLarkImHistory } from "../maintenance/history.mjs";
+import { createHistoryCommandBudget } from "../maintenance/history-command-budget.mjs";
 import { executeResourceWork } from "../maintenance/resource-work.mjs";
 import { MaintenanceRequestError } from "../maintenance/request-session.mjs";
 import { MaintenanceReviewError, reviewRequested } from '../maintenance/review-artifact.mjs';
@@ -17,6 +18,7 @@ import { renderSqliteMaintenanceText } from "../terminal/sqlite-maintenance-view
 function runMaintenanceCommand(options, context) {
   const action = options.action || context.route.split(".").at(-1);
   const deps = context.deps || {};
+  let historyBudget, outputWritten = false;
   try {
     if ((reviewRequested(options) || action === 'preview') && (!context.provided.has('--max-cli-attempts') || !context.provided.has('--max-seconds'))) {
       throw new CliUsageError('maintenance review requires explicit --max-cli-attempts and --max-seconds');
@@ -32,7 +34,15 @@ function runMaintenanceCommand(options, context) {
     } else if (action === 'preview') {
       report = (deps.executePreviewUnits || executePreviewUnits)(options, { ...deps, env: context.env, now: context.now });
     } else if (action === "history") {
-      report = (deps.executeLarkImHistory || executeLarkImHistory)(options, { ...deps, env: context.env, now: context.now });
+      const maxSeconds = options.maxSeconds ?? ((options.maxRecords ?? 1) === 1 ? 30 : 25);
+      historyBudget = createHistoryCommandBudget({ maxSeconds }, {
+        monotonicClock: context.monotonicNow,
+        startedMonotonicMs: context.startedMonotonicMs,
+        remainingTimeMs: () => maxSeconds * 1000 - (context.monotonicNow() - context.startedMonotonicMs),
+      });
+      report = (deps.executeLarkImHistory || executeLarkImHistory)(options, {
+        ...deps, env: context.env, now: context.now, historyCommandBudget: historyBudget,
+      });
     } else if (action === "resources") {
       if (!context.provided.has("--db")) throw new CliUsageError("resources requires an explicit --db");
       report = (deps.executeResourceWork || executeResourceWork)(options, { ...deps, env: context.env, now: context.now });
@@ -50,11 +60,22 @@ function runMaintenanceCommand(options, context) {
       }
       report = (deps.executeLarkImReplay || executeLarkImReplay)(parsed, { ...deps, env: context.env, now: context.now });
     } else throw new Error("unknown maintenance action");
-    if (options.format !== "json" && ["backup", "prune-runs", "compact"].includes(action)) context.stdout.write(renderSqliteMaintenanceText(report));
-    else context.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+    historyBudget?.assertOutputReady();
+    const output = options.format !== "json" && ["backup", "prune-runs", "compact"].includes(action)
+      ? renderSqliteMaintenanceText(report) : `${JSON.stringify(report, null, 2)}\n`;
+    historyBudget?.assertOutputReady();
+    context.stdout.write(output);
+    outputWritten = true;
+    historyBudget?.assertOutputReady();
     if (["backup", "prune-runs", "compact"].includes(action) && report.status === "failed") return 1;
     return report.ok === false || report.partial === true ? 2 : 0;
   } catch (error) {
+    // A late write cannot be retracted. Keep its one JSON document intact, but
+    // fail the process so the worker cannot accept it as a successful receipt.
+    if (outputWritten) {
+      context.stderr.write("History output exceeded its command deadline.\n");
+      return 1;
+    }
     const safe = error instanceof CliUsageError || error instanceof CliExecutionError || error instanceof EnrichmentInputError || error instanceof MaintenanceReviewError || error instanceof PreviewUnitsError ? error.message : action === "enrich" ? publicEnrichmentError(error, options.target === "scopes" ? "scope enrichment failed" : "record enrichment failed").message
       : action === "replay" ? safeReplayError(error) : publicMaintenanceError(error).message;
     writeCliError({ stdout: context.stdout, stderr: context.stderr }, { format: options.format,

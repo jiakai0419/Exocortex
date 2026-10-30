@@ -24,6 +24,8 @@ export function createCommandContext(overrides?: {}): {
     root: string;
     now: any;
     startedAtMs: any;
+    monotonicNow: any;
+    startedMonotonicMs: any;
     env: any;
     stdout: any;
     stderr: any;
