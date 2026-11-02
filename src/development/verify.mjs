@@ -22,7 +22,7 @@ export function verify(projectRoot, { generatedOnly = false, spawn = spawnSync,
   // One timing-sensitive real-process file runs without competing suite files.
   // Both phases belong to this invocation; failures never trigger a retry.
   const serial = tests.filter((file) => file === "tests/resource-worker-idle.test.mjs");
-  const parallel = tests.filter((file) => !serial.includes(file));
+  const parallel = tests.filter((file) => file !== "tests/resource-worker-idle.test.mjs");
   const steps = [
     [compiler, "-p", "tsconfig.build.json"],
     [compiler, "-p", "tsconfig.json"],
