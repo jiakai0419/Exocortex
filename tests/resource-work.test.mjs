@@ -12,7 +12,7 @@ import {readMessageSnapshot} from '../src/diagnostics/message-read-snapshot.mjs'
 import {executeResourceWork,resourceWorkAvailable,resourceWorkIdentity} from '../src/maintenance/resource-work.mjs';
 import {loadMessages} from '../src/diagnostics/messages-report.mjs';
 import {RESOURCE_CANDIDATE_WHERE,RESOURCE_CANDIDATE_INDEX} from '../src/maintenance/resource-candidates.mjs';
-import {enrichResources} from '../src/maintenance/enrich-resources.mjs';
+import {enrichResources,normalizeResourceFailure,RESOURCE_FAILURE_STAGES,RESOURCE_FAILURE_REASONS} from '../src/maintenance/enrich-resources.mjs';
 
 const SELF='ou_synthetic_resource_work_owner',AT=Date.UTC(2025,1,3),sha=x=>createHash('sha256').update(x).digest('hex');
 const crc=bytes=>{let v=0xffffffff;for(const b of bytes){v^=b;for(let i=0;i<8;i++)v=(v>>>1)^((v&1)?0xedb88320:0);}return(v^0xffffffff)>>>0;};
@@ -44,11 +44,12 @@ function fixture(t,count=1){
         assert.equal(command,'python3');assert(wrapped[2].includes('RLIMIT_FSIZE'));const args=wrapped.slice(4);f.calls.push(args);f.clock+=10;
         if(args[0]==='contact') {f.profiles++;f.settings.onProfile?.(f.profiles);return {status:0,stdout:JSON.stringify({open_id:f.settings.profile?.(f.profiles)??SELF}),stderr:''};}
         assert.equal(args[0],'api');assert.equal(args[1],'GET');f.settings.onDownload?.();
+        if(f.settings.response)return f.settings.response;
         if(f.settings.localDenied)return {status:1,stdout:'',stderr:'permission denied: synthetic local launcher'};
         if(f.settings.denied)return {status:1,stdout:JSON.stringify({code:210508,msg:'synthetic remote denial'}),stderr:''};
         if(f.settings.transient)return {status:1,stdout:JSON.stringify({code:999999999,msg:'synthetic transient'}),stderr:''};
-        const name=args[args.indexOf('--output')+1];writeFileSync(join(opts.cwd,name),PNG,{mode:0o600});
-        return {status:0,stdout:JSON.stringify({saved_path:name,size_bytes:PNG.length,content_type:'image/png'}),stderr:''};
+        const name=args[args.indexOf('--output')+1],bytes=f.settings.bytes??PNG;writeFileSync(join(opts.cwd,name),bytes,{mode:0o600});
+        return {status:0,stdout:JSON.stringify({saved_path:f.settings.savedPath??name,size_bytes:f.settings.size??bytes.length,content_type:f.settings.mime??'image/png'}),stderr:''};
       }}};
   f.run=()=>executeResourceWork(f.options,f.deps);
   f.advance=ms=>{f.wall+=ms;f.clock+=ms;};
@@ -441,4 +442,132 @@ for(const actualCommit of [false,true])test(`unknown source-change write acknowl
   assert.equal(next.outcome,actualCommit?'no_eligible_known_resource':'source_changed');
   assert.equal(sqliteQuery(f.db,'SELECT * FROM lark_im_resource_scan;')[0].priority_streak,2);
   assert.equal(f.tasks()[0].generation,beforeTask.generation+1);
+});
+
+// Every failure fixture below is synthetic. No CLI/network or production DB is used.
+test('resource diagnostic retains actual byte rejection instead of generic retry label',t=>{
+  const f=fixture(t);f.settings.bytes=Buffer.from('synthetic non-image bytes');
+  const result=f.run(),row=f.tasks()[0];
+  assert.deepEqual(result.failure,{stage:'download_validation',reason:'download_image_invalid',persisted:true});
+  assert.equal(row.failure_stage,'download_validation');assert.equal(row.failure_reason,'download_image_invalid');
+  assert.equal(row.state,'deferred');assert.equal(row.reason,'transient_failure');assert.equal(row.failures,1);
+  assert.equal(result.request_budget.cli_attempts,2);assert.equal(result.request_budget.self_attempts,1);
+});
+
+test('resource diagnostic distinguishes response validation at identical request counts',t=>{
+  const f=fixture(t);f.settings.savedPath='../synthetic-unrelated';
+  const result=f.run();
+  assert.deepEqual(result.failure,{stage:'download_validation',reason:'download_response_invalid',persisted:true});
+  assert.equal(result.request_budget.cli_attempts,2);assert.equal(result.request_budget.self_attempts,1);
+  assert.equal(f.tasks()[0].reason,'transient_failure');
+  assert(!JSON.stringify(result).includes('synthetic-unrelated'));assert(!JSON.stringify(result).includes(f.root));
+});
+
+test('resource diagnostic exact confirmed denial is separate from retry policy',t=>{
+  const f=fixture(t);f.settings.denied=true;const result=f.run();
+  assert.deepEqual(result.failure,{stage:'resource_request',reason:'permission_denied',persisted:true});
+  assert.equal(f.tasks()[0].state,'blocked');assert.equal(f.tasks()[0].failure_reason,'permission_denied');
+});
+
+for(const [label,settings,expected] of [
+  ['timeout',{response:{status:null,error:{code:'ETIMEDOUT'},stdout:'',stderr:''}},'network_timeout'],
+  ['spawn not started',{response:{status:null,pid:0,error:{code:'ENOENT'},stdout:'',stderr:''}},'request_not_started'],
+  ['execution unknown',{response:{status:null,pid:0,error:{code:'ETIMEDOUT'},stdout:'',stderr:''}},'request_execution_unknown'],
+  ['local permission text',{localDenied:true},'unknown'],
+  ['unknown API result',{transient:true},'unknown'],
+  ['wrong file size',{size:PNG.length+1},'download_file_invalid'],
+  ['wrong MIME',{mime:'image/gif'},'download_image_invalid'],
+  ['unsupported bytes',{bytes:Buffer.from('5249464612000000574542505650384c060000002f0000000000','hex'),mime:'image/webp'},'resource_format_unsupported'],
+])test(`resource diagnostic ${label} retains bounded cause without changing retries`,t=>{
+  const f=fixture(t);Object.assign(f.settings,settings);const result=f.run(),row=f.tasks()[0];
+  const stage=['wrong file size','wrong MIME','unsupported bytes'].includes(label)?'download_validation':'resource_request';
+  assert.deepEqual(result.failure,{stage,reason:expected,persisted:true});
+  assert.equal(row.failure_reason,expected);assert.equal(row.reason,'transient_failure');assert.equal(row.state,'deferred');assert.equal(row.failures,1);
+  assert.equal(result.request_budget.cli_attempts,2);assert.equal(result.request_budget.self_attempts,1);
+});
+
+for(const mode of ['changed','busy'])test(`resource diagnostic failed denial closing ${mode} is not confirmed remote refusal`,t=>{
+  const f=fixture(t);f.settings.denied=true;
+  if(mode==='changed')f.settings.profile=n=>n===2?'ou_synthetic_different_closer':SELF;
+  else f.settings.remoteBusyAt=3;
+  const result=f.run();
+  assert.deepEqual(result.failure,{stage:'closing_account',reason:mode==='changed'?'account_changed':'sync_busy',persisted:mode==='changed'});
+  assert.notEqual(f.tasks()[0].reason,'permission_denied');assert.notEqual(f.tasks()[0].failure_reason,'permission_denied');
+  if(mode==='busy'){
+    assert.equal(f.tasks()[0].state,'running');assert.equal(f.tasks()[0].failure_reason,null);
+    assert.equal(f.localLeases,2,'stopped session cannot take a later metadata lease to persist diagnostics');
+  }
+});
+
+test('resource diagnostic remains uncommitted when exact result CAS loses',t=>{
+  const f=fixture(t);f.settings.bytes=Buffer.from('synthetic rejected bytes');
+  f.settings.onDownload=()=>sqliteExec(f.db,'UPDATE lark_im_resource_work SET generation=generation+1;');
+  const result=f.run();assert.equal(result.outcome,'execution_failed');
+  assert.deepEqual(result.failure,{stage:'download_validation',reason:'download_image_invalid',persisted:false});
+  assert.equal(f.tasks()[0].state,'running');assert.equal(f.tasks()[0].failure_stage,null);assert.equal(f.tasks()[0].failure_reason,null);
+});
+
+test('resource diagnostic restart reads retained cause and normal success clears it',t=>{
+  const f=fixture(t);f.settings.bytes=Buffer.from('synthetic rejected bytes');f.run();
+  const program=`import {sqliteQuery} from ${JSON.stringify(new URL('../dist/storage/sqlite/ingestion-store.js',import.meta.url).href)};
+    import {normalizeResourceFailure} from ${JSON.stringify(new URL('../src/maintenance/enrich-resources.mjs',import.meta.url).href)};
+    const row=sqliteQuery(process.argv[1],'SELECT failure_stage,failure_reason FROM lark_im_resource_work;')[0];
+    process.stdout.write(JSON.stringify(normalizeResourceFailure({stage:row.failure_stage,reason:row.failure_reason})));`;
+  const restarted=spawnSync(process.execPath,['--input-type=module','-e',program,f.db],{encoding:'utf8',timeout:15000});
+  assert.equal(restarted.status,0,restarted.stderr);assert.deepEqual(JSON.parse(restarted.stdout),{stage:'download_validation',reason:'download_image_invalid'});
+  f.advance(121000);delete f.settings.bytes;const next=f.run();
+  assert.equal(next.available,1);assert.equal(next.failure,null);assert.equal(f.tasks()[0].failure_reason,null);assert.equal(f.tasks()[0].failure_stage,null);
+  assert.equal(f.tasks()[0].attempts,2);assert.equal(f.tasks()[0].failures,1,'diagnostics do not reset existing counters');
+});
+
+test('resource diagnostic migration preserves pre-022 task byte values and keeps old cause unknown',t=>{
+  const f=fixture(t);f.settings.transient=true;f.run();
+  sqliteExec(f.db,"ALTER TABLE lark_im_resource_work DROP COLUMN failure_stage; ALTER TABLE lark_im_resource_work DROP COLUMN failure_reason; DELETE FROM schema_migrations WHERE version='022';");
+  const before=f.tasks();ensureInitialized(f.db);const after=f.tasks();
+  assert.deepEqual(after.map(({failure_stage,failure_reason,...row})=>row),before);
+  assert.equal(after[0].failure_stage,null);assert.equal(after[0].failure_reason,null);
+  assert.deepEqual(normalizeResourceFailure({stage:after[0].failure_stage,reason:after[0].failure_reason}),{stage:'unknown',reason:'unknown'});
+  assert.equal(sqliteQuery(f.db,"SELECT COUNT(*) n FROM schema_migrations WHERE version='022';")[0].n,1);
+});
+
+test('resource diagnostic SQL and summary exclude arbitrary strings paths identities and response objects',t=>{
+  const f=fixture(t),secret='synthetic-private-payload/'+f.root;
+  f.deps.enrichResources=()=>({results:[{record_id:1,state:'blocked',reason:secret,failure:{stage:secret,reason:{payload:secret},extra:secret}}],request_budget:null});
+  const result=f.run();assert.deepEqual(result.failure,{stage:'unknown',reason:'unknown',persisted:true});
+  const row=f.tasks()[0];assert.equal(row.failure_stage,'unknown');assert.equal(row.failure_reason,'unknown');
+  assert.equal(row.state,'blocked');assert.equal(row.reason,'resource_invalid');
+  assert(!JSON.stringify(result).includes(secret));
+  assert.throws(()=>sqliteExec(f.db,`UPDATE lark_im_resource_work SET failure_reason=${q(secret)};`));
+  assert.throws(()=>sqliteExec(f.db,`UPDATE lark_im_resource_work SET failure_stage=${q(secret)};`));
+  assert(!JSON.stringify(f.tasks()).includes(secret));
+});
+
+for(const reason of ['permission_denied','restricted_mode','bot_user_out_of_chat'])test(`resource diagnostic producer-only ${reason} never upgrades remote evidence`,t=>{
+  const f=fixture(t);f.deps.enrichResources=()=>({results:[{record_id:1,state:'blocked',reason,failure:{stage:'resource_request',reason}}],request_budget:null});
+  const result=f.run();assert.deepEqual(result.failure,{stage:'resource_request',reason:'unverified_remote_failure',persisted:true});
+  assert.equal(f.tasks()[0].reason,'resource_invalid');assert.equal(f.tasks()[0].failure_reason,'unverified_remote_failure');assert.equal(f.calls.length,0);
+});
+
+test('resource diagnostic exhaustion preserves final concrete cause without reopening work',t=>{
+  const f=fixture(t);f.settings.bytes=Buffer.from('synthetic rejected bytes');
+  for(let n=0;n<3;n++){f.run();f.advance(500000);}
+  const before=f.tasks()[0],calls=f.calls.length;assert.equal(before.state,'exhausted');assert.equal(before.reason,'retry_exhausted');
+  assert.equal(before.failure_reason,'download_image_invalid');assert.equal(f.run().request_budget.cli_attempts,0);assert.equal(f.calls.length,calls);
+  assert.deepEqual(f.tasks()[0],before);
+});
+
+test('resource diagnostic migration CHECK vocabulary agrees with bounded exports',t=>{
+  const f=fixture(t);f.settings.transient=true;f.run();
+  for(const stage of RESOURCE_FAILURE_STAGES)sqliteExec(f.db,`UPDATE lark_im_resource_work SET failure_stage=${q(stage)};`);
+  for(const reason of RESOURCE_FAILURE_REASONS)sqliteExec(f.db,`UPDATE lark_im_resource_work SET failure_reason=${q(reason)};`);
+});
+
+test('resource diagnostic new attempt clears prior cause in claim CAS before unknown interruption',t=>{
+  const f=fixture(t);f.settings.bytes=Buffer.from('synthetic rejected bytes');f.run();
+  const old=f.tasks()[0];assert.equal(old.failure_reason,'download_image_invalid');
+  f.advance(121000);f.settings.remoteBusyAt=f.remoteLeases+1;
+  const result=f.run(),current=f.tasks()[0];assert.equal(result.request_budget.stop_reason,'sync_busy');
+  assert.equal(current.state,'running');assert.equal(current.attempts,2);assert(current.last_attempt_at_ms>old.last_attempt_at_ms);
+  assert.equal(current.failure_stage,null);assert.equal(current.failure_reason,null);
+  assert.deepEqual(result.failure,{stage:'opening_account',reason:'sync_busy',persisted:false});
 });

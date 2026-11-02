@@ -11,6 +11,7 @@ import { performance } from "node:perf_hooks";
 import { readScheduledRemoteSampleAdmission, readScheduledRemoteCooldowns, runScheduledRemoteSample } from "./remote-sample-scheduler.mjs";
 import { selectHistoryTarget } from "../../maintenance/history.mjs";
 import { resourceWorkAvailable } from "../../maintenance/resource-work.mjs";
+import { normalizeResourceFailure } from "../../maintenance/enrich-resources.mjs";
 import { readIdleFairState, claimIdleLane } from "./idle-fair-state.mjs";
 import { idleAdmission } from "./idle-admission.mjs";
 import { readOnlySqliteJson } from "../../storage/sqlite/readonly-query.mjs";
@@ -327,6 +328,10 @@ function compactResourceSummary(summary) {
   const result = { ok: summary.ok === true };
   if (summary.profile === "known_record_resources/v1") result.profile = summary.profile;
   if (RESOURCE_OUTCOMES.has(summary.outcome)) result.outcome = summary.outcome;
+  if (summary.failure === null) result.failure = null;
+  else if (summary.failure && typeof summary.failure === "object" && !Array.isArray(summary.failure)) {
+    result.failure = { ...normalizeResourceFailure(summary.failure), persisted: summary.failure.persisted === true };
+  }
   for (const field of ["processed", "available", "deferred", "blocked"]) {
     if (Number.isSafeInteger(summary[field]) && summary[field] >= 0) result[field] = summary[field];
   }
@@ -352,6 +357,26 @@ function trustedIdleBudget(value, cli, self, sample = false) {
     value.self_attempts <= self && value.self_attempts <= value.cli_attempts);
 }
 
+/** Keep each bounded receipt when spare capacity admits a second unit. Only
+ * counters present in every unit can be totalled; unknown is never zero. */
+function compactResourceUnits(steps, trusted) {
+  const units = steps.map(step => compactResourceSummary(step?.summary));
+  if (units.length === 1) return units[0] && { ...units[0],
+    ok: trusted[0] === true && steps[0]?.ok === true && units[0].ok === true };
+  const complete = trusted.every(Boolean) && units.every(unit => unit && unit.request_budget?.complete === true);
+  const result = { ok: complete && steps.every(step => step?.ok === true) && units.every(unit => unit?.ok === true),
+    profile: "known_record_resources/v1", units, request_budget: { complete } };
+  for (const field of ["processed", "available", "deferred", "blocked"]) {
+    if (complete && units.every(unit => Number.isSafeInteger(unit?.[field]))) result[field] = units.reduce((n, unit) => n + unit[field], 0);
+  }
+  for (const field of ["max_cli_attempts", "cli_attempts", "max_self_attempts", "self_attempts", "elapsed_ms"]) {
+    if (complete && units.every(unit => Number.isSafeInteger(unit?.request_budget?.[field]))) {
+      result.request_budget[field] = units.reduce((n, unit) => n + unit.request_budget[field], 0);
+    }
+  }
+  return result;
+}
+
 /** Three optional lanes share a single allowance. Persist only first-service
  * order; surplus work cannot erase a lane's next first opportunity. A claimed
  * failed attempt still rotates. Metadata lease/CAS failure is not a service.
@@ -367,7 +392,10 @@ function runSharedIdleWork(opts, cycle, runHistory, deps) {
   let deadline = began + Math.max(1000, Math.min(55_000, (opts.intervalSeconds - 5) * 1000));
   let previous = began, clockFailed = !Number.isFinite(began), cliRemaining = 12, selfRemaining = 6, called = false;
   /** @type {JsonObject|null} */ let historyStep = null;
-  /** @type {JsonObject|null} */ let resourceStep = null;
+  /** @type {JsonObject[]} */ const resourceSteps = [];
+  const resourceReceiptsTrusted = [];
+  const served = new Set();
+  let extraResourceReady = false, resourceUnitMs = 0;
   let idleOutcome = "completed";
   const remaining = () => {
     if (clockFailed) return 0;
@@ -419,7 +447,12 @@ function runSharedIdleWork(opts, cycle, runHistory, deps) {
   if (eligible.length && !state) idleOutcome = "state_unavailable";
   const jobs = state ? eligible.slice().sort((a, b) => state.last_served[a] - state.last_served[b] ||
     IDLE_LANES.indexOf(a) - IDLE_LANES.indexOf(b)) : [];
-  for (const name of jobs) {
+  // The appended slot is surplus only, after all originally eligible lanes.
+  // It never receives another first-service claim or displaces a skipped peer.
+  for (const [index, name] of [...jobs, "resources"].entries()) {
+    const surplus = index === jobs.length;
+    if (surplus && (!extraResourceReady || resourceSteps.length !== 1 ||
+        served.size !== jobs.length || remaining() < Math.max(minimumMs(name), resourceUnitMs + IDLE_CHILD_CLEANUP_MS) + 1000)) break;
     if (remaining() < 3000 || selfRemaining < 2 || cliRemaining < 3) break;
     if (remaining() < minimumMs(name)) continue;
     // Preserve the existing sampler's indivisible full call-plan admission.
@@ -447,6 +480,7 @@ function runSharedIdleWork(opts, cycle, runHistory, deps) {
     const maxSelf = name === "history" ? selfRemaining : 2;
     cliRemaining -= maxCli; selfRemaining -= maxSelf;
     called = true;
+    served.add(name);
     let receipt;
     if (name === "sample") {
       let sampled;
@@ -466,6 +500,7 @@ function runSharedIdleWork(opts, cycle, runHistory, deps) {
       if (seconds < 1) break;
       const limits = { timeoutMs, remainingTimeMs: remaining };
       let step;
+      const unitBegan = previous;
       try {
         step = name === "resources" ? deps.runResources(["resources", "--db", opts.db,
           "--max-cli-attempts", String(maxCli), "--max-self-attempts", String(maxSelf),
@@ -473,8 +508,11 @@ function runSharedIdleWork(opts, cycle, runHistory, deps) {
           runHistory(["history", "--db", opts.db, ...(opts.logDir ? ["--log-dir", opts.logDir] : []),
             "--max-records", "12", "--max-cli-attempts", String(maxCli), "--max-self-attempts", String(maxSelf),
             "--max-seconds", String(seconds), "--format", "json"], limits);
-      } catch { idleOutcome = "untrusted_result"; break; }
-      if (name === "resources") resourceStep = step; else historyStep = step;
+      } catch {
+        if (name === "resources") { resourceSteps.push({ ok: false, summary: null }); resourceReceiptsTrusted.push(false); }
+        idleOutcome = "untrusted_result"; break;
+      }
+      if (name === "resources") { resourceSteps.push(step); resourceReceiptsTrusted.push(false); } else historyStep = step;
       receipt = step?.summary?.request_budget;
       const validResource = name !== "resources" || step?.summary?.profile === "known_record_resources/v1" &&
         RESOURCE_OUTCOMES.has(step.summary.outcome) && receipt?.complete === true && receipt.max_seconds === seconds &&
@@ -484,10 +522,18 @@ function runSharedIdleWork(opts, cycle, runHistory, deps) {
       if (step?.guardian_diagnostic || !trustedIdleBudget(receipt, maxCli, maxSelf) || !validResource) {
         idleOutcome = "untrusted_result"; break;
       }
+      if (name === "resources") resourceReceiptsTrusted[resourceReceiptsTrusted.length - 1] = true;
       cliRemaining += maxCli - receipt.cli_attempts;
       selfRemaining += maxSelf - receipt.self_attempts;
       if (step.ok !== true || ["sync_busy", "lease_unavailable", "rate_limited", "rate_cooldown",
         "shared_cooldown_unavailable", "clock_unavailable"].includes(receipt.stop_reason)) break;
+      if (name === "resources") {
+        remaining();
+        resourceUnitMs = Math.max(0, previous - unitBegan);
+        extraResourceReady = !clockFailed && receipt.stop_reason === null && step.summary.ok === true &&
+          step.summary.outcome === "processed" && step.summary.processed === 1 && step.summary.available === 1 &&
+          step.summary.deferred === 0 && step.summary.blocked === 0;
+      }
     }
     if (remaining() === 0) break;
   }
@@ -497,11 +543,15 @@ function runSharedIdleWork(opts, cycle, runHistory, deps) {
   const base = historyStep || { name: "history", ok: true, exit_code: 0, stderr: "",
     summary: { ok: true, profile: "known_record_history/v1", outcome: "batch_deferred", processed: 0,
       cursor_policy: "unchanged", coverage: "known_rows_only" } };
+  const resources = resourceSteps.length ? compactResourceUnits(resourceSteps, resourceReceiptsTrusted) : null;
+  if (resources && clockFailed) resources.ok = false;
+  const ok = base.ok === true && base.summary?.ok === true && !clockFailed && idleOutcome === "completed" &&
+    (!resourceSteps.length || resources?.ok === true);
   // Keep the established logical history/idle event; nested resource projection
   // is already finite and contains no target-specific fields.
-  return { ...base, summary: { ...base.summary,
+  return { ...base, ok, exit_code: ok ? base.exit_code : (base.exit_code || 2), summary: { ...base.summary, ok,
     idle_outcome: clockFailed ? "clock_unavailable" : idleOutcome,
-    ...(resourceStep ? { resources: compactResourceSummary(resourceStep.summary) } : {}) },
+    ...(resourceSteps.length ? { resources } : {}) },
     started_at: startedAt, finished_at: new Date(now()).toISOString(), elapsed_ms: elapsed };
 }
 
@@ -602,9 +652,9 @@ function runWorker(opts, deps = {}) {
             started_at: at, finished_at: at, elapsed_ms: 0 };
         }
         return runSharedIdleWork(opts, cycle, runHistory, { nowMs, monotonicNowMs: monotonicNow,
-          hasHistoryWork: admission.mode === "resources_only" ? () => false : hasHistoryWork,
+          hasHistoryWork,
           hasResourceWork, runResources, readFair, claimFair,
-          remoteSampleAdmission, sample: admission.mode === "resources_only" ? null : sample,
+          remoteSampleAdmission, sample: admission.mode === "known_records" ? null : sample,
           cooldowns, onSample, sleepSeconds: sleep });
       },
     }) === true;

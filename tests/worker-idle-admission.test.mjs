@@ -74,7 +74,7 @@ test('saved old backoff producer proof is emitted only after commit and release;
   assert.equal(run.ok, false);
   assert.deepEqual(fixture.calls, ['release','due','backoff','admission']);
   const events = steps(rawPartial(run));
-  assert.deepEqual(idleAdmission(events), { mode: 'resources_only', why: 'saved_list_detail_backoff' });
+  assert.deepEqual(idleAdmission(events), { mode: 'known_records', why: 'saved_list_detail_backoff' });
   assert.equal(cycleHealthyWithoutHistory(events, true), false);
 });
 
@@ -195,7 +195,7 @@ test('real runStep process envelope + producer proof reaches resources-only, nev
   const stdout = JSON.stringify(rawPartial(producer().run()));
   const event = runStep('sent', [], { runProcess: () => ({ status: 2, stdout, stderr: '' }) });
   const events = steps(); events[0] = event;
-  assert.deepEqual(idleAdmission(events), { mode: 'resources_only', why: 'saved_list_detail_backoff' });
+  assert.deepEqual(idleAdmission(events), { mode: 'known_records', why: 'saved_list_detail_backoff' });
   assert.equal(cycleHealthyWithoutHistory(events, true), false);
 });
 
@@ -241,14 +241,14 @@ test('received aggregation retains one narrow failure among successful runs and 
   assert.deepEqual(compact.idle_evidence.detail_backoff, { version: 1, failed_runs: 1, pending_details: 2 });
   assert.equal(compact.received.failed, 1);
   assert.equal(compact.received.ok, false);
-  assert.deepEqual(idleAdmission(steps(raw)), { mode: 'resources_only', why: 'saved_list_detail_backoff' });
+  assert.deepEqual(idleAdmission(steps(raw)), { mode: 'known_records', why: 'saved_list_detail_backoff' });
 });
 
 test('multiple proven partial forward steps remain resource-only and do not change any receipt', () => {
   const events = steps();
   events[2] = { ...events[0], name: 'received-hot' };
   const before = structuredClone(events);
-  assert.deepEqual(idleAdmission(events), { mode: 'resources_only', why: 'saved_list_detail_backoff' });
+  assert.deepEqual(idleAdmission(events), { mode: 'known_records', why: 'saved_list_detail_backoff' });
   assert.deepEqual(events, before);
   assert.equal(cycleHealthyWithoutHistory(events, true), false);
 });

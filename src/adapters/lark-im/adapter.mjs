@@ -370,9 +370,9 @@ function assertRefreshedRoot(queued, refreshed, captureSameVersionConflict = fal
   }
   if (previousVersion === nextVersion) {
     if (!["exact", "json_representation", "reference_rename"].includes(mergeRootRelation(queued, refreshed))) {
-      // Only the orphan-task confirmation path requests conflict evidence.
-      // This is acquisition, not write admission; the store independently
-      // requires a second complete observation and its account/task fences.
+      // Orphan tasks and admitted known-record history can request conflict
+      // evidence. This is acquisition, not write admission; the store requires
+      // its independent observations and account/context/generation fences.
       if (!captureSameVersionConflict || previousVersion === null) {
         throw new MessageDetailError("source_version_conflict");
       }

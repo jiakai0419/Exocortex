@@ -101,7 +101,7 @@ for (const mutation of ['unchanged', 'source_policy', 'account', 'disabled', 'sc
     assert.equal(cycleHealthyWithoutHistory(steps, true), false);
     if (mutation === 'unchanged') {
       assert.deepEqual(run.idle_detail_backoff, { version: 1, kind: 'saved_list_backoff', pending_details: 1, detail_attempts: 0 });
-      assert.equal(idleAdmission(steps).mode, 'resources_only');
+      assert.equal(idleAdmission(steps).mode, 'known_records');
     } else {
       assert.equal(run.idle_detail_backoff, undefined, 'post-list source policy change must withhold old backoff proof');
       assert.equal(idleAdmission(steps).mode, 'none');

@@ -13,7 +13,7 @@ The runtime exports `resourceWorkAvailable(db,deps)` and
 `executeResourceWork(options,deps)` from `src/maintenance/resource-work.mjs`.
 Availability is a cheap bounded read-only hint; it grants no lock or authority
 and may be true when only local scanning is due. It does not initialize or
-migrate the database. The command requires migrations 019 and 021 already installed.
+migrate the database. The command requires migrations 019, 021 and 022 already installed.
 
 ## Discovery and durable selection
 
@@ -168,3 +168,22 @@ closed pending and quarantine restart, owner liveness, eight interrupted claims,
 unknown receipts, monotonic rollback and insufficient preparation budget.
 Fixtures contain newly authored messages/accounts/PNG bytes only. Real worker
 CLI/guardian/flock integration is a separate acceptance layer.
+
+
+## Failure evidence
+
+Migration 022 adds nullable `failure_stage` and `failure_reason` fields without
+changing existing queue state, attempts, retry times or source records. Old NULL
+means unknown retained evidence. A new claim clears the prior attempt's
+classification; the exact existing result CAS writes only bounded local-stage
+and reason vocabulary, together with that attempt's result. Success clears it.
+Arbitrary error prose, resource keys, record IDs and paths are not diagnostic
+fields. The worker retains only `{stage, reason, persisted}` and the existing
+bounded budget counters.
+
+`persisted` is true only after that diagnostic's result transaction is confirmed.
+Budget/lock stops do not obtain an extra lease to write a diagnostic after
+admission closes. Remote denial still requires the exact typed execution receipt
+and closing account fence. A local reason string cannot establish permission
+failure or authorize another request. Exhausted work is not automatically
+reopened by this migration; missing historical evidence cannot be reconstructed.

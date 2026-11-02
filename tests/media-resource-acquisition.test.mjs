@@ -42,7 +42,7 @@ function fixture(t,count=1,sticker=false) {
   return {root,db,rows,resourceDir:join(root,'resources'),options:{db,target:'resources',recordIds:rows.map(row=>row.id),apply:true}};
 }
 function transport(f,settings={}) {
-  let clock=1,profiles=0;const calls=[],stages=[];
+  let clock=1,profiles=0,resources=0;const calls=[],stages=[];
   const deps={tmpdir:f.root,now:()=>AT+10000,requestSessionDeps:{
     monotonicClock:()=>clock,sleep:ms=>{clock+=ms;},now:()=>AT+clock,
     tryAcquireLease:()=>({state:'acquired',release(){}}),readSharedCooldown:()=>({state:'ready'}),writeSharedCooldown:()=>true,
@@ -56,6 +56,7 @@ function transport(f,settings={}) {
       }
       assert.deepEqual(args.slice(0,2),['api','GET']);assert(args[2].includes('/resources/synthetic_image_'));
       assert(!args.includes('+messages-resources-download'));assert.equal(args[args.indexOf('--as')+1],'user');
+      resources++;const response=settings.resourceResponse?.(resources);if(response)return response;
       if(settings.denial)return {status:1,stdout:JSON.stringify({code:210508,msg:'permission denied: synthetic secret'}),stderr:''};
       const filename=args[args.indexOf('--output')+1],path=join(opts.cwd,filename);
       let bytes=settings.bytes??PNG;
@@ -244,4 +245,57 @@ test('continuation retention checks and stores one boundary time without re-agin
   const result=acquire(f,next);assert.equal(result.available,0);assert.equal(result.stop_reason,'sync_busy');
   assert.deepEqual(readFileSync(path),before);assert.equal(next.calls.filter(args=>args[0]==='api').length,0);
   assert.equal(samples,2,'one closing observation and one shared retention/check time');
+});
+
+for(const [label,settings,expected] of [
+  ['unusable image',{bytes:Buffer.from('synthetic malformed pixels')},'download_image_invalid'],
+  ['untrusted saved path',{savedPath:'../synthetic-private-path'},'download_response_invalid'],
+])test(`resource diagnostic ${label} is attached only to the requested item`,t=>{
+  const f=fixture(t,3),wire=transport(f,settings),report=acquire(f,wire);
+  assert.deepEqual(report.results[0].failure,{stage:'download_validation',reason:expected});
+  if(expected==='download_response_invalid'){
+    assert.equal(wire.calls.length,2);
+    assert.deepEqual(report.results.slice(1).map(item=>item.failure),Array(2).fill({stage:'selection',reason:'batch_stopped'}));
+  }else{
+    assert.equal(wire.calls.length,4);
+    assert(report.results.every(item=>item.failure.reason==='download_image_invalid'),'each item has its own real validation failure');
+  }
+  assert(!JSON.stringify(report).includes('synthetic-private-path'));
+});
+
+test('resource diagnostic raw producer denial remains unverified without closing account',t=>{
+  const f=fixture(t,2),wire=transport(f,{denial:true}),report=acquire(f,wire);
+  assert.deepEqual(report.results[0].failure,{stage:'resource_request',reason:'unverified_remote_failure'});
+  assert.deepEqual(report.results[1].failure,{stage:'selection',reason:'batch_stopped'});
+  assert.equal(wire.calls.length,2);assert.equal(report.request_budget.self_attempts,1);
+});
+
+test('resource diagnostic later request failure does not borrow earlier valid image identity',t=>{
+  const f=fixture(t,3),wire=transport(f,{resourceResponse:n=>n===2?{status:null,error:{code:'ETIMEDOUT'},stdout:'',stderr:''}:null}),report=acquire(f,wire);
+  assert.deepEqual(report.results.map(item=>item.reason),['publication_not_attempted','network_timeout','batch_stopped']);
+  assert.deepEqual(report.results.map(item=>item.failure),[
+    {stage:'publication',reason:'publication_not_attempted'},
+    {stage:'resource_request',reason:'network_timeout'},
+    {stage:'selection',reason:'batch_stopped'}]);
+  assert.equal(wire.calls.length,3);
+});
+
+test('resource diagnostic publication failure stays with its own item',t=>{
+  const f=fixture(t,3),wire=transport(f,{onProfile:n=>{if(n===2){mkdirSync(f.resourceDir,{mode:0o700});chmodSync(f.resourceDir,0o755);}}}),report=acquire(f,wire);
+  assert.deepEqual(report.results.map(item=>item.failure),[
+    {stage:'publication',reason:'resource_verification_failed'},
+    {stage:'publication',reason:'publication_not_attempted'},
+    {stage:'publication',reason:'publication_not_attempted'}]);
+  assert.equal(report.request_budget.cli_attempts,5);assert.equal(report.available,0);
+});
+
+test('resource diagnostic pending lookup failure does not taint staged or untouched neighbors',t=>{
+  const f=fixture(t,3),wire=transport(f,{afterFile:()=>{
+    mkdirSync(f.resourceDir,{mode:0o700});mkdirSync(join(f.resourceDir,'pending-v1'),{mode:0o755});
+  }}),report=acquire(f,wire);
+  assert.equal(report.stop_reason,'resource_pending_invalid');assert.equal(wire.calls.length,2);
+  assert.deepEqual(report.results.map(item=>item.failure),[
+    {stage:'publication',reason:'publication_not_attempted'},
+    {stage:'pending_recovery',reason:'resource_pending_invalid'},
+    {stage:'selection',reason:'batch_stopped'}]);
 });

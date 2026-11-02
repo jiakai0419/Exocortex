@@ -353,3 +353,91 @@ test('actual request-session fixed gaps require at least three remote seconds fo
     assert.equal(reason, seconds < 3 ? 'time_budget' : null);
   }
 });
+
+
+test('spare resource-only capacity serves two units without a second fair claim or larger budget', () => {
+  const f = harness({ historyAvailable: false, opts: { remoteSampleIntervalSeconds: 0, maxCycles: 1 }, resourceMs: 8000 });
+  assert.equal(f.run(), true);
+  const work = f.calls.filter(c => c.name === 'resources');
+  assert.equal(work.length, 2);
+  assert.equal(f.fair.sequence, 1);
+  assert.deepEqual(work.map(c => readArg(c.args, '--max-cli-attempts')), [3, 3]);
+  assert.deepEqual(work.map(c => readArg(c.args, '--max-self-attempts')), [2, 2]);
+  assert(work[1].limits.timeoutMs < work[0].limits.timeoutMs);
+  assert.equal(work[1].at - work[0].at, 9000);
+  const summary = f.events.find(e => e.name === 'history').summary.resources;
+  assert.equal(summary.available, 2);
+  assert.equal(summary.request_budget.cli_attempts, 6);
+  assert.equal(summary.request_budget.self_attempts, 4);
+  assert.equal(summary.units.length, 2);
+});
+
+test('surplus resources cannot jump an unserved eligible sampler or claim its next first turn', () => {
+  const f = harness({ historyAvailable: false,
+    fair: { sequence: 2, last_served: { sample: 1, history: 2, resources: 0 } }, opts: { maxCycles: 3 } });
+  f.run();
+  assert.deepEqual(f.calls.filter(c => c.cycle === 1).map(c => c.name), ['resources']);
+  assert.equal(f.first[1], 'sample');
+});
+
+for (const [label, mutate] of [
+  ['failed unit', s => { s.ok = false; s.outcome = 'blocked'; s.available = 0; s.blocked = 1; }],
+  ['unknown receipt', s => { s.request_budget.complete = false; }],
+  ['missing counter', s => { delete s.request_budget.cli_attempts; }],
+  ['throw after spawn', () => { throw new Error('authored synthetic process failure'); }],
+  ['clock rollback', (_s, advance) => advance(-10000)],
+]) test(`second resource ${label} cannot hide the first unit or report an entirely successful slice`, () => {
+  let n = 0;
+  const f = harness({ historyAvailable: false, opts: { remoteSampleIntervalSeconds: 0, maxCycles: 1 }, resourceMs: 4000,
+    mutateResource: (s, advance) => { if (++n === 2) mutate(s, advance); } });
+  assert.equal(f.run(), false);
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.fair.sequence, 1);
+  const result = f.events.find(e => e.name === 'history').summary;
+  assert.equal(result.ok, false);
+  assert.equal(f.events.find(e => e.name === 'history').ok, false);
+  assert.equal(f.events.find(e => e.type === 'lark_im_worker_cycle').ok, false);
+  assert.equal(result.resources.ok, false);
+  assert.equal(result.resources.units.length, 2);
+  assert.equal(result.resources.units[0].available, 1);
+  if (label === 'failed unit') {
+    assert.equal(result.resources.ok, false);
+    assert.equal(result.resources.available, 1);
+    assert.equal(result.resources.blocked, 1);
+  } else if (label === 'clock rollback') assert.equal(result.idle_outcome, 'clock_unavailable');
+  else {
+    assert.equal(result.idle_outcome, 'untrusted_result');
+    assert.equal(result.resources.ok, false);
+    assert.equal(result.resources.request_budget.complete, false);
+    assert.equal(result.resources.request_budget.cli_attempts, undefined);
+  }
+});
+
+test('a measured slow first resource reserves equal work and original cleanup before considering surplus', () => {
+  const f = harness({ historyAvailable: false, resourceMs: 12000,
+    opts: { remoteSampleIntervalSeconds: 0, maxCycles: 1 } });
+  f.run();
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.events.find(e => e.name === 'history').summary.resources.available, 1);
+});
+
+test('surplus uses balances after history and cannot exceed original self allowance', () => {
+  const f = harness({ sampleDue: false, historyCalls: 3, historyMs: 100, resourceMs: 100,
+    opts: { remoteSampleIntervalSeconds: 0, maxCycles: 1 } });
+  f.run();
+  assert.deepEqual(f.calls.map(c => c.name), ['history', 'resources', 'resources']);
+  const result = f.events.find(e => e.name === 'history').summary;
+  assert.equal(result.request_budget.self_attempts + result.resources.request_budget.self_attempts, 6);
+  assert.equal(result.request_budget.cli_attempts + result.resources.request_budget.cli_attempts, 9);
+  assert.equal(f.fair.sequence, 1);
+});
+
+test('worker preserves only finite resource failure evidence and its persistence receipt', () => {
+  const projected = compactResourceSummary({ ok: false, failure: { stage: 'download_validation',
+    reason: 'download_image_invalid', persisted: true, path: '/private/authored', body: 'authored content' } });
+  assert.deepEqual(projected.failure, { stage: 'download_validation', reason: 'download_image_invalid', persisted: true });
+  assert.deepEqual(compactResourceSummary({ ok: false, failure: { stage: 'authored private stage', reason: 'authored secret',
+    persisted: 'true' } }).failure, { stage: 'unknown', reason: 'unknown', persisted: false });
+  assert.equal(compactResourceSummary({ ok: true, failure: null }).failure, null);
+  assert.equal(compactResourceSummary({ ok: false }).failure, undefined);
+});

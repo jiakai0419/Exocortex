@@ -135,8 +135,8 @@ compatibility. Tests use only newly authored rows and private coordination roots
 
 `idleAdmission(steps)` is a pure decision, independent of cycle health. Its
 result is `{ mode, why }`: `all/healthy_forward` preserves the existing healthy
-three-lane policy; `resources_only/saved_list_detail_backoff` admits resources
-alone; `none` is accompanied by `missing_forward_receipts`,
+three-lane policy; `known_records/saved_list_detail_backoff` admits bounded resource and
+known-record history work (see `postdeployment-recovery-closure.md`); `none` is accompanied by `missing_forward_receipts`,
 `untrusted_forward_failure`, or `transport_not_clean`. It does not mark a partial
 cycle healthy, change adaptive/status semantics, grant extra requests, or reset
 history/sample service ages. The root worker owns lane wiring and the existing

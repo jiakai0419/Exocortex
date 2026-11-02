@@ -71,7 +71,7 @@ function fixture(t, options = {}) {
     nowMs: now, monotonicNowMs: mono,
     sleepSeconds: seconds => { sleeps.push(seconds); advance(seconds * 1000); },
     writeScheduler: (_opts, event) => scheduler.push(event),
-    hasHistoryWork: () => { hints.push('history'); return true; },
+    hasHistoryWork: () => { hints.push('history'); return options.historyAvailable === true; },
     hasResourceWork: () => { hints.push('resources'); advance(options.hintMs || 0); return options.resourceAvailable !== false; },
     readIdleFairState: (_db, budget) => { hints.push('fair'); hints.push({ deadline: budget.monotonicDeadlineMs, at: ms }); return structuredClone(fair); },
     claimIdleLane: (_db, state, lane, eligible, budget) => {
@@ -97,10 +97,10 @@ function fixture(t, options = {}) {
     runResources: (args, limits) => runStep('resources', args, {
       command: 'maintenance', nowMs: now, monotonicNowMs: mono, ...limits,
       runProcess: (_cmd, argv, settings) => {
-        recordCall('resources', argv, settings); advance(100);
+        recordCall('resources', argv, settings); advance(options.resourceMs ?? 12000);
         return { status: 0, stderr: '', stdout: JSON.stringify({ ok: true, profile: 'known_record_resources/v1',
           outcome: 'processed', processed: 1, available: 1, deferred: 0, blocked: 0,
-          request_budget: receipt(args, 3, 2) }) };
+          request_budget: receipt(args, 3, 2, options.resourceMs ?? 12000) }) };
       },
     }),
     runCycle: (cycleOpts, n, cycleDeps) => {
@@ -130,7 +130,7 @@ test('actual runWorker resources-only wiring preserves partial health, cycle ord
   const f = fixture(t);
   assert.equal(f.run(), false);
   assert.deepEqual(optional(f).map(row => row.name), ['resources','resources']);
-  assert.equal(f.hints.includes('history'), false, 'no history eligibility query');
+  assert.equal(f.hints.includes('history'), true, 'bounded known-record history hint remains eligible');
   assert.equal(f.hints.includes('sample'), false, 'no sampling admission query');
   assert.deepEqual(f.claims.map(row => row.eligible), [['resources'], ['resources']]);
   assert.deepEqual(f.fair, { sequence: 12, last_served: { sample: 2, history: 4, resources: 12 } });
@@ -158,7 +158,7 @@ test('resources-only children remain inside original 25-second/12-CLI/6-self sha
     assert(work.reduce((n, row) => n + num(row.args, '--max-cli-attempts'), 0) <= 12);
     assert(work.reduce((n, row) => n + num(row.args, '--max-self-attempts'), 0) <= 6);
   }
-  assert(f.sleeps.every(seconds => seconds === 59.4), 'measured 0.6s idle gets no extra allowance');
+  assert(f.sleeps.every(seconds => seconds === 47.5), 'measured 12.5s idle gets no extra allowance');
 });
 
 for (const [label, options] of [
@@ -187,7 +187,7 @@ test('resource absence or fair CAS refusal does not silently enable history/samp
     const f = fixture(t, options), before = structuredClone(f.fair);
     assert.equal(f.run(), false);
     assert.deepEqual(optional(f), []);
-    assert.equal(f.hints.includes('history'), false);
+    assert.equal(f.hints.includes('history'), true);
     assert.equal(f.hints.includes('sample'), false);
     assert.equal(f.fair.last_served.history, before.last_served.history);
     assert.equal(f.fair.last_served.sample, before.last_served.sample);
@@ -199,7 +199,7 @@ test('resource absence or fair CAS refusal does not silently enable history/samp
 });
 
 test('normal healthy worker retains history/resource service with exactly the shared 12/6 total cap', t => {
-  const f = fixture(t, { forward: 'healthy', opts: { maxCycles: 1 },
+  const f = fixture(t, { forward: 'healthy', historyAvailable: true, opts: { maxCycles: 1 },
     fair: { sequence: 2, last_served: { history: 0, resources: 1, sample: 2 } } });
   assert.equal(f.run(), true);
   const work = optional(f);
@@ -220,7 +220,7 @@ test('normal healthy worker retains history/resource service with exactly the sh
 });
 
 test('normal healthy non-final cycle still admits due sampling instead of globally disabling it', t => {
-  const f = fixture(t, { forward: 'healthy', fair: { sequence: 2, last_served: { sample: 0, history: 1, resources: 2 } } });
+  const f = fixture(t, { forward: 'healthy', historyAvailable: true, fair: { sequence: 2, last_served: { sample: 0, history: 1, resources: 2 } } });
   assert.equal(f.run(), true);
   const first = optional(f)[0];
   assert.equal(first.name, 'sample');
@@ -273,4 +273,18 @@ test('scheduled retention keeps its original position before resources-only idle
     [...REQUIRED_CYCLE_STEPS, 'retention', 'history']);
   assert.deepEqual(optional(f).map(row => row.name), ['resources']);
   assert.deepEqual(f.events.find(event => event.type === 'lark_im_worker_cycle').failed_steps, ['sent']);
+});
+
+
+test('proved saved-list backoff restores bounded known-record history and resources without admitting sample', t => {
+  const f = fixture(t, { historyAvailable: true, resourceMs: 100, opts: { maxCycles: 3 } });
+  assert.equal(f.run(), false);
+  assert.deepEqual(f.claims.map(row => row.lane), ['history', 'resources', 'history']);
+  assert(f.claims.every(row => row.eligible.length === 2 && row.eligible.includes('history') && row.eligible.includes('resources')));
+  assert.equal(f.calls.some(row => row.name === 'sample'), false);
+  assert.equal(f.hints.includes('sample'), false);
+  assert(f.events.filter(e => e.type === 'lark_im_worker_cycle').every(e => e.ok === false));
+  assert(optional(f).filter(row => row.name === 'history').every(row =>
+    num(row.args, '--max-records') === 12 && num(row.args, '--max-seconds') <= 22 && row.timeout <= 23000));
+  assertForwardOrder(f);
 });

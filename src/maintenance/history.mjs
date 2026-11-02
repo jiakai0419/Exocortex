@@ -105,6 +105,29 @@ function selectScheduledTarget(db, options, binding, accountKey, deps, startedAt
     return target ? {target,schedule,priority} : null;
 }
 
+/** Conflict capture is evidence acquisition for this selected known record,
+ * never an alternate source-acceptance rule. Validate its captured basis before
+ * asking the adapter for a complete conflicting tree. Current database facts
+ * remain guarded by the existing review/observation/account CAS at commit. */
+function assertHistoryDetailCaptureBasis(target, binding, self, accountKey, writeAdmission) {
+  const { record: row, scope, checkpoint } = target, fence = writeAdmission.fence;
+  const config = JSON.parse(scope.config_json), admittedScope = fence.scopes[0];
+  if (row.source_id !== 'lark.im' || row.record_type !== 'lark.im.message'
+    || JSON.parse(row.canonical_json)?.source_api !== 'im.v1.messages'
+    || !Number.isSafeInteger(row.id) || row.id < 1 || checkpoint.selectedId !== row.id
+    || !Number.isSafeInteger(target.observationGeneration) || target.observationGeneration < 0
+    || typeof row.external_version !== 'string' || !/^\d+$/.test(row.external_version)
+    || scope.source_id !== 'lark.im' || scope.enabled !== 1 || scope.id !== chatScopeId(config.chat_id)
+    || typeof config.chat_id !== 'string' || row.container_id !== config.chat_id
+    || !/^[a-f0-9]{64}$/.test(binding.database_key || '')
+    || !fence.requireVerified || fence.selfOpenId !== self.open_id || fence.accountKey !== accountKey
+    || accountKey !== sha(`lark.im\0${self.open_id}`) || fence.sourceConfigJson !== target.sourceConfigJson
+    || fence.scopes.length !== 1 || admittedScope?.id !== scope.id || admittedScope.source_id !== scope.source_id
+    || admittedScope.enabled !== scope.enabled || admittedScope.config_json !== scope.config_json) {
+    throw new Error('history detail acquisition basis unavailable');
+  }
+}
+
 /** One explicitly bounded autonomous slice; no name fanout or discovery cursor.
  * Tests inject a transport session, never real source or shared production state. */
 function executeHistoryTarget(options, deps, session, initialTarget, prepared = /** @type {Record<string,any>|null} */ (null)) {
@@ -149,8 +172,10 @@ function executeHistoryTarget(options, deps, session, initialTarget, prepared = 
     const ordinary = fetched.messages.filter(message => messageId(message) === row.external_id);
     const roots = detailRoots.filter(message => messageId(message) === row.external_id);
     if (ordinary.length + roots.length !== 1) throw new Error(ordinary.length + roots.length ? 'ambiguous' : 'missing');
+    if (roots.length) assertHistoryDetailCaptureBasis(target, binding, self, accountKey, writeAdmission);
     const selected = roots.length ? (deps.fetchMessageDetails || adapter.fetchMessageDetails)(roots[0], {
       retries: 0, retryDelayMs: 0, detailMaxPages: 2, detailMaxItems: 100, detailBudgetMs: 30_000,
+      captureSameVersionConflict: true, expectedScope: { kind: 'chat', identity: config.chat_id },
     }) : ordinary[0];
     const acquiredAt = new Date().toISOString();
     if (Buffer.byteLength(JSON.stringify(selected)) > 1024 * 1024) throw new Error('size_limit');

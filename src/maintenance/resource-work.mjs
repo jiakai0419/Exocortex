@@ -15,7 +15,7 @@ import { readLarkExecutionReceipt } from '../adapters/lark-im/transport-executio
 import { transportOperation } from '../adapters/lark-im/transport.mjs';
 import { tryAcquireLarkApiLease } from '../runtime/lark-api-lease.mjs';
 import { createMaintenanceRequestSession } from './request-session.mjs';
-import { enrichResources } from './enrich-resources.mjs';
+import { enrichResources, normalizeResourceFailure, resourceFailureFromError } from './enrich-resources.mjs';
 import { RESOURCE_CANDIDATE_INDEX, RESOURCE_CANDIDATE_WHERE } from './resource-candidates.mjs';
 
 /** @typedef {Record<string,any>} Row */
@@ -78,7 +78,7 @@ export function executeResourceWork(options,deps={}) {
   let previous=began,producerStarted=false,receiptInvalid=false;
   /** @type {Row|null} */let producerBudget=null,producerSession=null;
   /** @type {Row|null} */let claimed=null,denial=null;
-  const report={ok:true,profile:PROFILE,outcome:'no_eligible_known_resource',processed:0,available:0,deferred:0,blocked:0};
+  /** @type {Row} */ const report={ok:true,profile:PROFILE,outcome:'no_eligible_known_resource',processed:0,available:0,deferred:0,blocked:0,failure:null};
   const elapsed=()=>{const n=mono();if(!Number.isFinite(began)||!Number.isFinite(n)||n<previous)stop('clock_unavailable');previous=n;return n-began;};
   const ready=()=>{if(!integer(wall)||!integer(now())||now()<wall)stop('clock_unavailable');if(elapsed()>=maxSeconds*1000)stop('time_budget');};
   const query=(sql,label)=>(deps.sqliteJson||readOnlySqliteJson)(options.db,sql,label,{timeoutMs:Math.max(1,Math.min(2000,Math.floor(deadline-mono())))});
@@ -141,6 +141,8 @@ export function executeResourceWork(options,deps={}) {
           ON CONFLICT(source_id,account_key,work_key) DO UPDATE SET record_id=excluded.record_id,binding_key=excluded.binding_key,source_fence=excluded.source_fence,
           state=CASE WHEN ${denied} THEN 'blocked' WHEN ${bindingChanged} THEN 'pending' WHEN ${reopened} THEN CASE WHEN ${exhausted} THEN 'exhausted' ELSE 'pending' END ELSE ${TABLE}.state END,
           reason=CASE WHEN ${denied} THEN ${TABLE}.reason WHEN ${bindingChanged} THEN NULL WHEN ${reopened} THEN CASE WHEN ${exhausted} THEN 'retry_exhausted' ELSE NULL END ELSE ${TABLE}.reason END,
+          failure_stage=CASE WHEN NOT(${denied}) THEN NULL ELSE ${TABLE}.failure_stage END,
+          failure_reason=CASE WHEN NOT(${denied}) THEN NULL ELSE ${TABLE}.failure_reason END,
           attempts=CASE WHEN ${bindingChanged} AND NOT(${denied}) THEN 0 ELSE ${TABLE}.attempts END,
           failures=CASE WHEN ${bindingChanged} AND NOT(${denied}) THEN 0 ELSE ${TABLE}.failures END,
           deferrals=CASE WHEN ${bindingChanged} AND NOT(${denied}) THEN 0 ELSE ${TABLE}.deferrals END,
@@ -176,16 +178,16 @@ export function executeResourceWork(options,deps={}) {
       // keep selecting the fresh lane, and a failed CAS advances neither.
       local(()=>write(`INSERT INTO __resource_fence SELECT CASE WHEN ${observedSourceSql(row,task.record_id)} AND EXISTS(SELECT 1 FROM ${TABLE} WHERE ${keyWhere(task)} AND generation=${task.generation} AND state=${q(task.state)})
         AND EXISTS(SELECT 1 FROM ${SCAN} WHERE source_id='lark.im' AND generation=${scan.generation}) THEN 1 ELSE 0 END;
-        UPDATE ${TABLE} SET state='blocked',reason='source_changed',generation=generation+1,retry_at_ms=0
+        UPDATE ${TABLE} SET state='blocked',reason='source_changed',failure_stage='source_fence',failure_reason='source_changed',generation=generation+1,retry_at_ms=0
         WHERE ${keyWhere(task)} AND generation=${task.generation} AND state=${q(task.state)};
         UPDATE ${SCAN} SET priority_streak=${lane==='fair'?0:Math.min(2,scan.priority_streak+1)},generation=generation+1 WHERE source_id='lark.im';`));
-      report.ok=false;report.outcome='source_changed';report.deferred=1;return finish();
+      report.ok=false;report.outcome='source_changed';report.deferred=1;report.failure={stage:'source_fence',reason:'source_changed',persisted:true};return finish();
     }
     const token=randomUUID();
     if(Math.floor((maxSeconds*1000-elapsed())/1000)<3)stop('time_budget');
     local(()=>write(`INSERT INTO __resource_fence SELECT CASE WHEN ${sourceSql(row)} AND EXISTS(SELECT 1 FROM ${TABLE} WHERE ${keyWhere(task)} AND generation=${task.generation} AND state=${q(task.state)})
       AND EXISTS(SELECT 1 FROM ${SCAN} WHERE source_id='lark.im' AND generation=${scan.generation}) THEN 1 ELSE 0 END;
-      UPDATE ${TABLE} SET state='running',attempt_token=${q(token)},claim_owner=${q(DEFAULT_SYNC_LOCK_OWNER)},claim_until_ms=${wall+CLAIM_MS},last_attempt_at_ms=${wall},attempts=attempts+1,generation=generation+1 WHERE ${keyWhere(task)};
+      UPDATE ${TABLE} SET state='running',attempt_token=${q(token)},failure_stage=NULL,failure_reason=NULL,claim_owner=${q(DEFAULT_SYNC_LOCK_OWNER)},claim_until_ms=${wall+CLAIM_MS},last_attempt_at_ms=${wall},attempts=attempts+1,generation=generation+1 WHERE ${keyWhere(task)};
       UPDATE ${SCAN} SET priority_streak=${lane==='fair'?0:Math.min(2,scan.priority_streak+1)},generation=generation+1 WHERE source_id='lark.im';`));
     claimed={...task,attempts:task.attempts+1,generation:task.generation+1,attempt_token:token,row};
     ready();
@@ -205,9 +207,16 @@ export function executeResourceWork(options,deps={}) {
           if(receipt.status==='valid'&&receipt.value?.execution==='started'&&receipt.value.remote_result===true&&DENIAL.get(receipt.value.result_code)===receipt.value.result_kind) {
             // The original 3 CLI / 2 self grant has one closing observation
             // left. Denial belongs to this account only if that bracket closes.
-            const closing=createLarkImAdapter({run:session.runLark}).getSelfProfile({retries:0,retryDelayMs:0}).open_id;
-            if(!openingSelf||closing!==openingSelf||recipientAccountKey(closing)!==task.account_key)throw Object.assign(new Error('resource account changed'),{resourceReason:'account_changed'});
-            denial=receipt.value;
+            try {
+              const closing=createLarkImAdapter({run:session.runLark}).getSelfProfile({retries:0,retryDelayMs:0}).open_id;
+              if(!openingSelf||closing!==openingSelf||recipientAccountKey(closing)!==task.account_key)throw Object.assign(new Error('resource account changed'),{resourceReason:'account_changed'});
+              denial=receipt.value;
+            } catch(closingError) {
+              // This self call happens in the queue wrapper, outside the
+              // producer's resource_request site; preserve its actual stage.
+              if(closingError instanceof Error)Object.assign(closingError,{resourceFailure:resourceFailureFromError(closingError,'closing_account')});
+              throw closingError;
+            }
           }
         }
         throw error;
@@ -224,24 +233,28 @@ export function executeResourceWork(options,deps={}) {
     const stopped=STOP.has(result.request_budget?.stop_reason)?result.request_budget.stop_reason:null;
     let state='deferred',reason=stopped||'transient_failure',failures=task.failures,deferrals=task.deferrals;
     const confirmedDenial=/** @type {Row|null} */(denial);
+    let diagnostic=item.state==='available'?null:normalizeResourceFailure(item.failure);
+    if(diagnostic&&[...DENIAL.values()].includes(diagnostic.reason))diagnostic={...diagnostic,reason:'unverified_remote_failure'};
     if(item.state==='available'){state='available';reason=null;}
-    else if(confirmedDenial&&item.state==='failed'&&item.reason===confirmedDenial.result_kind){state='blocked';reason=confirmedDenial.result_kind;}
+    else if(confirmedDenial&&item.state==='failed'&&item.reason===confirmedDenial.result_kind){state='blocked';reason=confirmedDenial.result_kind;diagnostic={stage:'resource_request',reason};}
     else if(!producerStarted&&item.state==='blocked'){state='blocked';reason='resource_invalid';}
     else {if(stopped)deferrals=Math.min(8,deferrals+1);else failures=Math.min(3,failures+1);
       state=failures>=3||task.attempts+1>=8?'exhausted':'deferred';reason=state==='exhausted'?'retry_exhausted':reason;
       report.ok=false;report.outcome=state==='exhausted'?'exhausted':'batch_deferred';report.deferred=1;}
+    report.failure=diagnostic?{...diagnostic,persisted:false}:null;
     // A stopped request session cannot be bypassed by a later metadata lease.
     if(stopped)return finish(stopped);
     ready();
     const current=snapshot([task.record_id])[0];
     if(!current||makeMediaPendingSourceFence(current)!==identity.source_fence){
       local(()=>write(`INSERT INTO __resource_fence SELECT CASE WHEN ${observedSourceSql(current,task.record_id)} AND EXISTS(SELECT 1 FROM ${TABLE} WHERE ${keyWhere(task)} AND generation=${task.generation+1} AND attempt_token=${q(token)} AND state='running') THEN 1 ELSE 0 END;
-        UPDATE ${TABLE} SET state='blocked',reason='source_changed',attempt_token=NULL,claim_owner=NULL,claim_until_ms=0,generation=generation+1
+        UPDATE ${TABLE} SET state='blocked',reason='source_changed',failure_stage='source_fence',failure_reason='source_changed',attempt_token=NULL,claim_owner=NULL,claim_until_ms=0,generation=generation+1
         WHERE ${keyWhere(task)} AND generation=${task.generation+1} AND attempt_token=${q(token)} AND state='running';`));
-      report.ok=false;report.outcome='source_changed';report.deferred=1;return finish();}
+      report.ok=false;report.outcome='source_changed';report.deferred=1;report.failure={stage:'source_fence',reason:'source_changed',persisted:true};return finish();}
     local(()=>write(`INSERT INTO __resource_fence SELECT CASE WHEN ${sourceSql(row)} AND EXISTS(SELECT 1 FROM ${TABLE} WHERE ${keyWhere(task)} AND generation=${task.generation+1} AND attempt_token=${q(token)} AND state='running') THEN 1 ELSE 0 END;
-      UPDATE ${TABLE} SET state=${q(state)},reason=${q(reason)},failures=${failures},deferrals=${deferrals},retry_at_ms=${state==='deferred'?now()+Math.min(3600000,60000*2**Math.min(5,failures+deferrals)):0},
+      UPDATE ${TABLE} SET state=${q(state)},reason=${q(reason)},failure_stage=${q(diagnostic?.stage??null)},failure_reason=${q(diagnostic?.reason??null)},failures=${failures},deferrals=${deferrals},retry_at_ms=${state==='deferred'?now()+Math.min(3600000,60000*2**Math.min(5,failures+deferrals)):0},
       attempt_token=NULL,claim_owner=NULL,claim_until_ms=0,generation=generation+1 WHERE ${keyWhere(task)};`));
+    if(diagnostic)report.failure={...diagnostic,persisted:true};
     if(state==='available'){report.outcome='processed';report.processed=1;report.available=1;}
     else if(state==='blocked'){report.ok=false;report.outcome='blocked';report.blocked=1;}
     return finish();

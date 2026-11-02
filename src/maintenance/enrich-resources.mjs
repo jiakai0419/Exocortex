@@ -11,6 +11,7 @@ import { assessMediaImageBytes, makeMediaResourceBinding, MAX_MEDIA_RESOURCE_BYT
   publishMediaResource, readMediaResource, resourceStorePath, makeMediaPendingSourceFence,
   readPendingMediaResource, retainPendingMediaResource, discardPendingMediaResource, reclaimPendingMediaResources } from '../adapters/lark-im/media-resource-store.mjs';
 import { classifyLarkFailure } from '../adapters/lark-im/transport.mjs';
+import { readLarkExecutionReceipt } from '../adapters/lark-im/transport-execution.mjs';
 import { readMessageSnapshot } from '../diagnostics/message-read-snapshot.mjs';
 import { createMaintenanceRequestSession, MaintenanceRequestError } from './request-session.mjs';
 
@@ -28,6 +29,50 @@ const continuationCurrent=(evidence,time)=>Number.isSafeInteger(time)&&time>=evi
 const resumableStops = new Set(['sync_busy','cli_budget','self_budget','time_budget']);
 // Only these byte-content outcomes are independent of batch safety admission.
 const itemContentFailures = new Set(['download_image_invalid','resource_format_unsupported']);
+// Diagnostic vocabulary only. These fields never authorize a request, retry,
+// permanent denial or publication. Stage is a local call site, not proof that
+// the process/remote operation executed. Never retain error prose or payloads.
+export const RESOURCE_FAILURE_STAGES=Object.freeze(['selection','opening_account','pending_recovery',
+  'resource_request','download_validation','closing_account','publication','source_fence','unknown']);
+export const RESOURCE_FAILURE_REASONS=Object.freeze(['unknown','request_failed','request_not_started','request_execution_unknown',
+  'unverified_remote_failure','network_timeout','network_error','service_unavailable','internal_error','command_unavailable','spawn_error',
+  'permission_denied','restricted_mode','bot_user_out_of_chat',
+  'record_missing','content_not_supported','sticker_resource_unsupported','media_reference_missing','media_reference_invalid','account_unverified','source_binding_invalid',
+  'profile_unverified','account_mismatch','account_changed','source_changed','download_response_invalid','download_file_invalid',
+  'download_image_invalid','resource_publish_failed','resource_format_unsupported','resource_decoder_unavailable','resource_validation_limit',
+  'resource_pending_invalid','resource_pending_busy','resource_pending_expired','resource_pending_capacity','resource_pending_conflict',
+  'resource_pending_missing','resource_pending_account_unverified','resource_verification_failed','resource_image_invalid','resource_time_invalid',
+  'resource_not_cached','publication_not_attempted','batch_stopped','sync_busy','lease_unavailable','cli_budget','self_budget','time_budget',
+  'clock_unavailable','rate_cooldown','rate_limited','shared_cooldown_unavailable']);
+const denialReasons=new Set(['permission_denied','restricted_mode','bot_user_out_of_chat']);
+/** Bounded diagnostic projection; old nullable columns intentionally map to unknown.
+ * This validates shape, not the authority of a remote denial.
+ * @param {any} value */
+export function normalizeResourceFailure(value) {
+  return {stage:RESOURCE_FAILURE_STAGES.includes(value?.stage)?value.stage:'unknown',
+    reason:RESOURCE_FAILURE_REASONS.includes(value?.reason)?value.reason:'unknown'};
+}
+/** A trusted local call site plus finite command-boundary receipt, never prose.
+ * Exact endpoint/closing-account denial verification belongs to resource-work.
+ * @param {any} error @param {string} stage */
+export function resourceFailureFromError(error,stage) {
+  if(error?.resourceFailure) {
+    const diagnostic=normalizeResourceFailure(error.resourceFailure);
+    return denialReasons.has(diagnostic.reason)?{...diagnostic,reason:'unverified_remote_failure'}:diagnostic;
+  }
+  if(error instanceof MaintenanceRequestError)return normalizeResourceFailure({stage,reason:error.reason});
+  if(localReasons.has(error?.resourceReason))return normalizeResourceFailure({stage,reason:error.resourceReason});
+  const operation=['opening_account','closing_account'].includes(stage)?'self_profile':'other';
+  const receipt=readLarkExecutionReceipt(error,operation);
+  let reason='unknown';
+  if(receipt.status==='valid') {
+    const value=receipt.value;
+    reason=value?.execution==='not_started'?'request_not_started':value?.execution==='unknown'?'request_execution_unknown':
+      denialReasons.has(value?.result_kind)?(value?.remote_result===true?'unverified_remote_failure':'unknown'):value?.result_kind==='success'?'request_failed':value?.result_kind;
+  }
+  return normalizeResourceFailure({stage,reason});
+}
+
 function failure(error) {
   if (error instanceof MaintenanceRequestError) return error.reason;
   if (localReasons.has(error?.resourceReason)) return error.resourceReason;
@@ -91,6 +136,10 @@ export function enrichResources(options,deps={}) {
   /** @type {Row} */ const report={target:'resources',dry_run:options.apply!==true,
     selected:results.length,results,request_budget:null,partial:false};
   const finish=()=>{
+    for(const entry of results) {
+      if(['blocked','failed'].includes(entry.state))entry.failure=normalizeResourceFailure(entry.failure??{stage:'selection',reason:entry.reason});
+      else entry.failure=null;
+    }
     report.available=results.filter(item=>item.state==='available').length;
     report.planned=results.filter(item=>item.state==='planned').length;
     report.failed=results.filter(item=>['blocked','failed'].includes(item.state)).length;
@@ -105,6 +154,8 @@ export function enrichResources(options,deps={}) {
   /** @type {Row|null} */ let activeCandidate=null;
   let activeAttempts=0;
   let openingAtMs=null,originalClosingAtMs=null;
+  let failureStage='opening_account';
+  /** @type {Row|null} */ let failureOwner=null;
   try {
     const sessionDeps={env:deps.env,now:deps.now,...deps.requestSessionDeps};
     const executor=sessionDeps.spawnSync || spawnSync;
@@ -121,9 +172,12 @@ export function enrichResources(options,deps={}) {
     const account=verifySelf();
     if(candidates.some(candidate=>candidate.account.account_key!==account))throw localFailure('account_mismatch');
     openingAtMs=now();
+    failureStage='pending_recovery';
     const prepared=reclaimPendingMediaResources(cache,{nowMs:now()});
     if(prepared.status!=='ready')throw localFailure(prepared.reason);
     for(const [index,candidate] of candidates.entries()) {
+      failureOwner=candidate;
+      failureStage='pending_recovery';
       const pending=readPendingMediaResource(cache,candidate.binding,candidate.sourceFence,{nowMs:now()});
       if(pending.status==='invalid')throw localFailure('resource_pending_invalid');
       if(pending.status==='pending') {
@@ -134,39 +188,49 @@ export function enrichResources(options,deps={}) {
       // quarantined, never promoted by today's self profile. A fresh operation
       // must download again; success may remove that exact obsolete generation.
       if(pending.status==='quarantined')candidate.quarantine=pending;
+      failureStage='resource_request';
       session.assertReady();
       const filename=`resource-${index}.bin`;
       activeCandidate=candidate;activeAttempts=session.summary().cli_attempts;
       candidate.entry.state='fetching';
       const response=runLark(['api','GET',`/open-apis/im/v1/messages/${encodeURIComponent(candidate.row.external_id)}/resources/${encodeURIComponent(candidate.media.resource.key)}`,
         '--as','user','--params','{"type":"image"}','--output',filename,'--format','json']);
+      failureStage='download_validation';
       try {
         candidate.bytes=readDownload(stage,filename,response);candidate.entry.state='verified_download';
       } catch(error) {
         const reason=/** @type {Row} */(error)?.resourceReason;
         if(!itemContentFailures.has(reason))throw error;
         candidate.entry.state='blocked';candidate.entry.reason=reason;
+        candidate.entry.failure=resourceFailureFromError(error,failureStage);
       }
       activeCandidate=null;
     }
     const downloaded=candidates.filter(candidate=>candidate.entry.state==='verified_download');
     if(!downloaded.length)return finish();
+    failureOwner=null;
+    failureStage='closing_account';
     if(verifySelf()!==account)throw localFailure('account_changed');
     originalClosingAtMs=now();
+    failureStage='source_fence';
     session.withCommit(()=>{
       const current=snapshot(options.db,selection).rows;
       for(const candidate of downloaded) {
+        failureOwner=candidate;
+        failureStage='source_fence';
         const publicationAtMs=now();
         if(candidate.continuation && !continuationCurrent(candidate.continuation,publicationAtMs)) {
-          candidate.entry.state='blocked';candidate.entry.reason='resource_pending_expired';continue;
+          candidate.entry.state='blocked';candidate.entry.reason='resource_pending_expired';candidate.entry.failure={stage:'pending_recovery',reason:'resource_pending_expired'};continue;
         }
         const row=current.find(row=>row.id===candidate.row.id);
         if(!row||unchangedFields.some(key=>row[key]!==candidate.row[key])) {
-          candidate.entry.state='blocked';candidate.entry.reason='source_changed';continue;
+          candidate.entry.state='blocked';candidate.entry.reason='source_changed';candidate.entry.failure={stage:'source_fence',reason:'source_changed'};continue;
         }
+        failureStage='publication';
         const saved=publishMediaResource(cache,candidate.binding,candidate.bytes,{nowMs:publicationAtMs});
         candidate.entry.state=saved.status==='available'?'available':'blocked';
         candidate.entry.reason=saved.status==='available'?null:saved.reason;
+        if(saved.status!=='available')candidate.entry.failure=normalizeResourceFailure({stage:'publication',reason:saved.reason});
         if(saved.status!=='available')throw localFailure('resource_publish_failed');
         const receipt=candidate.continuation?.receipt??candidate.quarantine?.receipt;
         if(receipt) {
@@ -177,6 +241,7 @@ export function enrichResources(options,deps={}) {
     });
   } catch(error) {
     const reason=failure(error);report.stop_reason=reason;
+    const diagnostic=resourceFailureFromError(error,failureStage);
     if(resumableStops.has(reason)&&openingAtMs!==null) {
       // Local retention never publishes available evidence or obtains an API
       // lease. Recheck the exact row before preserving this original operation.
@@ -189,7 +254,7 @@ export function enrichResources(options,deps={}) {
           }
           const row=current.find(row=>row.id===candidate.row.id);
           if(!row||makeMediaPendingSourceFence(row)!==candidate.sourceFence) {
-            candidate.entry.state='blocked';candidate.entry.reason='source_changed';continue;
+            candidate.entry.state='blocked';candidate.entry.reason='source_changed';candidate.entry.failure={stage:'source_fence',reason:'source_changed'};continue;
           }
           const retained=retainPendingMediaResource(cache,candidate.binding,candidate.sourceFence,candidate.bytes,{nowMs:retentionAtMs,
             openingAtMs:candidate.continuation?.opening_at_ms??openingAtMs,
@@ -203,13 +268,16 @@ export function enrichResources(options,deps={}) {
     // A failed request is evidence about one resource, never its neighbors.
     // Pre-execution admission failures have no resource response to attribute.
     if(activeCandidate?.entry.state==='fetching' && (session?.summary().cli_attempts || 0)>activeAttempts) {
-      activeCandidate.entry.state='failed';activeCandidate.entry.reason=reason;
+      activeCandidate.entry.state='failed';activeCandidate.entry.reason=reason;activeCandidate.entry.failure=diagnostic;
     }
     for(const candidate of candidates) {
       if(candidate.entry.state==='verified_download') {
         candidate.entry.state='blocked';candidate.entry.reason='publication_not_attempted';
+        candidate.entry.failure=!failureOwner||failureOwner===candidate?diagnostic:{stage:'publication',reason:'publication_not_attempted'};
       } else if(['planned','fetching'].includes(candidate.entry.state)) {
         candidate.entry.state='blocked';candidate.entry.reason='batch_stopped';
+        // A not-yet-requested neighbor cannot borrow another resource's result.
+        candidate.entry.failure=failureOwner&&candidate!==failureOwner?{stage:'selection',reason:'batch_stopped'}:diagnostic;
       }
     }
   } finally {
