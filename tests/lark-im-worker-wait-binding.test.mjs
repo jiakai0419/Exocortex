@@ -16,7 +16,7 @@ const START = Date.parse("2034-05-06T07:08:09.000Z");
 const clone = value => structuredClone(value);
 const quiet = { stdout: { write() {} } };
 
-function fixtures(t, start = START) {
+function fixtures(t, start = START, mutateHistoryReceipt = () => {}) {
   const dir = mkdtempSync(join(tmpdir(), "synthetic-worker-binding-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const dbA = join(dir, "alpha.sqlite"); const dbB = join(dir, "beta.sqlite");
@@ -30,7 +30,25 @@ function fixtures(t, start = START) {
     const stop = new Error("synthetic stop after first waiting phase");
     assert.throws(() => runWorker(opts, { activity, nowMs: () => ++clock,
       runCycle: (options, cycle, deps) => runCycle(options, cycle, { ...deps, writeLog: quiet,
-        runStep: { runProcess: () => { beforeChild(); return { status: success ? 0 : 1, stdout: JSON.stringify({ ok: success }), stderr: "" }; } } }),
+        runStep: { runProcess: (_command, argv) => {
+          beforeChild();
+          const summary = { ok: success };
+          if (argv[1] === "maintenance" && argv[2] === "history") {
+            const grant = flag => {
+              assert.equal(argv.filter(arg => arg === flag).length, 1);
+              const value = Number(argv[argv.indexOf(flag) + 1]);
+              assert(Number.isSafeInteger(value) && value > 0);
+              return value;
+            };
+            Object.assign(summary, { profile: "known_record_history/v1", outcome: "batch_deferred", processed: 0,
+              cursor_policy: "unchanged", coverage: "known_rows_only", request_budget: { complete: true,
+                max_cli_attempts: grant("--max-cli-attempts"), cli_attempts: 0,
+                max_self_attempts: grant("--max-self-attempts"), self_attempts: 0,
+                max_seconds: grant("--max-seconds"), min_interval_ms: 1000, elapsed_ms: 0, stop_reason: null } });
+            mutateHistoryReceipt(summary);
+          }
+          return { status: success ? 0 : 1, stdout: JSON.stringify(summary), stderr: "" };
+        } } }),
       sleepSeconds: () => {
         captured = readFileSync(join(logDir, "worker.jsonl"), "utf8").trim().split("\n").map(JSON.parse); throw stop;
       } }), error => error === stop);
@@ -50,6 +68,21 @@ function evidence(events, currentEvents = events) {
   return { report, binding, summary, state };
 }
 const completed = events => events.filter(event => ["lark_im_worker_step", "lark_im_worker_cycle"].includes(event.type));
+
+for (const [label, mutate] of [
+  ["absent receipt", summary => { delete summary.request_budget; }],
+  ["missing counter", summary => { delete summary.request_budget.cli_attempts; }],
+  ["mismatched grant", summary => { summary.request_budget.max_self_attempts++; }],
+]) test(`matched worker with ${label} remains unhealthy rather than losing identity`, t => {
+  const f = fixtures(t, START, mutate), events = f.worker(f.dbA, "authored-untrusted-history");
+  const result = evidence(events);
+  assert.equal(result.binding.target_match, "matched");
+  assert.equal(result.state.ready, false);
+  const history = completed(events).find(event => event.name === "history");
+  assert.equal(history.ok, false); assert.equal(history.summary.ok, false);
+  assert.equal(history.summary.idle_outcome, "untrusted_result");
+  assert.equal(completed(events).at(-1).ok, false);
+});
 
 for (const retention of [false, true]) test(`a real single-instance cycle is complete with retention=${retention}`, t => {
   const f = fixtures(t); const events = f.worker(f.dbA, "alpha", true, retention);

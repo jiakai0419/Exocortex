@@ -19,6 +19,7 @@ import { createLarkCliRunner, createTransportState, getTransportStats, resetTran
 import { executeResourceWork, resourceWorkIdentity } from '../src/maintenance/resource-work.mjs';
 import { RESOURCE_CANDIDATE_INDEX, RESOURCE_CANDIDATE_WHERE } from '../src/maintenance/resource-candidates.mjs';
 import { parseArgs, runCycle, runStep, runWorker } from '../src/runtime/worker/worker.mjs';
+import { runGuardedWorkerStep } from '../src/runtime/worker/step-process.mjs';
 import { readSharedLarkCooldown, tryAcquireLarkApiLease, writeSharedLarkCooldown } from '../src/runtime/lark-api-lease.mjs';
 
 // All source events, responses and image bytes are authored. The resource lane
@@ -118,6 +119,67 @@ function observe(dir, context) {
   log(dir, { type: 'messages_observation', context, denominator: rows.length,
     rows: rows.map(row => ({ externalId: row.external_id, state: row.readiness.state, reasons: row.readiness.reasons })),
     jsonAtMs: json.atMs, textAtMs: terminal.atMs }); return rows;
+}
+// Match actual resource invocations to each logical idle slice. A second
+// bounded unit is optional; an empty probe is never counted as an acquisition.
+function assertResourceSlices(journal) {
+  const slices = []; let after = 0;
+  for (let end = 0; end < journal.length; end++) {
+    const cycle = journal[end]; if (cycle.type !== 'cycle') continue;
+    const rows = journal.slice(after, end); after = end + 1;
+    const units = rows.filter(x => x.type === 'resource_step');
+    const grants = rows.filter(x => x.type === 'resource_spawn');
+    const claims = rows.filter(x => x.type === 'lane_claim');
+    assert(units.length <= 2, 'at most two resource units in the original idle slice');
+    assert.equal(grants.length, units.length);
+    assert.equal(claims.length, units.length ? 1 : 0, 'surplus never claims another first-service turn');
+    if (!units.length) { slices.push({ cycle, units, grants, claims }); continue; }
+    assert(claims[0].claimed && claims[0].lane === 'resources');
+    const idle = cycle.steps.find(x => x.name === 'history'); assert(idle);
+    assert.equal(idle.ok, true); assert.equal(idle.summary.ok, true);
+    assert.equal(idle.summary.idle_outcome, 'completed');
+    assert(Number.isFinite(idle.elapsed_ms) && idle.elapsed_ms >= 0 && idle.elapsed_ms <= 25000,
+      'measured complete idle work remains inside the unchanged 25-second slice');
+    const measured = rows.slice(rows.indexOf(claims[0])).filter(x => x.type === 'api');
+    const totals = { cli: 0, self: 0, available: 0 };
+    for (let i = 0; i < units.length; i++) {
+      const { step } = units[i], grant = grants[i], summary = step.summary, budget = summary.request_budget;
+      assert(step.ok && !step.guardian_diagnostic); assert.equal(budget.complete, true);
+      assert.equal(budget.max_cli_attempts, 3); assert.equal(budget.max_self_attempts, 2);
+      assert.equal(budget.min_interval_ms, 1000); assert.equal(budget.stop_reason, null);
+      assert(Number.isSafeInteger(grant.timeoutMs) && grant.timeoutMs > 0 && grant.timeoutMs <= 23000);
+      assert(grant.timeoutMs + 2000 <= grant.remainingMs, 'original guardian cleanup is contained in remaining shared time');
+      assert(grant.remainingMs <= 25000 && grant.remainingMs > 2000,
+        'the final spawn shrinks after local preparation; the six-second scheduler admission is tested separately');
+      if (i) {
+        assert(grant.timeoutMs < grants[i - 1].timeoutMs, 'surplus shares the original shrinking deadline');
+        assert(grant.monotonicMs >= grants[i - 1].monotonicMs, 'observed monotonic time cannot move backwards');
+        const gap = journal.slice(journal.indexOf(units[i - 1]) + 1, journal.indexOf(grant))
+          .filter(x => x.type === 'worker_sleep');
+        assert.deepEqual(gap.map(x => x.seconds), [1], 'the existing one-second inter-unit sleep is requested exactly once');
+      }
+      const start = journal.indexOf(grant), finish = journal.indexOf(units[i]);
+      const calls = journal.slice(start, finish).filter(x => x.type === 'api');
+      assert.equal(budget.cli_attempts, calls.length);
+      assert.equal(budget.self_attempts, calls.filter(x => x.route === 'self').length);
+      if (summary.outcome === 'no_eligible_known_resource') {
+        assert.deepEqual(['processed','available','deferred','blocked'].map(key => summary[key]), [0,0,0,0]);
+        assert.equal(budget.cli_attempts, 0); assert.equal(budget.self_attempts, 0);
+      } else {
+        assert.equal(summary.outcome, 'processed');
+        assert.deepEqual(['processed','available','deferred','blocked'].map(key => summary[key]), [1,1,0,0]);
+        assert.equal(budget.cli_attempts, 3); assert.equal(budget.self_attempts, 2);
+      }
+      totals.cli += budget.cli_attempts; totals.self += budget.self_attempts; totals.available += summary.available;
+    }
+    assert(totals.cli <= 12 && totals.self <= 6, 'original shared API budgets remain unchanged');
+    assert.equal(totals.cli, measured.length); assert.equal(totals.self, measured.filter(x => x.route === 'self').length);
+    assert.equal(idle.summary.resources.available, totals.available);
+    assert.equal(idle.summary.resources.request_budget.cli_attempts, totals.cli);
+    assert.equal(idle.summary.resources.request_budget.self_attempts, totals.self);
+    slices.push({ cycle, units, grants, claims });
+  }
+  return slices;
 }
 function fixture(t, invalidPrefix) {
   const dir = mkdtempSync(join(tmpdir(), 'exocortex-resource-worker-synthetic-')), db = join(dir, 'synthetic.sqlite');
@@ -270,7 +332,9 @@ if (process.argv[2] === '--remote') {
   const opts = parseArgs(['--max-cycles','2','--db',db,'--log-dir',join(dir,'logs'),'--remote-sample-interval-seconds','0']);
   const helperDeps = deps => ({ ...deps, tryAcquireLease: (o, leaseDeps) => tryAcquireLarkApiLease(o, { ...leaseDeps, directory: join(dir, 'api-state') }) });
   const result = runWorker(opts, { nowMs: () => now(dir), monotonicNowMs: () => performance.now(),
-    sleepSeconds: s => { advance(dir, s * 1000); }, writeScheduler() {},
+    // Preserve this fixture's virtual worker sleeps. Actual elapsed I/O and the
+    // requested fixed gap are observed separately; neither is a production SLO.
+    sleepSeconds: s => { log(dir, { type: 'worker_sleep', seconds: s }); advance(dir, s * 1000); }, writeScheduler() {},
     hasHistoryWork: () => false,
     hasResourceWork: o => { const available = resourceWorkAvailable(o.db, { now: () => now(dir) }); log(dir, { type: 'resource_hint', available }); return available; },
     readIdleFairState: (path, deps) => { const state = readIdleFairState(path, helperDeps(deps)); log(dir, { type: 'fair_read', state }); return state; },
@@ -280,8 +344,14 @@ if (process.argv[2] === '--remote') {
     },
     runResources: (args, limits) => {
       const before = sqliteQuery(db, 'SELECT * FROM records ORDER BY id;');
+      let remainingMs;
       const step = runStep('resources', args, { command: 'maintenance', scriptPath: HERE, ...limits,
-        nowMs: () => now(dir), monotonicNowMs: () => performance.now() });
+        remainingTimeMs: () => (remainingMs = limits.remainingTimeMs()),
+        nowMs: () => now(dir), monotonicNowMs: () => performance.now(),
+        runProcess(command, argv, settings) {
+          log(dir, { type: 'resource_spawn', timeoutMs: settings.timeout, remainingMs, monotonicMs: performance.now() });
+          return runGuardedWorkerStep(command, argv, settings);
+        } });
       assert.deepEqual(sqliteQuery(db, 'SELECT * FROM records ORDER BY id;'), before,
         'resource work preserves every source column, including version, hash, raw, body, account evidence and clocks');
       log(dir, { type: 'resource_step', step });
@@ -307,7 +377,10 @@ if (process.argv[2] === '--remote') {
     const sources = read(join(dir, 'publisher.json')).entries;
     const stored = sqliteQuery(db, "SELECT id,external_id FROM records WHERE direction='received' ORDER BY id;");
     assert.equal(starts.length, 3); assert.equal(new Set(starts.map(event => event.pid)).size, 3);
-    assert.equal(steps.length, 6); assert.equal(checkpoints.length, 6); assert.equal(downloads.length, 6);
+    const slices = assertResourceSlices(journal); assert.equal(slices.length, 6);
+    assert(slices.every(slice => slice.units.length >= 1), 'each eligible cycle retains its first resource service');
+    assert.equal(checkpoints.length, steps.length); assert.equal(downloads.length, steps.length);
+    assert.equal(new Set(downloads.map(event => event.id)).size, downloads.length, 'no completed image is downloaded twice');
     assert.equal(claims.length, 6); assert(claims.every(event => event.claimed && event.lane === 'resources'));
     assert.deepEqual(claims.map(event => event.sequence), [1,2,3,4,5,6]);
     for (const claim of claims) {
@@ -321,9 +394,12 @@ if (process.argv[2] === '--remote') {
     assert(steps.every(event => event.step.ok && !event.step.guardian_diagnostic && event.step.summary.available === 1));
     assert(steps.every(event => event.step.summary.request_budget.complete
       && event.step.summary.request_budget.cli_attempts === 3 && event.step.summary.request_budget.self_attempts === 2));
-    assert.deepEqual(checkpoints.map(event => event.scan.priority_streak), [1,2,0,1,2,0]);
-    assert.equal(downloads[2].id, initial[0].message.message_id, 'oldest original is served on the first opportunity after process restart');
+    assert.deepEqual(checkpoints.map(event => event.scan.priority_streak), steps.map((_step, index) => (index + 1) % 3));
+    assert.equal(downloads[2].id, initial[0].message.message_id, 'oldest original is served on the third actual resource unit');
     assert.equal(downloads[5].id, initial[1].message.message_id, 'next oldest original is served under continuing new images');
+    assert(journal.indexOf(downloads[5]) > journal.indexOf(starts[1]), 'oldest service continues after an actual process restart');
+    for (let index = 2; index < downloads.length; index += 3)
+      assert.equal(downloads[index].id, initial[(index - 2) / 3].message.message_id, 'each third unit retains exact oldest original priority');
     const oldestId = stored.find(row => row.external_id === initial[0].message.message_id).id;
     const originalAge = checkpoints[0].tasks.find(task => task.record_id === oldestId).enqueued_at_ms;
     assert(checkpoints.every(event => event.tasks.find(task => task.record_id === oldestId).enqueued_at_ms === originalAge),
@@ -332,11 +408,14 @@ if (process.argv[2] === '--remote') {
     assert.equal(burst.length, 45);
     const burstIds = burst.map(source => stored.find(row => row.external_id === source.message.message_id)?.id);
     assert(burstIds.every(Number.isSafeInteger), 'all 45 images traverse the actual forward CLI');
-    const missingAfterBurst = burstIds.filter(id => !checkpoints[1].tasks.some(task => task.record_id === id));
+    const entries=journal.filter(event=>event.type==='resource_entry');
+    assert.equal(entries.length,steps.length);
+    const burstEntry = entries.findIndex(event => event.head >= Math.max(...burstIds));
+    assert(burstEntry >= 1, 'post-burst scan is located from the committed candidate head, not the unit number');
+    const missingAfterBurst = burstIds.filter(id => !checkpoints[burstEntry].tasks.some(task => task.record_id === id));
     assert.equal(missingAfterBurst.length, invalidPrefix ? 25 : 11,
       'bounded newest/history pages must leave a real unqueued middle cohort');
-    const entries=journal.filter(event=>event.type==='resource_entry');
-    assert.equal(entries.length,6);
+
     const scanKeys=['after_id','horizon_id','last_head_id','next_scan_at_ms'];
     const trace=checkpoints.map((checkpoint,index)=>{
       const before=entries[index],due=before.scan.next_scan_at_ms<=before.atMs||before.head>before.scan.last_head_id;
@@ -354,8 +433,10 @@ if (process.argv[2] === '--remote') {
         burstUnqueued:burstIds.filter(id=>!checkpoint.tasks.some(task=>task.record_id===id)).length};
     });
     assert(trace.some(row=>!row.due),'an existing task must actually be served between due scans');
-    const continued=trace.findIndex((row,index)=>index>1&&row.burstUnqueued===0);
-    assert(continued>=2 && continued<6,'all 45 original burst images are discovered in this finite due-scan schedule');
+    const continued=trace.findIndex((row,index)=>index>burstEntry&&row.burstUnqueued===0);
+    assert(continued>burstEntry,'all 45 original burst images require and receive a later due scan');
+    assert(trace.slice(0,continued+1).filter(row=>row.due).length<=6,
+      'burst completion retains the original six-cycle bound, independent of surplus units');
     assert(trace[continued].due,'burst discovery follows a due scan, not merely a selection turn');
     const invalid=journal.filter(event=>event.type==='invalid_prefix_seed');
     assert.equal(invalid.length,invalidPrefix?1:0);
@@ -365,10 +446,12 @@ if (process.argv[2] === '--remote') {
       'invalid candidates must never enroll or displace stable valid work');
     assert(downloads.every(event=>!event.id.startsWith('om_v')),'no invalid resource reaches the API boundary');
     if(invalidPrefix){
-      assert(trace[1].afterScan.after_id>=invalidIds[0]&&trace[1].afterScan.after_id<invalidIds.at(-1),
+      assert(trace[burstEntry].afterScan.after_id>=invalidIds[0]&&trace[burstEntry].afterScan.after_id<invalidIds.at(-1),
         'first post-burst history page stops inside the invalid prefix');
       const crossed=trace.find(row=>row.afterScan.after_id>=invalidIds.at(-1));
-      assert(crossed&&crossed.opportunity>2,'later due page crosses the invalid prefix after a process restart');
+      assert(crossed&&crossed.opportunity>burstEntry+1,'a later due page crosses the invalid prefix');
+      assert(journal.indexOf(checkpoints[crossed.opportunity-1])>journal.indexOf(starts[1]),
+        'the unfinished invalid-prefix horizon survives a process restart');
     }
     t.diagnostic(JSON.stringify({phase:'verified-due-scan-trace',invalidCandidates:invalidIds.length,trace}));
     const observations = journal.filter(event => event.type === 'messages_observation');
@@ -378,14 +461,16 @@ if (process.argv[2] === '--remote') {
     assert.equal(sources.length, 61); assert.equal(stored.length, 59); assert.equal(final.length, 59);
     assert.deepEqual(checkpoints.at(-1).tasks.map(task=>task.record_id),stored.map(row=>row.id),
       'every collected image has exactly one final task; no invalid candidate joins the denominator');
-    assert.equal(final.filter(row => row.readiness.state === 'ready').length, 6);
-    assert.equal(final.filter(row => row.readiness.state !== 'ready').length, 53);
+    assert.equal(final.filter(row => row.readiness.state === 'ready').length, downloads.length);
+    assert.equal(final.filter(row => row.readiness.state !== 'ready').length, 59-downloads.length);
+    assert.deepEqual(final.filter(row=>row.readiness.state==='ready').map(row=>row.external_id).sort(),
+      downloads.map(event=>event.id).sort(), 'each real ready image corresponds exactly to one verified acquisition');
     assert.equal(sqliteQuery(db, 'SELECT COUNT(*) n FROM records;')[0].n, 5559+(invalidPrefix?25:0));
     assert.deepEqual(journal.filter(event => event.type === 'api' && event.route === 'unexpected'), []);
     t.diagnostic(JSON.stringify({ scenario:invalidPrefix?'continuous-images-invalid-prefix-restarts':'continuous-images-after-deep-history', sourceImages:61, collectedImages:59,queuedImages:checkpoints.at(-1).tasks.length,
-      imageReady:6, imageUnready:53, notYetCollected:2, unrelatedTexts:5500, firstNewBurst:45,
+      imageReady:downloads.length, imageUnready:59-downloads.length, notYetCollected:2, unrelatedTexts:5500, firstNewBurst:45,
       burstMissingAfterFirstPage:missingAfterBurst.length, burstMissingAfterContinuation:0,burstCompleteOpportunity:continued+1,invalidCandidates:invalidIds.length,
-      opportunities:6, workerProcesses:3, oldestServiceOpportunities:[3,6], initialAgePreserved:true,
+      idleSlices:6, resourceUnits:steps.length, workerProcesses:3, oldestServiceOpportunities:downloads.map((_event,index)=>index+1).filter(n=>n%3===0), initialAgePreserved:true,
       sourceColumnsPreservedByRealResourceAndMessagesReads:true,
       bound:'conditional synthetic candidate-discovery and queue-order proof; resources-only eligible; not three-lane fairness or production latency' }));
   });

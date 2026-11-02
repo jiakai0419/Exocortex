@@ -64,8 +64,23 @@ trace('path_import_done')
 class ObservedInput:
     def read(self, *args, **kwargs):
         trace('stdin_read_start')
-        value = sys.stdin.read(*args, **kwargs)
-        trace('stdin_read_done', characters=len(value))
+        # Diagnostic-only, same bytes and EOF requirement. Do not emit input.
+        if args or kwargs:
+            raise RuntimeError('diagnostic reader expects the existing read-all call')
+        chunks, total, index = [], 0, 0
+        while True:
+            chunk = sys.stdin.buffer.read1(65536)
+            total += len(chunk)
+            # First chunks, logarithmic milestones and EOF keep input tracing
+            # bounded without consuming all 512 phase slots before SQL begins.
+            if index < 8 or (index & (index-1)) == 0 or not chunk:
+                trace('stdin_chunk', index=index, bytes=len(chunk), total_bytes=total, eof=not bool(chunk))
+            index += 1
+            if not chunk:
+                break
+            chunks.append(chunk)
+        value = b''.join(chunks).decode('utf-8')
+        trace('stdin_read_done', characters=len(value), bytes=total)
         return value
 trace('json_load_start')
 p = json.load(ObservedInput())
@@ -488,15 +503,19 @@ test('profiler boundary waits for EOF even when a complete valid JSON value was 
   const f = fixture(t), before = hash(readFileSync(f.db)), input = controlInput(f);
   const start = performance.now();
   const child = spawn('python3', [f.profiler], { stdio: ['pipe', 'pipe', 'pipe'] });
-  let stdout = '', stderr = '', release, endedAt, writeCallbackAt, overflow = false, sawReadStart = false, deadlineTriggered = false, firstError;
+  let stdout = '', stderr = '', release, endedAt, writeCallbackAt, payloadObservedAt, beforeEof;
+  let overflow = false, sawReadStart = false, sawFullPayload = false, deadlineTriggered = false, firstError;
   const timeout = setTimeout(() => { deadlineTriggered = true; child.kill('SIGKILL'); },
     Math.max(1, 30_000 - (performance.now() - start)));
   const capOutput = () => {
     if (Buffer.byteLength(stdout) + Buffer.byteLength(stderr) > OUTPUT_LIMIT) { overflow = true; child.kill('SIGKILL'); }
   };
   const releaseWhenObserved = () => {
-    if (!release && sawReadStart && Number.isFinite(writeCallbackAt)) {
-      release = setTimeout(() => { endedAt = performance.now(); child.stdin.end(); }, 250);
+    if (!release && sawReadStart && sawFullPayload && Number.isFinite(writeCallbackAt)) {
+      release = setTimeout(() => {
+        beforeEof = phases(stderr);
+        endedAt = performance.now(); child.stdin.end();
+      }, 250);
     }
   };
   child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
@@ -504,6 +523,13 @@ test('profiler boundary waits for EOF even when a complete valid JSON value was 
   child.stderr.on('data', value => {
     stderr += value; capOutput();
     if (stderr.includes('"phase":"stdin_read_start"')) sawReadStart = true;
+    const lines = stderr.split('\n').slice(0, -1);
+    for (const line of lines) {
+      const event = JSON.parse(line);
+      if (!sawFullPayload && event.phase === 'stdin_chunk' && event.total_bytes === Buffer.byteLength(input) && event.eof === false) {
+        sawFullPayload = true; payloadObservedAt = performance.now();
+      }
+    }
     releaseWhenObserved();
   });
   const failOwnedChild = error => { if (firstError === undefined) firstError = error; child.kill('SIGKILL'); };
@@ -525,9 +551,16 @@ test('profiler boundary waits for EOF even when a complete valid JSON value was 
   assert.equal(deadlineTriggered, false, 'a triggered watchdog is failure even if close delivery races with it');
   assert.equal(overflow, false, 'delayed-EOF control also retains the four MiB output bound');
   assert.deepEqual(status, { code: 0, signal: null }, stderr);
-  assert(Number.isFinite(writeCallbackAt) && Number.isFinite(endedAt));
+  assert(Number.isFinite(writeCallbackAt) && Number.isFinite(endedAt) && Number.isFinite(payloadObservedAt));
+  assert(endedAt - payloadObservedAt >= 200, 'all payload bytes are observed before the deliberately withheld EOF');
+  assert(beforeEof.some(event => event.phase === 'stdin_chunk' && event.total_bytes === Buffer.byteLength(input) && event.eof === false));
+  assert(!beforeEof.some(event => event.phase === 'stdin_read_done' || event.phase === 'json_load_done' || event.phase === 'connect_start'),
+    'a complete JSON payload without EOF must not be parsed or sent to SQLite');
   assert(endedAt - writeCallbackAt >= 200, 'write completion is not EOF or child parse completion');
   const log = phases(stderr), readStart = phase(log, 'stdin_read_start'), readDone = phase(log, 'stdin_read_done');
+  const eof = log.filter(event => event.phase === 'stdin_chunk' && event.eof === true);
+  assert.equal(eof.length, 1); assert.equal(eof[0].bytes, 0); assert.equal(eof[0].total_bytes, Buffer.byteLength(input));
+  assert(readDone.wall_ms >= eof[0].wall_ms);
   assert(readDone.wall_ms - readStart.wall_ms >= 200);
   assert(phase(log, 'json_load_done').wall_ms >= readDone.wall_ms);
   complete(JSON.parse(stdout), 'delayed EOF control', FIXED_BUDGET + ROW_OVERHEAD);
@@ -545,6 +578,24 @@ test('profiler boundary records completed input read before rejecting malformed 
   phase(log, 'stdin_read_done');
   assert(!log.some(item => ['json_load_done', 'connect_start', 'prepare_start'].includes(item.phase)));
   assert.equal(result.stdout, '');
+  assert.equal(hash(readFileSync(f.db)), before);
+});
+
+for (const [label, input] of [
+  ['truncated JSON', Buffer.from('{"sql":"SELECT 1;"')],
+  ['invalid UTF-8', Buffer.from([0x7b, 0x22, 0xff, 0x22, 0x3a, 0x31, 0x7d])],
+  ['invalid JSON', Buffer.from('{"sql":NaN missing}')],
+]) test(`chunk observations retain EOF but reject ${label} before SQLite`, t => {
+  const f = fixture(t), before = hash(readFileSync(f.db));
+  const result = spawnSync('python3', [f.profiler], { input, encoding: 'utf8', timeout: 30_000, maxBuffer: OUTPUT_LIMIT });
+  assert.equal(result.error, undefined); assert.equal(result.status, 1); assert.equal(result.signal, null);
+  assert.equal(result.stdout, '');
+  const log = phases(result.stderr), chunks = log.filter(event => event.phase === 'stdin_chunk');
+  assert(chunks.length > 0); assert.equal(chunks.at(-1).bytes, 0); assert.equal(chunks.at(-1).eof, true);
+  assert.equal(chunks.at(-1).total_bytes, input.length);
+  assert(log.length <= 512);
+  assert(!log.some(event => ['json_load_done', 'input_read', 'connect_start', 'prepare_start'].includes(event.phase)));
+  if (label !== 'invalid UTF-8') assert.equal(phase(log, 'stdin_read_done').bytes, input.length);
   assert.equal(hash(readFileSync(f.db)), before);
 });
 

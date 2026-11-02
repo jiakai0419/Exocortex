@@ -18,6 +18,7 @@ import { syncNames } from '../src/adapters/lark-im/name-sync.mjs';
 import { createLarkCliRunner, createTransportState, getTransportStats, resetTransportStats } from '../src/adapters/lark-im/transport.mjs';
 import { createMaintenanceRequestSession } from '../src/maintenance/request-session.mjs';
 import { parseArgs, runCycle, runStep, runWorker } from '../src/runtime/worker/worker.mjs';
+import { runGuardedWorkerStep } from '../src/runtime/worker/step-process.mjs';
 import { readSharedLarkCooldown, tryAcquireLarkApiLease, writeSharedLarkCooldown } from '../src/runtime/lark-api-lease.mjs';
 
 // All source events, responses and image bytes are authored. The resource lane
@@ -133,6 +134,67 @@ function observe(dir, context) {
   log(dir, { type: 'messages_observation', context, denominator: rows.length,
     rows: rows.map(row => ({ externalId: row.external_id, state: row.readiness.state, reasons: row.readiness.reasons })),
     jsonAtMs: json.atMs, textAtMs: terminal.atMs }); return rows;
+}
+// Match actual resource invocations to each logical idle slice. A second
+// bounded unit is optional; an empty probe is never counted as an acquisition.
+function assertResourceSlices(journal) {
+  const slices = []; let after = 0;
+  for (let end = 0; end < journal.length; end++) {
+    const cycle = journal[end]; if (cycle.type !== 'cycle') continue;
+    const rows = journal.slice(after, end); after = end + 1;
+    const units = rows.filter(x => x.type === 'resource_step');
+    const grants = rows.filter(x => x.type === 'resource_spawn');
+    const claims = rows.filter(x => x.type === 'lane_claim');
+    assert(units.length <= 2, 'at most two resource units in the original idle slice');
+    assert.equal(grants.length, units.length);
+    assert.equal(claims.length, units.length ? 1 : 0, 'surplus never claims another first-service turn');
+    if (!units.length) { slices.push({ cycle, units, grants, claims }); continue; }
+    assert(claims[0].claimed && claims[0].lane === 'resources');
+    const idle = cycle.steps.find(x => x.name === 'history'); assert(idle);
+    assert.equal(idle.ok, true); assert.equal(idle.summary.ok, true);
+    assert.equal(idle.summary.idle_outcome, 'completed');
+    assert(Number.isFinite(idle.elapsed_ms) && idle.elapsed_ms >= 0 && idle.elapsed_ms <= 25000,
+      'measured complete idle work remains inside the unchanged 25-second slice');
+    const measured = rows.slice(rows.indexOf(claims[0])).filter(x => x.type === 'api');
+    const totals = { cli: 0, self: 0, available: 0 };
+    for (let i = 0; i < units.length; i++) {
+      const { step } = units[i], grant = grants[i], summary = step.summary, budget = summary.request_budget;
+      assert(step.ok && !step.guardian_diagnostic); assert.equal(budget.complete, true);
+      assert.equal(budget.max_cli_attempts, 3); assert.equal(budget.max_self_attempts, 2);
+      assert.equal(budget.min_interval_ms, 1000); assert.equal(budget.stop_reason, null);
+      assert(Number.isSafeInteger(grant.timeoutMs) && grant.timeoutMs > 0 && grant.timeoutMs <= 23000);
+      assert(grant.timeoutMs + 2000 <= grant.remainingMs, 'original guardian cleanup is contained in remaining shared time');
+      assert(grant.remainingMs <= 25000 && grant.remainingMs > 2000,
+        'the final spawn shrinks after local preparation; the six-second scheduler admission is tested separately');
+      if (i) {
+        assert(grant.timeoutMs < grants[i - 1].timeoutMs, 'surplus shares the original shrinking deadline');
+        assert(grant.monotonicMs >= grants[i - 1].monotonicMs, 'observed monotonic time cannot move backwards');
+        const gap = journal.slice(journal.indexOf(units[i - 1]) + 1, journal.indexOf(grant))
+          .filter(x => x.type === 'worker_sleep');
+        assert.deepEqual(gap.map(x => x.seconds), [1], 'the existing one-second inter-unit sleep is requested exactly once');
+      }
+      const start = journal.indexOf(grant), finish = journal.indexOf(units[i]);
+      const calls = journal.slice(start, finish).filter(x => x.type === 'api');
+      assert.equal(budget.cli_attempts, calls.length);
+      assert.equal(budget.self_attempts, calls.filter(x => x.route === 'self').length);
+      if (summary.outcome === 'no_eligible_known_resource') {
+        assert.deepEqual(['processed','available','deferred','blocked'].map(key => summary[key]), [0,0,0,0]);
+        assert.equal(budget.cli_attempts, 0); assert.equal(budget.self_attempts, 0);
+      } else {
+        assert.equal(summary.outcome, 'processed');
+        assert.deepEqual(['processed','available','deferred','blocked'].map(key => summary[key]), [1,1,0,0]);
+        assert.equal(budget.cli_attempts, 3); assert.equal(budget.self_attempts, 2);
+      }
+      totals.cli += budget.cli_attempts; totals.self += budget.self_attempts; totals.available += summary.available;
+    }
+    assert(totals.cli <= 12 && totals.self <= 6, 'original shared API budgets remain unchanged');
+    assert.equal(totals.cli, measured.length); assert.equal(totals.self, measured.filter(x => x.route === 'self').length);
+    assert.equal(idle.summary.resources.available, totals.available);
+    assert.equal(idle.summary.resources.request_budget.cli_attempts, totals.cli);
+    assert.equal(idle.summary.resources.request_budget.self_attempts, totals.self);
+    slices.push({ cycle, units, grants, claims });
+  }
+  return slices;
 }
 function fixture(t, light = false, deep = false) {
   const dir = mkdtempSync(join(tmpdir(), 'exocortex-resource-worker-synthetic-')), db = join(dir, 'synthetic.sqlite');
@@ -259,7 +321,9 @@ if (process.argv[2] === '--remote') {
   const opts = parseArgs(['--max-cycles', light ? '1' : deep ? '2' : '4', '--db', db, '--log-dir', join(dir, 'logs'), ...(light || deep ? ['--remote-sample-interval-seconds', '0'] : [])]);
   const helperDeps = deps => ({ ...deps, tryAcquireLease: (o, leaseDeps) => tryAcquireLarkApiLease(o, { ...leaseDeps, directory: join(dir, 'api-state') }) });
   const result = runWorker(opts, { nowMs: () => now(dir), monotonicNowMs: () => performance.now(),
-    sleepSeconds: s => { advance(dir, s * 1000); }, writeScheduler() {},
+    // Preserve this fixture's virtual worker sleeps. Actual elapsed I/O and the
+    // requested fixed gap are observed separately; neither is a production SLO.
+    sleepSeconds: s => { log(dir, { type: 'worker_sleep', seconds: s }); advance(dir, s * 1000); }, writeScheduler() {},
     ...(light || deep ? { hasHistoryWork: () => false } : {}),
     hasResourceWork: o => { const available = resourceWorkAvailable(o.db, { now: () => now(dir) }); log(dir, { type: 'resource_hint', available }); return available; },
     readIdleFairState: (path, deps) => { const state = readIdleFairState(path, helperDeps(deps)); log(dir, { type: 'fair_read', state }); return state; },
@@ -269,8 +333,14 @@ if (process.argv[2] === '--remote') {
     },
     runResources: (args, limits) => {
       const before = sqliteQuery(db, 'SELECT * FROM records ORDER BY id;');
+      let remainingMs;
       const step = runStep('resources', args, { command: 'maintenance', scriptPath: HERE, ...limits,
-        nowMs: () => now(dir), monotonicNowMs: () => performance.now() });
+        remainingTimeMs: () => (remainingMs = limits.remainingTimeMs()),
+        nowMs: () => now(dir), monotonicNowMs: () => performance.now(),
+        runProcess(command, argv, settings) {
+          log(dir, { type: 'resource_spawn', timeoutMs: settings.timeout, remainingMs, monotonicMs: performance.now() });
+          return runGuardedWorkerStep(command, argv, settings);
+        } });
       assert.deepEqual(sqliteQuery(db, 'SELECT * FROM records ORDER BY id;'), before,
         'resource work preserves every source column, including version, hash, raw, body, account evidence and clocks');
       log(dir, { type: 'resource_step', step });
@@ -409,15 +479,21 @@ if (process.argv[2] === '--remote') {
     assert.deepEqual(firstCheckpoint.tasks.map(x=>x.record_id),imageRecordIds,'first actual opportunity must enroll all six images');
     assert.equal(firstCheckpoint.tasks.filter(x=>x.state==='available').length,1);
     assert.deepEqual(firstTasks.map(x=>x.record_id),imageRecordIds);
-    assert.equal(firstTasks.filter(x=>x.state==='available').length,2);
+    const firstJournal=events(dir), firstSlices=assertResourceSlices(firstJournal);
+    assert.equal(firstSlices.length,2);assert(firstSlices.every(slice=>slice.units.length>=1));
+    const firstAvailable=firstTasks.filter(x=>x.state==='available').length;
+    assert(firstAvailable>=2 && firstAvailable<=4, 'two initial cycles serve one or two units each');
+    assert.equal(firstAvailable,firstJournal.filter(x=>x.type==='resource_step').reduce((sum,x)=>sum+x.step.summary.available,0));
     worker(dir);worker(dir);
     const journal=events(dir), final=observe(dir,'deep_final');
     assert.equal(final.length,11);assert(final.every(row=>row.readiness.state==='ready'));
     assert.equal(sqliteQuery(db,'SELECT COUNT(*) n FROM records;')[0].n,5511);
     assert(journal.filter(x=>x.type==='worker_started').length===3);
-    const resourceSteps=journal.filter(x=>x.type==='resource_step');assert.equal(resourceSteps.length,6);
-    assert(resourceSteps.every(x=>x.step.ok && !x.step.guardian_diagnostic && x.step.summary.available===1));
-    assert(resourceSteps.every(x=>x.step.summary.request_budget.cli_attempts===3 && x.step.summary.request_budget.self_attempts===2));
+    const slices=assertResourceSlices(journal);assert.equal(slices.length,6);
+    const resourceSteps=journal.filter(x=>x.type==='resource_step');
+    const acquired=resourceSteps.filter(x=>x.step.summary.outcome==='processed');assert.equal(acquired.length,6);
+    assert(resourceSteps.every(x=>x.step.summary.outcome==='processed'||x.step.summary.outcome==='no_eligible_known_resource'));
+    assert.equal(new Set(journal.filter(x=>x.type==='api'&&x.route==='download').map(x=>x.id)).size,6);
     const imageIds=initial.map(x=>x.message.message_id).sort(), originalIds=initial.slice(0,4).map(x=>x.message.message_id);
     assert.deepEqual(firstTasks.slice(0,4).map(x=>x.record_id),imageRecordIds.slice(0,4)); // newest-image ranks 6,5,4,3
     const seeds=journal.filter(x=>x.type==='deep_history_seed');
@@ -435,13 +511,16 @@ if (process.argv[2] === '--remote') {
     const commits=journal.filter(x=>x.type==='collection_commit');
     assert(stored.every(x=>commits.some(c=>c.ids.includes(x.external_id))),'fresh traffic still traverses real forward commit');
     t.diagnostic(JSON.stringify({unrelatedHistory:5500,originalImageDenominator:4,available:4,
-      additionalNewerImages:2,resourceOpportunities:6,restarts:2,freshCollected:5,freshAwaitingNextCycle:1,
-      bound:'six valid image candidates including four fixed targets at newest ranks 3-6; no external denial/contention, resource eligible on each of six idle slices; not a production latency percentile'}));
+      additionalNewerImages:2,idleSlices:6,resourceUnits:resourceSteps.length,resourceAcquisitions:acquired.length,restarts:2,freshCollected:5,freshAwaitingNextCycle:1,
+      bound:'six valid image candidates including four fixed targets at newest ranks 3-6; no external denial/contention, at most two units per eligible idle slice; all six acquisitions within six cycles; not a production latency percentile'}));
   });
   test('one light-load source image becomes readable in the first real worker resource opportunity', t => {
     const { dir, initial } = fixture(t, true), result = worker(dir), journal = events(dir), source = initial[0];
     assert.equal(result.ok, true);
-    const steps = journal.filter(x => x.type === 'resource_step'); assert.equal(steps.length, 1);
+    const slices=assertResourceSlices(journal);assert.equal(slices.length,1);
+    const steps = journal.filter(x => x.type === 'resource_step'); assert(steps.length>=1&&steps.length<=2);
+    assert.equal(steps.filter(x=>x.step.summary.outcome==='processed').length,1);
+    if(steps.length===2)assert.equal(steps[1].step.summary.outcome,'no_eligible_known_resource');
     assert.equal(steps[0].step.summary.available, 1); assert.equal(steps[0].step.summary.request_budget.cli_attempts, 3);
     assert.equal(steps[0].step.summary.request_budget.self_attempts, 2);
     assert.equal(journal.filter(x => x.type === 'api' && x.route === 'download').length, 1);

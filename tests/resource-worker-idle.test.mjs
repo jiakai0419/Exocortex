@@ -34,9 +34,11 @@ function harness(options = {}) {
     const duration = options.historyMs ?? 100;
     advance(duration);
     const grant = readArg(args, '--max-cli-attempts');
-    return { name: 'history', ok: true, exit_code: 0, stderr: '', elapsed_ms: duration,
+    const step = { name: 'history', ok: true, exit_code: 0, stderr: '', elapsed_ms: duration,
       summary: { ok: true, profile: 'known_record_history/v1', outcome: 'batch_processed', processed: 1,
         request_budget: receipt(args, options.historyCalls ?? grant, Math.min(2, grant), duration) } };
+    options.mutateHistory?.(step);
+    return step;
   }
   const resourceRun = (args, limits) => {
     mark('resources', args, limits);
@@ -440,4 +442,17 @@ test('worker preserves only finite resource failure evidence and its persistence
     persisted: 'true' } }).failure, { stage: 'unknown', reason: 'unknown', persisted: false });
   assert.equal(compactResourceSummary({ ok: true, failure: null }).failure, null);
   assert.equal(compactResourceSummary({ ok: false }).failure, undefined);
+});
+
+for (const [label, mutate] of [
+  ['missing receipt', step => { delete step.summary.request_budget; }],
+  ['mismatched grant', step => { step.summary.request_budget.max_cli_attempts++; }],
+]) test(`history ${label} cannot become a successful logical idle cycle`, () => {
+  const f = harness({ resourceAvailable: false, opts: { remoteSampleIntervalSeconds: 0, maxCycles: 1 }, mutateHistory: mutate });
+  assert.equal(f.run(), false);
+  const event = f.events.find(e => e.name === 'history');
+  assert.equal(event.ok, false); assert.equal(event.summary.ok, false);
+  assert.equal(event.summary.idle_outcome, 'untrusted_result');
+  assert.equal(f.events.find(e => e.type === 'lark_im_worker_cycle').ok, false);
+  assert.equal(f.calls.length, 1);
 });
