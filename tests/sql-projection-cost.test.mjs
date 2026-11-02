@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -52,9 +52,24 @@ def trace(phase, **fields):
                           cpu_ms=round((time.process_time()-cpu_start)*1000, 6), **fields),
                      separators=(',', ':')), file=sys.stderr, flush=True)
 trace('startup')
-import hashlib, sqlite3
+trace('hashlib_import_start')
+import hashlib
+trace('hashlib_import_done')
+trace('sqlite_import_start')
+import sqlite3
+trace('sqlite_import_done')
+trace('path_import_start')
 from pathlib import Path
-p = json.load(sys.stdin)
+trace('path_import_done')
+class ObservedInput:
+    def read(self, *args, **kwargs):
+        trace('stdin_read_start')
+        value = sys.stdin.read(*args, **kwargs)
+        trace('stdin_read_done', characters=len(value))
+        return value
+trace('json_load_start')
+p = json.load(ObservedInput())
+trace('json_load_done')
 trace('input_read', sqlite_version=sqlite3.sqlite_version)
 sql = p['sql']
 report = {'complete': False, 'statements': [], 'opcodes': 0, 'rows': [],
@@ -203,18 +218,64 @@ function seed(db, records) {
   }).join('\n')} COMMIT;`, 'seed entirely synthetic structural fixture');
 }
 
-function profile(f, sql, { budget = FIXED_BUDGET + ROW_OVERHEAD, readonly = false } = {}) {
-  const result = spawnSync('python3', [f.profiler], {
-    input: JSON.stringify({ db: f.db, sql, budget, readonly, prepare_limit: STATEMENT_PREPARE_LIMIT }),
-    encoding: 'utf8', maxBuffer: OUTPUT_LIMIT, timeout: 30_000,
-  });
+// Overrides are only for authored boundary controls below; original callers use defaults.
+function profile(f, sql, { budget = FIXED_BUDGET + ROW_OVERHEAD, readonly = false } = {},
+  { run = spawnSync, command = 'python3', observe = event => process.stderr.write(JSON.stringify(event) + '\n') } = {}) {
+  const serializationStart = performance.now();
+  const input = JSON.stringify({ db: f.db, sql, budget, readonly, prepare_limit: STATEMENT_PREPARE_LIMIT });
+  const serializationEnd = performance.now();
+  const inputBytes = Buffer.byteLength(input), inputSha256 = hash(input);
+  const beforeSpawnObservation = performance.now();
+  observe({ profile: 'bounded_sql_parent_observation', phase: 'before_spawn',
+    parent_monotonic_ms: beforeSpawnObservation, input_bytes: inputBytes, input_sha256: inputSha256,
+    sql_bytes: Buffer.byteLength(sql), sql_sha256: hash(sql), timeout_ms: 30_000,
+    max_buffer_bytes: OUTPUT_LIMIT });
+  const spawnStart = performance.now();
+  let result;
+  try {
+    result = run(command, [f.profiler], {
+      input, encoding: 'utf8', maxBuffer: OUTPUT_LIMIT, timeout: 30_000,
+    });
+  } catch (error) {
+    const spawnEnd = performance.now();
+    try {
+      observe({ profile: 'bounded_sql_parent_observation', phase: 'spawn_throw',
+      spawn_start_monotonic_ms: spawnStart, spawn_return_monotonic_ms: spawnEnd,
+      spawn_elapsed_ms: spawnEnd - spawnStart, observer_elapsed_ms: spawnEnd - serializationStart,
+      serialization_ms: serializationEnd - serializationStart, parent_prepare_ms: spawnStart - serializationEnd,
+      input_bytes: inputBytes, input_sha256: inputSha256, sql_bytes: Buffer.byteLength(sql),
+      sql_sha256: hash(sql), timeout_ms: 30_000, max_buffer_bytes: OUTPUT_LIMIT,
+      error_code: typeof error?.code === 'string' ? error.code : null,
+      status: null, signal: null, stdout_bytes: null, stderr_bytes: null,
+      execution_state: 'unknown' });
+    } catch { /* An observation failure must not replace the original thrown value. */ }
+    throw error;
+  }
+  const spawnEnd = performance.now();
+  let observationFailed = false, observationError;
+  try {
+    observe({ profile: 'bounded_sql_parent_observation', phase: 'after_spawn',
+    spawn_start_monotonic_ms: spawnStart, spawn_return_monotonic_ms: spawnEnd,
+    serialization_ms: serializationEnd - serializationStart,
+    parent_prepare_ms: spawnStart - serializationEnd,
+    spawn_elapsed_ms: spawnEnd - spawnStart,
+    observer_elapsed_ms: spawnEnd - serializationStart,
+    input_bytes: inputBytes, input_sha256: inputSha256, sql_bytes: Buffer.byteLength(sql),
+    sql_sha256: hash(sql), timeout_ms: 30_000, max_buffer_bytes: OUTPUT_LIMIT,
+    status: result.status, signal: result.signal, error_code: result.error?.code,
+    stdout_bytes: typeof result.stdout === 'string' ? Buffer.byteLength(result.stdout) : Buffer.isBuffer(result.stdout) ? result.stdout.length : null,
+    stderr_bytes: typeof result.stderr === 'string' ? Buffer.byteLength(result.stderr) : Buffer.isBuffer(result.stderr) ? result.stderr.length : null,
+    trace: result.stderr });
+  } catch (error) { observationFailed = true; observationError = error; }
   assert.equal(result.error, undefined, 'the bounded profiler must not overflow stdout or fail to launch: ' + JSON.stringify({
     status: result.status, signal: result.signal, error_code: result.error?.code, stderr: result.stderr,
   }));
   assert.equal(result.status, 0, JSON.stringify({
     status: result.status, signal: result.signal, error_code: result.error?.code, stderr: result.stderr,
   }));
-  return JSON.parse(result.stdout);
+  const report = JSON.parse(result.stdout);
+  if (observationFailed) throw observationError;
+  return report;
 }
 
 function complete(report, label, budget) {
@@ -349,4 +410,281 @@ test('read-only bounded replay measures its complete program and preserves the d
   }
   assert.ok(costs[1] <= costs[0] + ROW_OVERHEAD * 11);
   assert.ok(costs[2] <= costs[1] + ROW_OVERHEAD * 88);
+});
+
+// These controls use newly authored inputs. They verify evidence and rejection,
+// not the cause of the earlier full-suite startup-only timeout.
+const controlSql = 'BEGIN; SELECT 1 AS invented; COMMIT;';
+const controlInput = f => JSON.stringify({ db: f.db, sql: controlSql, budget: FIXED_BUDGET + ROW_OVERHEAD,
+  readonly: true, prepare_limit: STATEMENT_PREPARE_LIMIT });
+function phases(stderr) {
+  return String(stderr ?? '').split('\n').filter(line => line.startsWith('{"phase":')).map(line => JSON.parse(line));
+}
+function phase(log, name) {
+  const item = log.find(value => value.phase === name);
+  assert(item, `missing observed boundary ${name}`);
+  return item;
+}
+function observedProfile(f, invoke) {
+  const events = [];
+  const options = { observe: value => events.push(value) };
+  const result = invoke(options, events);
+  assert.equal(events[0].phase, 'before_spawn');
+  assert.equal(events.length, 2, 'exactly one before and one terminal parent observation');
+  for (const event of events) {
+    assert.equal(event.timeout_ms, 30_000);
+    assert.equal(event.max_buffer_bytes, OUTPUT_LIMIT);
+  }
+  return { result, events, terminal: events.at(-1) };
+}
+
+test('profiler boundary preserves complete SQL and captures full parent and child intervals', t => {
+  const f = fixture(t), before = hash(readFileSync(f.db));
+  const observed = observedProfile(f, options => profile(f, controlSql, { readonly: true }, options));
+  complete(observed.result, 'observed control program', FIXED_BUDGET + ROW_OVERHEAD);
+  assert.deepEqual(observed.result.rows, [{ invented: 1 }]);
+  assert.equal(hash(readFileSync(f.db)), before);
+  const { terminal, events } = observed, log = phases(terminal.trace);
+  assert.equal(terminal.phase, 'after_spawn');
+  assert.equal(terminal.status, 0);
+  assert.equal(terminal.input_bytes, Buffer.byteLength(controlInput(f)));
+  assert.equal(terminal.input_sha256, hash(controlInput(f)));
+  assert.equal(events[0].input_sha256, terminal.input_sha256);
+  assert.equal(terminal.sql_sha256, hash(controlSql));
+  assert.equal(terminal.sql_bytes, Buffer.byteLength(controlSql));
+  assert.equal(terminal.spawn_elapsed_ms, terminal.spawn_return_monotonic_ms - terminal.spawn_start_monotonic_ms);
+  assert(terminal.observer_elapsed_ms >= terminal.spawn_elapsed_ms);
+  assert(terminal.stdout_bytes > 0 && terminal.stderr_bytes > 0);
+  const ordered = ['startup', 'hashlib_import_start', 'hashlib_import_done', 'sqlite_import_start',
+    'sqlite_import_done', 'path_import_start', 'path_import_done', 'json_load_start', 'stdin_read_start',
+    'stdin_read_done', 'json_load_done', 'input_read', 'connect_start', 'connect_done', 'prepare_start', 'exit'];
+  let previous = -1;
+  for (const name of ordered) {
+    const index = log.findIndex(item => item.phase === name);
+    assert(index > previous, `${name} must follow the preceding observed stage`); previous = index;
+  }
+  assert(log.length <= 512);
+  assert(log.every(item => !Object.hasOwn(item, 'sql')));
+  t.diagnostic(JSON.stringify({ control: 'normal_parent_child_boundaries', spawn_ms: terminal.spawn_elapsed_ms,
+    child_trace_ms: phase(log, 'exit').wall_ms, input_bytes: terminal.input_bytes }));
+});
+
+test('profiler boundary distinguishes pre-clock startup and an injected import-stage wait', t => {
+  const f = fixture(t);
+  writeFileSync(f.profiler, PROFILER.replace('wall_start, cpu_start =',
+    'time.sleep(0.25)\nwall_start, cpu_start =').replace("trace('sqlite_import_start')",
+    "trace('sqlite_import_start')\ntime.sleep(0.25)"));
+  const { result, terminal } = observedProfile(f, options => profile(f, controlSql, { readonly: true }, options));
+  complete(result, 'delayed import control', FIXED_BUDGET + ROW_OVERHEAD);
+  const log = phases(terminal.trace), start = phase(log, 'sqlite_import_start'), end = phase(log, 'sqlite_import_done');
+  assert(end.wall_ms - start.wall_ms >= 200, 'the declared import-stage wait is visible');
+  assert(terminal.spawn_elapsed_ms - phase(log, 'exit').wall_ms >= 200,
+    'time before the internal clock remains inside the parent spawn interval');
+  t.diagnostic(JSON.stringify({ control: 'injected_waits_not_original_cause', spawn_ms: terminal.spawn_elapsed_ms,
+    import_interval_ms: end.wall_ms - start.wall_ms, child_trace_ms: phase(log, 'exit').wall_ms }));
+});
+
+test('profiler boundary waits for EOF even when a complete valid JSON value was written', async t => {
+  const f = fixture(t), before = hash(readFileSync(f.db)), input = controlInput(f);
+  const start = performance.now();
+  const child = spawn('python3', [f.profiler], { stdio: ['pipe', 'pipe', 'pipe'] });
+  let stdout = '', stderr = '', release, endedAt, writeCallbackAt, overflow = false, sawReadStart = false, deadlineTriggered = false, firstError;
+  const timeout = setTimeout(() => { deadlineTriggered = true; child.kill('SIGKILL'); },
+    Math.max(1, 30_000 - (performance.now() - start)));
+  const capOutput = () => {
+    if (Buffer.byteLength(stdout) + Buffer.byteLength(stderr) > OUTPUT_LIMIT) { overflow = true; child.kill('SIGKILL'); }
+  };
+  const releaseWhenObserved = () => {
+    if (!release && sawReadStart && Number.isFinite(writeCallbackAt)) {
+      release = setTimeout(() => { endedAt = performance.now(); child.stdin.end(); }, 250);
+    }
+  };
+  child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
+  child.stdout.on('data', value => { stdout += value; capOutput(); });
+  child.stderr.on('data', value => {
+    stderr += value; capOutput();
+    if (stderr.includes('"phase":"stdin_read_start"')) sawReadStart = true;
+    releaseWhenObserved();
+  });
+  const failOwnedChild = error => { if (firstError === undefined) firstError = error; child.kill('SIGKILL'); };
+  const closed = new Promise(resolve => {
+    child.once('error', failOwnedChild);
+    child.stdin.once('error', failOwnedChild);
+    child.once('close', (code, signal) => resolve({ code, signal }));
+  });
+  try {
+    child.stdin.write(input, error => {
+      if (error) failOwnedChild(error);
+      else { writeCallbackAt = performance.now(); releaseWhenObserved(); }
+    });
+  } catch (error) { failOwnedChild(error); }
+  let status;
+  try { status = await closed; } // Wait for owned child and stdio close before fixture cleanup, even on errors.
+  finally { clearTimeout(timeout); clearTimeout(release); }
+  if (firstError !== undefined) throw firstError;
+  assert.equal(deadlineTriggered, false, 'a triggered watchdog is failure even if close delivery races with it');
+  assert.equal(overflow, false, 'delayed-EOF control also retains the four MiB output bound');
+  assert.deepEqual(status, { code: 0, signal: null }, stderr);
+  assert(Number.isFinite(writeCallbackAt) && Number.isFinite(endedAt));
+  assert(endedAt - writeCallbackAt >= 200, 'write completion is not EOF or child parse completion');
+  const log = phases(stderr), readStart = phase(log, 'stdin_read_start'), readDone = phase(log, 'stdin_read_done');
+  assert(readDone.wall_ms - readStart.wall_ms >= 200);
+  assert(phase(log, 'json_load_done').wall_ms >= readDone.wall_ms);
+  complete(JSON.parse(stdout), 'delayed EOF control', FIXED_BUDGET + ROW_OVERHEAD);
+  assert.equal(hash(readFileSync(f.db)), before);
+  t.diagnostic(JSON.stringify({ control: 'declared_delayed_EOF', parent_ms: performance.now() - start,
+    child_read_ms: readDone.wall_ms - readStart.wall_ms }));
+});
+
+test('profiler boundary records completed input read before rejecting malformed JSON', t => {
+  const f = fixture(t), before = hash(readFileSync(f.db));
+  const result = spawnSync('python3', [f.profiler], { input: '{', encoding: 'utf8', timeout: 30_000, maxBuffer: OUTPUT_LIMIT });
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 1);
+  const log = phases(result.stderr);
+  phase(log, 'stdin_read_done');
+  assert(!log.some(item => ['json_load_done', 'connect_start', 'prepare_start'].includes(item.phase)));
+  assert.equal(result.stdout, '');
+  assert.equal(hash(readFileSync(f.db)), before);
+});
+
+test('profiler boundary retains child failure before the original status assertion rejects it', t => {
+  const f = fixture(t); writeFileSync(f.profiler, 'import sys\nsys.exit(7)\n');
+  const { terminal } = observedProfile(f, options => {
+    assert.throws(() => profile(f, controlSql, { readonly: true }, options), { code: 'ERR_ASSERTION' });
+  });
+  assert.equal(terminal.status, 7);
+  assert.equal(terminal.stdout_bytes, 0);
+  assert.equal(terminal.stderr_bytes, 0);
+});
+
+test('profiler boundary keeps unavailable output unknown when no executable exists', t => {
+  const f = fixture(t);
+  const { terminal } = observedProfile(f, options => {
+    assert.throws(() => profile(f, controlSql, { readonly: true }, {
+      ...options, command: f.profiler + '.invented-nonexistent-python',
+    }), { code: 'ERR_ASSERTION' });
+  });
+  assert.equal(terminal.error_code, 'ENOENT');
+  assert.equal(terminal.status, null);
+  assert.equal(terminal.stdout_bytes, null);
+  assert.equal(terminal.stderr_bytes, null);
+});
+
+test('profiler boundary reports a synchronous throw without inventing an execution result', t => {
+  const f = fixture(t), sentinel = Object.assign(new Error('invented local spawn adapter failure'), { code: 'SYNTHETIC_THROW' });
+  let calls = 0;
+  const { terminal } = observedProfile(f, options => {
+    assert.throws(() => profile(f, controlSql, { readonly: true }, { ...options,
+      run: (command, args, settings) => {
+        calls++; assert.equal(command, 'python3'); assert.deepEqual(args, [f.profiler]);
+        assert.equal(settings.timeout, 30_000); assert.equal(settings.maxBuffer, OUTPUT_LIMIT); throw sentinel;
+      },
+    }), error => error === sentinel);
+  });
+  assert.equal(calls, 1);
+  assert.equal(terminal.phase, 'spawn_throw');
+  assert.equal(terminal.execution_state, 'unknown');
+  assert.equal(terminal.stdout_bytes, null);
+  assert.equal(terminal.stderr_bytes, null);
+  assert.equal(terminal.status, null);
+  assert.equal(terminal.error_code, 'SYNTHETIC_THROW');
+});
+
+test('profiler boundary rejects real output overflow at the unchanged four MiB cap', t => {
+  const f = fixture(t); writeFileSync(f.profiler, `import sys\nsys.stdout.write('x' * ${OUTPUT_LIMIT + 65_536})\nsys.stdout.flush()\n`);
+  const { terminal } = observedProfile(f, options => {
+    assert.throws(() => profile(f, controlSql, { readonly: true }, options), { code: 'ERR_ASSERTION' });
+  });
+  assert.equal(terminal.error_code, 'ENOBUFS');
+  assert(terminal.stdout_bytes >= OUTPUT_LIMIT);
+  assert.equal(terminal.max_buffer_bytes, OUTPUT_LIMIT);
+});
+
+test('profiler boundary rejects success JSON followed by a real thirty-second timeout', t => {
+  const f = fixture(t), before = hash(readFileSync(f.db));
+  writeFileSync(f.profiler, PROFILER + '\nsys.stdout.flush()\ntime.sleep(35)\n');
+  let actualChild;
+  const { terminal } = observedProfile(f, options => {
+    assert.throws(() => profile(f, controlSql, { readonly: true }, { ...options,
+      run: (...args) => { actualChild = spawnSync(...args); return actualChild; },
+    }), { code: 'ERR_ASSERTION' });
+  });
+  complete(JSON.parse(actualChild.stdout), 'success report still rejected after deadline', FIXED_BUDGET + ROW_OVERHEAD);
+  assert.equal(terminal.error_code, 'ETIMEDOUT');
+  assert.equal(terminal.status, null);
+  assert.equal(terminal.signal, 'SIGTERM');
+  assert(terminal.stdout_bytes > 0, 'the child emitted its complete successful report before the tail');
+  assert.equal(phase(phases(terminal.trace), 'exit').complete, true);
+  assert(terminal.spawn_elapsed_ms >= 29_000, 'this is the real original thirty-second budget, not a shortened surrogate');
+  assert.equal(terminal.timeout_ms, 30_000);
+  assert.equal(hash(readFileSync(f.db)), before);
+  t.diagnostic(JSON.stringify({ control: 'real_original_timeout_after_success_report',
+    spawn_ms: terminal.spawn_elapsed_ms, timeout_ms: terminal.timeout_ms, rejected: true }));
+});
+
+test('profiler boundary rejects a real signal-only child result', t => {
+  const f = fixture(t); writeFileSync(f.profiler, 'import os,signal\nos.kill(os.getpid(),signal.SIGTERM)\n');
+  const { terminal } = observedProfile(f, options => {
+    assert.throws(() => profile(f, controlSql, { readonly: true }, options), { code: 'ERR_ASSERTION' });
+  });
+  assert.equal(terminal.error_code, undefined);
+  assert.equal(terminal.status, null);
+  assert.equal(terminal.signal, 'SIGTERM');
+});
+
+for (const [label, output] of [['empty', ''], ['malformed', '{']]) {
+  test(`profiler boundary retains zero-exit ${label} stdout before JSON parsing rejects it`, t => {
+    const f = fixture(t); writeFileSync(f.profiler, `import sys\nsys.stdout.write(${JSON.stringify(output)})\n`);
+    const { terminal } = observedProfile(f, options => {
+      assert.throws(() => profile(f, controlSql, { readonly: true }, options), SyntaxError);
+    });
+    assert.equal(terminal.status, 0);
+    assert.equal(terminal.stdout_bytes, Buffer.byteLength(output));
+  });
+}
+
+test('profiler boundary does not make a parsed null report satisfy the original complete-program gate', t => {
+  const f = fixture(t); writeFileSync(f.profiler, "print('null')\n");
+  const { result, terminal } = observedProfile(f, options => profile(f, controlSql, { readonly: true }, options));
+  assert.equal(terminal.status, 0);
+  assert.equal(result, null);
+  assert.throws(() => complete(result, 'invalid report control', FIXED_BUDGET + ROW_OVERHEAD));
+});
+
+test('profiler boundary accepts bounded transport output just below the unchanged four MiB cap', t => {
+  const f = fixture(t), size = OUTPUT_LIMIT - 1024;
+  // This is only a transport/parser fixture, not an asserted SQL report.
+  writeFileSync(f.profiler, `import json\nprint(json.dumps({'invented_marker':'bounded-output','padding':'x'*${size}}))\n`);
+  const { result, terminal } = observedProfile(f, options => profile(f, controlSql, { readonly: true }, options));
+  assert.equal(terminal.status, 0);
+  assert.equal(result.invented_marker, 'bounded-output');
+  assert.equal(result.padding.length, size);
+  assert(terminal.stdout_bytes >= size && terminal.stdout_bytes < OUTPUT_LIMIT);
+  assert.equal(terminal.max_buffer_bytes, OUTPUT_LIMIT);
+});
+
+test('profiler boundary observer failure cannot replace the original thrown value', t => {
+  const f = fixture(t), original = new Error('invented original throw'), observer = new Error('invented observer failure');
+  for (const error of [original, Object.defineProperty(new Error('invented getter control'), 'code', {
+    get() { throw observer; },
+  })]) {
+    assert.throws(() => profile(f, controlSql, { readonly: true }, {
+      run: () => { throw error; },
+      observe: event => { if (event.phase !== 'before_spawn') throw observer; },
+    }), value => value === error);
+  }
+});
+
+test('profiler boundary observer failure preserves primary returned failures and fails closed on successful transport', t => {
+  const f = fixture(t), observer = new Error('invented observer failure');
+  const missing = Object.assign(new Error('invented returned spawn failure'), { code: 'ENOENT' });
+  const harness = result => ({ run: () => result,
+    observe: event => { if (event.phase !== 'before_spawn') throw observer; } });
+  assert.throws(() => profile(f, controlSql, {}, harness({ error: missing, status: null })),
+    error => error.code === 'ERR_ASSERTION' && error.actual === missing);
+  assert.throws(() => profile(f, controlSql, {}, harness({ status: 7, stdout: '' })),
+    error => error.code === 'ERR_ASSERTION' && error.actual === 7);
+  assert.throws(() => profile(f, controlSql, {}, harness({ status: 0, stdout: '{' })), SyntaxError);
+  assert.throws(() => profile(f, controlSql, {}, harness({ status: 0, stdout: '{}' })), error => error === observer);
 });
