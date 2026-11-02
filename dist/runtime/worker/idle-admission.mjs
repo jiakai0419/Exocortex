@@ -105,5 +105,5 @@ export function idleAdmission(steps) {
             }
         }
     }
-    return { mode: 'resources_only', why: 'saved_list_detail_backoff' };
+    return { mode: 'known_records', why: 'saved_list_detail_backoff' };
 }
