@@ -13,7 +13,7 @@ import { BoundedReplayCleanupError } from '../../dist/storage/sqlite/lark-ingest
 import { commitBoundedReplayRecords, quoteSql, normalizeBoundedReplayRecords } from '../../dist/storage/sqlite/ingestion-store.js';
 import { scopeObservationContext } from './scope-config-policy.mjs';
 import { loadHistoryDebtHints, readHistoryDebtSchedule, selectHistoryDebtTarget, readHistoryFairRound, readHistoryCandidatePool } from './history-debt.mjs';
-import { historyFailureDiagnostic } from './history-diagnostics.mjs';
+import { historyFailureDiagnostic, historyOperation, preserveHistoryFailure } from './history-diagnostics.mjs';
 
 const sha = text => createHash('sha256').update(text).digest('hex');
 const PROFILE = 'known_record_history/v1';
@@ -26,7 +26,7 @@ function isDirectBudgetAdmissionStop(error) {
   return error instanceof HistoryCommandBudgetError && error.reason === 'time_budget'
     || error instanceof MaintenanceRequestError && ['time_budget','cli_budget','self_budget','sync_busy'].includes(error.reason);
 }
-function historyRead(deps, work) { return deps.historyReadBoundary ? deps.historyReadBoundary(work) : work(); }
+function historyRead(deps, work, required = true) { return deps.historyReadBoundary ? deps.historyReadBoundary(work, required) : work(); }
 function withFailureCause(report, cause) {
   if (cause != null) Object.defineProperty(report, 'cause', { value: cause, enumerable: false });
   return report;
@@ -34,7 +34,7 @@ function withFailureCause(report, cause) {
 function preserveFailureAtCutoff(error, budget) {
   if (isDirectBudgetAdmissionStop(error)) return;
   try { budget?.assertReady(); }
-  catch (stop) { throw new AggregateError([error, stop], 'history operation failed and command stopped', { cause: error }); }
+  catch (stop) { throw preserveHistoryFailure(new AggregateError([error, stop], 'history operation failed and command stopped', { cause: error }), error); }
 }
 
 /** Read-only selection. A discovered chat routes all its known native records;
@@ -92,7 +92,7 @@ function selectHistoryTarget(db, deps = {}) { return selectHistoryTargets(db, de
 
 function selectScheduledTarget(db, options, binding, accountKey, deps, startedAtMs) {
   const now=deps.now || Date.now;
-    const loaded = historyRead(deps, () => loadHistoryDebtHints(db, options.logDir, { database_key: binding.database_key, account_key: accountKey }, now(), deps.debtDeps));
+    const loaded = historyRead(deps, () => loadHistoryDebtHints(db, options.logDir, { database_key: binding.database_key, account_key: accountKey }, now(), deps.debtDeps), false);
     const schedule = readHistoryDebtSchedule(db, loaded, now(), { sqliteJson: deps.sqliteJson });
     const fair = readHistoryFairRound(db, schedule.scheduler, { now: () => startedAtMs, sqliteJson: deps.sqliteJson });
     schedule.fairRound = fair;
@@ -133,8 +133,8 @@ function assertHistoryDetailCaptureBasis(target, binding, self, accountKey, writ
 function executeHistoryTarget(options, deps, session, initialTarget, prepared = /** @type {Record<string,any>|null} */ (null)) {
   const db = options.db, now = deps.now || Date.now, startedAtMs = prepared?.startedAtMs ?? now(), attemptId = randomUUID();
   let target = initialTarget, schedule = null, priority = false;
-  const binding = prepared?.binding || historyRead(deps, () => captureRemoteAccountBinding({ db }, { query: deps.sqliteJson }));
-  if (!binding || binding.conflict) throw new Error('history account binding unavailable');
+  const binding = prepared?.binding || historyOperation('account_snapshot', () => historyRead(deps, () => captureRemoteAccountBinding({ db }, { query: deps.sqliteJson })));
+  historyOperation('account_snapshot', () => { if (!binding || binding.conflict) throw new Error('history account binding unavailable'); });
   const attemptsBefore = prepared?.attemptsBefore ?? session.summary().cli_attempts;
   const targetSession = { ...session, runLark(...args) {
     if (session.summary().cli_attempts - attemptsBefore >= 4) throw new Error('target_cli_budget');
@@ -143,24 +143,24 @@ function executeHistoryTarget(options, deps, session, initialTarget, prepared = 
   const adapter = createLarkImAdapter({ run: targetSession.runLark });
   const fetchOptions = { pageSize: 50, chatPageSize: 100, maxPages: 2, retries: 0, retryDelayMs: 0 };
   // Account failures do not advance a selected scope or publish a candidate.
-  const self = prepared?.self || (deps.getSelfProfile || adapter.getSelfProfile)(fetchOptions);
-  const admission = historyRead(deps, () => readRemoteAccountBinding({ db, selfOpenId: self?.open_id }, { query: deps.sqliteJson }));
+  const self = prepared?.self || historyOperation('opening_self', () => (deps.getSelfProfile || adapter.getSelfProfile)(fetchOptions));
+  const admission = historyOperation('account_admission', () => historyRead(deps, () => readRemoteAccountBinding({ db, selfOpenId: self?.open_id }, { query: deps.sqliteJson })));
   const accountKey = 'account_key' in admission ? admission.account_key : null;
   if (typeof self?.open_id !== 'string' || !self.open_id.startsWith('ou_') || admission.state !== 'verified' || !/^[a-f0-9]{64}$/.test(accountKey || '') || accountBindingAdmissionError(admission)) {
     throw new Error('history account identity unavailable');
   }
-  const selection = prepared?.selection || selectScheduledTarget(db,options,binding,accountKey,deps,startedAtMs);
+  const selection = prepared?.selection || historyOperation('target_select', () => selectScheduledTarget(db,options,binding,accountKey,deps,startedAtMs));
   if (!selection) return null;
   ({target,schedule,priority}=selection);
   const row = target.record, scope = target.scope, config = JSON.parse(scope.config_json);
-  const writeAdmission = historyRead(deps, () => captureLarkWriteAdmission(db, { selfOpenId: self.open_id, requireVerified: true, scopeIds: [scope.id] }, { query: deps.sqliteJson }));
+  const writeAdmission = historyOperation('write_admission', () => historyRead(deps, () => captureLarkWriteAdmission(db, { selfOpenId: self.open_id, requireVerified: true, scopeIds: [scope.id] }, { query: deps.sqliteJson })));
   const startMs = Math.max(target.baseline, Math.floor(row.occurred_at_ms / 1000) * 1000);
   const endMs = Math.floor(row.occurred_at_ms / 1000) * 1000 + 1000;
   let records = [], pages = 1, fetchedCount = 0, error = null;
   try {
     // Complete the list before selecting; unrelated merge roots never consume
     // this known row's detail budget or turn their permission debt into ours.
-    const fetched = (deps.fetchChatMessageList || adapter.fetchChatMessageList)(config.chat_id, startMs, endMs, fetchOptions);
+    const fetched = historyOperation('legacy_fetch', () => (deps.fetchChatMessageList || adapter.fetchChatMessageList)(config.chat_id, startMs, endMs, fetchOptions));
     const detailRoots = fetched.detailRoots ?? [];
     if (!Array.isArray(fetched.messages) || !Array.isArray(detailRoots)
       || fetched.messages.length + detailRoots.length > 100 || fetched.has_more === true
@@ -211,11 +211,12 @@ function commitHistoryTarget(options, deps, session, input) {
   const row=target.record,scope=target.scope,config=JSON.parse(scope.config_json);
   const {policy:scopePolicy,configJson:scopeConfig}=scopeObservationContext(scope.config_json);
   const startMs=Math.max(target.baseline,Math.floor(row.occurred_at_ms/1000)*1000),endMs=Math.floor(row.occurred_at_ms/1000)*1000+1000;
-  const checkBinding = () => {
-    historyRead(deps, () => writeAdmission.assertCurrent());
-    if (JSON.stringify(historyRead(deps, () => captureRemoteAccountBinding({ db }, { query: deps.sqliteJson }))) !== JSON.stringify(binding)
-      || accountBindingAdmissionError(historyRead(deps, () => readRemoteAccountBinding({ db, selfOpenId: self.open_id }, { query: deps.sqliteJson })))) throw new Error('history account binding changed');
-  };
+  const checkBinding = () => historyOperation('binding_recheck', () => {
+    // assertCurrent captures and validates one fresh snapshot at this boundary.
+    // Both this check and reviewBeforeCommit remain; never reuse across them.
+    const current = historyRead(deps, () => writeAdmission.assertCurrent());
+    if (JSON.stringify(current) !== JSON.stringify(binding)) throw new Error('history account binding changed');
+  });
   checkBinding();
   const requestBudget = { ...session.summary(), ...(input.acquisitionMode ? {acquisition_mode:input.acquisitionMode,batch_targets:input.batchTargets} : {}) };
   const commit = () => (deps.commit || commitBoundedReplayRecords)(db, {
@@ -238,7 +239,7 @@ function commitHistoryTarget(options, deps, session, input) {
       scopes: [{ id: scope.id, source_id: scope.source_id, enabled: scope.enabled, config_json: scope.config_json }] },
   });
   let effects, cleanupFailed = false, cleanupCause = null;
-  try { effects = session.withCommit ? session.withCommit(commit, { allowStoppedForFailure: error !== null && records.length === 0 }) : commit(); }
+  try { effects = historyOperation('storage_commit', () => session.withCommit ? session.withCommit(commit, { allowStoppedForFailure: error !== null && records.length === 0 }) : commit()); }
   catch (failure) {
     // Only storage's validated completed-transaction receipt may preserve known
     // effects through a cleanup failure. Arbitrary exception properties cannot.
@@ -256,17 +257,17 @@ function commitHistoryTarget(options, deps, session, input) {
  * scheduler can select a row from this acquisition for its single-row CAS. */
 function executeHistoryGroup(options, deps, session, initialTarget, capacity, diagnosticContext) {
   const db=options.db,now=deps.now || Date.now,startedAtMs=now(),attemptsBefore=session.summary().cli_attempts;
-  const binding=historyRead(deps, () => captureRemoteAccountBinding({db}, { query: deps.sqliteJson }));
-  if(!binding || binding.conflict) throw new Error('history account binding unavailable');
+  const binding=historyOperation('account_snapshot', () => historyRead(deps, () => captureRemoteAccountBinding({db}, { query: deps.sqliteJson })));
+  historyOperation('account_snapshot', () => { if(!binding || binding.conflict) throw new Error('history account binding unavailable'); });
   const adapter=createLarkImAdapter({run:session.runLark});
-  const self=(deps.getSelfProfile || adapter.getSelfProfile)({retries:0,retryDelayMs:0});
-  const admitted=historyRead(deps, () => readRemoteAccountBinding({db,selfOpenId:self?.open_id}, { query: deps.sqliteJson }));
+  const self=historyOperation('opening_self', () => (deps.getSelfProfile || adapter.getSelfProfile)({retries:0,retryDelayMs:0}));
+  const admitted=historyOperation('account_admission', () => historyRead(deps, () => readRemoteAccountBinding({db,selfOpenId:self?.open_id}, { query: deps.sqliteJson })));
   const accountKey='account_key' in admitted ? admitted.account_key : null;
   if(typeof self?.open_id!=='string' || !self.open_id.startsWith('ou_') || admitted.state!=='verified' ||
       !/^[a-f0-9]{64}$/.test(accountKey || '') || accountBindingAdmissionError(admitted)) throw new Error('history account identity unavailable');
-  const selection=selectScheduledTarget(db,options,binding,accountKey,deps,startedAtMs);
+  const selection=historyOperation('target_select', () => selectScheduledTarget(db,options,binding,accountKey,deps,startedAtMs));
   if(!selection)return {results:[]};
-  const isDetail=target=>target.checkpoint.detailTask || JSON.parse(target.record.raw_json)?.msg_type==='merge_forward';
+  const isDetail=target=>historyOperation('message_prepare', () => target.checkpoint.detailTask || JSON.parse(target.record.raw_json)?.msg_type==='merge_forward');
   const legacy=(prepared=/** @type {Record<string,any>|null} */(null))=>{
     const summary=session.summary();
     // A fresh legacy acquisition can need self + list + two detail pages.
@@ -279,17 +280,17 @@ function executeHistoryGroup(options, deps, session, initialTarget, capacity, di
   };
   const prepared={binding,self,startedAtMs,attemptsBefore,selection};
   if(isDetail(selection.target)) return legacy(prepared);
-  const pool=readHistoryCandidatePool(db,selection,capacity,(scope,limit)=>
-    selectHistoryTargets(db,{...deps,...(scope ? {eligibleScopeIds:[scope]} : {})},limit), { sqliteJson: deps.sqliteJson });
+  const pool=historyOperation('candidate_pool', () => readHistoryCandidatePool(db,selection,capacity,(scope,limit)=>
+    selectHistoryTargets(db,{...deps,...(scope ? {eligibleScopeIds:[scope]} : {})},limit), { sqliteJson: deps.sqliteJson }));
   // One ordinary row needs no bulk bracket. Keep its original two-call path.
   if(pool.length<2) {
     if(options.maxCliAttempts-session.summary().cli_attempts<1)return {results:[]};
     const result=executeHistoryTarget(options,deps,session,initialTarget,prepared);
     return {results:result?[result]:[]};
   }
-  const admission=historyRead(deps, () => captureLarkWriteAdmission(db,{selfOpenId:self.open_id,requireVerified:true,scopeIds:[...new Set(pool.map(t=>t.scope.id))]}, { query: deps.sqliteJson }));
+  const admission=historyOperation('write_admission', () => historyRead(deps, () => captureLarkWriteAdmission(db,{selfOpenId:self.open_id,requireVerified:true,scopeIds:[...new Set(pool.map(t=>t.scope.id))]}, { query: deps.sqliteJson })));
   let fetched;
-  try { fetched=(deps.fetchKnownMessageList || adapter.fetchKnownMessageList)(pool.map(t=>t.record.external_id),{retries:0,retryDelayMs:0}); }
+  try { fetched=historyOperation('message_fetch', () => (deps.fetchKnownMessageList || adapter.fetchKnownMessageList)(pool.map(t=>t.record.external_id),{retries:0,retryDelayMs:0})); }
   catch(error) {
     preserveFailureAtCutoff(error, deps.historyCommandBudget);
     if(session.summary().stop_reason)throw error;
@@ -303,6 +304,7 @@ function executeHistoryGroup(options, deps, session, initialTarget, capacity, di
   if(fetched.detailRoots?.length) return legacy();
   const preparedRecords=new Map();
   try {
+  historyOperation('message_prepare', () => {
   const listed=fetched.messages;
   if(!Array.isArray(listed) || listed.length!==pool.length || fetched.has_more===true || fetched.pages!==1 ||
       Buffer.byteLength(JSON.stringify(listed))>1024*1024) throw new Error('incomplete');
@@ -320,6 +322,7 @@ function executeHistoryGroup(options, deps, session, initialTarget, capacity, di
     records=records.map(record=>({...record,expected_external_version:row.external_version}));
     preparedRecords.set(row.id,records);
   }
+  });
   } catch(error) {
     preserveFailureAtCutoff(error, deps.historyCommandBudget);
     if(session.summary().stop_reason)throw error;
@@ -327,16 +330,16 @@ function executeHistoryGroup(options, deps, session, initialTarget, capacity, di
     // rechecks this row's identity and can record only its own bounded failure.
     return {...legacy(),bulkUnavailable:true};
   }
-  const after=(deps.getSelfProfile || adapter.getSelfProfile)({retries:0,retryDelayMs:0});
-  if(after?.open_id!==self.open_id)throw new Error('history account identity changed');
-  historyRead(deps, () => admission.assertCurrent());session.assertReady();
+  const after=historyOperation('closing_self', () => (deps.getSelfProfile || adapter.getSelfProfile)({retries:0,retryDelayMs:0}));
+  historyOperation('closing_self', () => { if(after?.open_id!==self.open_id)throw new Error('history account identity changed'); });
+  historyOperation('admission_recheck', () => historyRead(deps, () => admission.assertCurrent()));session.assertReady();
   const results=[],consumed=new Set(),group=randomUUID();
   let stage = 'batch_select', selectionStop = null;
   try {
   for(let index=0;index<capacity;index++) {
     stage = 'batch_select';
     session.assertReady();
-    const live=selectScheduledTarget(db,options,binding,accountKey,deps,startedAtMs);
+    const live=historyOperation('target_select', () => selectScheduledTarget(db,options,binding,accountKey,deps,startedAtMs));
     if(!live) { selectionStop='no_target'; break; }
     const fixed=pool.find(item=>item.record.id===live.target.record.id);
     if(!fixed) { selectionStop='outside_pool'; break; }
@@ -379,7 +382,7 @@ function executeHistoryWithinBudget(options, deps = {}, execution = { session: n
       !Number.isSafeInteger(maxSeconds) || maxSeconds < 1 || maxSeconds > 30 ||
       !Number.isSafeInteger(requestedSelfAttempts) || requestedSelfAttempts < 0 || requestedSelfAttempts > 6)
     throw new Error('history requires at most 12 records, 12 batch requests (4 per record), and 30 seconds');
-  let target = selectHistoryTarget(options.db, deps);
+  let target = historyOperation('history_target_read', () => selectHistoryTarget(options.db, deps));
   if (!target) return { ok: true, profile: PROFILE, outcome: 'no_eligible_known_record', cursor_policy: 'unchanged', processed:0,
     request_budget:{cli_attempts:0,self_attempts:0,max_cli_attempts:maxCliAttempts,max_self_attempts:maxSelfAttempts,max_seconds:maxSeconds,elapsed_ms:0,min_interval_ms:1000,stop_reason:null} };
   const session = (deps.createRequestSession || createMaintenanceRequestSession)({ db: options.db, maxCliAttempts, maxSelfAttempts, maxSeconds },
@@ -387,7 +390,7 @@ function executeHistoryWithinBudget(options, deps = {}, execution = { session: n
   execution.session = session;
   const results = [];
   let stopReason = null, interrupted = false, legacyRequired = false, bulkUnavailable = false;
-  let failureDiagnostic = null, failureCause = null, stage = 'batch_prepare';
+  let failureDiagnostic = /** @type {Record<string,any>|null} */ (null), failureCause = null, stage = 'batch_prepare';
   const recordFailure = (error, errorStage, diagnostic = /** @type {Record<string,any>|null} */ (null)) => {
     const directStop = isDirectBudgetAdmissionStop(error);
     stopReason = session.summary().stop_reason || (directStop ? error.reason : null);
@@ -402,7 +405,7 @@ function executeHistoryWithinBudget(options, deps = {}, execution = { session: n
   const diagnosticContext={failure:null};
   const configured={...options,maxRecords,maxCliAttempts,maxSelfAttempts};
   while(results.length<maxRecords) {
-    try { target=selectHistoryTarget(options.db, deps); } catch (error) {
+    try { target=historyOperation('history_target_read', () => selectHistoryTarget(options.db, deps)); } catch (error) {
       recordFailure(error, 'batch_select');
       if (maxRecords === 1 && interrupted && !stopReason) throw error;
       break;
@@ -453,6 +456,7 @@ function executeHistoryWithinBudget(options, deps = {}, execution = { session: n
     priority_hint_reason: results.at(-1)?.priority_hint_reason || 'not_attempted',
     ...(results.at(-1)?.priority_hint_diagnostic ? { priority_hint_diagnostic: results.at(-1).priority_hint_diagnostic } : {}),
     ...(interrupted && failureDiagnostic ? { failure_diagnostic: failureDiagnostic } : {}),
+    ...(interrupted && failureDiagnostic?.operation === 'storage_commit' ? { failed_target_commit_state: 'unknown' } : {}),
     ...(Object.keys(selectionStops).length ? { selection_stop_counts: selectionStops } : {}),
     ...(results.length ? { fair_round_reason: results.at(-1).fair_round_reason } : {}),
     request_budget: budget, cursor_policy: 'unchanged', coverage: 'known_rows_only' }, failureCause);
@@ -474,11 +478,16 @@ function executeLarkImHistory(options, deps = {}) {
   // Keep terminal command errors exact across those helper returns, without
   // changing their normal optional-hint/account policies for other callers.
   /** @type {unknown} */ let terminalQueryError = null;
-  const historyReadBoundary = work => {
-    let value;
-    try { value = work(); } catch (error) { throw terminalQueryError || error; }
-    if (terminalQueryError) throw terminalQueryError;
-    return value;
+  /** @type {{failure:unknown}|null} */ let requiredRead = null;
+  const historyReadBoundary = (work, required = true) => {
+    const parent = requiredRead, boundary = required ? { failure: null } : null;
+    requiredRead = boundary;
+    try {
+      let value;
+      try { value = work(); } catch (error) { throw terminalQueryError || boundary?.failure || error; }
+      if (terminalQueryError || boundary?.failure) throw terminalQueryError || boundary?.failure;
+      return value;
+    } finally { requiredRead = parent; }
   };
   const wrapQuery = query => (db, sql, label, queryDeps = {}) => {
     if (terminalQueryError) throw terminalQueryError;
@@ -488,6 +497,7 @@ function executeLarkImHistory(options, deps = {}) {
     let rows;
     try { rows = query(db, sql, label, { ...queryDeps, timeoutMs }); }
     catch (error) {
+      if (requiredRead && !requiredRead.failure) requiredRead.failure = error;
       if (isDirectBudgetAdmissionStop(error)) { terminalQueryError = error; throw error; }
       // A failed operation is not a successful read followed by admission stop.
       // Retain both facts if its failure and the command cutoff coincide.

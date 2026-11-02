@@ -1,6 +1,7 @@
 // @ts-check
 import { spawnSync } from "node:child_process";
 import { performance } from "node:perf_hooks";
+import { registerHistoryLocalFailure, preserveHistoryFailure } from "./history-diagnostics.mjs";
 import { isHistoryCommandBudget, HistoryCommandBudgetError } from "./history-command-budget.mjs";
 import { classifyLarkFailure, createLarkCliRunner, createTransportState, transportOperation } from "../adapters/lark-im/transport.mjs";
 import { NAME_LOOKUP_RETRY_BUDGET_MS } from "../adapters/lark-im/name-resolver.mjs";
@@ -18,6 +19,7 @@ class MaintenanceRequestError extends Error {
     super(`maintenance requests stopped: ${safeReason}`);
     this.name = "MaintenanceRequestError";
     this.reason = safeReason;
+    registerHistoryLocalFailure(this, safeReason);
     /** @type {Record<string, number|string|null> | undefined} */
     this.requestBudget = undefined;
   }
@@ -184,7 +186,7 @@ function createMaintenanceRequestSession(options = {}, deps = {}) {
         if (transportAdmissionStop) throw transportAdmissionStop;
         if (error instanceof MaintenanceRequestError || error instanceof HistoryCommandBudgetError) throw error;
         try { assertReady(); }
-        catch (stop) { throw new AggregateError([error, stop], 'maintenance request failed and command stopped', { cause: error }); }
+        catch (stop) { throw preserveHistoryFailure(new AggregateError([error, stop], 'maintenance request failed and command stopped', { cause: error }), error); }
       } else assertReady();
       throw error;
     } finally {

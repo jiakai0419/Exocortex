@@ -42,3 +42,21 @@ test('worker accepts only exact diagnostic structures and bounded selection coun
   }
   assert.deepEqual(sanitizeHistorySelectionStops({outside_pool:12}),{outside_pool:12});
 });
+
+
+test('worker retains exact command cutoff and known cleanup receipts without claiming unknown suffix completion',()=>{
+  const command={version:1,max_ms:19000,elapsed_ms:18009,stop_reason:'time_budget',complete:true};
+  const r=compactHistorySummary({ok:false,processed:5,failed_target_commit_state:'unknown',command_budget:command});
+  assert.deepEqual(r.command_budget,command);assert.equal(r.processed,5);
+  assert.equal(r.failed_target_commit_state,'unknown');assert.equal(r.commit_state,undefined);
+  assert.deepEqual(compactHistorySummary({ok:false,commit_state:'committed',cleanup_state:'failed'}),
+    {ok:false,commit_state:'committed',cleanup_state:'failed'});
+  for(const bad of [{...command,secret:'INVENTED_PRIVATE_BODY'},{...command,version:2},{...command,max_ms:30001},
+    {...command,elapsed_ms:-1},{...command,stop_reason:'INVENTED_PRIVATE_ERROR'}, {...command,complete:'true'}])
+    assert.equal(compactHistorySummary({ok:false,command_budget:bad}).command_budget,undefined);
+  for(const r of [{commit_state:'committed'},{commit_state:'unknown',cleanup_state:'failed'},
+    {commit_state:'committed',cleanup_state:'INVENTED_PRIVATE_ERROR'}]){
+    const out=compactHistorySummary(r);assert.equal(out.commit_state,undefined);assert.equal(out.cleanup_state,undefined);
+  }
+  assert.equal(compactHistorySummary({failed_target_commit_state:'INVENTED_PRIVATE_BODY'}).failed_target_commit_state,undefined);
+});

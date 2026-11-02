@@ -1,7 +1,7 @@
 // @ts-check
 import { createHash } from 'node:crypto';
 import { activityDatabaseKey } from './lark-im-activity-evidence.mjs';
-import { captureRemoteAccountBinding, readRemoteAccountBinding, readRemoteAccountBindingSidecar,
+import { captureRemoteAccountBinding, readRemoteAccountBinding, readRemoteAccountBindingWithSnapshot, readRemoteAccountBindingSidecar,
   accountBindingAdmissionError } from './remote-account-binding.mjs';
 import { readOnlySqliteJson } from '../storage/sqlite/readonly-query.mjs';
 import { quoteSql } from '../../dist/storage/sqlite/sqlite-executor.js';
@@ -54,20 +54,34 @@ export function captureLarkWriteAdmission(db, options = {}, deps = {}) {
       throw new Error('Lark admission scopes unavailable');
     }
   }
-  function assertCurrent() {
-    if (activityDatabaseKey(db) !== databaseKey) throw new Error('Lark admission database identity changed');
+  function readCurrentSidecar() {
     const current = readRemoteAccountBindingSidecar(db);
     if (current && (current.database_key !== databaseKey || !fence.accountKey || current.account_key !== fence.accountKey)
         || sidecar && !current) throw new Error('Lark admission sidecar changed');
+    return current;
+  }
+  function assertCurrent() {
+    if (activityDatabaseKey(db) !== databaseKey) throw new Error('Lark admission database identity changed');
+    readCurrentSidecar();
+    let snapshot = null;
     if (fence.selfOpenId) {
-      const admitted = readRemoteAccountBinding({ db, selfOpenId: fence.selfOpenId }, { query });
+      const observed = readRemoteAccountBindingWithSnapshot({ db, selfOpenId: fence.selfOpenId }, { query });
+      const admitted = observed.admission;
       const error = accountBindingAdmissionError(admitted);
       if (error || admitted.database_key !== databaseKey || fence.requireVerified && admitted.state !== 'verified') {
         throw new Error(error || 'Lark request admission changed');
       }
+      snapshot = observed.snapshot;
     }
-    fence.sidecarVerified = Boolean(current);
+    // The paired account read also observes the sidecar. Recheck afterwards
+    // so disappearance during that read cannot retain the earlier file proof.
+    // This is still a bounded observation under the caller's shared lease,
+    // not an atomic filesystem transaction.
+    fence.sidecarVerified = Boolean(readCurrentSidecar());
     if (activityDatabaseKey(db) !== databaseKey) throw new Error('Lark admission database identity changed');
+    // Only the observation validated during this invocation can be reused by
+    // its immediate caller. Every later assertCurrent performs a fresh read.
+    return snapshot;
   }
   if (options.selfOpenId !== undefined) setSelf(options.selfOpenId);
   if (options.requireVerified && !options.selfOpenId) throw new Error('verified admission requires an existing self observation');

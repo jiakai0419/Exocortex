@@ -1,7 +1,7 @@
 // @ts-check
 
 import { spawnSync } from "node:child_process";
-import { formatLarkExecutionReceipt } from "./transport-execution.mjs";
+import { formatLarkExecutionReceipt, validateLarkExecutionReceipt } from "./transport-execution.mjs";
 import { getLarkApiLeaseStdio, readSharedLarkCooldown, writeSharedLarkCooldown } from "../../runtime/lark-api-lease.mjs";
 
 /**
@@ -33,6 +33,24 @@ import { getLarkApiLeaseStdio, readSharedLarkCooldown, writeSharedLarkCooldown }
  * @property {typeof getLarkApiLeaseStdio=} getLeaseStdio
  * @typedef {(args: string[], options?: AdapterRunOptions) => JsonObject | null} LarkRunner
  */
+
+// Error text remains the existing external compatibility contract. This local
+// provenance lets trusted in-process consumers observe a genuine runner result
+// without treating a caller-created Error or its message as transport evidence.
+const executionFailures = new WeakMap();
+/** @param {string} message @param {string} operation @param {Record<string,any>} execution @param {string|null} localReason */
+function executionFailure(message, operation, execution, localReason = null) {
+  const error = new Error(message);
+  if (validateLarkExecutionReceipt(execution)) executionFailures.set(error, Object.freeze({
+    operation, receipt: Object.freeze({...execution}), local_reason: localReason,
+  }));
+  return error;
+}
+/** @param {unknown} error */
+export function readLarkExecutionFailure(error) {
+  const evidence = error !== null && typeof error === 'object' ? executionFailures.get(error) : null;
+  return evidence ? {...evidence, receipt: {...evidence.receipt}} : null;
+}
 
 const DEFAULT_LARK_CLI_TIMEOUT_MS = 120_000;
 const DEFAULT_LARK_RETRY_BUDGET_MS = 180_000;
@@ -415,18 +433,18 @@ function createLarkCliRunner({
     let execution = {version:1,launch_attempted:false,execution:'not_started',result_at_ms:null,
       result_kind:null,result_code:null,remote_result:false};
     const receipt = () => formatLarkExecutionReceipt(execution);
-    /** @param {string} descriptor @returns {never} */
-    const localFailure = descriptor => { throw new Error(`lark-cli failed: ${descriptor} operation=${operation} ${receipt()}`); };
+    /** @param {string} descriptor @param {string|null} [localReason] @returns {never} */
+    const localFailure = (descriptor, localReason = null) => { throw executionFailure(`lark-cli failed: ${descriptor} operation=${operation} ${receipt()}`, operation, execution, localReason); };
     const wallNow = () => {
       let value;
-      try { value = clock(); } catch { return localFailure('kind=unknown reason=clock_unavailable'); }
-      if (!Number.isSafeInteger(value) || value < 0) return localFailure('kind=unknown reason=clock_unavailable');
+      try { value = clock(); } catch { return localFailure('kind=unknown reason=clock_unavailable', 'clock_unavailable'); }
+      if (!Number.isSafeInteger(value) || value < 0) return localFailure('kind=unknown reason=clock_unavailable', 'clock_unavailable');
       return value;
     };
     const now = () => {
       let value;
-      try { value = monotonicClock(); } catch { return localFailure('kind=unknown reason=clock_unavailable'); }
-      if (!Number.isFinite(value)) return localFailure('kind=unknown reason=clock_unavailable');
+      try { value = monotonicClock(); } catch { return localFailure('kind=unknown reason=clock_unavailable', 'clock_unavailable'); }
+      if (!Number.isFinite(value)) return localFailure('kind=unknown reason=clock_unavailable', 'clock_unavailable');
       return value;
     };
     const publish = () => { try { options.onExecutionReceipt?.({...execution}); } catch { /* Optional diagnostics cannot change execution. */ } };
@@ -447,28 +465,28 @@ function createLarkCliRunner({
     const fail = budgetExhausted => {
       if (budgetExhausted) counters.exhausted += 1;
       const descriptor = lastResult ? publicFailureDescriptor(lastResult, lastTimeoutMs, lastFailure) : "kind=rate_limited retry_after_source=shared";
-      throw new Error(`lark-cli failed: ${descriptor} operation=${operation}${budgetExhausted ? " retry_exhausted=1" : ""} ${receipt()}`);
+      throw executionFailure(`lark-cli failed: ${descriptor} operation=${operation}${budgetExhausted ? " retry_exhausted=1" : ""} ${receipt()}`, operation, execution);
     };
     for (let attempt = 0; attempt <= retries; attempt += 1) {
       while (true) {
         const sharedAt = wallNow();
         let shared;
         try { shared = readSharedCooldown?.({ operation, nowMs: sharedAt }); }
-        catch { return localFailure('kind=unknown reason=shared_cooldown_unavailable'); }
-        if (shared?.state === "unavailable") return localFailure('kind=unknown reason=shared_cooldown_unavailable');
+        catch { return localFailure('kind=unknown reason=shared_cooldown_unavailable', 'shared_cooldown_unavailable'); }
+        if (shared?.state === "unavailable") return localFailure('kind=unknown reason=shared_cooldown_unavailable', 'shared_cooldown_unavailable');
         if (shared?.state === "cooldown") state.cooldowns.set(operation, Math.max(state.cooldowns.get(operation) || 0, Number(shared.untilMs)));
         const current = now();
         const waitMs = Math.max(0, nextAttemptAt - current, (state.cooldowns.get(operation) || 0) - wallNow());
         if (current >= deadline || waitMs >= deadline - current) return fail(true);
         if (waitMs <= 0) break;
-        try { sleep(waitMs); } catch { return localFailure('kind=unknown reason=retry_wait_unavailable'); }
+        try { sleep(waitMs); } catch { return localFailure('kind=unknown reason=retry_wait_unavailable', 'retry_wait_unavailable'); }
         counters.wait_ms += waitMs;
       }
       const remaining = Math.floor(deadline - now());
       if (remaining <= 0) return fail(true);
       lastTimeoutMs = Math.min(requestedTimeoutMs, remaining);
       let stdio;
-      try { stdio = getLeaseStdio?.(); } catch { return localFailure('kind=unknown reason=lease_unavailable'); }
+      try { stdio = getLeaseStdio?.(); } catch { return localFailure('kind=unknown reason=lease_unavailable', 'lease_unavailable'); }
       counters.attempts += 1;
       if (attempt > 0) counters.retries += 1;
       execution.launch_attempted = true;
@@ -523,7 +541,7 @@ function createLarkCliRunner({
       // A successful CLI process can still return a structured API failure.
       // Keep it on the same failure/retry path as a nonzero process result.
       if (result?.status === 0 && !business.failed) {
-        if (parseFailed) return localFailure('kind=unknown reason=invalid_json');
+        if (parseFailed) return localFailure('kind=unknown reason=invalid_json', 'invalid_json');
         state.rateStreaks.delete(operation);
         if ((state.cooldowns.get(operation) || 0) <= wallNow()) state.cooldowns.delete(operation);
         return parsed;
@@ -542,8 +560,8 @@ function createLarkCliRunner({
         if (writeSharedCooldown && until > wall) {
           let written;
           try { written = writeSharedCooldown({ operation, untilMs: until, nowMs: wall }); }
-          catch { return localFailure('kind=rate_limited reason=shared_cooldown_unavailable'); }
-          if (!written) return localFailure('kind=rate_limited reason=shared_cooldown_unavailable');
+          catch { return localFailure('kind=rate_limited reason=shared_cooldown_unavailable', 'shared_cooldown_unavailable'); }
+          if (!written) return localFailure('kind=rate_limited reason=shared_cooldown_unavailable', 'shared_cooldown_unavailable');
         }
       }
       if (!failure.transient) return fail(false);

@@ -515,6 +515,23 @@ function compactHistorySummary(summary: SyncSummary | null | undefined) {
   if (failureDiagnostic) result.failure_diagnostic = failureDiagnostic;
   if (hintDiagnostic) result.priority_hint_diagnostic = hintDiagnostic;
   if (selectionStops) result.selection_stop_counts = selectionStops;
+  // A confirmed prefix says nothing about a later unacknowledged transaction.
+  // Preserve these closed receipts rather than imply rollback or completion.
+  if (summary.commit_state === 'committed' && summary.cleanup_state === 'failed') {
+    result.commit_state = 'committed'; result.cleanup_state = 'failed';
+  }
+  if (summary.failed_target_commit_state === 'unknown') result.failed_target_commit_state = 'unknown';
+  const command = summary.command_budget as JsonObject | undefined;
+  const commandKeys = ['version','max_ms','elapsed_ms','stop_reason','complete'];
+  if (command && typeof command === 'object' && !Array.isArray(command)
+      && Object.keys(command).length === commandKeys.length && commandKeys.every(key => Object.hasOwn(command,key))
+      && command.version === 1 && Number.isSafeInteger(command.max_ms) && command.max_ms >= 1000 && command.max_ms <= 30000
+      && (command.elapsed_ms === null || Number.isSafeInteger(command.elapsed_ms) && command.elapsed_ms >= 0)
+      && [null,'time_budget','clock_unavailable'].includes(command.stop_reason) && typeof command.complete === 'boolean') {
+    result.command_budget = {version:1,max_ms:command.max_ms,elapsed_ms:command.elapsed_ms,
+      stop_reason:command.stop_reason,complete:command.complete};
+  }
+
   if (["ready", "scope_budget"].includes(String(summary.fair_round_reason))) result.fair_round_reason = summary.fair_round_reason;
   const error = summary.error as JsonObject | undefined;
   if (summary.schema_version === 1 && error && ["invalid_arguments", "execution_failed"].includes(error.code)) result.reason = error.code;

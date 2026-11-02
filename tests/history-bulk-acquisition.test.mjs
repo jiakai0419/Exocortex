@@ -17,7 +17,8 @@ import { loadHistoryDebtHints, mergeHistoryDebtHints, readHistoryDebtSchedule, r
 import childProcess from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 import { compactHistorySummary } from '../dist/runtime/worker/lark-im-worker-core.js';
-import { SqliteReadError } from '../src/storage/sqlite/readonly-query.mjs';
+import { SqliteReadError, readOnlySqliteJson } from '../src/storage/sqlite/readonly-query.mjs';
+import { runMaintenanceCommand } from '../src/cli/maintenance-command.mjs';
 
 const SELF = { open_id: 'ou_synthetic_debt_observer', name: 'Synthetic observer' };
 const hash = text => createHash('sha256').update(text).digest('hex');
@@ -78,8 +79,10 @@ function fixture(t, sizes = [12]) {
         sleep:ms=>{assert.equal(f.held,false);f.tick+=ms;},
         tryAcquireLease:()=>{if(f.mode==='busy')return {state:'busy'};assert.equal(f.held,false);f.held=true;return {state:'acquired',release(){f.held=false;}};},
         readSharedCooldown:()=>({state:'ready'}),writeSharedCooldown:()=>true,
-        spawnSync:(_command,args)=>{
+        spawnSync:(_command,args,settings)=>{
           assert.equal(f.held,true); f.calls.push(args); f.tick+=f.latency;
+          const override=f.onSpawn?.(args,settings);
+          if(override)return override;
           if(args[0]==='contact')return {status:0,stdout:JSON.stringify(f.onSelf?.() || SELF),stderr:''};
           if(args[2]==='/open-apis/im/v1/messages/mget') {
             const params=JSON.parse(args[args.indexOf('--params')+1]);
@@ -358,7 +361,7 @@ test(`local ${kind} after three cross-chat commits retains the exact prefix and 
   assert.equal(injected,1);assert.equal(commits,3);assert.equal(result.processed,3);
   assert.equal(result.ok,false);assert.equal(result.outcome,'batch_interrupted');assert.equal(result.failed,0);
   assert.equal(result.request_budget.stop_reason,null);assert.equal(result.request_budget.cli_attempts,3);assert.equal(result.request_budget.self_attempts,2);
-  assert.deepEqual(result.failure_diagnostic,{version:1,stage:'batch_select',kind});
+  assert.deepEqual(result.failure_diagnostic,{version:1,stage:'batch_select',kind,operation:'target_select'});
   assert.deepEqual(f.query('SELECT id,raw_json,external_version FROM records ORDER BY id'),before);
   assert.equal(f.query('SELECT SUM(generation) AS n FROM lark_im_history_progress')[0].n,3);
   assert.equal(f.query('SELECT generation FROM lark_im_history_scheduler')[0].generation,3);
@@ -375,7 +378,7 @@ test('unknown commit exception after three rows is observable without adopting p
     const effects=store.commitBoundedReplayRecords(db,options);commits++;return effects;
   }});
   assert.equal(result.processed,3);assert.equal(result.outcome,'batch_interrupted');assert.equal(result.request_budget.stop_reason,null);
-  assert.deepEqual(result.failure_diagnostic,{version:1,stage:'batch_commit',kind:'unknown'});
+  assert.deepEqual(result.failure_diagnostic,{version:1,stage:'batch_commit',kind:'unknown',operation:'storage_commit'});
   assert.equal(f.query('SELECT generation FROM lark_im_history_scheduler')[0].generation,3);
   assert.equal(f.query('SELECT COUNT(*) AS n FROM bounded_replay_runs')[0].n,3);
   assert.doesNotMatch(JSON.stringify(compactHistorySummary(result)),/INVENTED_PRIVATE|SqliteReadError|sql|stack|message/);
@@ -386,7 +389,7 @@ test('a zero-prefix commit error retains its actual inner stage and single-targe
   const deps={commit:()=>{throw error;}};
   const result=f.run({},deps);
   assert.equal(result.processed,0);assert.equal(result.outcome,'batch_interrupted');assert.equal(result.request_budget.stop_reason,null);
-  assert.deepEqual(result.failure_diagnostic,{version:1,stage:'batch_commit',kind:'read_failed'});
+  assert.deepEqual(result.failure_diagnostic,{version:1,stage:'batch_commit',kind:'read_failed',operation:'storage_commit'});
   assert.equal(f.query('SELECT COUNT(*) AS n FROM bounded_replay_runs')[0].n,0);
   assert.throws(()=>f.run({maxRecords:1,maxCliAttempts:4},deps),cause=>cause===error,'the existing single-target error must remain the same thrown object');
 });
@@ -405,6 +408,87 @@ test('a zero-prefix live-selection timeout is distinct from batch preparation',t
   syncBuiltinESMExports();let result;
   try {result=f.run();} finally {childProcess.spawnSync=original;syncBuiltinESMExports();}
   assert.equal(selections,2);assert.equal(result.processed,0);assert.equal(result.outcome,'batch_interrupted');
-  assert.deepEqual(result.failure_diagnostic,{version:1,stage:'batch_select',kind:'read_timeout'});
+  assert.deepEqual(result.failure_diagnostic,{version:1,stage:'batch_select',kind:'read_timeout',operation:'target_select'});
   assert.equal(result.request_budget.stop_reason,null);assert.equal(f.query('SELECT COUNT(*) AS n FROM bounded_replay_runs')[0].n,0);
+});
+
+
+for(const count of [6,12])test(`fresh account checks avoid duplicate scans for ${count} real history commits`,t=>{
+  const f=fixture(t,[count]);let scans=0;
+  const result=f.run({maxRecords:count},{sqliteJson(db,sql,label,settings){
+    if(label==='remote account binding'){scans++;f.tick+=200;}
+    return readOnlySqliteJson(db,sql,label,settings);
+  }});
+  assert.equal(result.ok,true);assert.equal(result.processed,count);
+  assert.equal(scans,count===6?17:34);
+  assert.equal(result.request_budget.cli_attempts,count===6?3:6);
+  assert.equal(result.request_budget.self_attempts,count===6?2:4);
+  assert.equal(result.request_budget.stop_reason,null);
+  assert.equal(f.query('SELECT after_id FROM lark_im_history_progress')[0].after_id,count);
+});
+
+test('opening self transport timeout remains a failure with ample whole-command time',t=>{
+  const f=fixture(t);f.onSpawn=()=>{f.tick=5483;return {status:null,pid:1234,signal:'SIGKILL',stdout:'',stderr:'',
+    error:Object.assign(new Error('INVENTED_SECRET_TIMEOUT'),{code:'ETIMEDOUT'})};};
+  const result=f.run({maxSeconds:21});
+  assert.equal(result.ok,false);assert.equal(result.processed,0);assert.equal(result.outcome,'batch_interrupted');
+  assert.equal(result.request_budget.cli_attempts,1);assert.equal(result.request_budget.self_attempts,1);
+  assert.equal(result.request_budget.elapsed_ms,5483);assert.equal(result.request_budget.stop_reason,null);
+  assert.equal(result.failure_diagnostic.operation,'opening_self');
+  assert.equal(result.failure_diagnostic.kind,'network_timeout');
+  assert.equal(result.failure_diagnostic.transport.execution,'started');
+  assert.equal(result.failure_diagnostic.transport.remote_result,false);
+  assert.deepEqual(f.query('SELECT * FROM lark_im_history_progress'),[]);
+  assert.doesNotMatch(JSON.stringify(compactHistorySummary(result)),/INVENTED_SECRET/);
+});
+
+for(const kind of ['read_timeout','read_failed'])test(`required account read retains ${kind} through helper fallback`,t=>{
+  const f=fixture(t),before=f.query('SELECT * FROM records');
+  const result=f.run({}, {sqliteJson(db,sql,label,settings){
+    if(label==='remote account binding')throw new SqliteReadError(kind,'INVENTED_SECRET_QUERY');
+    return readOnlySqliteJson(db,sql,label,settings);
+  }});
+  assert.equal(result.ok,false);assert.equal(result.processed,0);assert.equal(result.request_budget.cli_attempts,0);
+  assert.equal(result.request_budget.stop_reason,null);
+  assert.deepEqual(result.failure_diagnostic,{version:1,stage:'batch_prepare',kind,operation:'account_snapshot'});
+  assert.deepEqual(f.query('SELECT * FROM records'),before);
+  assert.deepEqual(f.query('SELECT * FROM lark_im_history_progress'),[]);
+});
+
+for(const kind of ['read_timeout','read_failed'])test(`committed prefix and ${kind} remain distinct from simultaneous cutoff in actual CLI`,t=>{
+  const f=fixture(t);let self=0,armed=false;
+  f.onSpawn=args=>{if(args[0]==='contact'&&++self===3){f.tick=17990;armed=true;}};
+  const reports=[];let err='';
+  const exit=runMaintenanceCommand({action:'history',db:f.db,logDir:f.dir,maxRecords:12,maxCliAttempts:12,maxSelfAttempts:6,maxSeconds:19,format:'json'}, {
+    stdout:{write:text=>reports.push(String(text))},stderr:{write:text=>{err+=text;}},
+    monotonicNow:()=>f.tick,startedMonotonicMs:0,now:()=>Date.now(),
+    deps:{executeLarkImHistory:(_options,deps)=>f.run({maxSeconds:19},{historyCommandBudget:deps.historyCommandBudget,sqliteJson(db,sql,label,settings){
+      if(armed&&label==='remote account binding'){f.tick=18009;throw new SqliteReadError(kind,'INVENTED_SECRET_QUERY');}
+      return readOnlySqliteJson(db,sql,label,settings);
+    }})},
+  });
+  assert.equal(exit,2);assert.equal(err,'');
+  const result=JSON.parse(reports.join(''));
+  assert.equal(result.ok,false);assert.equal(result.processed,6);assert.equal(result.request_budget.cli_attempts,4);
+  assert.equal(result.request_budget.self_attempts,3);assert.equal(result.request_budget.stop_reason,'time_budget');
+  assert.deepEqual(result.failure_diagnostic,{version:1,stage:'batch_prepare',kind,operation:'account_admission'});
+  assert.equal(f.query('SELECT after_id FROM lark_im_history_progress')[0].after_id,6);
+  assert.deepEqual(compactHistorySummary(result).failure_diagnostic,result.failure_diagnostic);
+  assert.doesNotMatch(reports.join(''),/INVENTED_SECRET|cause|stack/);
+});
+
+
+test('an unconfirmed sixth commit never becomes five-row rollback or a successful six-row receipt',t=>{
+  const f=fixture(t);let commits=0;
+  const result=f.run({}, {commit(db,options){
+    const effects=store.commitBoundedReplayRecords(db,options);
+    if(++commits===6)throw new Error('INVENTED_SECRET_COMMIT_ACK_LOST');
+    return effects;
+  }});
+  assert.equal(commits,6);assert.equal(result.ok,false);assert.equal(result.processed,5);
+  assert.equal(result.failed_target_commit_state,'unknown');
+  assert.equal(result.failure_diagnostic.operation,'storage_commit');
+  assert.equal(f.query('SELECT after_id FROM lark_im_history_progress')[0].after_id,6);
+  assert.equal(compactHistorySummary(result).failed_target_commit_state,'unknown');
+  assert.doesNotMatch(JSON.stringify(compactHistorySummary(result)),/INVENTED_SECRET/);
 });

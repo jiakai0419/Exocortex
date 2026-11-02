@@ -11,11 +11,13 @@ const KIND = "lark_im_remote_account_binding/v1";
 const INITIAL_ACCOUNT_SQL = `(SELECT config_json FROM sources WHERE id='lark.im')`;
 const INITIAL_ACCOUNT_COLUMNS = `json_type(${INITIAL_ACCOUNT_SQL}, '$.initial_account_binding') AS initial_account_type,
   json_extract(${INITIAL_ACCOUNT_SQL}, '$.initial_account_binding') AS initial_account_json,`;
+// These three presence columns are private inputs to empty only. Exact counts
+// are needed solely for sent-actor identity, whose aggregates remain below.
 const SQL = `SELECT
   ${INITIAL_ACCOUNT_COLUMNS}
-  (SELECT COUNT(*) FROM records WHERE source_id = 'lark.im') AS records,
-  (SELECT COUNT(*) FROM sync_runs WHERE source_id = 'lark.im') AS runs,
-  (SELECT COUNT(*) FROM sync_scopes WHERE source_id = 'lark.im' AND cursor_json IS NOT NULL) AS cursors,
+  EXISTS(SELECT 1 FROM records WHERE source_id = 'lark.im') AS records,
+  EXISTS(SELECT 1 FROM sync_runs WHERE source_id = 'lark.im') AS runs,
+  EXISTS(SELECT 1 FROM sync_scopes WHERE source_id = 'lark.im' AND cursor_json IS NOT NULL) AS cursors,
   COUNT(*) AS sent_records, COUNT(DISTINCT actor_id) AS sent_actors, MIN(actor_id) AS sent_actor,
   COALESCE(SUM(CASE WHEN actor_id IS NULL OR actor_id NOT GLOB 'ou_?*' THEN 1 ELSE 0 END), 0) AS invalid_actors,
   COALESCE(SUM(CASE WHEN canonical_json IS NOT NULL AND (
@@ -133,10 +135,27 @@ function readSidecar(db, nowMs = Date.now()) {
  * cannot upgrade the local evidence or silently change the account namespace.
  * @param {{db: string, selfOpenId: string, selfTenantKey?: string}} options @param {BindingDeps} [deps] */
 function readRemoteAccountBinding(options, deps = {}) {
+  return readRemoteAccountBindingWithSnapshot(options, deps).admission;
+}
+
+/** One fresh observation supplies both the account decision and its comparison
+ * snapshot. This function never accepts a caller-supplied snapshot, and does
+ * not retain one across requests, records or transaction boundaries.
+ * @param {{db: string, selfOpenId: string, selfTenantKey?: string}} options @param {BindingDeps} [deps] */
+function readRemoteAccountBindingWithSnapshot(options, deps = {}) {
   const unavailable = (reason) => ({ state: "unavailable", evidence: null, database_key: null, tenant_verified: false, reason });
-  if (!validOpenId(options.selfOpenId)) return unavailable("self_identity_unverified");
+  if (!validOpenId(options.selfOpenId)) return { snapshot: null, admission: unavailable("self_identity_unverified") };
   const before = captureRemoteAccountBinding(options, deps);
-  if (!before) return unavailable("database_evidence_unavailable");
+  if (!before) return { snapshot: null, admission: unavailable("database_evidence_unavailable") };
+  return { snapshot: before, admission: evaluateRemoteAccountSnapshot(options, before, deps) };
+}
+
+/** Private evaluator: only the fresh reader above supplies its observation.
+ * @param {{db: string, selfOpenId: string, selfTenantKey?: string}} options
+ * @param {NonNullable<ReturnType<typeof captureRemoteAccountBinding>>} before
+ * @param {BindingDeps} deps */
+function evaluateRemoteAccountSnapshot(options, before, deps) {
+  const unavailable = (reason) => ({ state: "unavailable", evidence: null, database_key: null, tenant_verified: false, reason });
   const base = { evidence: /** @type {string|null} */ (null), database_key: before.database_key,
     account_key: accountKey(options.selfOpenId), tenant_verified: false };
   try {
@@ -189,5 +208,5 @@ function recordSuccessfulSyncBinding(options, deps = {}) {
   finally { try { if (temporary) unlinkSync(temporary); } catch { /* Already renamed or inaccessible. */ } }
 }
 
-export { captureRemoteAccountBinding, readRemoteAccountBinding, recordSuccessfulSyncBinding,
+export { captureRemoteAccountBinding, readRemoteAccountBinding, readRemoteAccountBindingWithSnapshot, recordSuccessfulSyncBinding,
   accountBindingAdmissionError, reserveSyncAccountBinding, readSidecar as readRemoteAccountBindingSidecar };
