@@ -139,8 +139,10 @@ Migration 021 removes unrelated text from resource discovery pages without
 changing source/account validation. History now includes startup, selection,
 local work, cleanup and publication in its command budget, still within the
 existing shared slice and guardian reservation. A narrowly proved old-detail
-backoff can admit resources alone; unknown forward failures admit no optional
-work, while known operation cooldowns retain their exact deferred classification.
+backoff can admit bounded work on known records: history and resources, with
+remote sampling still excluded. The same strict saved-list/detail-backoff
+predicate applies; unknown forward failures admit no optional work, while known
+operation cooldowns retain their exact deferred classification.
 Cycle health, permanent denial isolation and all existing API allowances remain
 unchanged. The conditional lane opportunity bound above is not a successful
 resource or end-to-end latency guarantee.

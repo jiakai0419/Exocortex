@@ -1,5 +1,56 @@
 # SQL profiler observation boundary
 
+## Follow-up to 2020285: primary path and bounded evidence
+
+The structural primary profiler again delegates exactly one TextIO.read call.
+It inherits that stream's encoding, errors and newline semantics. The separate
+CHUNK_PROFILER is a byte/EOF calibration using read1 and strict UTF-8 decoding;
+only declared calibration controls select it. Passing calibration never proves
+that the original primary read path passed or explains the original 6be stall.
+Neither path changes 30 seconds, 4 MiB, SQL consumption, opcode/prepare/result
+limits, original cohorts or database assertions. Product SQL and guardians stay
+unchanged.
+
+Method-dispatch controls distinguish one delegated TextIO.read from read1,
+including an original-read exception, valid/split multi-byte UTF-8, declared
+Latin-1, surrogateescape, CRLF and malformed input. An original-read exception
+must fail both direct and nested primary execution before SQLite. Calibration
+keeps its own explicit label and EOF/invalid-byte controls. Callback and timer
+errors in the delayed-EOF control enter the existing first-error/owned-child
+kill-and-close path; they cannot escape as uncaught EventEmitter exceptions.
+
+Unexpected primary transport/status/JSON/complete-report failures retain only
+bounded authored evidence: exact serialized input when within the cap, the
+profiler script, and pre-attempt copies of the fixture DB and existing WAL/SHM.
+These are file captures, not an asserted consistent SQLite backup or replayable
+transaction state. Unknown completion or commit remains unknown. No extra
+attempt, process inventory, failed-child probing or automatic replay is added.
+Expected-negative controls do not consume the unexpected-failure allowance.
+The retention limit is four fixture captures and eight MiB per capture, with a
+fixed file allowlist and finite metadata; oversized/missing/failed evidence is
+explicitly unavailable, never silently presented as exact. This does not cover
+arbitrary later test assertions after a valid report was returned, nor a
+status-zero outer driver's JSON parse failure. The actual nested Python profiler
+has the same explicit transport/parse/incomplete-report capture as direct calls.
+
+Startup fingerprints are limited to the explicit command/argv shape (inline
+driver source represented by its hash, not mistaken for a Python argv), Node
+version/platform/architecture and executable-path hash, actual Python's own
+version/executable-path hash/stdin encoding/errors/UTF-8 mode, and the presence,
+length and hash of a fixed preload/encoding environment allowlist. No environment
+value, credential, preload file or runtime-private directory is read or emitted.
+These observations describe a new attempt, not the uncaptured old environment.
+Retention or observer errors cannot replace the original spawn/status/parse
+failure. Successful runs clean their temporary evidence normally.
+
+The original 6be stdin-stage timeout remains unexplained. The prior independent
+14/17 and corrected valid-receipt 3/3 retain separate denominators. Current
+production images, app names and minute-scale completion remain separate open
+outcomes. This test-only change is local, with no release authorization.
+
+## Earlier observation contract (historical context)
+
+
 Design v0.2, implemented observation and finite controls. Base129ac2c164de3937213dbb5a7b12f90f78b7c1a6.
 The original full-run timeout remains a failed, unexplained observation. Its only
 child trace was startup: it does not establish import completion, stdin EOF,

@@ -2,14 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import {spawnSync} from 'node:child_process';
-import {mkdtempSync,rmSync,writeFileSync} from 'node:fs';
+import {mkdtempSync,rmSync,writeFileSync,readFileSync,mkdirSync,existsSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {deflateSync} from 'node:zlib';
 import {ensureInitialized,sqliteExec,sqliteQuery,quoteSql as q} from '../dist/storage/sqlite/ingestion-store.js';
 import {SENT_SCOPE_ID} from '../src/adapters/lark-im/core.mjs';
 import {readMessageSnapshot} from '../src/diagnostics/message-read-snapshot.mjs';
-import {executeResourceWork,resourceWorkAvailable,resourceWorkIdentity} from '../src/maintenance/resource-work.mjs';
+import {executeResourceWork,resourceWorkAvailable,resourceWorkIdentity,resourceWorkFailureEvidence} from '../src/maintenance/resource-work.mjs';
 import {loadMessages} from '../src/diagnostics/messages-report.mjs';
 import {RESOURCE_CANDIDATE_WHERE,RESOURCE_CANDIDATE_INDEX} from '../src/maintenance/resource-candidates.mjs';
 import {enrichResources,normalizeResourceFailure,RESOURCE_FAILURE_STAGES,RESOURCE_FAILURE_REASONS} from '../src/maintenance/enrich-resources.mjs';
@@ -522,9 +522,9 @@ test('resource diagnostic restart reads retained cause and normal success clears
 
 test('resource diagnostic migration preserves pre-022 task byte values and keeps old cause unknown',t=>{
   const f=fixture(t);f.settings.transient=true;f.run();
-  sqliteExec(f.db,"ALTER TABLE lark_im_resource_work DROP COLUMN failure_stage; ALTER TABLE lark_im_resource_work DROP COLUMN failure_reason; DELETE FROM schema_migrations WHERE version='022';");
+  sqliteExec(f.db,"DROP TRIGGER lark_resource_failure_attempt_guard; DROP TRIGGER lark_resource_failure_association_guard; ALTER TABLE lark_im_resource_work DROP COLUMN failure_binding_key; ALTER TABLE lark_im_resource_work DROP COLUMN failure_source_fence; ALTER TABLE lark_im_resource_work DROP COLUMN failure_stage; ALTER TABLE lark_im_resource_work DROP COLUMN failure_reason; DELETE FROM schema_migrations WHERE version IN ('022','023');");
   const before=f.tasks();ensureInitialized(f.db);const after=f.tasks();
-  assert.deepEqual(after.map(({failure_stage,failure_reason,...row})=>row),before);
+  assert.deepEqual(after.map(({failure_stage,failure_reason,failure_binding_key,failure_source_fence,...row})=>row),before);
   assert.equal(after[0].failure_stage,null);assert.equal(after[0].failure_reason,null);
   assert.deepEqual(normalizeResourceFailure({stage:after[0].failure_stage,reason:after[0].failure_reason}),{stage:'unknown',reason:'unknown'});
   assert.equal(sqliteQuery(f.db,"SELECT COUNT(*) n FROM schema_migrations WHERE version='022';")[0].n,1);
@@ -570,4 +570,182 @@ test('resource diagnostic new attempt clears prior cause in claim CAS before unk
   assert.equal(current.state,'running');assert.equal(current.attempts,2);assert(current.last_attempt_at_ms>old.last_attempt_at_ms);
   assert.equal(current.failure_stage,null);assert.equal(current.failure_reason,null);
   assert.deepEqual(result.failure,{stage:'opening_account',reason:'sync_busy',persisted:false});
+});
+
+const retainedFailure=row=>Object.fromEntries(['failure_stage','failure_reason','failure_binding_key','failure_source_fence'].map(key=>[key,row[key]]));
+const currentResource=f=>resourceWorkIdentity(f.db,readMessageSnapshot(f.db,{recordIds:[1]}).rows[0]);
+const exhaustInvalid=f=>{f.settings.bytes=Buffer.from('Synthetic invalid image bytes');for(let i=0;i<3;i++){assert.equal(f.run().outcome,i===2?'exhausted':'batch_deferred');f.advance(500000);}};
+const scanWithoutClaim=f=>{const acquire=f.deps.tryAcquireLease;let calls=0;f.deps.tryAcquireLease=args=>++calls===1?acquire(args):{state:'busy'};};
+
+for(const field of ['chat_name','sender_name','recipient_name'])test(`resource association retains actual exhausted failure across derived ${field}`,t=>{
+  const f=fixture(t);exhaustInvalid(f);const before=f.tasks()[0],calls=f.calls.length;
+  assert.equal(before.failure_binding_key,before.binding_key);assert.equal(before.failure_source_fence,before.source_fence);
+  assert.equal(resourceWorkFailureEvidence(before,currentResource(f)).applicability,'exact_source');
+  sqliteExec(f.db,`UPDATE records SET canonical_json=json_set(canonical_json,'$.${field}','Synthetic corrected name') WHERE id=1;`);
+  const current=currentResource(f);
+  assert.equal(resourceWorkFailureEvidence(before,current).applicability,'same_binding','fresh source comparison already sees drift before discovery');
+  f.advance(61000);assert.equal(f.run().request_budget.cli_attempts,0);const after=f.tasks()[0];
+  assert.equal(f.calls.length,calls);assert.notEqual(after.source_fence,before.source_fence);
+  assert.deepEqual(retainedFailure(after),retainedFailure(before));
+  for(const key of ['work_key','binding_key','state','reason','attempts','failures','deferrals','last_attempt_at_ms'])assert.equal(after[key],before[key],key);
+  assert.equal(resourceWorkFailureEvidence(after,current).applicability,'same_binding');
+});
+
+test('resource association retains old binding on true version drift until the existing new-claim policy runs',t=>{
+  const f=fixture(t);exhaustInvalid(f);const before=f.tasks()[0],calls=f.calls.length;
+  sqliteExec(f.db,"UPDATE records SET external_version='Synthetic new resource version' WHERE id=1;");
+  f.advance(61000);scanWithoutClaim(f);assert.equal(f.run().request_budget.stop_reason,'sync_busy');const after=f.tasks()[0];
+  assert.equal(f.calls.length,calls);assert.equal(after.work_key,before.work_key);assert.notEqual(after.binding_key,before.binding_key);
+  assert.deepEqual(retainedFailure(after),retainedFailure(before));
+  assert.equal(resourceWorkFailureEvidence(after,currentResource(f)).applicability,'different_binding');
+  assert.equal(after.state,'pending');assert.equal(after.attempts,0);assert.equal(after.failures,0,'original true-binding policy unchanged');
+});
+
+for(const change of ['resource','account'])test(`resource association does not transfer evidence to a different ${change} task`,t=>{
+  const f=fixture(t);exhaustInvalid(f);const before=f.tasks()[0],calls=f.calls.length;
+  const row=readMessageSnapshot(f.db,{recordIds:[1]}).rows[0],raw=JSON.parse(row.raw_json),canonical=JSON.parse(row.canonical_json);
+  let actor=row.actor_id;
+  if(change==='resource')raw.body.content=JSON.stringify({image_key:'synthetic_changed_resource'});
+  else {actor='ou_synthetic_replacement_owner';raw.sender.id=actor;canonical.sender_id=actor;}
+  const json=JSON.stringify(raw);
+  sqliteExec(f.db,`UPDATE records SET actor_id=${q(actor)},raw_json=${q(json)},content_hash=${q(sha(json))},canonical_json=${q(JSON.stringify(canonical))} WHERE id=1;`);
+  const identity=currentResource(f);assert(identity);assert.notEqual(identity.work_key,before.work_key);
+  assert.equal(resourceWorkFailureEvidence(before,identity).applicability,'different_binding');
+  f.advance(61000);scanWithoutClaim(f);assert.equal(f.run().request_budget.stop_reason,'sync_busy');
+  assert.equal(f.calls.length,calls);assert.deepEqual(f.tasks().find(row=>row.work_key===before.work_key),before);
+  const added=f.tasks().find(row=>row.work_key===identity.work_key);assert(added);assert.equal(added.state,'pending');assert.equal(added.attempts,0);
+  assert.equal(resourceWorkFailureEvidence(added,identity),null);
+});
+
+test('resource association retains permanent denial without attributing it to corrected binding',t=>{
+  const f=fixture(t);f.settings.denied=true;assert.equal(f.run().outcome,'blocked');const before=f.tasks()[0],calls=f.calls.length;
+  sqliteExec(f.db,"UPDATE records SET external_version='Synthetic corrected denied version' WHERE id=1;");
+  f.advance(61000);assert.equal(f.run().request_budget.cli_attempts,0);const after=f.tasks()[0];
+  assert.equal(f.calls.length,calls);assert.deepEqual(retainedFailure(after),retainedFailure(before));
+  assert.equal(after.reason,'permission_denied');assert.equal(after.state,'blocked');assert.equal(after.attempts,before.attempts);
+  assert.equal(resourceWorkFailureEvidence(after,currentResource(f)).applicability,'different_binding');
+});
+
+test('resource association pre-claim source mismatch preserves prior attempt and only reports local diagnosis',t=>{
+  const f=fixture(t);f.settings.bytes=Buffer.from('Synthetic invalid image bytes');f.run();const before=f.tasks()[0],calls=f.calls.length;
+  sqliteExec(f.db,`UPDATE records SET canonical_json=json_set(canonical_json,'$.sender_name_account_key',${q(sha('synthetic-other-account'))}) WHERE id=1;`);
+  f.advance(121000);const result=f.run(),after=f.tasks()[0];
+  assert.equal(result.outcome,'source_changed');assert.deepEqual(result.failure,{stage:'source_fence',reason:'source_changed',persisted:false});
+  assert.equal(f.calls.length,calls);assert.equal(after.attempts,before.attempts);assert.equal(after.last_attempt_at_ms,before.last_attempt_at_ms);
+  assert.deepEqual(retainedFailure(after),retainedFailure(before));assert.equal(resourceWorkFailureEvidence(after,currentResource(f)).applicability,'unknown');
+});
+
+test('resource association post-claim source mismatch records the claimed source instead of changed source',t=>{
+  const f=fixture(t),identity=currentResource(f);f.settings.bytes=Buffer.from('Synthetic invalid image bytes');
+  f.settings.onDownload=()=>sqliteExec(f.db,"UPDATE records SET canonical_json=json_set(canonical_json,'$.chat_name','Synthetic concurrent title') WHERE id=1;");
+  const result=f.run(),after=f.tasks()[0];assert.equal(result.outcome,'source_changed');
+  assert.deepEqual(result.failure,{stage:'source_fence',reason:'source_changed',persisted:true});
+  assert.equal(after.failure_binding_key,identity.binding_key);assert.equal(after.failure_source_fence,identity.source_fence);
+  assert.equal(resourceWorkFailureEvidence(after,currentResource(f)).applicability,'same_binding');
+});
+
+test('resource association post-claim real binding drift never adopts the changed binding',t=>{
+  const f=fixture(t),claimed=currentResource(f);f.settings.bytes=Buffer.from('Synthetic invalid image bytes');
+  f.settings.onDownload=()=>sqliteExec(f.db,"UPDATE records SET external_version='Synthetic version changed during resource request' WHERE id=1;");
+  const result=f.run(),after=f.tasks()[0],current=currentResource(f);
+  assert.equal(result.outcome,'source_changed');assert.equal(result.failure.persisted,true);
+  assert.equal(current.work_key,claimed.work_key);assert.notEqual(current.binding_key,claimed.binding_key);assert.notEqual(current.source_fence,claimed.source_fence);
+  assert.equal(after.failure_binding_key,claimed.binding_key);assert.equal(after.failure_source_fence,claimed.source_fence);
+  assert.equal(resourceWorkFailureEvidence(after,current).applicability,'different_binding');
+  assert.equal(after.attempts,1);assert.equal(after.state,'blocked');assert.equal(downloads(f).length,1);
+});
+
+for(const point of ['scan','claim','result'])test(`resource association ${point} CAS conflict cannot partially write diagnostic provenance`,t=>{
+  const f=fixture(t);f.settings.bytes=Buffer.from('Synthetic invalid image bytes');f.run();const before=f.tasks()[0];f.advance(121000);
+  if(point==='scan')sqliteExec(f.db,"UPDATE records SET canonical_json=json_set(canonical_json,'$.chat_name','Synthetic conflicting title') WHERE id=1;");
+  let changed=false;const marker=point==='scan'?'ON CONFLICT(source_id,account_key,work_key)':point==='claim'?"SET state='running',attempt_token":'failure_stage=\'download_validation\'';
+  f.deps.sqliteWrite=(db,sql,label)=>{if(!changed&&sql.includes(marker)){changed=true;sqliteExec(db,point==='scan'?'UPDATE lark_im_resource_scan SET generation=generation+1;':'UPDATE lark_im_resource_work SET generation=generation+1;');}return sqliteQuery(db,sql,label);};
+  const result=f.run(),after=f.tasks()[0];assert(changed);assert.equal(result.outcome,'execution_failed');
+  if(point==='result')assert.deepEqual(retainedFailure(after),{failure_stage:null,failure_reason:null,failure_binding_key:null,failure_source_fence:null},'new claim cleared all fields; rejected result writes none');
+  else {assert.deepEqual(retainedFailure(after),retainedFailure(before));assert.equal(after.attempts,before.attempts);assert.equal(after.source_fence,before.source_fence);}
+});
+
+test('resource association new claim clears all evidence before interruption and restart; later success remains clear',t=>{
+  const f=fixture(t);f.settings.bytes=Buffer.from('Synthetic invalid image bytes');f.run();assert(f.tasks()[0].failure_binding_key);
+  f.advance(121000);f.settings.remoteBusyAt=f.remoteLeases+1;assert.equal(f.run().request_budget.stop_reason,'sync_busy');
+  const expected={failure_stage:null,failure_reason:null,failure_binding_key:null,failure_source_fence:null};assert.deepEqual(retainedFailure(f.tasks()[0]),expected);
+  const program=`import {sqliteQuery} from ${JSON.stringify(new URL('../dist/storage/sqlite/ingestion-store.js',import.meta.url).href)};process.stdout.write(JSON.stringify(sqliteQuery(process.argv[1],'SELECT failure_stage,failure_reason,failure_binding_key,failure_source_fence FROM lark_im_resource_work;')[0]));`;
+  const child=spawnSync(process.execPath,['--input-type=module','-e',program,f.db],{encoding:'utf8',timeout:15000});assert.equal(child.status,0,child.stderr);assert.deepEqual(JSON.parse(child.stdout),expected);
+  f.advance(121000);f.deps.ownerState=()=> 'dead';delete f.settings.bytes;assert.equal(f.run().available,1);assert.deepEqual(retainedFailure(f.tasks()[0]),expected);
+});
+
+test('resource association success clears an already retained failed attempt',t=>{
+  const f=fixture(t);f.settings.bytes=Buffer.from('Synthetic invalid image bytes');f.run();f.advance(121000);delete f.settings.bytes;
+  assert.equal(f.run().available,1);const row=f.tasks()[0];assert.equal(resourceWorkFailureEvidence(row,currentResource(f)),null);
+  assert.equal(row.failure_binding_key,null);assert.equal(row.failure_source_fence,null);assert.equal(row.failures,1);assert.equal(row.attempts,2);
+});
+
+test('resource association 023 migration retains all prior values without inventing provenance and rolls back atomically',t=>{
+  const f=fixture(t);f.settings.bytes=Buffer.from('Synthetic invalid image bytes');f.run();
+  sqliteExec(f.db,"DROP TRIGGER lark_resource_failure_attempt_guard; DROP TRIGGER lark_resource_failure_association_guard; ALTER TABLE lark_im_resource_work DROP COLUMN failure_binding_key; ALTER TABLE lark_im_resource_work DROP COLUMN failure_source_fence; DELETE FROM schema_migrations WHERE version='023';");
+  const before=f.tasks(),schema=sqliteQuery(f.db,"SELECT type,name,sql FROM sqlite_master ORDER BY type,name;"),versions=sqliteQuery(f.db,'SELECT * FROM schema_migrations ORDER BY version;');
+  const dir=join(f.root,'synthetic-broken-migrations');mkdirSync(dir);
+  const migration=readFileSync(new URL('../migrations/023_resource_failure_association.sql',import.meta.url),'utf8');
+  writeFileSync(join(dir,'023_resource_failure_association.sql'),migration.replace('ALTER TABLE lark_im_resource_work ADD COLUMN failure_source_fence','SELECT * FROM synthetic_missing_migration_table;\nALTER TABLE lark_im_resource_work ADD COLUMN failure_source_fence'));
+  assert.throws(()=>ensureInitialized(f.db,{migrationsDir:dir}),/synthetic_missing_migration_table/);
+  assert.deepEqual(f.tasks(),before);assert.deepEqual(sqliteQuery(f.db,"SELECT type,name,sql FROM sqlite_master ORDER BY type,name;"),schema);
+  assert.deepEqual(sqliteQuery(f.db,'SELECT * FROM schema_migrations ORDER BY version;'),versions);assert.equal(existsSync(`${f.db}.init.lock`),false);
+  assert.deepEqual(ensureInitialized(f.db).applied,['023_resource_failure_association.sql']);const after=f.tasks()[0];
+  assert.deepEqual(f.tasks().map(({failure_binding_key,failure_source_fence,...row})=>row),before);
+  assert.equal(after.failure_binding_key,null);assert.equal(after.failure_source_fence,null);
+  assert.equal(resourceWorkFailureEvidence(after,currentResource(f)).applicability,'unknown');assert.equal(after.failure_reason,'download_image_invalid');
+  assert.deepEqual(ensureInitialized(f.db).applied,[]);
+  for(const col of ['failure_binding_key','failure_source_fence'])for(const value of ['', 'a'.repeat(63), 'A'.repeat(64), 'g'.repeat(64), 'Synthetic private string'])assert.throws(()=>sqliteExec(f.db,`UPDATE lark_im_resource_work SET ${col}=${q(value)};`));
+});
+
+test('resource association helper requires explicit complete current identity and both original hashes',t=>{
+  const f=fixture(t);f.settings.bytes=Buffer.from('Synthetic invalid image bytes');f.run();const task=f.tasks()[0],identity=currentResource(f),before=f.tasks();
+  assert.equal(resourceWorkFailureEvidence(task).applicability,'unknown');
+  for(const key of ['failure_binding_key','failure_source_fence'])for(const value of [null,undefined,'',{},'A'.repeat(64)])assert.equal(resourceWorkFailureEvidence({...task,[key]:value},identity).applicability,'unknown');
+  assert.equal(resourceWorkFailureEvidence(task,{...identity,binding_key:sha('different binding'),source_fence:task.failure_source_fence}).applicability,'different_binding','matching source alone is insufficient');
+  assert.equal(resourceWorkFailureEvidence(task,{...identity,account_key:sha('different account')}).applicability,'different_binding');
+  assert.equal(resourceWorkFailureEvidence(task,{...identity,work_key:sha('different endpoint')}).applicability,'different_binding');
+  assert.equal(resourceWorkFailureEvidence(task,{...identity,source_id:'synthetic foreign source'}).applicability,'unknown');
+  assert.deepEqual(f.tasks(),before,'projection is read-only and does not change state, retries or denial policy');
+});
+
+for(const recursive of [0,1])test(`resource legacy guards clear only new attempts/results with recursive_triggers=${recursive}`,t=>{
+  const f=fixture(t);f.settings.bytes=Buffer.from('Synthetic invalid image bytes');f.run();const before=f.tasks()[0],diagnostic=retainedFailure(before);
+  const sql=body=>sqliteExec(f.db,`PRAGMA recursive_triggers=${recursive};${body}`);
+  const restore=()=>sql(`UPDATE lark_im_resource_work SET ${Object.entries(diagnostic).map(([key,value])=>`${key}=${q(value)}`).join(',')};`);
+  const cleared={failure_stage:null,failure_reason:null,failure_binding_key:null,failure_source_fence:null};
+  // The published 7c claim omitted all diagnostic columns. Its original state,
+  // token, count, clock and generation changes remain the only task changes.
+  sql(`UPDATE lark_im_resource_work SET state='running',attempt_token='synthetic-legacy-first',claim_owner='synthetic-legacy-owner',claim_until_ms=${f.wall+120000},last_attempt_at_ms=${f.wall+1},attempts=attempts+1,generation=generation+1;`);
+  const claimed=f.tasks()[0];assert.deepEqual(retainedFailure(claimed),cleared);
+  assert.deepEqual(claimed,{...before,...cleared,state:'running',attempt_token:'synthetic-legacy-first',claim_owner:'synthetic-legacy-owner',claim_until_ms:f.wall+120000,last_attempt_at_ms:f.wall+1,attempts:before.attempts+1,generation:before.generation+1});
+  restore();sql("UPDATE lark_im_resource_work SET state='running',attempt_token='synthetic-legacy-first';");assert.deepEqual(retainedFailure(f.tasks()[0]),diagnostic,'same claim is not a new attempt');
+  sql("UPDATE lark_im_resource_work SET attempt_token='synthetic-legacy-next';");assert.deepEqual(retainedFailure(f.tasks()[0]),cleared,'a changed running token is a new attempt');
+  restore();sql("UPDATE lark_im_resource_work SET state='available',reason=NULL,attempt_token=NULL,claim_owner=NULL,claim_until_ms=0;");assert.deepEqual(retainedFailure(f.tasks()[0]),cleared);
+  restore();const available=f.tasks()[0];sql(`UPDATE lark_im_resource_work SET state='available',source_fence=${q(sha('synthetic derived source'))};`);
+  assert.deepEqual(f.tasks()[0],{...available,source_fence:sha('synthetic derived source')},'same-state available scan has no new success and preserves history');
+});
+
+for(const recursive of [0,1])test(`resource legacy association guard rejects stale pairing but preserves scan/new provenance with recursive_triggers=${recursive}`,t=>{
+  const f=fixture(t);f.settings.bytes=Buffer.from('Synthetic invalid image bytes');f.run();const before=f.tasks()[0];
+  const sql=body=>sqliteExec(f.db,`PRAGMA recursive_triggers=${recursive};${body}`);
+  sql(`UPDATE lark_im_resource_work SET binding_key=${q(sha('synthetic corrected binding'))},source_fence=${q(sha('synthetic corrected source'))},failure_stage=failure_stage,failure_reason=failure_reason;`);
+  assert.deepEqual(retainedFailure(f.tasks()[0]),retainedFailure(before),'same-value legacy permanent-denial scan does not erase association');
+  const scanned=f.tasks()[0];sql("UPDATE lark_im_resource_work SET failure_stage='source_fence',failure_reason='source_changed';");
+  assert.deepEqual(f.tasks()[0],{...scanned,failure_stage:'source_fence',failure_reason:'source_changed',failure_binding_key:null,failure_source_fence:null},'legacy diagnosis cannot inherit old hashes');
+  sql(`UPDATE lark_im_resource_work SET failure_stage='download_validation',failure_reason='download_file_invalid',failure_binding_key=${q(scanned.binding_key)},failure_source_fence=${q(scanned.source_fence)};`);
+  assert.equal(resourceWorkFailureEvidence(f.tasks()[0],scanned).applicability,'exact_source','new writer supplies a new explicit association');
+});
+
+test('resource legacy guard effects roll back with the original transaction and leave failed CAS unchanged',t=>{
+  const f=fixture(t);f.settings.bytes=Buffer.from('Synthetic invalid image bytes');f.run();const before=f.tasks()[0];
+  assert.throws(()=>sqliteExec(f.db,`PRAGMA recursive_triggers=ON;BEGIN IMMEDIATE;
+    UPDATE lark_im_resource_work SET state='running',attempt_token='synthetic-rolled-back-token',claim_owner='synthetic-rolled-back-owner',claim_until_ms=${f.wall+120000},attempts=attempts+1,generation=generation+1;
+    SELECT * FROM synthetic_missing_after_guard; COMMIT;`),/synthetic_missing_after_guard/);
+  assert.deepEqual(f.tasks()[0],before,'the diagnosis and original task changes roll back together');
+  sqliteExec(f.db,`UPDATE lark_im_resource_work SET failure_stage='source_fence',failure_reason='source_changed' WHERE generation=${before.generation+1};`);
+  assert.deepEqual(f.tasks()[0],before,'no matching row means no trigger side effect');
+  const triggers=sqliteQuery(f.db,"SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name LIKE 'lark_resource_failure_%' ORDER BY name;");
+  assert.equal(triggers.length,2);assert.deepEqual(ensureInitialized(f.db).applied,[]);
+  assert.deepEqual(sqliteQuery(f.db,"SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name LIKE 'lark_resource_failure_%' ORDER BY name;"),triggers);
 });

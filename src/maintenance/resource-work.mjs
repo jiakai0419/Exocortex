@@ -53,6 +53,26 @@ export function resourceWorkIdentity(db,row) {
   } catch {return null;}
 }
 
+/** Retained finite attempt diagnosis, never authority to request, retry or deny.
+ * The caller supplies a freshly admitted current identity; a queue snapshot alone
+ * is not a fresh source observation. Old 022 rows have unknown associations.
+ * @param {Row} task @param {Row|null} [currentIdentity] */
+export function resourceWorkFailureEvidence(task,currentIdentity=null) {
+  if(task.failure_stage==null&&task.failure_reason==null)return null;
+  const hash=value=>typeof value==='string'&&/^[a-f0-9]{64}$/.test(value);
+  const binding=hash(task.failure_binding_key)?task.failure_binding_key:null;
+  const fence=hash(task.failure_source_fence)?task.failure_source_fence:null;
+  let applicability='unknown';
+  if(binding&&fence&&currentIdentity&&hash(currentIdentity.binding_key)&&hash(currentIdentity.source_fence)&&
+    task.source_id==='lark.im'&&hash(task.account_key)&&hash(task.work_key)&&
+    currentIdentity.source_id==='lark.im'&&hash(currentIdentity.account_key)&&hash(currentIdentity.work_key)) {
+    applicability=task.account_key!==currentIdentity.account_key||task.work_key!==currentIdentity.work_key||binding!==currentIdentity.binding_key
+      ?'different_binding':fence===currentIdentity.source_fence?'exact_source':'same_binding';
+  }
+  return {...normalizeResourceFailure({stage:task.failure_stage,reason:task.failure_reason}),
+    association:{binding_key:binding,source_fence:fence},applicability};
+}
+
 /** Cheap, bounded, read-only scheduling hint, not authority or guaranteed work.
  * No migration, permission repair, cache read, API or claim occurs here.
  * @param {string} db @param {Row} [deps] */
@@ -141,8 +161,6 @@ export function executeResourceWork(options,deps={}) {
           ON CONFLICT(source_id,account_key,work_key) DO UPDATE SET record_id=excluded.record_id,binding_key=excluded.binding_key,source_fence=excluded.source_fence,
           state=CASE WHEN ${denied} THEN 'blocked' WHEN ${bindingChanged} THEN 'pending' WHEN ${reopened} THEN CASE WHEN ${exhausted} THEN 'exhausted' ELSE 'pending' END ELSE ${TABLE}.state END,
           reason=CASE WHEN ${denied} THEN ${TABLE}.reason WHEN ${bindingChanged} THEN NULL WHEN ${reopened} THEN CASE WHEN ${exhausted} THEN 'retry_exhausted' ELSE NULL END ELSE ${TABLE}.reason END,
-          failure_stage=CASE WHEN NOT(${denied}) THEN NULL ELSE ${TABLE}.failure_stage END,
-          failure_reason=CASE WHEN NOT(${denied}) THEN NULL ELSE ${TABLE}.failure_reason END,
           attempts=CASE WHEN ${bindingChanged} AND NOT(${denied}) THEN 0 ELSE ${TABLE}.attempts END,
           failures=CASE WHEN ${bindingChanged} AND NOT(${denied}) THEN 0 ELSE ${TABLE}.failures END,
           deferrals=CASE WHEN ${bindingChanged} AND NOT(${denied}) THEN 0 ELSE ${TABLE}.deferrals END,
@@ -178,16 +196,16 @@ export function executeResourceWork(options,deps={}) {
       // keep selecting the fresh lane, and a failed CAS advances neither.
       local(()=>write(`INSERT INTO __resource_fence SELECT CASE WHEN ${observedSourceSql(row,task.record_id)} AND EXISTS(SELECT 1 FROM ${TABLE} WHERE ${keyWhere(task)} AND generation=${task.generation} AND state=${q(task.state)})
         AND EXISTS(SELECT 1 FROM ${SCAN} WHERE source_id='lark.im' AND generation=${scan.generation}) THEN 1 ELSE 0 END;
-        UPDATE ${TABLE} SET state='blocked',reason='source_changed',failure_stage='source_fence',failure_reason='source_changed',generation=generation+1,retry_at_ms=0
+        UPDATE ${TABLE} SET state='blocked',reason='source_changed',generation=generation+1,retry_at_ms=0
         WHERE ${keyWhere(task)} AND generation=${task.generation} AND state=${q(task.state)};
         UPDATE ${SCAN} SET priority_streak=${lane==='fair'?0:Math.min(2,scan.priority_streak+1)},generation=generation+1 WHERE source_id='lark.im';`));
-      report.ok=false;report.outcome='source_changed';report.deferred=1;report.failure={stage:'source_fence',reason:'source_changed',persisted:true};return finish();
+      report.ok=false;report.outcome='source_changed';report.deferred=1;report.failure={stage:'source_fence',reason:'source_changed',persisted:false};return finish();
     }
     const token=randomUUID();
     if(Math.floor((maxSeconds*1000-elapsed())/1000)<3)stop('time_budget');
     local(()=>write(`INSERT INTO __resource_fence SELECT CASE WHEN ${sourceSql(row)} AND EXISTS(SELECT 1 FROM ${TABLE} WHERE ${keyWhere(task)} AND generation=${task.generation} AND state=${q(task.state)})
       AND EXISTS(SELECT 1 FROM ${SCAN} WHERE source_id='lark.im' AND generation=${scan.generation}) THEN 1 ELSE 0 END;
-      UPDATE ${TABLE} SET state='running',attempt_token=${q(token)},failure_stage=NULL,failure_reason=NULL,claim_owner=${q(DEFAULT_SYNC_LOCK_OWNER)},claim_until_ms=${wall+CLAIM_MS},last_attempt_at_ms=${wall},attempts=attempts+1,generation=generation+1 WHERE ${keyWhere(task)};
+      UPDATE ${TABLE} SET state='running',attempt_token=${q(token)},failure_stage=NULL,failure_reason=NULL,failure_binding_key=NULL,failure_source_fence=NULL,claim_owner=${q(DEFAULT_SYNC_LOCK_OWNER)},claim_until_ms=${wall+CLAIM_MS},last_attempt_at_ms=${wall},attempts=attempts+1,generation=generation+1 WHERE ${keyWhere(task)};
       UPDATE ${SCAN} SET priority_streak=${lane==='fair'?0:Math.min(2,scan.priority_streak+1)},generation=generation+1 WHERE source_id='lark.im';`));
     claimed={...task,attempts:task.attempts+1,generation:task.generation+1,attempt_token:token,row};
     ready();
@@ -248,11 +266,11 @@ export function executeResourceWork(options,deps={}) {
     const current=snapshot([task.record_id])[0];
     if(!current||makeMediaPendingSourceFence(current)!==identity.source_fence){
       local(()=>write(`INSERT INTO __resource_fence SELECT CASE WHEN ${observedSourceSql(current,task.record_id)} AND EXISTS(SELECT 1 FROM ${TABLE} WHERE ${keyWhere(task)} AND generation=${task.generation+1} AND attempt_token=${q(token)} AND state='running') THEN 1 ELSE 0 END;
-        UPDATE ${TABLE} SET state='blocked',reason='source_changed',failure_stage='source_fence',failure_reason='source_changed',attempt_token=NULL,claim_owner=NULL,claim_until_ms=0,generation=generation+1
+        UPDATE ${TABLE} SET state='blocked',reason='source_changed',failure_stage='source_fence',failure_reason='source_changed',failure_binding_key=${q(identity.binding_key)},failure_source_fence=${q(identity.source_fence)},attempt_token=NULL,claim_owner=NULL,claim_until_ms=0,generation=generation+1
         WHERE ${keyWhere(task)} AND generation=${task.generation+1} AND attempt_token=${q(token)} AND state='running';`));
       report.ok=false;report.outcome='source_changed';report.deferred=1;report.failure={stage:'source_fence',reason:'source_changed',persisted:true};return finish();}
     local(()=>write(`INSERT INTO __resource_fence SELECT CASE WHEN ${sourceSql(row)} AND EXISTS(SELECT 1 FROM ${TABLE} WHERE ${keyWhere(task)} AND generation=${task.generation+1} AND attempt_token=${q(token)} AND state='running') THEN 1 ELSE 0 END;
-      UPDATE ${TABLE} SET state=${q(state)},reason=${q(reason)},failure_stage=${q(diagnostic?.stage??null)},failure_reason=${q(diagnostic?.reason??null)},failures=${failures},deferrals=${deferrals},retry_at_ms=${state==='deferred'?now()+Math.min(3600000,60000*2**Math.min(5,failures+deferrals)):0},
+      UPDATE ${TABLE} SET state=${q(state)},reason=${q(reason)},failure_stage=${q(diagnostic?.stage??null)},failure_reason=${q(diagnostic?.reason??null)},failure_binding_key=${q(diagnostic?identity.binding_key:null)},failure_source_fence=${q(diagnostic?identity.source_fence:null)},failures=${failures},deferrals=${deferrals},retry_at_ms=${state==='deferred'?now()+Math.min(3600000,60000*2**Math.min(5,failures+deferrals)):0},
       attempt_token=NULL,claim_owner=NULL,claim_until_ms=0,generation=generation+1 WHERE ${keyWhere(task)};`));
     if(diagnostic)report.failure={...diagnostic,persisted:true};
     if(state==='available'){report.outcome='processed';report.processed=1;report.available=1;}
