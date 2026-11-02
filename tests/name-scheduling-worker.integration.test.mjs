@@ -67,20 +67,34 @@ function publishFresh(dir) {
   journal(dir, { type: 'source_publication', sourceAtMs: atMs, availableAtMs: atMs, labels: fresh.map(x => x.label) });
 }
 function actualMessages(dir, context) {
+  const entryAtMs=epoch(dir), entryMono=performance.now(), phase={};
   const db = join(dir, 'synthetic.sqlite'), snapshot = readMessageSnapshot(db, { direction: 'all', limit: 100, search: '' });
-  const before = snapshot.rows, storedBefore = sqliteQuery(db, 'SELECT * FROM records ORDER BY id;');
+  phase.snapshotMs=performance.now()-entryMono;
+  const auditStart=performance.now(), before = snapshot.rows, storedBefore = sqliteQuery(db, 'SELECT * FROM records ORDER BY id;');
+  phase.sourceAuditBeforeMs=performance.now()-auditStart;
   const started = performance.now();
+  phase.preflightMs=started-entryMono;
   const invoke = format => {
+    const invokedAtMs=epoch(dir), invokedMono=performance.now();
     const response = spawnSync(process.execPath, ['--import', join(dir, 'deny-network.mjs'), join(ROOT, 'bin/exocortex.mjs'),
       'messages', '--db', db, '--limit', '100', '--format', format], {
       cwd: dir, encoding: 'utf8', timeout: 15_000, maxBuffer: 3 * 1024 * 1024,
       env: { ...process.env, LARK_CLI: join(dir, 'reject-lark'), NO_COLOR: '1' },
     });
+    const returnedAtMs=epoch(dir);
+    phase[format+'Ms']=performance.now()-invokedMono;
+    phase[format+'StartedAtMs']=invokedAtMs;
+    phase[format+'CompletedAtMs']=returnedAtMs;
+    phase[format+'Bytes']=Buffer.byteLength(response.stdout||'');
     assert.equal(response.status, 0, response.stderr || response.stdout);
     assert.equal(response.stderr, '');
     return { value: response.stdout, atMs: epoch(dir) };
   };
-  const json = invoke('json'), rows = JSON.parse(json.value), text = invoke('text');
+  const json = invoke('json'), parseStarted=performance.now(), rows = JSON.parse(json.value);
+  phase.jsonParseMs=performance.now()-parseStarted;
+  const text = invoke('text');
+  phase.entryToCliCompleteMs=performance.now()-entryMono;
+  journal(dir,{type:'messages_timing',context,entryAtMs,phase});
   assert.deepEqual(rows.map(x => x.external_id), before.map(x => x.external_id), 'latest N never drops unresolved rows');
   const textIds = [...text.value.matchAll(/om_(?:o\d{4}|donr0|hot00|cold0)\b/g)];
   assert.deepEqual(textIds.map(match => match[0]), before.map(x => x.external_id), 'text preserves the same latest N order');
@@ -169,7 +183,7 @@ function actualMessages(dir, context) {
   });
   assert.deepEqual(sqliteQuery(db, 'SELECT * FROM records ORDER BY id;'), storedBefore, 'actual JSON/text observation is read-only');
   journal(dir, { type: 'messages_observation', context, count: rows.length, observations,
-    populationObservations, completeness, elapsedMs: performance.now() - started });
+    populationObservations, completeness, elapsedMs: performance.now() - started, phase });
   return observations;
 }
 
@@ -319,9 +333,14 @@ if (process.argv[2] === '--synthetic-remote') {
     const worker = spawnSync(process.execPath, [HERE, '--synthetic-worker'], { cwd: dir, encoding: 'utf8',
       timeout: 120_000, maxBuffer: 3 * 1024 * 1024,
       env: { ...process.env, SYNTHETIC_WORKER_ROOT: dir, LARK_CLI: join(dir, 'fake-lark'), NO_COLOR: '1' } });
+    const log = events(dir);
+    // Emit bounded, authored stage evidence before any worker/latency assertion
+    // or fixture cleanup can hide it. None of these audit costs is subtracted.
+    t.diagnostic(JSON.stringify({profile:'synthetic_worker_observer_stages',
+      timings:log.filter(x=>x.type==='messages_timing'),
+      commits:log.filter(x=>x.type==='content_commit').map(x=>({atMs:x.atMs,rows:x.messageIds.length,elapsedMs:x.elapsedMs}))}));
     assert.equal(worker.status, 0, worker.stderr || worker.stdout);
     assert.equal(worker.stderr, '');
-    const log = events(dir);
     assert.deepEqual(log.filter(x => x.type === 'api' && x.route === 'unexpected'), []);
     assert.equal(JSON.parse(worker.stdout).ok, true, JSON.stringify(log.filter(x => x.type === 'history_commit_error' || x.type === 'worker_cycle' && !x.ok)));
     const cycles = log.filter(x => x.type === 'worker_cycle');
@@ -348,7 +367,7 @@ if (process.argv[2] === '--synthetic-remote') {
     const outcomes = [];
     for (const expected of manifest.fresh) {
       const seen = log.filter(x => x.type === 'messages_observation').flatMap(x => x.observations
-        .filter(o => o.label === expected.label).map(o => ({ ...o, sampleAtMs: x.atMs, readElapsedMs: x.elapsedMs })));
+        .filter(o => o.label === expected.label).map(o => ({ ...o, sampleAtMs: x.atMs, readElapsedMs: x.elapsedMs, readPhase: x.phase })));
       const first = seen.find(x => x.present); assert(first, `${expected.label} must be observed`);
       assert.equal(first.readinessState, 'ready');
       assert(first.fullJson && first.fullText, `${expected.label} must be accurate on the first visible read: ${JSON.stringify(first)}`);
@@ -360,8 +379,17 @@ if (process.argv[2] === '--synthetic-remote') {
       assert(fullAtMs >= committed.atMs && committed.atMs >= prepared.atMs && prepared.atMs >= discovered.atMs);
       const absent = seen.slice(0, seen.indexOf(first)).findLast(x => !x.present);
       assert(absent && absent.sampleAtMs <= committed.atMs, 'bound first visibility by the preceding absent CLI read');
-      assert(fullAtMs - expected.sourceAtMs <= 120_000, 'proposed synthetic end-to-end upper bound');
-      assert(fullAtMs - committed.atMs <= 2000, 'first actual JSON and text read follows commit within proposed two seconds');
+      const measured = { label: expected.label, sourceAtMs: expected.sourceAtMs,
+        availableAtMs: expected.availableAtMs, discoveredAtMs: discovered.atMs,
+        preparedAtMs: prepared.atMs, committedAtMs: committed.atMs,
+        firstJsonAtMs: first.jsonAtMs, firstTextAtMs: first.textAtMs,
+        readMs: fullAtMs - committed.atMs, endToEndMs: fullAtMs - expected.sourceAtMs,
+        precedingAbsentObservedAtMs: absent.sampleAtMs, readPhase: first.readPhase };
+      t.diagnostic(JSON.stringify({profile:'synthetic_worker_first_visible',...measured}));
+      assert(fullAtMs - expected.sourceAtMs <= 120_000,
+        `proposed synthetic end-to-end upper bound: actual=${measured.endToEndMs}ms limit=120000ms; ${JSON.stringify(measured)}`);
+      assert(fullAtMs - committed.atMs <= 2000,
+        `first actual JSON and text read follows commit within proposed two seconds: actual=${measured.readMs}ms limit=2000ms; ${JSON.stringify(measured)}`);
       outcomes.push({ label: expected.label, upstreamMs: expected.availableAtMs - expected.sourceAtMs,
         collectionMs: discovered.atMs - expected.availableAtMs, preparationMs: prepared.atMs - discovered.atMs,
         commitMs: committed.atMs - prepared.atMs, readMs: fullAtMs - committed.atMs,

@@ -4,6 +4,8 @@ import { mkdtempSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { performance } from 'node:perf_hooks';
+import { spawnSync } from 'node:child_process';
+import { runGuardedWorkerStep, WORKER_STEP_GUARDIAN } from '../src/runtime/worker/step-process.mjs';
 import { createMaintenanceRequestSession } from '../src/maintenance/request-session.mjs';
 import { runWorker, runStep, runCycle, compactResourceSummary } from '../src/runtime/worker/worker.mjs';
 import { runCycleWithRunner } from '../dist/runtime/worker/lark-im-worker-core.js';
@@ -224,22 +226,85 @@ test('sampler-only eligibility preserves its existing 55-second allowance', () =
   assert.equal(f.calls[0].sampleBudget, 55_000);
 });
 
-test('the existing real guardian encloses a slow resource local tail', t => {
+// Keep the production monotonic clock, work deadline and cleanup allowance.
+// A shell builtin reaches the invented local tail without an unrelated second
+// Node bootstrap. Production Node startup still spends the same work deadline;
+// this test does not promise any runtime can start within 300ms on a suspended host.
+function resourceTailFixture(t, { delayedAnchor = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'synthetic-resource-idle-guardian-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const marker = join(dir, 'entered-tail'), script = join(dir, 'child.mjs');
-  writeFileSync(script, `import {writeFileSync} from 'node:fs';
-    writeFileSync(${JSON.stringify(marker)},'synthetic');
-    process.stdout.write(JSON.stringify({ok:true,profile:'known_record_resources/v1'}));
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10000);`);
+  const marker = join(dir, 'entered-tail'), anchorMarker = join(dir, 'entered-anchor');
+  const script = join(dir, 'child.sh');
+  writeFileSync(script, `printf '%s' '{"ok":true,"profile":"known_record_resources/v1"}'\n` +
+    `printf '%s' 'synthetic' > "$2"\nexec /bin/sleep 10\n`);
+  const env = { PATH: process.env.PATH, LANG: 'C', LC_ALL: 'C',
+    PYTHONNOUSERSITE: '1', PYTHONDONTWRITEBYTECODE: '1' };
   const started = performance.now();
-  const step = runStep('resources', [], { scriptPath: script, timeoutMs: 300,
-    remainingTimeMs: () => 2300 - (performance.now() - started) });
-  const elapsed = performance.now() - started;
-  assert.equal(existsSync(marker), true, 'synthetic child entered its local tail');
+  let captured, workTimeout, outerTimeout;
+  const step = runStep('resources', [marker], { execPath: '/bin/sh', scriptPath: script, timeoutMs: 300,
+    remainingTimeMs: () => 2300 - (performance.now() - started),
+    runProcess: (command, args, options) => {
+      workTimeout = options.timeout;
+      captured = runGuardedWorkerStep(command, args, { ...options, env }, {
+        spawnSync: (binary, argv, settings) => {
+          assert.equal(argv[1], WORKER_STEP_GUARDIAN);
+          outerTimeout = settings.timeout;
+          let source = argv[1];
+          if (delayedAnchor) {
+            // Only the invented anchor's startup is delayed. The guardian's
+            // original deadline, READY/GO checks and cleanup code are unchanged.
+            const declaration = source.split('\n').find(line => line.startsWith('ANCHOR_CODE='));
+            assert(declaration);
+            const prelude = `import os,time\nwith open(${JSON.stringify(anchorMarker)},'x') as f: f.write('synthetic')\ntime.sleep(1.0)\n`;
+            source = source.replace(declaration, `${declaration}\nANCHOR_CODE=${JSON.stringify(prelude)}+ANCHOR_CODE`);
+          }
+          return spawnSync(binary, [argv[0], source, ...argv.slice(2)], settings);
+        },
+      });
+      return captured;
+    },
+  });
+  return { step, captured, marker, anchorMarker, elapsed: performance.now() - started, workTimeout, outerTimeout };
+}
+
+function assertResourceGuardianDeadline(f) {
+  assert(f.workTimeout > 0 && f.workTimeout <= 300, 'original 300ms work grant is never enlarged');
+  assert.equal(f.outerTimeout, f.workTimeout + 2000, 'original cleanup reserve is retained');
+  assert(f.outerTimeout <= 2300, 'whole synchronous backstop stays inside the original allowance');
+  assert.equal(f.step.ok, false);
+  assert.equal(f.step.exit_code, undefined);
+  assert(['deadline', 'anchor_deadline'].includes(f.step.guardian_diagnostic?.primary?.stage),
+    `require an actual deadline result, got ${JSON.stringify(f.step.guardian_diagnostic)}`);
+  assert.equal(f.step.guardian_diagnostic.cleanup, null, 'owned-group kill/reap and descriptor cleanup succeeded');
+  assert(f.elapsed < 3000, 'bounded guardian exited well before the ten-second synthetic tail');
+}
+
+test('resource admission exhausted before spawn starts no guardian or child', () => {
+  let elapsed = 301, invoked = 0;
+  const step = runStep('resources', [], { timeoutMs: 300, remainingTimeMs: () => 2300 - elapsed,
+    runProcess: () => { invoked++; throw Error('must not start a child after admission expired'); } });
+  assert.equal(invoked, 0);
   assert.equal(step.ok, false);
-  assert(step.guardian_diagnostic, 'a success JSON cannot bypass the guardian deadline');
-  assert(elapsed < 3000, 'bounded guardian exited well before the ten-second synthetic tail');
+  assert.equal(step.exit_code, undefined);
+  assert.equal(step.summary, null);
+  assert.equal(step.stderr, 'worker step idle deadline elapsed');
+  assert.equal(step.guardian_diagnostic, undefined, 'no guardian was started');
+});
+
+test('the real guardian expires during anchor startup before the resource child enters its tail', t => {
+  const f = resourceTailFixture(t, { delayedAnchor: true });
+  assert.equal(existsSync(f.anchorMarker), true, 'the controlled slow anchor actually started');
+  assert.equal(existsSync(f.marker), false, 'startup time consumed the grant before worker launch');
+  assert.equal(f.captured.stdout, '');
+  assertResourceGuardianDeadline(f);
+});
+
+test('the existing real guardian encloses a slow resource local tail', t => {
+  const f = resourceTailFixture(t);
+  assert.equal(existsSync(f.marker), true, 'synthetic child entered its local tail');
+  assert.deepEqual(JSON.parse(f.captured.stdout), { ok: true, profile: 'known_record_resources/v1' },
+    'the child really emitted success JSON before the deadline');
+  assertResourceGuardianDeadline(f); // success JSON cannot bypass the guardian deadline
 });
 
 
