@@ -65,3 +65,39 @@ run into an all-green result. Production writer inspection was separately denied
 before execution and is not retried or replaced by an indirect process query.
 A new candidate requires its own release approval and complete CI. Neither
 production SLO nor fixed production resource/name gaps are closed by this work.
+
+## Follow-up after exact779 CI
+
+The exact779 run41399995316 completed6502 tests:6501passed,1failed,zero
+skips/cancellations. Its sole failure was the slow-tail entry marker, before the
+fixture reported captured output or guardian diagnostics. The502ms case duration
+does not identify the failed stage or prove the internal300ms grant was exceeded.
+The four previously protected local process cases passed in this same CI run;
+that does not turn the failed run into a release gate pass. Production was not
+stopped or migrated. Original logs remain private release evidence.
+
+Verification design: execute the entire resource-worker-idle.test.mjs file once
+in its own concurrency1 phase before the remaining concurrency4 files, within
+one complete verify invocation. The disjoint union must equal the discovered
+complete test set. Either phase failure stops verification with a nonzero exit;
+there is no retry, skip or name-pattern filtering. npm test retains its existing
+general parallel entry; the release gate uses verify. This removes concurrent
+files created by this verification suite, not arbitrary host contention, and is
+not proof of the historical CI cause.
+
+Before its first assertion, each real guardian fixture emits only finite synthetic
+phase facts: grant, outer timeout, elapsed interval, marker presence, captured
+byte lengths, expected-JSON match, process status/signal/error and sanitized
+guardian diagnostics. No clock, deadline,300/2300/3000ms threshold, cleanup rule,
+marker or JSON prerequisite changes. A missing tail marker remains failure; a
+new candidate requires complete verification and separate publication approval.
+
+Implemented bounded validation: the two affected files passed36/36 in one
+serial invocation after a new nested-test control was corrected to remove the
+parent Node test-runner context from its child environment. Its initial35/36
+failure remains recorded; the corrected control requires no launch error or
+signal,exit1 and the authored failure text, rather than accepting any failure.
+Both real guardian cases retained299ms granted work and2299ms outer backstop in
+this sample. The tail marker and exact JSON were observed before a deadline with
+successful cleanup. This local sample does not explain the CI marker failure.
+The complete fixed-revision verification and independent review remain required.

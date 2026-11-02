@@ -19,11 +19,16 @@ export function verify(projectRoot, { generatedOnly = false, spawn = spawnSync,
   if (!tests.length) throw new Error("No tests matched tests/*.test.mjs");
   const generatedStatus = generatedCheck(projectRoot);
   if (generatedStatus !== 0) return generatedStatus;
+  // One timing-sensitive real-process file runs without competing suite files.
+  // Both phases belong to this invocation; failures never trigger a retry.
+  const serial = tests.filter((file) => file === "tests/resource-worker-idle.test.mjs");
+  const parallel = tests.filter((file) => !serial.includes(file));
   const steps = [
     [compiler, "-p", "tsconfig.build.json"],
     [compiler, "-p", "tsconfig.json"],
     ["tools/check-syntax.mjs"],
-    ["--test", "--test-concurrency=4", ...tests],
+    ...(serial.length ? [["--test", "--test-concurrency=1", ...serial]] : []),
+    ...(parallel.length ? [["--test", "--test-concurrency=4", ...parallel]] : []),
   ];
   for (const args of steps) {
     const result = spawn(process.execPath, args, { cwd: projectRoot, stdio: "inherit" });

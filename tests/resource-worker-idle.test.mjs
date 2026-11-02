@@ -240,7 +240,7 @@ function resourceTailFixture(t, { delayedAnchor = false } = {}) {
   const env = { PATH: process.env.PATH, LANG: 'C', LC_ALL: 'C',
     PYTHONNOUSERSITE: '1', PYTHONDONTWRITEBYTECODE: '1' };
   const started = performance.now();
-  let captured, workTimeout, outerTimeout;
+  let captured, workTimeout, outerTimeout, guardianProcess;
   const step = runStep('resources', [marker], { execPath: '/bin/sh', scriptPath: script, timeoutMs: 300,
     remainingTimeMs: () => 2300 - (performance.now() - started),
     runProcess: (command, args, options) => {
@@ -258,13 +258,29 @@ function resourceTailFixture(t, { delayedAnchor = false } = {}) {
             const prelude = `import os,time\nwith open(${JSON.stringify(anchorMarker)},'x') as f: f.write('synthetic')\ntime.sleep(1.0)\n`;
             source = source.replace(declaration, `${declaration}\nANCHOR_CODE=${JSON.stringify(prelude)}+ANCHOR_CODE`);
           }
-          return spawnSync(binary, [argv[0], source, ...argv.slice(2)], settings);
+          const result = spawnSync(binary, [argv[0], source, ...argv.slice(2)], settings);
+          guardianProcess = { status: result.status ?? null, signal: result.signal ?? null,
+            error_code: result.error?.code ?? null, stdout_bytes: Buffer.byteLength(result.stdout || ''),
+            stderr_bytes: Buffer.byteLength(result.stderr || '') };
+          return result;
         },
       });
       return captured;
     },
   });
-  return { step, captured, marker, anchorMarker, elapsed: performance.now() - started, workTimeout, outerTimeout };
+  return { step, captured, marker, anchorMarker, elapsed: performance.now() - started, workTimeout, outerTimeout, guardianProcess };
+}
+
+function observeResourceGuardian(t, f) {
+  let expectedJson = false;
+  try { expectedJson = JSON.stringify(JSON.parse(f.captured?.stdout || '')) ===
+    JSON.stringify({ ok: true, profile: 'known_record_resources/v1' }); } catch { /* report, never accept */ }
+  t.diagnostic(JSON.stringify({ observation: 'synthetic_resource_guardian_phase/v1',
+    work_timeout_ms: f.workTimeout ?? null, outer_timeout_ms: f.outerTimeout ?? null,
+    elapsed_ms: f.elapsed, anchor_marker: existsSync(f.anchorMarker), tail_marker: existsSync(f.marker),
+    stdout_bytes: Buffer.byteLength(f.captured?.stdout || ''), stderr_bytes: Buffer.byteLength(f.captured?.stderr || ''),
+    expected_json: expectedJson, guardian_process: f.guardianProcess ?? null,
+    wrapper_status: f.captured?.status ?? null, wrapper_signal: f.captured?.signal ?? null, guardian_diagnostic: f.step.guardian_diagnostic ?? null }));
 }
 
 function assertResourceGuardianDeadline(f) {
@@ -293,6 +309,7 @@ test('resource admission exhausted before spawn starts no guardian or child', ()
 
 test('the real guardian expires during anchor startup before the resource child enters its tail', t => {
   const f = resourceTailFixture(t, { delayedAnchor: true });
+  observeResourceGuardian(t, f);
   assert.equal(existsSync(f.anchorMarker), true, 'the controlled slow anchor actually started');
   assert.equal(existsSync(f.marker), false, 'startup time consumed the grant before worker launch');
   assert.equal(f.captured.stdout, '');
@@ -301,6 +318,7 @@ test('the real guardian expires during anchor startup before the resource child 
 
 test('the existing real guardian encloses a slow resource local tail', t => {
   const f = resourceTailFixture(t);
+  observeResourceGuardian(t, f);
   assert.equal(existsSync(f.marker), true, 'synthetic child entered its local tail');
   assert.deepEqual(JSON.parse(f.captured.stdout), { ok: true, profile: 'known_record_resources/v1' },
     'the child really emitted success JSON before the deadline');

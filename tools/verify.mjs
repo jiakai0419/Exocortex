@@ -5,7 +5,7 @@ import { verify } from "../src/development/verify.mjs";
 
 const args = process.argv.slice(2);
 if (args.length === 1 && ["--help", "-h"].includes(args[0])) {
-  process.stdout.write("Usage: node tools/verify.mjs [--generated-only]\nFull verification checks current generated files before building, typechecking, checking syntax and running all tests (concurrency 4).\n");
+  process.stdout.write("Usage: node tools/verify.mjs [--generated-only]\nFull verification checks current generated files before building, typechecking, checking syntax and running all tests (the resource idle guardian file separately at concurrency 1, then the remainder at concurrency 4).\n");
 } else if (args.length > 1 || (args.length === 1 && args[0] !== "--generated-only")) {
   process.stderr.write("Usage: node tools/verify.mjs [--generated-only]\n");
   process.exitCode = 1;
