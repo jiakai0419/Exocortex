@@ -151,3 +151,46 @@ test('trusted business result stays distinct from a later local result-clock fai
   assert.equal(value.kind,'permission_denied'); assert.equal(value.transport.remote_result,true);
   assert.equal(value.transport.result_code,210508); assert.equal(value.transport.local_reason,'clock_unavailable');
 });
+
+// Constructor registration proves a pure local stop only while the error has
+// no arbitrary attached chain. Merely tagging an operation cannot make a later
+// unknown cause/errors collection safe. Check presence without invoking getters.
+for(const field of ['cause','errors']) for(const placement of ['own','inherited'])
+for(const timing of ['before_operation','after_operation'])
+for(const variant of ['error','null','undefined','empty_array','accessor'])
+  test(`constructor-only stop becomes unknown: ${field}/${placement}/${timing}/${variant}`,()=>{
+    const error=new MaintenanceRequestError('time_budget');
+    if(timing==='after_operation') {
+      assert.equal(caught(()=>historyOperation('storage_commit',()=>{throw error;})),error);
+      assert.equal(historyFailureDiagnostic(error,'single_target','failure').kind,'time_budget');
+    }
+    let getterReads=0;
+    const host=placement==='own'?error:Object.create(Object.getPrototypeOf(error));
+    const descriptor=variant==='accessor'?{configurable:true,get(){getterReads++;throw Error(PRIVATE);}}
+      :{configurable:true,value:variant==='error'?new Error(PRIVATE):variant==='null'?null:variant==='empty_array'?[]:undefined};
+    Object.defineProperty(host,field,descriptor);
+    if(placement==='inherited')Object.setPrototypeOf(error,host);
+    assert.equal(caught(()=>historyOperation('storage_commit',()=>{throw error;})),error);
+    const expected={version:1,stage:'single_target',kind:'unknown',operation:'storage_commit'};
+    assert.deepEqual(historyFailureDiagnostic(error,'single_target','failure'),expected);
+    const wrapper=preserveHistoryFailure(new AggregateError([error],PRIVATE,{cause:error}),error);
+    assert.deepEqual(historyFailureDiagnostic(wrapper,'single_target','failure'),expected);
+    assert.equal(getterReads,0);
+    delete host[field];
+    assert.deepEqual(historyFailureDiagnostic(error,'single_target','failure'),expected,
+      'removing an already observed unknown chain cannot restore pure-stop evidence');
+    assert.doesNotMatch(JSON.stringify(expected),new RegExp(PRIVATE));
+  });
+
+test('explicit registered wrapper retains its trusted category without parsing its own arbitrary chain',()=>{
+  const read=caught(()=>historyOperation('candidate_pool',()=>{throw new SqliteReadError('read_timeout',PRIVATE);}));
+  const wrapper=preserveHistoryFailure(new AggregateError([new Error(PRIVATE)],PRIVATE,{cause:new Error(PRIVATE)}),read);
+  let getterReads=0;
+  Object.defineProperty(wrapper,'errors',{get(){getterReads++;throw Error(PRIVATE);}});
+  Object.defineProperty(wrapper,'cause',{get(){getterReads++;throw Error(PRIVATE);}});
+  assert.deepEqual(historyFailureDiagnostic(wrapper,'batch_prepare','failure'),
+    {version:1,stage:'batch_prepare',kind:'read_timeout',operation:'candidate_pool'});
+  assert.equal(getterReads,0);
+  const unknownWrapper=new AggregateError([read],PRIVATE,{cause:read});
+  assert.equal(historyFailureDiagnostic(unknownWrapper,'batch_prepare','failure').kind,'unknown');
+});

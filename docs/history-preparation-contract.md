@@ -106,3 +106,14 @@ different categories and the same six-row committed prefix. Neither is evidence
 of the underlying cause of an earlier uninstrumented production failure. A
 separate exception thrown by existing finally cleanup can still replace an
 original error; this patch does not change that unrelated exception policy.
+
+
+## Conservative local-admission evidence
+
+A constructor-registered local stop remains a pure admission diagnostic only
+while the actual error has no cause or errors member, including inherited or
+accessor members. Adding either member makes the cause unknown without reading
+its value. Recheck this condition when observing or preserving the error; an
+earlier operation observation must not freeze a now-ambiguous category. Owned
+wrapper registration still preserves genuine failure evidence. CLI result,
+unknown-commit handling, time endpoints, and all budgets are unchanged.

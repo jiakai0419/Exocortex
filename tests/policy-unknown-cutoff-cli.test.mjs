@@ -140,7 +140,7 @@ for(const [name,makeError,canDefer] of failureCases)test(`actual CLI separates d
   assert.equal(report.request_budget.stop_reason,'time_budget');
   if(canDefer){assert.equal(report.failure_diagnostic,undefined);assert.equal(domainReport.cause,undefined);}
   else{
-    assert.deepEqual(report.failure_diagnostic,{version:1,stage:'single_target',kind:'unknown'});
+    assert.deepEqual(report.failure_diagnostic,{version:1,stage:'single_target',kind:'unknown',operation:'storage_commit'});
     assert.equal(domainReport.cause,failure);assert.equal(Object.getOwnPropertyDescriptor(domainReport,'cause').enumerable,false);
   }
   assert.doesNotMatch(stdout+stderr,new RegExp(PRIVATE_SENTINEL));

@@ -6,18 +6,39 @@ import { sanitizeHistoryDiagnostic, isHistoryFailureOperation } from '../../dist
 // These maps contain only evidence observed by our synchronous boundaries.
 // Never traverse a caller's .cause, .errors, message, name, code or payload.
 const failures = new WeakMap();
+const localAdmissions = new WeakSet();
 const LOCAL_KINDS = new Set(['cli_budget','self_budget','time_budget','clock_unavailable','sync_busy',
   'lease_unavailable','rate_cooldown','rate_limited','shared_cooldown_unavailable']);
 /** @param {unknown} value @returns {value is object} */
 const object = value => value !== null && typeof value === 'object';
-/** @param {unknown} error @param {Record<string,any>} evidence */
-function remember(error, evidence) {
-  if (object(error) && !failures.has(error)) failures.set(error, evidence);
+/** @param {unknown} error @param {Record<string,any>} evidence @param {boolean} [localAdmission] */
+function remember(error, evidence, localAdmission = false) {
+  if (object(error) && !failures.has(error)) {
+    failures.set(error, evidence);
+    if (localAdmission) localAdmissions.add(error);
+  }
+}
+
+/** Presence alone invalidates the constructor's pure-admission premise. Do not
+ * read values/getters or infer anything from an arbitrary nested error chain. */
+function hasUnknownErrorChain(error) {
+  try { return 'cause' in error || 'errors' in error; }
+  catch { return true; }
 }
 
 function failureEvidence(error) {
   const recorded = object(error) ? failures.get(error) : null;
-  if (recorded) return recorded;
+  if (recorded) {
+    if (localAdmissions.has(error) && hasUnknownErrorChain(error)) {
+      const unknown = {kind:'unknown', ...(recorded.operation ? {operation:recorded.operation} : {})};
+      // Once observed, deleting an unknown chain must not restore a previously
+      // optimistic constructor-only classification. Explicit wrapper evidence
+      // has separate provenance and is not subject to this constructor premise.
+      failures.set(error, unknown);
+      return unknown;
+    }
+    return recorded;
+  }
   if (error instanceof SqliteReadError) return {kind:error.reason};
   const known = readLarkExecutionFailure(error);
   if (!known) return {kind:'unknown'};
@@ -43,7 +64,7 @@ function failureEvidence(error) {
  * @param {string} kind
  * @returns {T} */
 export function registerHistoryLocalFailure(error, kind) {
-  if (LOCAL_KINDS.has(kind)) remember(error, {kind});
+  if (LOCAL_KINDS.has(kind)) remember(error, {kind}, true);
   return error;
 }
 
