@@ -16,6 +16,7 @@ import { readMessageSnapshot } from "./message-read-snapshot.mjs";
 import { readSavedSenderRouteEvidence } from "../adapters/lark-im/saved-sender-route-failures.mjs";
 import { evaluateMessageCompleteness } from "../adapters/lark-im/message-completeness.mjs";
 import { readLocalSenderProjectionEvidence } from "../adapters/lark-im/name-history.mjs";
+import { isHistoryCommandBudget } from "../maintenance/history-command-budget.mjs";
 
 // Ephemeral proof used only during this read. Never serialize it as canonical
 // authority or accept a caller-supplied source label in its place.
@@ -58,6 +59,7 @@ const projectionEvidence = new WeakMap();
  * @typedef {object} LoadMessageDeps
  * @property {(dbPath: string, sql: string, label: string, options?:{timeoutMs:number}) => Row[]=} sqliteJson
  * @property {(()=>{timeoutMs:number})=} sqliteReadOptions
+ * @property {ReturnType<typeof import('../maintenance/history-command-budget.mjs').createHistoryCommandBudget>=} executionBudget
  */
 
 /**
@@ -90,7 +92,11 @@ function buildWhere(opts) {
  * @returns {EnrichedMessage[]}
  */
 function loadMessages(dbPath, opts, deps = {}) {
+  const budget=deps.executionBudget;
+  if (budget!==undefined && !isHistoryCommandBudget(budget)) throw new TypeError('invalid message projection budget');
+  budget?.assertReady();
   const snapshot=readMessageSnapshot(dbPath,opts,deps), {rows}=snapshot;
+  budget?.assertReady();
   const scopeIds=new Map(rows.filter(row=>typeof row.container_id==='string' && row.container_id)
     .map(row=>[chatScopeId(row.container_id),row.container_id]));
   /** @type {Map<string, Row | null>} */
@@ -137,6 +143,7 @@ function loadMessages(dbPath, opts, deps = {}) {
     }
   }
   const messages=rows.map(({type_scope_id,type_scope_source_id,external_version,content_hash,...row})=>{
+    budget?.assertReady();
     // Source-version proof inputs stay internal; the established public fields
     // do not acquire a second serialized source payload or hashing contract.
     Object.defineProperties(row,{external_version:{value:external_version},content_hash:{value:content_hash}});
@@ -150,11 +157,14 @@ function loadMessages(dbPath, opts, deps = {}) {
     const task=senderTasks.get(JSON.stringify([owner.account_key,row.container_id,row.actor_id,identity.type]));
     const saved=owner.state==='verified' ? (task && readSenderProjectionEvidence(task,row,owner.account_key||'')
       || readLocalSenderProjectionEvidence(row,canonical,raw,owner.account_key||'',snapshot.senderDonors)) : null;
-    return enrichRow(row,chats.get(row.container_id),type_scope_source_id==='lark.im'
+    const message=enrichRow(row,chats.get(row.container_id),type_scope_source_id==='lark.im'
       && typeof row.container_id==='string' && type_scope_id===chatScopeId(row.container_id),
       account?recipients.get(`${recipientAccountKey(account)}:${row.container_id}`):undefined,
       nameAccount?titles.get(`${nameAccount}:${row.container_id}`):undefined,saved,true,
-      readSavedSenderRouteEvidence(row,canonical,raw,owner,snapshot.nameRoutes),{db:dbPath,resourceDir:opts.resourceDir});
+      readSavedSenderRouteEvidence(row,canonical,raw,owner,snapshot.nameRoutes),
+      {db:dbPath,resourceDir:opts.resourceDir,executionBudget:budget});
+    budget?.assertReady();
+    return message;
   });
   messageReadMetadata.set(messages,{population:snapshot.population,as_of:snapshot.as_of,
     observations:snapshot.observations,
@@ -162,6 +172,7 @@ function loadMessages(dbPath, opts, deps = {}) {
     source_records:snapshot.rows.map(row=>Object.fromEntries(['id','source_id','record_type','external_id',
       'external_version','content_hash','actor_id','container_id','direction','occurred_at','occurred_at_ms','raw_json']
       .map(key=>[key,row[key]])))});
+  budget?.assertReady();
   return messages;
 }
 
@@ -386,7 +397,7 @@ function conversationType(row, canonical, raw, config, currentChat, recipientCon
  * @param {{blockers:Row[]}} [routeEvidence]
  * @returns {EnrichedMessage}
  */
-function enrichRow(row, currentChat, scopeSourceMatches = true, recipientConfig, currentName, savedSender = null, includeReadiness = false, routeEvidence = undefined, /** @type {{db:string,resourceDir?:string}|undefined} */ resourceContext = undefined) {
+function enrichRow(row, currentChat, scopeSourceMatches = true, recipientConfig, currentName, savedSender = null, includeReadiness = false, routeEvidence = undefined, /** @type {{db:string,resourceDir?:string,executionBudget?:ReturnType<typeof import('../maintenance/history-command-budget.mjs').createHistoryCommandBudget>}|undefined} */ resourceContext = undefined) {
   const canonical = parseMaybeJson(row.canonical_json) || {};
   const raw = parseMaybeJson(row.raw_json) || {};
   const config = parseMaybeJson(row.scope_config_json) || {};
@@ -405,7 +416,8 @@ function enrichRow(row, currentChat, scopeSourceMatches = true, recipientConfig,
   const isGroupLike = !isP2p;
   const system = messageType === "system" ? displaySystem(row.body, canonical, raw, systemContext(row, canonical, raw, config)) : null;
   const sourceMedia = renderMediaProjection(row, canonical, raw);
-  const media = resourceContext ? projectMediaResource(resourceContext.db,resourceContext.resourceDir,row,canonical,raw,sourceMedia) : sourceMedia;
+  const media = resourceContext ? projectMediaResource(resourceContext.db,resourceContext.resourceDir,row,canonical,raw,sourceMedia,
+    {executionBudget:resourceContext.executionBudget}) : sourceMedia;
   /** @type {EnrichedMessage} */
   const result = {
     ...row,

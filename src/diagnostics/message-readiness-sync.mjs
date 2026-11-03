@@ -62,8 +62,10 @@ export function syncReadiness(db, self, deps = {}) {
             // must retain the ordinary framed wire, not the legacy JSON path.
             loadMessages: (selectedDb, options) => loadMessages(selectedDb, options, {
               sqliteReadOptions: () => ({ timeoutMs: budget.timeoutMs() }),
+              executionBudget: budget,
             }),
           });
+          budget.assertReady();
           return { messages, metadata: readMessagesMetadata(messages) };
         },
         commit: (updates, reason) => {

@@ -7,6 +7,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { inflateSync } from 'node:zlib';
 import { validateJsonObjectText } from '../../../dist/core/json-text-patch.js';
 import { validateJpegResource } from './jpeg-resource-validator.mjs';
+import { HistoryCommandBudgetError, isHistoryCommandBudget } from '../../maintenance/history-command-budget.mjs';
 
 /** @typedef {Record<string,any>} JsonObject */
 export const MAX_MEDIA_RESOURCE_BYTES = 16 * 1024 * 1024;
@@ -306,7 +307,12 @@ function webp(bytes) {
   return { mime_type:'image/webp',width,height };
 }
 
-export function assessMediaImageBytes(bytes) {
+/** @param {Buffer} bytes
+ * @param {{executionBudget?:ReturnType<typeof import('../../maintenance/history-command-budget.mjs').createHistoryCommandBudget>}} [deps] */
+export function assessMediaImageBytes(bytes,deps={}) {
+  const budget=deps.executionBudget;
+  if(budget!==undefined&&!isHistoryCommandBudget(budget))throw new TypeError('invalid media validation budget');
+  budget?.assertReady();
   try {
     if (!Buffer.isBuffer(bytes) || bytes.length < 12 || bytes.length > MAX_MEDIA_RESOURCE_BYTES) throw new Error('image_invalid');
     let image;
@@ -314,14 +320,19 @@ export function assessMediaImageBytes(bytes) {
     else if (['GIF87a','GIF89a'].includes(bytes.toString('latin1',0,6))) image=gif(bytes);
     else if (bytes[0] === 0xff && bytes[1] === 0xd8) {
       // The mature decoder owns JPEG structure, entropy, coverage and budgets.
-      return validateJpegResource(bytes);
+      return validateJpegResource(bytes,undefined,{executionBudget:budget});
     }
     else if (bytes.toString('latin1',0,4) === 'RIFF' && bytes.toString('latin1',8,12) === 'WEBP') {
       webp(bytes);throw Object.assign(new Error('format_unsupported'),{code:'MEDIA_FORMAT_UNSUPPORTED'});
     }
     else throw new Error('image_invalid');
+    budget?.assertReady();
     return {image:{mime_type:image.mime_type,width:image.width,height:image.height}};
-  } catch(error) {return {reason:errorCode(error)==='MEDIA_FORMAT_UNSUPPORTED'?'resource_format_unsupported':'resource_image_invalid'};}
+  } catch(error) {
+    if(budget&&error instanceof HistoryCommandBudgetError)throw error;
+    budget?.assertReady();
+    return {reason:errorCode(error)==='MEDIA_FORMAT_UNSUPPORTED'?'resource_format_unsupported':'resource_image_invalid'};
+  }
 }
 /** @param {Buffer} bytes */
 export function inspectMediaImageBytes(bytes) {return assessMediaImageBytes(bytes).image ?? null;}
@@ -358,28 +369,40 @@ function fileUnchanged(path,info) {
 
 /** Revalidate each read. Missing evidence cannot become an implicit download.
  * @param {string} cacheDir @param {JsonObject|null} binding
- * @param {{afterBlobRead?:()=>void}} [deps] */
+ * @param {{afterBlobRead?:()=>void,executionBudget?:ReturnType<typeof import('../../maintenance/history-command-budget.mjs').createHistoryCommandBudget>}} [deps] */
 export function readMediaResource(cacheDir,binding,deps={}) {
+  const budget=deps.executionBudget;
+  if(budget!==undefined&&!isHistoryCommandBudget(budget))throw new TypeError('invalid media read budget');
+  budget?.assertReady();
   try {
     const normalized=normalizedBinding(binding), digest=sha(JSON.stringify(normalized));
+    budget?.assertReady();
     const dir=directory(cacheDir,false), file=join(dir.root,`${digest}.json`);
     const manifestFile=readPrivateBytes(file,MAX_MANIFEST_BYTES,undefined);
+    budget?.assertReady();
     const json=manifestFile.bytes.toString('utf8');validateJsonObjectText(json);const manifest=JSON.parse(json);
     if(!exactKeys(manifest,manifestKeys)||manifest.schema!=='lark_media_resource/v1'
       ||JSON.stringify(manifest.binding)!==JSON.stringify(normalized)||manifest.binding_digest!==digest
       ||!hashValid(manifest.sha256)||!Number.isSafeInteger(manifest.size_bytes)||manifest.size_bytes<1||manifest.size_bytes>MAX_MEDIA_RESOURCE_BYTES
       ||typeof manifest.observed_at!=='string'||!Number.isFinite(Date.parse(manifest.observed_at))||Date.parse(manifest.observed_at)<0
       ||new Date(manifest.observed_at).toISOString()!==manifest.observed_at)throw new Error('invalid_manifest');
+    budget?.assertReady();
     const path=join(dir.root,`${manifest.sha256}.blob`), blobFile=readPrivateBytes(path,MAX_MEDIA_RESOURCE_BYTES,deps.afterBlobRead), asset=blobFile.bytes;
+    budget?.assertReady();
     if(asset.length!==manifest.size_bytes||sha(asset)!==manifest.sha256)throw new Error('asset_changed');
-    const inspected=assessMediaImageBytes(asset), image=inspected.image;
+    budget?.assertReady();
+    const inspected=assessMediaImageBytes(asset,{executionBudget:budget}), image=inspected.image;
+    budget?.assertReady();
     if(!image)return finite('invalid',inspected.reason);
     if(image.mime_type!==manifest.mime_type)throw new Error('invalid_image');
     fileUnchanged(file,manifestFile.info);fileUnchanged(path,blobFile.info);
     directoryUnchanged(dir);normalizedBinding(binding);
+    budget?.assertReady();
     return {status:'available',path,sha256:manifest.sha256,size_bytes:asset.length,mime_type:image.mime_type,
       binding_digest:digest,observed_at:manifest.observed_at};
   } catch(error) {
+    if(budget&&error instanceof HistoryCommandBudgetError)throw error;
+    budget?.assertReady();
     if(errorCode(error)==='ENOENT')return finite('missing','resource_not_cached');
     return finite('invalid','resource_verification_failed');
   }

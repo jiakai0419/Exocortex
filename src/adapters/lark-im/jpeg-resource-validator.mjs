@@ -5,6 +5,7 @@ import { accessSync, constants, closeSync, fstatSync, lstatSync, openSync, readS
 import { dirname, isAbsolute, join, parse } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validateJsonObjectText } from '../../../dist/core/json-text-patch.js';
+import { HistoryCommandBudgetError, isHistoryCommandBudget } from '../../maintenance/history-command-budget.mjs';
 
 const defaultHelper=fileURLToPath(new URL('../../../build/native/jpeg-validator',import.meta.url));
 const source=fileURLToPath(new URL('../../native/jpeg-validator.c',import.meta.url));
@@ -35,7 +36,7 @@ function closeDirectories(entries) {
 
 /** Hold a bounded canonical chain. Protection is inherited only from an
  * unbroken non-writable prefix; a deeper root-owned directory cannot reset it. */
-function captureDirectories(helper) {
+function captureDirectories(helper,checkpoint) {
   const parent=dirname(helper),root=parse(parent).root,paths=[root];
   for(const part of parent.slice(root.length).split('/').filter(Boolean)) {
     if(paths.length===64)throw new Error('decoder_path_depth');
@@ -44,6 +45,7 @@ function captureDirectories(helper) {
   const entries=[];let protectedEntry=true;
   try {
     for(const path of paths) {
+      checkpoint();
       const fd=openSync(path,constants.O_RDONLY|constants.O_DIRECTORY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
       const entry={path,fd,info:/** @type {import('node:fs').BigIntStats|undefined} */(undefined),protectedEntry};entries.push(entry);
       const info=fstatSync(fd,{bigint:true}),named=lstatSync(path,{bigint:true});
@@ -51,62 +53,93 @@ function captureDirectories(helper) {
         ||!sameDirectory(info,named)||!protectedEntry&&info.ctimeNs!==named.ctimeNs||realpathSync(path)!==path)throw new Error('changed_decoder_path');
       entry.info=info;
       protectedEntry=protectedEntry&&!mayReplaceChildren(path,info);
+      checkpoint();
     }
     return entries;
   } catch(error) {closeDirectories(entries);throw error;}
 }
 
-function directoriesUnchanged(entries) {
+function directoriesUnchanged(entries,checkpoint) {
   return entries.every(({path,fd,info,protectedEntry})=>{
+    checkpoint();
     const opened=fstatSync(fd,{bigint:true}),named=lstatSync(path,{bigint:true});
-    return opened.isDirectory()&&named.isDirectory()&&!named.isSymbolicLink()
+    const valid=opened.isDirectory()&&named.isDirectory()&&!named.isSymbolicLink()
       &&sameDirectory(info,opened)&&sameDirectory(info,named)&&realpathSync(path)===path
       &&(protectedEntry||(info.ctimeNs===opened.ctimeNs&&info.ctimeNs===named.ctimeNs));
+    checkpoint();return valid;
   });
 }
 
 /** Small stable code/receipt reads. No executable or path is supplied by media. */
-function readStable(path,maximum,executable=false) {
-  let fd;
+function readStable(path,maximum,executable,checkpoint) {
+  let fd,primary;
   try {
+    checkpoint();
     fd=openSync(path,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
     const before=fstatSync(fd,{bigint:true}),uid=BigInt(process.getuid?.()??-1);
     if(!before.isFile()||before.nlink!==1n||before.size<1n||before.size>BigInt(maximum)
       || ![0n,uid].includes(before.uid)||(before.mode&0o022n)!==0n
       || executable&&(before.mode&0o111n)===0n)throw new Error('unsafe_decoder');
+    checkpoint();
     const buffer=Buffer.alloc(Number(before.size)+1);let length=0;
-    while(length<buffer.length){const n=readSync(fd,buffer,length,buffer.length-length,length);if(!n)break;length+=n;}
+    while(length<buffer.length){checkpoint();const n=readSync(fd,buffer,length,buffer.length-length,length);checkpoint();if(!n)break;length+=n;}
     const after=fstatSync(fd,{bigint:true});
     if(length!==Number(before.size)||!same(before,after)||!unchanged(path,after))throw new Error('changed_decoder');
+    checkpoint();
     return {bytes:buffer.subarray(0,length),info:after};
-  } finally {if(fd!==undefined)closeSync(fd);}
+  } catch(error) {primary=error;throw error;}
+  finally {
+    if(fd!==undefined)try {closeSync(fd);}catch(error) {
+      if(!(primary instanceof HistoryCommandBudgetError))throw error;
+    }
+  }
 }
 
 /** A trusted static native helper supplies decoding authority; the JS layer
  * validates installation/protocol and keeps all source bytes off disk/stdout.
  * @param {Buffer} bytes @param {{width:number,height:number}} [expected]
- * @param {{env?:NodeJS.ProcessEnv,spawnSync?:typeof spawnSync}} [deps] */
+ * @param {{env?:NodeJS.ProcessEnv,spawnSync?:typeof spawnSync,
+ * executionBudget?:ReturnType<typeof import('../../maintenance/history-command-budget.mjs').createHistoryCommandBudget>}} [deps] */
 export function validateJpegResource(bytes,expected=undefined,deps={}) {
-  if(!Buffer.isBuffer(bytes)||bytes.length<4||bytes.length>16*1024*1024)return failure('resource_image_invalid');
-  if(expected&&(!Number.isSafeInteger(expected.width)||!Number.isSafeInteger(expected.height)||expected.width<1||expected.height<1
-    ||expected.width>65535||expected.height>65535
-    ||expected.width*expected.height*4>64*1024*1024))return failure('resource_validation_limit');
-  const env=deps.env||process.env,configured=env.EXOCORTEX_JPEG_VALIDATOR??defaultHelper;
+  const budget=deps.executionBudget;
+  if(budget!==undefined&&!isHistoryCommandBudget(budget))throw new TypeError('invalid internal JPEG execution budget');
+  let budgetAbort;
+  const checkpoint=()=>{
+    try {return budget?.timeoutMs(5000);}
+    catch(error) {
+      if(error instanceof HistoryCommandBudgetError) {budgetAbort??=error;throw budgetAbort;}
+      throw error;
+    }
+  };
   let helper,receipt,installed,receiptFile;let directories=[];
   try {
+    checkpoint();
+    if(!Buffer.isBuffer(bytes)||bytes.length<4||bytes.length>16*1024*1024)return failure('resource_image_invalid');
+    if(expected&&(!Number.isSafeInteger(expected.width)||!Number.isSafeInteger(expected.height)||expected.width<1||expected.height<1
+      ||expected.width>65535||expected.height>65535
+      ||expected.width*expected.height*4>64*1024*1024))return failure('resource_validation_limit');
+    const env=deps.env||process.env,configured=env.EXOCORTEX_JPEG_VALIDATOR??defaultHelper;
     if(!isAbsolute(configured)||configured.length>8192||/[\x00-\x1f\x7f]/.test(configured))throw new Error('invalid_decoder_path');
-    helper=realpathSync(configured);directories=captureDirectories(helper);installed=readStable(helper,32*1024*1024,true);
-    receiptFile=readStable(`${helper}.json`,8192);const receiptJson=receiptFile.bytes.toString('utf8');validateJsonObjectText(receiptJson);receipt=JSON.parse(receiptJson);
+    checkpoint();helper=realpathSync(configured);checkpoint();
+    directories=captureDirectories(helper,checkpoint);installed=readStable(helper,32*1024*1024,true,checkpoint);
+    checkpoint();receiptFile=readStable(`${helper}.json`,8192,false,checkpoint);
+    const receiptJson=receiptFile.bytes.toString('utf8');validateJsonObjectText(receiptJson);receipt=JSON.parse(receiptJson);checkpoint();
     const receiptKeys=['version','protocol','platform','arch','source_sha256','binary_sha256','decoder','decoder_version','archive_sha256','headers_sha256'];
     if(!object(receipt)||Object.keys(receipt).length!==receiptKeys.length||receiptKeys.some(key=>!Object.hasOwn(receipt,key))
       ||receipt.version!==1||receipt.protocol!=='exocortex_jpeg_validator/v1'||receipt.platform!==process.platform||receipt.arch!==process.arch
       ||receipt.decoder!=='libjpeg-turbo'||typeof receipt.decoder_version!=='string'||!/^\d+(?:\.\d+){2,3}$/.test(receipt.decoder_version)
       ||!['source_sha256','binary_sha256','archive_sha256','headers_sha256'].every(key=>digest(receipt[key]))
-      ||receipt.binary_sha256!==sha(installed.bytes)||receipt.source_sha256!==sha(readStable(source,128*1024).bytes))throw new Error('invalid_decoder_receipt');
-    if(!directoriesUnchanged(directories))throw new Error('changed_decoder_path');
-    const result=(deps.spawnSync||spawnSync)(helper,[],{input:bytes,encoding:'utf8',timeout:5000,killSignal:'SIGKILL',
+      ||receipt.binary_sha256!==sha(installed.bytes)||receipt.source_sha256!==sha(readStable(source,128*1024,false,checkpoint).bytes))throw new Error('invalid_decoder_receipt');
+    checkpoint();
+    if(!directoriesUnchanged(directories,checkpoint))throw new Error('changed_decoder_path');
+    // The installation checks consume this same grant. Only the dispatch-time
+    // remainder may become the child timeout; ordinary calls retain5000ms.
+    const timeout=checkpoint()??5000;
+    const result=(deps.spawnSync||spawnSync)(helper,[],{input:bytes,encoding:'utf8',timeout,killSignal:'SIGKILL',
       maxBuffer:8192,env:{PATH:'/usr/bin:/bin',LANG:'C',LC_ALL:'C',TZ:'UTC'}});
-    if(!directoriesUnchanged(directories)||!unchanged(helper,installed.info)||!unchanged(`${helper}.json`,receiptFile.info))return failure('resource_decoder_unavailable');
+    checkpoint();
+    if(!directoriesUnchanged(directories,checkpoint)||!unchanged(helper,installed.info)||!unchanged(`${helper}.json`,receiptFile.info))return failure('resource_decoder_unavailable');
+    checkpoint();
     if(result.error||result.signal)return failure(/** @type {NodeJS.ErrnoException|undefined} */(result.error)?.code==='ETIMEDOUT'||result.signal==='SIGXCPU'
       ?'resource_validation_limit':'resource_decoder_unavailable');
     if(result.stderr)return failure('resource_decoder_unavailable');
@@ -127,6 +160,13 @@ export function validateJpegResource(bytes,expected=undefined,deps={}) {
       ||expected&&(response.width!==expected.width||response.height!==expected.height)||!Number.isSafeInteger(response.scans)||response.scans<1||response.scans>100
       ||response.decoder!=='libjpeg-turbo'||response.decoder_version!==receipt.decoder_version)return failure('resource_decoder_unavailable');
     return {image:{mime_type:'image/jpeg',width:response.width,height:response.height}};
-  } catch {return failure('resource_decoder_unavailable');}
-  finally {if(!closeDirectories(directories))return failure('resource_decoder_unavailable');}
+  } catch(error) {
+    if(budget&&error instanceof HistoryCommandBudgetError) {budgetAbort??=error;throw budgetAbort;}
+    checkpoint();return failure('resource_decoder_unavailable');
+  } finally {
+    const closed=closeDirectories(directories);
+    // Always release held descriptors. A cleanup failure must not turn a
+    // proven observer deadline/clock abort into a claim about image bytes.
+    if(!budgetAbort) {checkpoint();if(!closed)return failure('resource_decoder_unavailable');}
+  }
 }
