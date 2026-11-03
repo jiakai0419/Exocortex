@@ -288,8 +288,23 @@ export function observeMessageReadiness(db, options) {
         diagnostic = { version: 1, stage, kind: 'invalid_response', read: null };
       }
     }
-    const tailAfter = tail.at(-1)?.id ?? tailStart;
-    const historyAfter = historical.length < ROLE_LIMIT ? historicalHorizon : historical.at(-1).id;
+    // Capacity exclusion is still owed. Moving across it can make a large
+    // page head consume the same budget on every historical round forever.
+    // Either role may have selected an overlapping row; individually
+    // unobservable rows must not prevent legal successors from progressing.
+    // Selection is only cursor progress, never proof of a ready observation.
+    const prefix = (page, start) => {
+      let after = start;
+      for (const row of page) {
+        if (!selected.has(row.id) && row.bytes <= ROW_BYTES) return { after, complete: false };
+        after = row.id;
+      }
+      return { after, complete: true };
+    };
+    const tailAfter = prefix(tail, tailStart).after;
+    const historyPrefix = prefix(historical, historyStart);
+    const historyAfter = historyPrefix.complete && historical.length < ROLE_LIMIT
+      ? historicalHorizon : historyPrefix.after;
     const guard = `CREATE TEMP TABLE __readiness_observation_fence(allowed INTEGER NOT NULL CHECK(allowed=1));
       INSERT INTO __readiness_observation_fence SELECT CASE WHEN EXISTS(SELECT 1 FROM ${SCAN}
         WHERE ${keyWhere(observer)} AND generation=${generation} AND last_attempt_at_ms=${nowMs}) THEN 1 ELSE 0 END;`;

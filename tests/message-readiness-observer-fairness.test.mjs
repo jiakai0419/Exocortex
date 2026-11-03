@@ -148,13 +148,18 @@ if (process.argv[2] === '--observe-child') {
     seedScan(f, { tail: 50, history: 0, horizon: 100 });
     const result = f.run(), selected = f.reads[0];
     assert.equal(result.scanned, 40); assert.equal(result.observed, 37); assert.equal(result.deferred, 3);
-    assert.equal(scan(f).tail_after_id, 60); assert.equal(scan(f).history_after_id, 20);
+    assert.equal(scan(f).tail_after_id, 57, 'capacity-deferred58–60 remain ahead of the continuous cursor');
+    assert.equal(scan(f).history_after_id, 20);
     const sizes = new Map(f.query('SELECT id,length(CAST(raw_json AS BLOB))+length(CAST(canonical_json AS BLOB))+length(CAST(body AS BLOB)) AS bytes FROM records;').map(item => [item.id, item.bytes]));
     const recentBytes = selected.filter(id => id >= 51).reduce((sum, id) => sum + sizes.get(id), 0);
     const historyBytes = selected.filter(id => id <= 20).reduce((sum, id) => sum + sizes.get(id), 0);
     assert(recentBytes <= ROLE_BYTES); assert(historyBytes <= ROLE_BYTES);
     assert(range(1, 20).every(id => selected.includes(id)), 'head payload cannot consume the history byte grant');
     assert.equal(ledger(f).length, 37); assert.equal(f.query('SELECT COUNT(*) AS n FROM records;')[0].n, 100);
+    assert(range(58, 60).every(id => !ledger(f).some(row => row.record_id === id)));
+    f.now += 60000; f.run();
+    const after = new Map(ledger(f).map(row => [row.record_id, row]));
+    for (const id of range(58, 60)) assert.equal(after.get(id).first_ready_observed_at_ms, NOW + 60000);
   });
 
   test('restart preserves cadence, head visibility and contiguous watermarks without rebuilding progress', t => {
