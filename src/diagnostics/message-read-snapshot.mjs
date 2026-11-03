@@ -71,7 +71,8 @@ const invalid = () => new SqliteReadError('invalid_response', 'read message snap
  *
  * @param {string} db
  * @param {{direction?:'all'|'sent'|'received',limit?:number,search?:string,recordIds?:number[]}} [options]
- * @param {{sqliteJson?:(db:string,sql:string,label:string)=>Record<string,any>[]}} [deps]
+ * @param {{sqliteJson?:(db:string,sql:string,label:string,options?:{timeoutMs:number})=>Record<string,any>[],
+ * sqliteReadOptions?:()=>{timeoutMs:number}}} [deps]
  */
 function readMessageSnapshot(db, options = {}, deps = {}) {
   const { direction = 'all', limit = 30, search = '' } = options;
@@ -80,7 +81,21 @@ function readMessageSnapshot(db, options = {}, deps = {}) {
   if (options.recordIds!==undefined && (!Array.isArray(options.recordIds) || options.recordIds.length>40
     || options.recordIds.some(id=>!Number.isSafeInteger(id) || id<1)
     || new Set(options.recordIds).size!==options.recordIds.length)) throw new TypeError('invalid internal message selection');
-  const query = deps.sqliteJson || readOnlySqliteJson;
+  // Carry deadlines separately from the wire reader. Replacing sqliteJson to
+  // add a timeout would also replace the framed snapshot path below. Read the
+  // remaining grant immediately before each subprocess, never once per page.
+  const readOptions = () => {
+    if (deps.sqliteReadOptions === undefined) return undefined;
+    if (typeof deps.sqliteReadOptions !== 'function') throw new TypeError('invalid SQLite read options provider');
+    const value = deps.sqliteReadOptions();
+    const timeoutMs = value?.timeoutMs;
+    // readOnlySqliteJson intentionally defaults invalid timeouts to 30s for
+    // unbudgeted callers. A deadline-bearing caller must never take that path.
+    if (!value || typeof value !== 'object' || Array.isArray(value)
+      || !Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new RangeError('invalid SQLite read timeout');
+    return { timeoutMs };
+  };
+  const query = (path, sql, label) => (deps.sqliteJson || readOnlySqliteJson)(path, sql, label, readOptions());
   const optionalTables = [NAME_TABLE, RECIPIENT_TABLE, OBSERVATION_TABLE, ROUTE_TABLE];
   const schema = query(db, `SELECT name FROM sqlite_schema WHERE (type='table'
     AND name IN (${optionalTables.map(quote).join(',')})) OR (type='index' AND (name=${quote(DONOR_INDEX)}
@@ -205,7 +220,11 @@ function readMessageSnapshot(db, options = {}, deps = {}) {
       WHERE s.source_id='lark.im' AND CASE WHEN json_valid(s.config_json)
         THEN json_extract(s.config_json,'$.chat_id') END IN (SELECT container_id FROM containers)`, 'id'),
     names, recipients, observations, donorRows, donorGroups, routeRows, routeGroups].filter(Boolean).join('\nUNION ALL\n');
-  const snapshotQuery = deps.sqliteJson || ((path, sql, label) => readOnlySqliteJsonLines(path, snapshotWireSql(sql), label));
+  const snapshotQuery = (path, sql, label) => {
+    if (deps.sqliteJson) return deps.sqliteJson(path, sql, label, readOptions());
+    const wire = snapshotWireSql(sql);
+    return readOnlySqliteJsonLines(path, wire, label, readOptions());
+  };
   const result = snapshotQuery(db, `WITH
     matched AS MATERIALIZED (
       SELECT r.id,r.occurred_at_ms,r.external_id FROM records r WHERE ${filters.join(' AND ')}

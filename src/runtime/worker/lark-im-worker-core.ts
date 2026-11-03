@@ -3,6 +3,7 @@ import { REQUIRED_CYCLE_STEPS } from "./step-vocabulary.mjs";
 import { compactIdleEvidence } from "./idle-admission.mjs";
 import { parseWorkerEventTimestamp } from "../../diagnostics/worker-event-time.mjs";
 import { sanitizeHistoryDiagnostic, sanitizeHistorySelectionStops } from "../../core/history-diagnostics.js";
+import { normalizeReadinessObservation } from "../../core/readiness-observer-result.js";
 
 type JsonObject = Record<string, any>;
 
@@ -433,6 +434,9 @@ function compactSummary(summary: SyncSummary | null | undefined) {
   if (!summary) return null;
 
   const idleEvidence = compactIdleEvidence(summary);
+  const readiness = normalizeReadinessObservation(summary.readiness) || (Object.hasOwn(summary, 'readiness')
+    ? { reason: 'observation_failed', scanned: 0, observed: 0, deferred: 0,
+      diagnostic: { version: 1, stage: 'dispatch', kind: 'invalid_response', read: null } } : null);
   const received = Array.isArray(summary.received) ? summary.received : [];
   const receivedFailures = received.filter((run) => run.ok === false || (!run.ok && !run.skipped));
   const receivedSkipped = received.filter((run) => run.skipped === true).length;
@@ -451,6 +455,7 @@ function compactSummary(summary: SyncSummary | null | undefined) {
 
   return {
     ok: summary.ok,
+    ...(readiness ? { readiness } : {}),
     ...(idleEvidence ? { idle_evidence: idleEvidence } : {}),
     ...(summary.partial ? { partial: true } : {}),
     ...(summary.incomplete ? { incomplete: true } : {}),

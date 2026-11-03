@@ -80,7 +80,8 @@ if (process.argv[2] === '--synthetic-cycle') {
       assert.equal(value.names, 1); assert.equal(value.profiles, 1); assert.equal(value.lists, 1);
       const summary = JSON.parse(value.stdout);
       assert.equal(summary.ok, true); assert.equal(summary.sent.scanned, 0); assert.equal(summary.sent.list_complete, true);
-      assert.equal(Object.hasOwn(summary, 'readiness'), false, 'status/public sync shape remains unchanged');
+      assert.equal(typeof summary.readiness?.reason, 'string', 'optional observer outcome is retained independently of collection success');
+      if (value.readiness) assert.deepEqual(summary.readiness, value.readiness, 'public CLI retains the safe current-attempt result');
       return value;
     }
     return { directory, db, query, ledger, cycle };
@@ -93,6 +94,49 @@ if (process.argv[2] === '--synthetic-cycle') {
     assert.equal(f.ledger().length, 1); assert.equal(f.ledger()[0].state, 'enriching');
     assert.equal(f.ledger()[0].observer_account_key, ACCOUNT);
     assert.deepEqual(f.query('SELECT * FROM records;'), records);
+  });
+
+  test('actual sync CLI observes a large authored record through the bounded wire reader', t => {
+    const f = fixture(t);
+    const padding = 'Invented quote " slash \\ newline\n'.repeat(21000);
+    sqliteExec(f.db, `UPDATE records SET raw_json=json_set(raw_json,'$.synthetic_padding',${q(padding)});`);
+    const before = f.query('SELECT id,external_version,hex(raw_json) AS raw,hex(canonical_json) AS canonical,body FROM records;');
+    const result = f.cycle(1);
+    assert.equal(result.readiness.reason, 'observed'); assert.equal(result.readiness.observed, 1);
+    assert.equal(result.readiness.claim_state, 'confirmed'); assert.equal(result.readiness.finish_state, 'confirmed');
+    assert.equal(result.readiness.command_budget.max_ms, 5000);
+    assert.equal(result.readiness.command_budget.stop_reason, null);
+    assert(result.readiness.command_budget.elapsed_ms < 5000);
+    assert.equal(f.ledger().length, 1);
+    assert.deepEqual(f.query('SELECT id,external_version,hex(raw_json) AS raw,hex(canonical_json) AS canonical,body FROM records;'), before);
+  });
+
+  test('actual sync processes observe the fresh head without skipping a nine-hundred-record backlog', t => {
+    const f = fixture(t), now = Date.now();
+    f.cycle(1, now);
+    sqliteExec(f.db, `WITH RECURSIVE invented(id) AS (SELECT 2 UNION ALL SELECT id+1 FROM invented WHERE id<901)
+      INSERT INTO records(id,source_id,first_seen_scope_id,external_id,external_version,record_type,occurred_at,occurred_at_ms,
+        actor_id,container_id,direction,body,canonical_json,raw_json)
+      SELECT invented.id,r.source_id,r.first_seen_scope_id,'om_synthetic_fresh_'||invented.id,r.external_version,r.record_type,
+        r.occurred_at,r.occurred_at_ms,r.actor_id,r.container_id,r.direction,r.body,
+        json_set(r.canonical_json,'$.message_id','om_synthetic_fresh_'||invented.id,'$.sender_name','Invented Fresh Human',
+          '$.sender_name_source','contact','$.sender_name_confidence','high','$.sender_name_account_key',${q(ACCOUNT)}),
+        json_set(r.raw_json,'$.message_id','om_synthetic_fresh_'||invented.id)
+      FROM invented JOIN records r ON r.id=1;`);
+    const original = f.query('SELECT id,body,raw_json,canonical_json FROM records ORDER BY id;');
+    const second = f.cycle(2, now + 60001);
+    const latest = f.ledger().find(row => row.record_id === 901);
+    assert.equal(second.readiness.reason, 'observed');
+    assert.equal(latest.state, 'ready'); assert(latest.first_ready_observed_at_ms > START + 1000);
+    let scan = f.query('SELECT * FROM lark_im_message_readiness_scan;')[0];
+    assert.equal(scan.tail_after_id, 11); assert.equal(scan.history_after_id, 20);
+    assert.equal(scan.history_horizon_id, 901); assert(second.readiness.scanned <= 40);
+    const third = f.cycle(3, now + 120002);
+    assert.notEqual(second.pid, third.pid);
+    assert.equal(f.ledger().find(row => row.record_id === 901).first_ready_observed_at_ms, latest.first_ready_observed_at_ms);
+    scan = f.query('SELECT * FROM lark_im_message_readiness_scan;')[0];
+    assert.equal(scan.tail_after_id, 21); assert.equal(scan.history_after_id, 40);
+    assert.deepEqual(f.query('SELECT id,body,raw_json,canonical_json FROM records ORDER BY id;'), original);
   });
 
   test('separate CLI processes observe old-record recovery and regression without any new message', t => {

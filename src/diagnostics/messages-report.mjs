@@ -56,7 +56,8 @@ const projectionEvidence = new WeakMap();
  * }} EnrichedMessage
  *
  * @typedef {object} LoadMessageDeps
- * @property {(dbPath: string, sql: string, label: string) => Row[]=} sqliteJson
+ * @property {(dbPath: string, sql: string, label: string, options?:{timeoutMs:number}) => Row[]=} sqliteJson
+ * @property {(()=>{timeoutMs:number})=} sqliteReadOptions
  */
 
 /**

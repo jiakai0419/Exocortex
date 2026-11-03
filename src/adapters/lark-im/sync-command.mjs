@@ -8,6 +8,7 @@ import { SYNC_DEFAULTS } from "./sync-options.mjs";
 import { ensureInitialized, ensureSourceInitialSyncStart, validateInitialSyncStartMs } from "../../../dist/storage/sqlite/ingestion-store.js";
 import { captureRemoteAccountBinding, readRemoteAccountBinding, recordSuccessfulSyncBinding, accountBindingAdmissionError, reserveSyncAccountBinding } from "../../diagnostics/remote-account-binding.mjs";
 import { captureLarkWriteAdmission } from "../../diagnostics/lark-write-admission.mjs";
+import { failedReadinessObservation, normalizeReadinessObservation } from "../../diagnostics/readiness-observer-result.mjs";
 
 /**
  * @typedef {"all" | "sent" | "discover" | "received" | "details"} SyncScopeOption
@@ -251,8 +252,15 @@ function executeLarkImSync(opts, deps = {}) {
     catch { /* Its durable claim remains retryable; committed messages stand. */ }
     // Observe the actual readable projection independently of name recovery.
     // A failed name tail cannot hide previously committed incomplete messages.
-    try { runner.syncReadiness?.(dbPath, selfProfile); }
-    catch { /* Optional historical observation never rolls back collection. */ }
+    if (runner.syncReadiness) {
+      try {
+        const observation = normalizeReadinessObservation(runner.syncReadiness(dbPath, selfProfile));
+        summary.readiness = observation || { ...failedReadinessObservation('dispatch', null),
+          diagnostic: { version: 1, stage: 'dispatch', kind: 'invalid_response', read: null } };
+      } catch (error) {
+        summary.readiness = failedReadinessObservation('dispatch', error);
+      }
+    }
   }
   return summary;
 }

@@ -75,7 +75,8 @@ function removeName(f) { sqliteExec(f.db, "UPDATE records SET canonical_json=jso
 
 test('actual pipeline observations preserve first clocks and count ready regressions once', t => {
   const f = fixture(t), original = f.query('SELECT * FROM records;');
-  assert.deepEqual(f.run(), { reason: 'observed', scanned: 1, observed: 1, deferred: 0 });
+  assert.deepEqual(f.run(), { reason: 'observed', scanned: 1, observed: 1, deferred: 0,
+    claim_state: 'confirmed', finish_state: 'confirmed', cleanup_state: 'unknown' });
   assert.equal(ledger(f)[0].state, 'enriching');
   assert.equal(ledger(f)[0].first_missing_observed_at_ms, NOW);
   f.now += 60000; f.run();
@@ -217,21 +218,26 @@ test('a lost scan claim rolls back the entire short final transaction', t => {
 
 test('durable history horizon keeps progressing while the independent new tail receives traffic', t => {
   const f = fixture(t, 65); f.run();
-  assert.equal(f.reads[0].length, 40); assert.equal(scan(f).tail_after_id, 65);
+  assert.equal(f.reads[0].length, 30); assert.equal(scan(f).tail_after_id, 10);
   assert.equal(scan(f).history_after_id, 20); assert.equal(scan(f).history_horizon_id, 65);
   for (let id = 66; id <= 90; id++) insert(f.db, id);
   f.now += 60000; f.run();
-  assert.equal(scan(f).history_after_id, 40); assert.equal(scan(f).history_horizon_id, 65); assert.equal(scan(f).tail_after_id, 85);
+  assert.equal(scan(f).history_after_id, 40); assert.equal(scan(f).history_horizon_id, 65); assert.equal(scan(f).tail_after_id, 20);
   f.now += 60000; f.run(); assert.equal(scan(f).history_after_id, 60);
   f.now += 60000; f.run(); assert.equal(scan(f).history_after_id, 65);
-  assert.equal(ledger(f).length, 90); assert(f.reads.every(ids => ids.length <= 40 && new Set(ids).size === ids.length));
+  assert.equal(ledger(f).length, 75, 'the 25-record burst exceeds the ten-record fresh share; retain the outstanding fifteen');
+  assert.equal(scan(f).tail_after_id, 40, 'head reads do not skip a contiguous tail range');
+  for (let cycle = 5; cycle <= 8; cycle++) { f.now += 60000; f.run(); }
+  assert.equal(ledger(f).length, 90, 'the bounded tail/history lanes eventually include every original and burst record');
+  assert.deepEqual(ledger(f).map(row => row.record_id), Array.from({ length: 90 }, (_, index) => index + 1));
+  assert(f.reads.every(ids => ids.length <= 40 && new Set(ids).size === ids.length));
 });
 
 test('capacity deferrals remain visible and do not prevent later historical rows', t => {
   const f = fixture(t, 0); insert(f.db, 1, { padding: 'x'.repeat(2 * 1024 * 1024) });
   for (let id = 2; id <= 45; id++) insert(f.db, id);
   const first = f.run();
-  assert.equal(first.scanned, 40); assert.equal(first.observed, 39); assert.equal(first.deferred, 1);
+  assert.equal(first.scanned, 30); assert.equal(first.observed, 29); assert.equal(first.deferred, 1);
   assert.equal(scan(f).history_after_id, 20);
   f.now += 60000; f.run();
   assert.equal(scan(f).history_after_id, 40); assert.equal(ledger(f).length, 44);
@@ -253,17 +259,18 @@ test('actual snapshot growth is deferred despite the earlier small metadata sele
 test('failed reading attempts persist visible debt and advance a bounded historical prefix', t => {
   const f = fixture(t, 61);
   const result = f.run({ readRows() { throw new Error('synthetic mapping failure'); } });
-  assert.equal(result.deferred, 40); assert.equal(ledger(f).length, 0);
-  assert.equal(scan(f).last_scanned_count, 40); assert.equal(scan(f).last_deferred_count, 40);
+  assert.equal(result.deferred, 30); assert.equal(ledger(f).length, 0);
+  assert.equal(scan(f).last_scanned_count, 30); assert.equal(scan(f).last_deferred_count, 30);
   assert.equal(scan(f).history_after_id, 20); assert.equal(scan(f).history_horizon_id, 61);
   f.now += 60000; f.run();
-  assert.equal(scan(f).history_after_id, 40); assert.equal(ledger(f).length, 20);
-  assert.equal(ledger(f)[0].record_id, 21);
+  assert.equal(scan(f).history_after_id, 40); assert.equal(ledger(f).length, 40);
+  assert.equal(ledger(f)[0].record_id, 11, 'the tail reobserves prior failed rows while history continues');
 });
 
 test('empty population records an empty bounded attempt without inventing observations', t => {
   const f = fixture(t, 0);
-  assert.deepEqual(f.run(), { reason: 'observed', scanned: 0, observed: 0, deferred: 0 });
+  assert.deepEqual(f.run(), { reason: 'observed', scanned: 0, observed: 0, deferred: 0,
+    claim_state: 'confirmed', finish_state: 'confirmed', cleanup_state: 'unknown' });
   assert.equal(f.reads.length, 0); assert.equal(ledger(f).length, 0);
   assert.equal(scan(f).history_horizon_id, 0); assert.equal(scan(f).last_scanned_count, 0);
 });
@@ -294,7 +301,7 @@ test('restart preserves the cadence and resumes the saved historical cursor', t 
     assert.equal(child.status, 0, child.stderr); return JSON.parse(child.stdout); };
   const before = readFileSync(f.db);
   assert.equal(run(NOW + 1).reason, 'cadence'); assert.deepEqual(readFileSync(f.db), before);
-  assert.equal(run(NOW + 60000).observed, 20); assert.equal(scan(f).history_after_id, 40);
+  assert.equal(run(NOW + 60000).observed, 40); assert.equal(scan(f).history_after_id, 40);
 });
 
 test('account observers are separate historical contexts and do not write record ownership', t => {

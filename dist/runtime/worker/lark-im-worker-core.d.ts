@@ -197,6 +197,7 @@ declare function compactSummary(summary: SyncSummary | null | undefined): {
         version: number;
         transport_clean: boolean;
     } | undefined;
+    readiness?: Record<string, any> | undefined;
     ok: boolean | undefined;
 } | null;
 /** Strict public projection: never copy record IDs, raw/error payloads, arbitrary

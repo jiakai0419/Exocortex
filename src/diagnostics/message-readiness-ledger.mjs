@@ -2,11 +2,13 @@
 import { createHash } from 'node:crypto';
 import { quoteSql } from '../../dist/storage/sqlite/sqlite-executor.js';
 import { summarizeMessageCompleteness } from './message-completeness-summary.mjs';
+import { readinessFailure } from './readiness-observer-result.mjs';
+import { getEnrichmentCommitOutcome } from '../maintenance/enrichment-commit.mjs';
 
 export const READINESS_CONTRACT_VERSION = 1;
 export const READINESS_OBSERVATION_INTERVAL_MS = 60_000;
 export const READINESS_OBSERVATION_LIMIT = 40;
-const ROLE_LIMIT = 20, ROW_BYTES = 2 * 1024 * 1024, ROLE_BYTES = 2 * 1024 * 1024;
+const ROLE_LIMIT = 20, HEAD_LIMIT = 10, ROW_BYTES = 2 * 1024 * 1024, ROLE_BYTES = 2 * 1024 * 1024;
 const TABLE = 'lark_im_message_readiness', SCAN = 'lark_im_message_readiness_scan';
 const SOURCE = "source_id='lark.im' AND record_type='lark.im.message'";
 const PROOF = ['id', 'source_id', 'record_type', 'external_id', 'external_version',
@@ -147,17 +149,61 @@ export function planReadinessObservations({ messages, metadata, previous = [], o
  */
 export function observeMessageReadiness(db, options) {
   const { observerAccountKey: observer, query, readRows, commit, nowMs } = options || {};
+  const states = { claim_state: 'not_started', finish_state: 'not_started', cleanup_state: 'not_required' };
+  let diagnostic, cleanupDiagnostic;
+  const report = result => ({ ...result, ...states,
+    ...(diagnostic ? { diagnostic } : {}), ...(cleanupDiagnostic ? { cleanup_diagnostic: cleanupDiagnostic } : {}) });
   if (!account(observer) || !integer(nowMs) || nowMs > Number.MAX_SAFE_INTEGER - READINESS_OBSERVATION_INTERVAL_MS
-    || typeof query !== 'function' || typeof readRows !== 'function' || typeof commit !== 'function') return failed('invalid_dependencies');
-  let scanned = 0;
+    || typeof query !== 'function' || typeof readRows !== 'function' || typeof commit !== 'function') return report(failed('invalid_dependencies'));
+  let scanned = 0, stage = 'select';
+  const invalid = reason => {
+    diagnostic ??= { version: 1, stage, kind: 'invalid_response', read: null };
+    return report(failed(reason, scanned));
+  };
+  const retainCleanup = outcome => {
+    if (!outcome) return;
+    states.cleanup_state = outcome.cleanup_state;
+    if (['failed', 'unknown'].includes(outcome.cleanup_state)) {
+      const failure = readinessFailure('release', outcome.cleanup_error);
+      cleanupDiagnostic = failure.kind === 'unknown' ? { ...failure, kind: 'cleanup_failed' } : failure;
+    }
+  };
+  const guardedCommit = (updates, reason, boundary) => {
+    stage = boundary;
+    states[`${boundary}_state`] = 'unknown';
+    try {
+      const value = commit(updates, reason), outcome = getEnrichmentCommitOutcome(value);
+      // Compatibility callbacks can prove their guarded update count, but
+      // provide no owner-release receipt. Unknown cleanup alone is not a new
+      // failure for those callbacks; actual bounded cleanup errors stop work.
+      if (!outcome) states.cleanup_state = 'unknown';
+      retainCleanup(outcome);
+      const count = value?.updated;
+      const valid = integer(count) && (boundary === 'claim' ? count === 1 : count >= 1 && count <= updates.length);
+      // A confirmed transaction with no successful claim is contention, not
+      // ownership. Never borrow counts from an unknown execution outcome.
+      states[`${boundary}_state`] = outcome?.commit_state === 'not_started' ? 'not_started'
+        : valid && (!outcome || outcome.commit_state === 'confirmed') ? 'confirmed'
+        : boundary === 'claim' && count === 0 && (!outcome || outcome.commit_state === 'confirmed') ? 'not_started' : 'unknown';
+      return value;
+    } catch (error) {
+      const outcome = getEnrichmentCommitOutcome(error);
+      if (outcome) states[`${boundary}_state`] = outcome.commit_state;
+      else states.cleanup_state = 'unknown';
+      retainCleanup(outcome);
+      throw error;
+    }
+  };
   try {
     const stateRows = query(`SELECT s.*,COALESCE((SELECT MAX(id) FROM records WHERE ${SOURCE}),0) AS source_max_id
       FROM (SELECT 1) seed LEFT JOIN ${SCAN} s ON ${keyWhere(observer)};`, 'read readiness observation opportunity');
-    if (!Array.isArray(stateRows) || stateRows.length !== 1) return failed('invalid_scan');
-    const prior = stateRows[0], exists = prior.generation !== null;
+    if (!Array.isArray(stateRows) || stateRows.length !== 1) return invalid('invalid_scan');
+    const prior = stateRows[0];
+    if (!object(prior)) return invalid('invalid_scan');
+    const exists = prior.generation !== null;
     if (!integer(prior.source_max_id) || exists && (!integer(prior.generation) || prior.generation < 1
-      || !['tail_after_id', 'history_after_id', 'history_horizon_id', 'next_attempt_at_ms', 'last_attempt_at_ms'].every(key => integer(prior[key])))) return failed('invalid_scan');
-    if (exists && nowMs < prior.next_attempt_at_ms) return failed('cadence');
+      || !['tail_after_id', 'history_after_id', 'history_horizon_id', 'next_attempt_at_ms', 'last_attempt_at_ms'].every(key => integer(prior[key])))) return invalid('invalid_scan');
+    if (exists && nowMs < prior.next_attempt_at_ms) return report(failed('cadence'));
     const generation = exists ? prior.generation + 1 : 1;
     const predicate = exists ? `EXISTS(SELECT 1 FROM ${SCAN} WHERE ${keyWhere(observer)} AND generation=${prior.generation}
       AND next_attempt_at_ms<=${nowMs})` : `NOT EXISTS(SELECT 1 FROM ${SCAN} WHERE ${keyWhere(observer)})`;
@@ -166,21 +212,41 @@ export function observeMessageReadiness(db, options) {
       WHERE ${predicate} ON CONFLICT(source_id,observer_account_key,contract_version) DO UPDATE SET
         next_attempt_at_ms=excluded.next_attempt_at_ms,last_attempt_at_ms=excluded.last_attempt_at_ms,generation=excluded.generation;
       ${EFFECT}`;
-    const claimed = commit([claim], 'readiness_observation_claim');
-    if (claimed?.updated !== 1) return failed('contended');
+    const claimed = guardedCommit([claim], 'readiness_observation_claim', 'claim');
+    if (states.claim_state !== 'confirmed') return report(failed(claimed?.updated === 0 ? 'contended' : 'commit_unconfirmed'));
+    if (cleanupDiagnostic) return report(failed('observation_failed'));
+    stage = 'select';
     const max = prior.source_max_id;
     const historicalAfter = exists ? prior.history_after_id : 0;
     const historicalHorizon = exists && prior.history_horizon_id > historicalAfter ? prior.history_horizon_id : max;
     const historyStart = exists && prior.history_horizon_id > historicalAfter ? historicalAfter : 0;
     const size = "COALESCE(length(CAST(raw_json AS BLOB)),0)+COALESCE(length(CAST(canonical_json AS BLOB)),0)+COALESCE(length(CAST(body AS BLOB)),0) AS bytes";
-    const tail = query(`SELECT id,${size} FROM records INDEXED BY records_name_scan WHERE ${SOURCE}
-      AND id${exists ? `>${prior.tail_after_id}` : `<=${max}`} ORDER BY id ${exists ? 'ASC' : 'DESC'} LIMIT ${ROLE_LIMIT};`, 'select new readiness observations');
+    const validPage = (page, limit, after, horizon, ascending = true) => Array.isArray(page) && page.length <= limit
+      && page.every((row, index) => object(row) && integer(row.id) && row.id > after && row.id <= horizon
+        && integer(row.bytes) && (!index || (ascending ? page[index - 1].id < row.id : page[index - 1].id > row.id)));
+    const head = query(`SELECT id,${size} FROM records INDEXED BY records_name_scan WHERE ${SOURCE}
+      AND id<=${max} ORDER BY id DESC LIMIT ${HEAD_LIMIT};`, 'select latest readiness observations');
+    if (!validPage(head, HEAD_LIMIT, 0, max, false)) return invalid('invalid_scan');
+    const tailStart = exists ? prior.tail_after_id : 0;
+    // The head is an independent low-latency sample, never a contiguous scan.
+    // Count only non-head IDs against its remaining slots. The bounded CTE
+    // returns a continuous ascending prefix, reusing head duplicates without
+    // skipping intervening rows or selecting more than twenty unique IDs.
+    const tail = query(`WITH page AS (
+      SELECT id,${size} FROM records INDEXED BY records_name_scan WHERE ${SOURCE}
+        AND id>${tailStart} AND id<=${max} ORDER BY id ASC LIMIT ${ROLE_LIMIT}
+      ), ranked AS (
+        SELECT id,bytes,SUM(CASE WHEN id IN (${head.map(row => row.id).join(',') || 'NULL'}) THEN 0 ELSE 1 END)
+          OVER (ORDER BY id ROWS UNBOUNDED PRECEDING) AS new_slots FROM page
+      ) SELECT id,bytes FROM ranked WHERE new_slots<=${ROLE_LIMIT - head.length} ORDER BY id ASC;`, 'select new readiness observations');
     const historical = query(`SELECT id,${size} FROM records INDEXED BY records_name_scan WHERE ${SOURCE}
       AND id>${historyStart} AND id<=${historicalHorizon} ORDER BY id ASC LIMIT ${ROLE_LIMIT};`, 'select historical readiness observations');
-    if (![tail, historical].every(page => Array.isArray(page) && page.length <= ROLE_LIMIT
-      && page.every(row => integer(row.id) && row.id > 0 && integer(row.bytes)))) return failed('invalid_scan');
+    if (!validPage(tail, ROLE_LIMIT, tailStart, max)
+      || !validPage(historical, ROLE_LIMIT, historyStart, historicalHorizon)) return invalid('invalid_scan');
+    const recent = [...head, ...tail.filter(row => !head.some(value => value.id === row.id))];
+    if (recent.length > ROLE_LIMIT) return invalid('invalid_scan');
     const candidates = new Map(), selected = new Map();
-    for (const [role, page] of [tail, historical].entries()) {
+    for (const [role, page] of [recent, historical].entries()) {
       let used = 0;
       for (const row of page) {
         candidates.set(row.id, row);
@@ -194,6 +260,7 @@ export function observeMessageReadiness(db, options) {
     let outcome = 'observed';
     if (ids.length) {
       try {
+        stage = 'read';
         const read = readRows(db, ids);
         if (!object(read) || !Array.isArray(read.messages) || read.messages.length !== ids.length
           || read.messages.some(row => !object(row) || !ids.includes(row.id))
@@ -209,15 +276,19 @@ export function observeMessageReadiness(db, options) {
             if (size > ROW_BYTES || roleBytes[role] > ROLE_BYTES) { outcome = 'capacity_deferred'; break; }
           }
           if (outcome === 'observed') {
+            stage = 'plan';
             const previous = query(`SELECT * FROM ${TABLE} WHERE ${keyWhere(observer)} AND record_id IN (${ids.join(',')});`, 'read prior readiness observations');
             const plan = planReadinessObservations({ ...read, messages: read.messages, metadata: read.metadata, previous, observerAccountKey: observer });
             if (plan.reason !== 'planned') outcome = plan.reason;
             else updates = plan.updates;
           }
         }
-      } catch { outcome = 'observation_failed'; }
+      } catch (error) { diagnostic = readinessFailure(stage, error); outcome = 'observation_failed'; }
+      if (outcome === 'invalid_observation' && !diagnostic) {
+        diagnostic = { version: 1, stage, kind: 'invalid_response', read: null };
+      }
     }
-    const tailAfter = exists ? (tail.at(-1)?.id ?? prior.tail_after_id) : max;
+    const tailAfter = tail.at(-1)?.id ?? tailStart;
     const historyAfter = historical.length < ROLE_LIMIT ? historicalHorizon : historical.at(-1).id;
     const guard = `CREATE TEMP TABLE __readiness_observation_fence(allowed INTEGER NOT NULL CHECK(allowed=1));
       INSERT INTO __readiness_observation_fence SELECT CASE WHEN EXISTS(SELECT 1 FROM ${SCAN}
@@ -228,8 +299,11 @@ export function observeMessageReadiness(db, options) {
       WHERE ${keyWhere(observer)} AND generation=${generation}; ${EFFECT}`;
     updates.push(finish);
     updates[0] = `${guard}\n${updates[0]}`;
-    const result = commit(updates, 'readiness_observation_finish');
-    if (!integer(result?.updated) || result.updated < 1 || result.updated > updates.length) return failed('commit_unconfirmed', scanned);
-    return { reason: outcome, scanned, observed: result.updated - 1, deferred: scanned - result.updated + 1 };
-  } catch { return failed('observation_failed', scanned); }
+    const result = guardedCommit(updates, 'readiness_observation_finish', 'finish');
+    if (states.finish_state !== 'confirmed') return report(failed('commit_unconfirmed', scanned));
+    return report({ reason: outcome, scanned, observed: result.updated - 1, deferred: scanned - result.updated + 1 });
+  } catch (error) {
+    diagnostic ??= readinessFailure(stage, error);
+    return report(failed('observation_failed', scanned));
+  }
 }
