@@ -136,3 +136,29 @@ test('an unbudgeted read hook cannot forge a trusted command deadline',t=>{
   const result=readMediaResource(f.resourceDir,f.binding,{afterBlobRead(){throw new HistoryCommandBudgetError('time_budget');}});
   assert.equal(result.status,'invalid');assert.equal(result.reason,'resource_verification_failed');
 });
+for(const boundary of ['parent_realpath','stage_mkdir'])test(`zero-session ${boundary} expiry retains exact preparation-stop evidence`,t=>{
+  const f=prepared(t),target={record_id:1,resource_key:'synthetic_producer_budget',reference_kind:'image_key'};
+  f.options.resourceTargets=[target];let stages=0,sessions=0,cacheChecked=false;
+  const cachePath=join(fs.realpathSync(f.root),'resources');
+  f.deps.createRequestSession=(...args)=>{sessions++;return createMaintenanceRequestSession(...args);};
+  const report=patchedFs({realpathSync(run,path,...args){const result=run(path,...args);
+    if(boundary==='parent_realpath'&&cacheChecked&&path===f.root)f.tick=4001;return result;},
+    lstatSync(run,path,...args){if(path===cachePath)cacheChecked=true;return run(path,...args);},
+    mkdtempSync(run,path,...args){if(String(path).includes('exocortex-media-'))stages++;
+      const result=run(path,...args);if(boundary==='stage_mkdir'&&String(path).includes('exocortex-media-'))f.tick=4001;return result;}},()=>f.run());
+  assert.equal(sessions,0);assert.equal(f.calls.length,0);assert.equal(stages,boundary==='stage_mkdir'?1:0);
+  assert.deepEqual(report.results,[{...target,state:'blocked',reason:'batch_stopped',failure:{stage:'selection',reason:'time_budget'}}]);
+  assert.equal(report.request_budget.max_cli_attempts,3);assert.equal(report.request_budget.cli_attempts,0);
+  assert.equal(report.request_budget.max_self_attempts,2);assert.equal(report.request_budget.self_attempts,0);
+  assert.equal(report.request_budget.max_seconds,3);assert.equal(report.request_budget.elapsed_ms,4000);
+  assert.equal(report.request_budget.stop_reason,'time_budget');assert.equal(report.available,0);
+  assert(!fs.readdirSync(f.root).some(name=>name.startsWith('exocortex-media-')));
+});
+test('unrelated staging failure is not preparation budget or permission evidence',t=>{
+  const f=prepared(t);let sessions=0;
+  f.deps.createRequestSession=(...args)=>{sessions++;return createMaintenanceRequestSession(...args);};
+  const report=patchedFs({mkdtempSync(run,path,...args){if(String(path).includes('exocortex-media-'))throw Error('Synthetic local staging failure');return run(path,...args);}},()=>f.run());
+  assert.equal(sessions,0);assert.equal(f.calls.length,0);assert.equal(report.request_budget.stop_reason,null);
+  assert.equal(report.results[0].failure.reason,'unknown');assert.notEqual(report.stop_reason,'time_budget');
+  assert(!JSON.stringify(report).includes('Synthetic local staging failure'));
+});

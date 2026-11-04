@@ -59,6 +59,11 @@ non-null zero-call request receipt keeps the original option quotas and the
 branded clock's observed elapsed/stop. Only integration can accept that receipt
 against its identical already-stopped budget; a lookalike result alone authorizes
 nothing. Ordinary cached/unsupported zero-session results retain a null receipt.
+The same preparation projection covers parent-directory resolution and staging
+creation before a session exists. Resolution and creation have separate budget
+checks. Ordinary local staging failures do not become budget or permission facts.
+`resourceStorePath` itself only resolves path strings; it performs no filesystem
+read or subprocess operation before the first readiness check.
 
 A publication call entered without a confirmed return carries
 `publication_state: unknown`; an available return marks it confirmed. A later

@@ -154,6 +154,12 @@ export function enrichResources(options,deps={}) {
   if(exact!==undefined&&(!Array.isArray(exact)||exact.length<1||exact.length>64||exact.some(target=>!target
     ||!options.recordIds.includes(target.record_id)||typeof target.resource_key!=='string'
     ||!['image_key','attachment_origin_key'].includes(target.reference_kind))))throw new RangeError('invalid exact resource selection');
+  const preparationStopped=error=>{
+    report.stop_reason=error.reason;report.request_budget=zeroBudget();
+    results=(exact??options.recordIds.map(record_id=>({record_id}))).map(target=>({...target,state:'blocked',reason:'batch_stopped',
+      failure:{stage:'selection',reason:error.reason}}));
+    return finish();
+  };
   try {
     const rows=snapshot(options.db,selection).rows, byId=new Map(rows.map(row=>[row.id,row]));
     results=options.recordIds.flatMap(id=>{
@@ -194,10 +200,7 @@ export function enrichResources(options,deps={}) {
     budget.assertReady();
   } catch(error) {
     if(!(error instanceof HistoryCommandBudgetError))throw error;
-    report.stop_reason=error.reason;report.request_budget=zeroBudget();
-    results=(exact??options.recordIds.map(record_id=>({record_id}))).map(target=>({...target,state:'blocked',reason:'batch_stopped',
-      failure:{stage:'selection',reason:error.reason}}));
-    return finish();
+    return preparationStopped(error);
   }
   if(options.apply!==true || !candidates.length)return finish();
   // Staging stays outside the source DB/store until all remote and local fences
@@ -210,7 +213,9 @@ export function enrichResources(options,deps={}) {
   /** @type {Row|null} */ let failureOwner=null;
   try {
     budget.assertReady();
-    stage=mkdtempSync(join(realpathSync(deps.tmpdir || tmpdir()),'exocortex-media-'));
+    const stagingParent=realpathSync(deps.tmpdir || tmpdir());
+    budget.assertReady();
+    stage=mkdtempSync(join(stagingParent,'exocortex-media-'));
     budget.assertReady();
     const sessionDeps={env:deps.env,now:deps.now,...deps.requestSessionDeps,commandBudget:budget};
     const executor=sessionDeps.spawnSync || spawnSync;
@@ -302,6 +307,9 @@ export function enrichResources(options,deps={}) {
       }
     });
   } catch(error) {
+    // Staging is still preparation. No account request/session exists yet;
+    // retain the same exact zero-call contract as a stopped initial snapshot.
+    if(!session&&error instanceof HistoryCommandBudgetError)return preparationStopped(error);
     const reason=failure(error);report.stop_reason=reason;
     const diagnostic=resourceFailureFromError(error,failureStage);
     if(resumableStops.has(reason)&&openingAtMs!==null&&candidates.some(item=>item.entry.state==='verified_download')) {
