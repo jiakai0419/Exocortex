@@ -11,6 +11,7 @@ import { performance } from "node:perf_hooks";
 import { readScheduledRemoteSampleAdmission, readScheduledRemoteCooldowns, runScheduledRemoteSample } from "./remote-sample-scheduler.mjs";
 import { selectHistoryTarget } from "../../maintenance/history.mjs";
 import { resourceWorkAvailable } from "../../maintenance/resource-work.mjs";
+import { copyResourceReadDiagnostic } from "../../diagnostics/resource-read-diagnostic.mjs";
 import { normalizeResourceFailure } from "../../maintenance/enrich-resources.mjs";
 import { readIdleFairState, claimIdleLane } from "./idle-fair-state.mjs";
 import { idleAdmission } from "./idle-admission.mjs";
@@ -328,6 +329,8 @@ function compactResourceSummary(summary) {
   const result = { ok: summary.ok === true };
   if (summary.profile === "known_record_resources/v1") result.profile = summary.profile;
   if (RESOURCE_OUTCOMES.has(summary.outcome)) result.outcome = summary.outcome;
+  const readDiagnostic = copyResourceReadDiagnostic(summary.read_diagnostic);
+  if (readDiagnostic) result.read_diagnostic = readDiagnostic;
   if (summary.failure === null) result.failure = null;
   else if (summary.failure && typeof summary.failure === "object" && !Array.isArray(summary.failure)) {
     result.failure = { ...normalizeResourceFailure(summary.failure), persisted: summary.failure.persisted === true };

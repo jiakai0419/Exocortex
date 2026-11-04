@@ -6,7 +6,8 @@ import { DEFAULT_SYNC_LOCK_OWNER, defaultOwnerState } from '../../dist/storage/s
 import { createLarkImAdapter } from '../adapters/lark-im/adapter.mjs';
 import { recipientAccountKey } from '../adapters/lark-im/p2p-recipient.mjs';
 import { larkWriteAdmissionSql } from '../../dist/storage/sqlite/lark-write-admission.js';
-import { readOnlySqliteJson } from '../storage/sqlite/readonly-query.mjs';
+import { readOnlySqliteJson, readOnlySqliteJsonLines } from '../storage/sqlite/readonly-query.mjs';
+import { resourceReadDiagnostic } from '../diagnostics/resource-read-diagnostic.mjs';
 import { captureLarkWriteAdmission } from '../diagnostics/lark-write-admission.mjs';
 import { projectionAccount } from '../adapters/lark-im/message-projection-evidence.mjs';
 import { extractMessageResourceReferences, imageResourceCapability, mediaFromImageSlot } from '../adapters/lark-im/media-resource-references.mjs';
@@ -179,14 +180,27 @@ export function executeResourceWork(options,deps={}) {
     return Math.max(0,maxSeconds*1000-elapsed());};
   /** @type {ReturnType<typeof createResourceCommandBudget>} */let executionBudget;
   const ready=()=>executionBudget.assertReady();
-  const query=(sql,label)=>{
+  /** @param {string} sql @param {string} label @param {string|null} [wire] */
+  const query=(sql,label,wire=null)=>{
     const timeoutMs=executionBudget.timeoutMs(2000);
-    const result=(deps.sqliteJson||readOnlySqliteJson)(options.db,sql,label,{timeoutMs});
-    ready();return result;
+    try {
+      const result=deps.sqliteJson?deps.sqliteJson(options.db,sql,label,{timeoutMs}):wire
+        ?readOnlySqliteJsonLines(options.db,wire,label,{timeoutMs}):readOnlySqliteJson(options.db,sql,label,{timeoutMs});
+      ready();return result;
+    }catch(error){
+      const diagnostic=resourceReadDiagnostic(label,error);
+      if(diagnostic)report.read_diagnostic=diagnostic;
+      throw error;
+    }
   };
-  const snapshot=(ids)=>deps.readSnapshot?deps.readSnapshot(options.db,{direction:'all',limit:ids.length,recordIds:ids}).rows:
-    query(`SELECT ${MEDIA_RESOURCE_SOURCE_FIELDS.join(',')} FROM records WHERE id IN (${ids.join(',')})
-      AND (${sourceBytes})<=${MAX_ROW_BYTES} ORDER BY id;`,'read bounded resource source rows');
+  const snapshot=(ids)=>{
+    if(deps.readSnapshot)return deps.readSnapshot(options.db,{direction:'all',limit:ids.length,recordIds:ids}).rows;
+    const from=`FROM records WHERE id IN (${ids.join(',')}) AND (${sourceBytes})<=${MAX_ROW_BYTES} ORDER BY id;`;
+    // SQL encodes source TEXT exactly once. The existing framed reader accepts
+    // rows only after COMMIT, avoiding CLI -json re-escaping of large payloads.
+    const object=`json_object(${MEDIA_RESOURCE_SOURCE_FIELDS.flatMap(k=>[q(k),k]).join(',')})`;
+    return query(`SELECT ${MEDIA_RESOURCE_SOURCE_FIELDS.join(',')} ${from}`,'read bounded resource source rows',`SELECT ${object} AS encoded_row ${from}`);
+  };
   const acquire=deps.tryAcquireLease||deps.requestSessionDeps?.tryAcquireLease||tryAcquireLarkApiLease;
   const local=action=>{
     ready();let lease;
