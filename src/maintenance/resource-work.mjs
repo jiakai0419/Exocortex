@@ -364,6 +364,23 @@ export function executeResourceWork(options,deps={}) {
     if(stopped)return finish(stopped);
     ready();
     const current=snapshot([task.record_id])[0];
+    if(confirmedDenial&&state==='blocked'&&reason===confirmedDenial.result_kind) {
+      // Refusal is a fact about the original account/endpoint, independently
+      // of whether that source may still accept successful bytes. Keep its old
+      // association; a fresh source observation is only a concurrent-race CAS.
+      const claim=`${keyWhere(task)} AND record_id=${task.record_id}
+        AND binding_key=${q(identity.binding_key)} AND source_fence=${q(identity.source_fence)}
+        AND generation=${task.generation+1} AND attempt_token=${q(token)} AND state='running'
+        AND claim_owner=${q(DEFAULT_SYNC_LOCK_OWNER)} AND claim_until_ms=${wall+CLAIM_MS}
+        AND attempts=${task.attempts+1}`;
+      local(()=>write(`INSERT INTO __resource_fence SELECT CASE WHEN ${observedSourceSql(current,task.record_id)}
+        AND EXISTS(SELECT 1 FROM ${TABLE} WHERE ${claim}) THEN 1 ELSE 0 END;
+        UPDATE ${TABLE} SET state='blocked',reason=${q(reason)},capability_evidence_json=NULL,
+          failure_stage='resource_request',failure_reason=${q(reason)},failure_binding_key=${q(identity.binding_key)},failure_source_fence=${q(identity.source_fence)},
+          retry_at_ms=0,attempt_token=NULL,claim_owner=NULL,claim_until_ms=0,generation=generation+1 WHERE ${claim};`));
+      report.ok=false;report.outcome='blocked';report.blocked=1;
+      report.failure={stage:'resource_request',reason,persisted:true};return finish();
+    }
     if(!current||makeMediaPendingSourceFence(current)!==identity.source_fence){
       local(()=>write(`INSERT INTO __resource_fence SELECT CASE WHEN ${observedSourceSql(current,task.record_id)} AND EXISTS(SELECT 1 FROM ${TABLE} WHERE ${keyWhere(task)} AND generation=${task.generation+1} AND attempt_token=${q(token)} AND state='running') THEN 1 ELSE 0 END;
         UPDATE ${TABLE} SET state='blocked',reason='source_changed',failure_stage='source_fence',failure_reason='source_changed',failure_binding_key=${q(identity.binding_key)},failure_source_fence=${q(identity.source_fence)},attempt_token=NULL,claim_owner=NULL,claim_until_ms=0,generation=generation+1

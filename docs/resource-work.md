@@ -221,3 +221,27 @@ command performs no recovery query or retry after expiry; the next normal
 invocation reads the durable state. Preserve previously confirmed effects and
 never infer zero committed tasks from a failed command or zero reported task
 counters.
+
+## Confirmed refusal is separate from source freshness
+
+A resource refusal is confirmed only by the exact selected GET's trusted
+execution receipt and its matching closing account observation. That fact
+belongs to the original account/message/resource endpoint. A later canonical
+name or source change cannot replace it with retryable `source_changed`.
+
+Commit that refusal through a separate result branch. Under the same normal
+lease and source/account admission, fence the currently observed source plus
+the original task/work key, record ID, binding/source hashes, running claim
+token/generation/owner/expiry and attempt count. Store the refusal against the
+original binding/source hashes, never against a newly observed endpoint or
+account. Current-source observation guards against another race; it does not
+validate old bytes. Successful publication and success results retain their
+original exact-source checks unchanged.
+
+A failed or lost result acknowledgement remains `execution_failed`, with the
+in-memory refusal diagnosis `persisted:false`; this is neither evidence of
+rollback nor permission to repeat the request. A later invocation sees the
+actual durable state. A committed refusal is not retried across name changes
+or restart; an unconfirmed running claim remains subject to the existing
+owner/expiry recovery policy. No new retry, API allowance or storage table is
+introduced.
