@@ -385,7 +385,10 @@ export function assessMediaImageBytes(bytes,deps={}) {
     return {image:{mime_type:image.mime_type,width:image.width,height:image.height}};
   } catch(error) {
     if(budget&&error instanceof HistoryCommandBudgetError)throw error;
-    budget?.assertReady();
+    // A parser rejection and an exhausted grant are separate facts. Observe
+    // the grant without replacing the finite rejection already established;
+    // this unsuccessful assessment cannot authorize later file publication.
+    try{budget?.assertReady();}catch(stop){if(!(stop instanceof HistoryCommandBudgetError))throw stop;}
     return {reason:errorCode(error)==='MEDIA_FORMAT_UNSUPPORTED'?'resource_format_unsupported':'resource_image_invalid'};
   }
 }
