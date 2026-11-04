@@ -72,3 +72,24 @@ no retention starts, and `unknown` if entered retention does not return a receip
 Neither label proves a rollback. The task's existing claim and recovery semantics
 are unchanged. Store catches preserve budget errors only with an actual branded
 budget, retaining the old behavior of unbudgeted callers.
+
+## Validation failure at the deadline
+
+The resource result and the command stop are independent observations. A trusted
+local validation rejection already established from a response, file descriptor,
+file identity, or decoded image remains the resource's finite diagnostic if the
+original deadline expires at that same boundary. The command budget receipt still
+records `time_budget` (or `clock_unavailable`); neither fact authorizes another
+request, a closing-account check, publication, retention, or result writeback
+after expiry. A report may therefore carry `download_file_invalid` together with
+`request_budget.stop_reason: time_budget` and `persisted: false`. That means the
+known failure was returned, not that it was stored. Existing claim recovery remains
+unchanged.
+
+A pure budget stop before a validator decides is not evidence of invalid media.
+Keep typed budget exceptions intact, and never infer corruption or permission
+denial from elapsed time or error text. Regression controls use real private
+files, descriptor stats and a real extra hardlink, with only the monotonic clock
+modeled: valid/invalid file crossed with available/expired budget. The cutoff
+control must show no closing request, publication, pending retention or new
+database write; normal validation and ordinary failure controls remain unchanged.

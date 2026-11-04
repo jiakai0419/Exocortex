@@ -108,7 +108,14 @@ function readDownload(stage, filename, response, budget) {
     if (!image || response.content_type.split(';')[0].trim().toLowerCase()!==image.mime_type)
       throw localFailure('download_image_invalid');
     return result;
-  } catch(error) {if(error instanceof HistoryCommandBudgetError)throw error;budget.assertReady();if(localReasons.has(/** @type {Row} */(error)?.resourceReason))throw error;throw localFailure('download_file_invalid');}
+  } catch(error) {
+    if(error instanceof HistoryCommandBudgetError)throw error;
+    // A rejection already established by this validator is independent of a
+    // deadline reached at the same boundary. finish() still records the budget
+    // stop; preserving the diagnostic grants no further request or mutation.
+    if(localReasons.has(/** @type {Row} */(error)?.resourceReason))throw error;
+    budget.assertReady();throw localFailure('download_file_invalid');
+  }
   finally {if(fd!==undefined)closeSync(fd);}
 }
 
