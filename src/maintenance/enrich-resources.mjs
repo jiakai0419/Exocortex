@@ -1,5 +1,6 @@
 // @ts-check
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { constants, closeSync, fstatSync, lstatSync, mkdtempSync, openSync, readSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -51,13 +52,15 @@ const denialReasons=new Set(['permission_denied','restricted_mode','bot_user_out
 // ephemeral proof is diagnostic; it authorizes neither requests nor writes.
 const preparationProofs=new WeakMap();
 const preparationTargetKey=target=>JSON.stringify([target.record_id,target.resource_key??null,target.reference_kind??null]);
-export function readResourcePreparationOutcome(report,budget,target) {
+export function readResourcePreparationOutcome(report,budget,target,origin=undefined) {
   const proof=report&&typeof report==='object'?preparationProofs.get(report):null;
   if(!isHistoryCommandBudget(budget)||!proof||proof.budget!==budget)return null;
   const expected=proof.outcomes.get(preparationTargetKey(target));
   if(!expected||!Array.isArray(report.results))return null;
+  if(!origin||!['account_key','binding_key','source_fence'].every(key=>
+    typeof origin[key]==='string'&&/^[a-f0-9]{64}$/.test(origin[key])&&origin[key]===expected.origin?.[key]))return null;
   const actual=report.results.filter(item=>preparationTargetKey(item)===preparationTargetKey(target));
-  return actual.length===1&&JSON.stringify(actual[0])===expected?JSON.parse(expected):null;
+  return actual.length===1&&JSON.stringify(actual[0])===expected.outcome?JSON.parse(expected.outcome):null;
 }
 
 /** Bounded diagnostic projection; old nullable columns intentionally map to unknown.
@@ -157,6 +160,21 @@ export function enrichResources(options,deps={}) {
     if(session)report.request_budget=session.summary();
     try {budget.assertReady();}catch(error){if(!(error instanceof HistoryCommandBudgetError))throw error;
       report.stop_reason ||= error.reason;report.request_budget=session?.summary()??zeroBudget();}
+    // Every session-free stop, including the first deadline observation here,
+    // keeps completed preparation facts separate from the command stop.
+    const retained=new Map();
+    const preparationStop=!session&&['time_budget','clock_unavailable'].includes(report.stop_reason);
+    if(!session&&(preparationStop||exact)) {
+      results=options.recordIds.flatMap(id=>targetsByRecord.get(id)).map(target=>{
+        const key=preparationTargetKey(target),completed=completedPreparation.get(key);
+        if(completed&&(!preparationStop||['available','blocked','failed'].includes(completed.state))) {
+          const item={...completed,...target};
+          if(['available','blocked','failed'].includes(item.state))retained.set(item,preparationOrigins.get(key));
+          return item;
+        }
+        return {...target,state:'blocked',reason:'batch_stopped',failure:{stage:'selection',reason:report.stop_reason}};
+      });
+    }
     report.results=results;report.selected=results.length;
     for(const entry of results) {
       if(['resource_endpoint_unverified','resource_identity_conflict'].includes(entry.reason)) {
@@ -168,29 +186,28 @@ export function enrichResources(options,deps={}) {
     report.planned=results.filter(item=>item.state==='planned').length;
     report.failed=results.filter(item=>['blocked','failed'].includes(item.state)).length;
     report.partial=report.failed>0 || options.apply===true && report.planned>0 || Boolean(report.stop_reason);
-    report.ok=!report.partial;return report;
+    report.ok=!report.partial;
+    if(retained.size) {
+      const outcomes=new Map();
+      for(const [item,origin] of retained)if(origin)outcomes.set(preparationTargetKey(item),{origin,outcome:JSON.stringify(item)});
+      preparationProofs.set(report,{budget,outcomes});
+    }
+    return report;
   };
-  const exact=options.resourceTargets;
-  if(exact!==undefined&&(!Array.isArray(exact)||exact.length<1||exact.length>64||exact.some(target=>!target
+  const suppliedTargets=options.resourceTargets;
+  if(suppliedTargets!==undefined&&(!Array.isArray(suppliedTargets)||suppliedTargets.length<1||suppliedTargets.length>64||suppliedTargets.some(target=>!target
     ||!options.recordIds.includes(target.record_id)||typeof target.resource_key!=='string'
     ||!['image_key','attachment_origin_key'].includes(target.reference_kind))))throw new RangeError('invalid exact resource selection');
+  // Selection supplies identity only, never a validation state or diagnostic.
+  const exact=suppliedTargets?.map(({record_id,resource_key,reference_kind})=>({record_id,resource_key,reference_kind}));
   const targetsByRecord=new Map(options.recordIds.map(record_id=>[record_id,
     exact?exact.filter(target=>target.record_id===record_id):[{record_id}]]));
   const completedPreparation=new Map();
+  const preparationOrigins=new Map();
   const remember=(target,entry)=>{completedPreparation.set(preparationTargetKey(target),entry);results.push(entry);};
   const preparationStopped=error=>{
     report.stop_reason=error.reason;report.request_budget=zeroBudget();
-    const retained=new Set();
-    results=options.recordIds.flatMap(id=>targetsByRecord.get(id)).map(target=>{
-      const completed=completedPreparation.get(preparationTargetKey(target));
-      if(completed&&['available','blocked','failed'].includes(completed.state)) {
-        const item={...completed,...target};retained.add(item);return item;
-      }
-      return {...target,state:'blocked',reason:'batch_stopped',failure:{stage:'selection',reason:error.reason}};
-    });
-    const finished=finish(),outcomes=new Map();
-    for(const item of finished.results)if(retained.has(item))outcomes.set(preparationTargetKey(item),JSON.stringify(item));
-    preparationProofs.set(finished,{budget,outcomes});return finished;
+    return finish();
   };
   try {
     const rows=snapshot(options.db,selection).rows, byId=new Map(rows.map(row=>[row.id,row]));
@@ -214,6 +231,12 @@ export function enrichResources(options,deps={}) {
       const slots=selected.filter(Boolean),medias=slots.map(mediaFromImageSlot),account=projectionAccount(row,canonical,raw);
       const bindings=account.state==='verified'?makeMediaResourceBindings(options.db,row,account.account_key,medias):[];
       const bound=new Map(slots.map((slot,index)=>[slot,bindings[index]]));
+      const sourceFence=makeMediaPendingSourceFence(row);
+      for(const [index,slot] of selected.entries()) {
+        const binding=bound.get(slot);
+        if(binding&&sourceFence&&account.state==='verified')preparationOrigins.set(preparationTargetKey(targetsByRecord.get(id)[index]),
+          Object.freeze({account_key:account.account_key,binding_key:createHash('sha256').update(JSON.stringify(binding)).digest('hex'),source_fence:sourceFence}));
+      }
       const kindsByKey=new Map();for(const slot of all) {
         if(!kindsByKey.has(slot.key))kindsByKey.set(slot.key,new Set());kindsByKey.get(slot.key).add(slot.reference_kind);
       }
@@ -229,7 +252,7 @@ export function enrichResources(options,deps={}) {
         if(cached.status==='available')return {...result,state:'available',reason:null};
         if(cached.status==='invalid')return {...result,reason:cached.reason};
         if(imageResourceCapability(slot,deps.resourceCapability)!=='message_image')return {...result,reason:'resource_endpoint_unverified'};
-        const planned={...result,state:'planned',reason:null},sourceFence=makeMediaPendingSourceFence(row);
+        const planned={...result,state:'planned',reason:null};
         if(!sourceFence)return {...result,reason:'source_binding_invalid'};
         candidates.push({row,account,media,binding,sourceFence,entry:planned});return planned;
       };

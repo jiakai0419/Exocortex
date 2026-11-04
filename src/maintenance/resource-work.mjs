@@ -345,9 +345,10 @@ export function executeResourceWork(options,deps={}) {
       &&(result.results[0].resource_key===undefined||result.results[0].resource_key===identity.resource_key)
       &&(result.results[0].reference_kind===undefined||result.results[0].reference_kind===identity.reference_kind)?result.results[0]:null;
     if(!item) {receiptInvalid=true;throw new Error('resource result unavailable');}
+    const prepared=!producerStarted?readResourcePreparationOutcome(result,executionBudget,
+      {record_id:task.record_id,resource_key:identity.resource_key,reference_kind:identity.reference_kind},identity):null;
     if(!producerStarted&&result.request_budget!==null) {
       const observed=executionBudget.summary(),b=result.request_budget;
-      const prepared=readResourcePreparationOutcome(result,executionBudget,{record_id:task.record_id,resource_key:identity.resource_key,reference_kind:identity.reference_kind});
       const undecided=item.state==='blocked'&&item.reason==='batch_stopped'&&item.failure?.stage==='selection'&&item.failure?.reason===observed.stop_reason;
       const stoppedBeforeSession=['time_budget','clock_unavailable'].includes(observed.stop_reason??'')
         &&b?.stop_reason===observed.stop_reason&&b.max_cli_attempts===maxCli&&b.max_self_attempts===2&&b.max_seconds===seconds
@@ -360,7 +361,7 @@ export function executeResourceWork(options,deps={}) {
         report.failure=prepared?.failure?{...prepared.failure,persisted:false}:{stage:'selection',reason:observed.stop_reason,persisted:false};return finish(observed.stop_reason);
       }
     }
-    if(!producerStarted&&!(result.request_budget===null&&['available','blocked'].includes(item.state))) {receiptInvalid=true;producerStarted=true;throw new Error('resource zero receipt unavailable');}
+    if(!producerStarted&&!(result.request_budget===null&&prepared&&['available','blocked'].includes(item.state))) {receiptInvalid=true;producerStarted=true;throw new Error('resource zero receipt unavailable');}
     const stopped=STOP.has(result.request_budget?.stop_reason)?result.request_budget.stop_reason:null;
     let state='deferred',reason=stopped||'transient_failure',failures=task.failures,deferrals=task.deferrals;
     const confirmedDenial=/** @type {Row|null} */(denial);

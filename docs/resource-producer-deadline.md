@@ -69,7 +69,42 @@ target and immutable post-normalization outcome. A fabricated or modified
 diagnostic, another report/budget/target, and an alleged remote denial cannot
 borrow this proof. The wrapper keeps the observed finite failure separately from
 the stopped budget, with `persisted: false`; it performs no late result write.
-Ordinary cached/unsupported zero-session results retain a null receipt.
+All session-free completion paths use the same reduction, including a deadline
+first observed by `finish()` after preparation returned normally. A completed
+cache rejection is not discarded merely because it did not pass through the
+preparation catch. Ordinary cached/unsupported zero-session results with a live
+budget retain a null receipt.
+
+The private preparation proof also binds the actual preparation's verified
+account, resource binding hash and complete source fence. The resource binding
+already includes the canonical database path, device and inode, together with
+the exact endpoint and source version; ordinary database growth/mtime does not
+change this identity. These values are derived from the producer's actual
+snapshot and binding, not copied from a caller's claimed expected identity.
+The wrapper compares the proof with its previously selected identity in memory;
+it must not perform a new database, filesystem or account read after cutoff.
+Missing or different origin evidence fails closed. An entry without a verified
+binding cannot become an exact queue diagnosis simply because its target fields
+match. The returned preparation report may retain that local observation, but
+it supplies no matching queue-origin proof.
+The same origin gate applies to live zero-session cached/unsupported outcomes;
+`request_budget: null` is not a way to bypass provenance. A fabricated local
+available result from a test dependency is no longer sufficient for queue
+completion. Legitimate cache/fairness fixtures must exercise the actual producer
+on a synthetic verified cache. Pure undecided budget stops retain their existing
+budget receipt checks and do not claim a source-specific diagnosis.
+Exact target input is projected to its three identity fields before any result
+merge. Extra target metadata cannot overwrite an observed state, reason or failure
+and acquire a producer proof. This closes the related internal extra-field control
+without expanding the public CLI or granting new side effects.
+
+Synthetic controls preserve the original same-database `finish()` cutoff and
+the trusted-dependency miswiring counterexample where another database has the
+same target fields. The latter demonstrates an internal evidence contract gap,
+not that the default CLI selects a foreign database. Additional controls separate
+database identity, account/binding identity and source-fence changes, preserving
+the existing report/budget/outcome tamper checks. No test may obtain a passing
+diagnosis by late writes or by treating an existing running claim as rolled back.
 The same preparation projection covers parent-directory resolution and staging
 creation before a session exists. Resolution and creation have separate budget
 checks. Ordinary local staging failures do not become budget or permission facts.

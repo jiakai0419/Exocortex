@@ -6,6 +6,7 @@ import {join} from 'node:path';
 import {fixture} from './resource-producer-deadline.fixture.mjs';
 import * as producer from '../src/maintenance/enrich-resources.mjs';
 import {createResourceCommandBudget} from '../src/maintenance/history-command-budget.mjs';
+import {resourceWorkIdentity} from '../src/maintenance/resource-work.mjs';
 const {enrichResources}=producer,sha=x=>createHash('sha256').update(x).digest('hex');
 function manifest(f,key) {
   const path=fs.readdirSync(f.resourceDir).filter(name=>name.endsWith('.json')).map(name=>join(f.resourceDir,name))
@@ -48,6 +49,19 @@ for(const invalid of [false,true])for(const expired of [false,true])test(`cache 
   } else if(invalid)assert.deepEqual(report.failure,{stage:'selection',reason:'resource_image_invalid',persisted:true});
   t.diagnostic(JSON.stringify({invalid,expired,reason,queue_failure:report.failure,calls:f.calls.length,writes_after_cutoff:expired?f.writes.length-observed.writesAt:null}));
 });
+
+for(const expired of [false,true])test(`target metadata cannot overwrite actual cache rejection (expired=${expired})`,t=>{
+  const f=fixture(t),key='synthetic_target_metadata';f.add('image',[key]);
+  assert.equal(enrichResources({...f.options,recordIds:[1],apply:true},f.deps).available,1);corrupt(f,key);
+  f.tick=1;f.calls.length=0;f.writes.length=0;
+  const budget=createResourceCommandBudget({maxSeconds:3},{monotonicClock:()=>f.tick}),origin=resourceWorkIdentity(f.db,f.row(1));
+  const target={record_id:1,resource_key:key,reference_kind:'image_key',state:'failed',reason:'permission_denied',failure:{stage:'resource_request',reason:'permission_denied'}};
+  const result=cutoff(f,expired?1:Infinity,()=>enrichResources({...f.options,maxSeconds:3,recordIds:[1],resourceTargets:[target],apply:true},{...f.deps,executionBudget:budget})).value;
+  assert.equal(result.results[0].reason,'resource_image_invalid');assert.equal(result.results[0].state,'blocked');
+  assert.deepEqual(result.results[0].failure,{stage:'selection',reason:'resource_image_invalid'});
+  assert.equal(producer.readResourcePreparationOutcome(result,budget,target,origin).failure.reason,'resource_image_invalid');
+  assert.equal(result.request_budget?.stop_reason??null,expired?'time_budget':null);assert.equal(f.calls.length,0);assert.equal(f.writes.length,0);
+});
 for(const layout of ['records','slots'])for(const prefix of ['invalid','available'])for(const explicit of [false,true])test(`${layout} ${prefix} prefix survives later cutoff (exact=${explicit})`,t=>{
   const f=fixture(t),keys=['synthetic_first_cache','synthetic_second_cache','synthetic_unread_cache'];
   f.deps.resourceCapability=()=> 'message_image';
@@ -71,10 +85,12 @@ for(const layout of ['records','slots'])for(const prefix of ['invalid','availabl
   assert.equal(result.available,prefix==='available'?1:0);assert.equal(f.calls.length,0);assert.equal(f.writes.length,0);
   assert.deepEqual(fs.readdirSync(f.resourceDir).sort().map(name=>[name,sha(fs.readFileSync(join(f.resourceDir,name)))]),before);
 });
-for(const change of ['none','reason','stage','state','key','reference','report_clone','budget','target'])test(`preparation proof remains exact under ${change}`,t=>{
+for(const change of ['none','reason','stage','state','key','reference','report_clone','budget','target',
+  'origin_missing','origin_account_key','origin_binding_key','origin_source_fence'])test(`preparation proof remains exact under ${change}`,t=>{
   const f=fixture(t),key='synthetic_proof_cache';f.add('image',[key]);
   assert.equal(enrichResources({...f.options,recordIds:[1],apply:true},f.deps).available,1);corrupt(f,key);f.tick=1;f.calls.length=0;
   const target={record_id:1,resource_key:key,reference_kind:'image_key'},budget=createResourceCommandBudget({maxSeconds:3},{monotonicClock:()=>f.tick});
+  const origin=resourceWorkIdentity(f.db,f.row(1));
   let result=cutoff(f,1,()=>enrichResources({...f.options,maxSeconds:3,recordIds:[1],resourceTargets:[target],apply:true},{...f.deps,executionBudget:budget})).value;
   const item=result.results[0];
   if(change==='reason')item.reason='permission_denied';
@@ -84,7 +100,8 @@ for(const change of ['none','reason','stage','state','key','reference','report_c
   if(change==='reference')item.reference_kind='attachment_origin_key';
   if(change==='report_clone')result={...result};
   const otherBudget=createResourceCommandBudget({maxSeconds:3},{monotonicClock:()=>f.tick});
-  const checked=producer.readResourcePreparationOutcome(result,change==='budget'?otherBudget:budget,change==='target'?{...target,record_id:2}:target);
+  const checkedOrigin=change==='origin_missing'?undefined:change.startsWith('origin_')?{...origin,[change.slice(7)]:'a'.repeat(64)}:origin;
+  const checked=producer.readResourcePreparationOutcome(result,change==='budget'?otherBudget:budget,change==='target'?{...target,record_id:2}:target,checkedOrigin);
   if(change==='none')assert.equal(checked.failure.reason,'resource_image_invalid');else assert.equal(checked,null);
   assert.equal(f.calls.length,0);
 });
