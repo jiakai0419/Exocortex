@@ -3,7 +3,6 @@ import { createHash } from 'node:crypto';
 import test from 'node:test';
 import { projectPostContent, readPostProjectionEvidence } from '../src/adapters/lark-im/message-post-projection.mjs';
 import { renderApiMessageContent } from '../src/adapters/lark-im/raw-message.mjs';
-import { HistoryCommandBudgetError } from '../src/maintenance/history-command-budget.mjs';
 
 // Every message, identity and body in this file is independently invented.
 const prose = { title: 'Synthetic paper boat', content: [[{ tag: 'text', text: 'A fictional harbor note.' }]] };
@@ -105,7 +104,8 @@ test('a bare available object cannot supply image authority', () => {
   assert.equal(state(f,result),'partial'); assert.equal(result.status,'partial');
 });
 
-test('a resolver budget abort escapes rather than becoming a source-corruption diagnosis', () => {
-  const f=fixture(picture), stop=new HistoryCommandBudgetError('time_budget');
-  assert.throws(()=>projectPostContent(f.row,f.canonical,f.raw,{resolveImage(){throw stop;}}),error=>error===stop);
+test('an unbound resolver is not called and cannot supply this row image evidence', () => {
+  const f=fixture(picture);let calls=0;
+  const result=projectPostContent(f.row,f.canonical,f.raw,{resolveImage(){calls++;throw new Error('Untrusted callback');}});
+  assert.equal(calls,0);assert.equal(state(f,result),'partial');
 });

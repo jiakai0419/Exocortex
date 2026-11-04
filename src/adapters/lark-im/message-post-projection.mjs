@@ -2,6 +2,7 @@
 import { renderApiMessageContent } from './raw-message.mjs';
 import { validateJsonObjectText } from '../../../dist/core/json-text-patch.js';
 import { isDeepStrictEqual } from 'node:util';
+import { isCurrentImageContext } from './media-resource-projection.mjs';
 
 /** @typedef {Record<string, any>} Row */
 /** @param {unknown} value @returns {value is Row} */
@@ -58,9 +59,13 @@ export function projectPostContent(row, canonical, raw, options = {}) {
   } catch {
     diagnosis = evidence('invalid', 'post_source_invalid');
   }
+  // A legitimate read from another message/account/version is still not this
+  // post's resource evidence. The generic renderer cannot enforce row binding.
+  const renderOptions = isCurrentImageContext(row,canonical,raw,options.imageContext)
+    ? {imageContext:options.imageContext,resolveImage:options.resolveImage} : {};
   /** @type {import('./raw-message.mjs').RenderResult} */
   const rendered = baseline
-    ? (diagnosis ? baseline : renderApiMessageContent(item, options))
+    ? (diagnosis ? baseline : renderApiMessageContent(item, renderOptions))
     : { text: '', status: 'partial', reason: diagnosis?.reason || 'post_source_missing', version: 1 };
   /** @type {import('./raw-message.mjs').RenderResult} */
   const result = diagnosis ? { ...rendered, status: 'partial', reason: diagnosis.reason } : rendered;

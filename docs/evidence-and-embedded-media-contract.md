@@ -63,7 +63,7 @@ Preserve the original per-unit and shared API/self/time budgets, fairness, failu
 
 ## Read-time compatibility and review artifacts
 
-Post rendering is rebuilt from validated raw and canonical JSON bound to the exact stored row. The stored body must match either the current unverified projection or the exact old renderer mode; an arbitrary nonempty body or stale rendering flag cannot prove completeness. A private, immutable read-time proof binds the result to the encoded source and row fields. This does not rewrite historical bodies or reconstruct unknown earlier completion times.
+Post rendering is rebuilt from validated raw and canonical JSON bound to the exact stored row. The stored body must match either the current unverified projection or the exact old renderer mode; an arbitrary nonempty body or stale rendering flag cannot prove completeness. A private, immutable read-time proof binds the result to the encoded source and row fields. Post resource options must carry a current image context for this exact row/account/source fence; genuine bytes from another message are not transferable. Unbound callbacks are not invoked, and an admitted callback budget error still propagates unchanged. This does not rewrite historical bodies or reconstruct unknown earlier completion times.
 
 The actual messages JSON keeps stored body fields and adds `display.post` and, when present, `display.embedded_media`. Its `extraction_complete` field only describes reference extraction. The terminal uses the same verified projection with its existing field/order/layout. Card decoration reprojection reuses this read's nonserialized byte proof; a JSON clone, altered source or caller-injected resolver cannot obtain that authority.
 
