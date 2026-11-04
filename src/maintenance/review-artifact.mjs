@@ -15,6 +15,7 @@ import { recordProof, compareObservation, OBSERVATION_POLICY } from '../../dist/
 import { SCOPE_CONFIG_POLICY, SCOPE_CONFIG_PROJECTION_SQL } from './scope-config-policy.mjs';
 
 const OBSERVATION_REVIEW_SCHEMA = 'exocortex_private_maintenance_review/v4';
+const FINITE_CARD_REVIEW_SCHEMA = 'exocortex_private_maintenance_review/v5';
 const REVIEW_SCHEMA = 'exocortex_private_maintenance_review/v1';
 const TEXT_REVIEW_SCHEMA = 'exocortex_private_maintenance_review/v2';
 const SCOPE_REVIEW_SCHEMA = 'exocortex_private_maintenance_review/v3';
@@ -35,6 +36,10 @@ const REVIEW_DISCLOSURE = { opaque_columns: OPAQUE_FIELDS,
   omissions: 'interactive_values_and_url_credentials_are_intentionally_not_displayed' };
 const TEXT_REVIEW_DISCLOSURE = { ...REVIEW_DISCLOSURE,
   non_card_text: 'exact_stored_title_and_body_not_client_state; private_text_is_not_redacted' };
+const FINITE_CARD_REVIEW_DISCLOSURE = { ...TEXT_REVIEW_DISCLOSURE,
+  omissions: 'callback_payloads_and_url_credentials_are_intentionally_not_displayed',
+  static_controls: 'source_declared_static_control_values_and_options_may_be_displayed; placeholders_are_hints_not_values',
+  actions: 'action_definitions_are_not_execution_or_business_approval' };
 const REASONS = new Set(['invalid_options', 'unsafe_path', 'invalid_file', 'approval_mismatch', 'expired', 'binding_unavailable',
   'binding_changed', 'snapshot_changed', 'proposal_changed', 'too_large', 'incomplete_card', 'no_changes', 'publish_failed', 'evidence_capacity']);
 /** A finite local diagnostic; never expose file contents, IDs or filesystem errors. */
@@ -113,13 +118,14 @@ function publish(path, artifact, { sync = fsyncSync, maxBytes = REVIEW_MAX_BYTES
 }
 
 function validateArtifact(value, now) {
-  const observationReview = value?.schema === OBSERVATION_REVIEW_SCHEMA;
+  const finiteCardReview = value?.schema === FINITE_CARD_REVIEW_SCHEMA;
+  const observationReview = value?.schema === OBSERVATION_REVIEW_SCHEMA || finiteCardReview;
   const scopeReview = value?.schema === SCOPE_REVIEW_SCHEMA || observationReview;
   const textReview = value?.schema === TEXT_REVIEW_SCHEMA || scopeReview;
   if (!exactKeys(value, ['schema', 'mode', 'created_at_ms', 'expires_at_ms', 'disclosure', 'binding', 'constraints', 'records'])
-    || ![REVIEW_SCHEMA, TEXT_REVIEW_SCHEMA, SCOPE_REVIEW_SCHEMA, OBSERVATION_REVIEW_SCHEMA].includes(value.schema) || !['names', 'replay'].includes(value.mode)
-    || [TEXT_REVIEW_SCHEMA, OBSERVATION_REVIEW_SCHEMA].includes(value.schema) && value.mode !== 'replay'
-    || !equal(value.disclosure, textReview ? TEXT_REVIEW_DISCLOSURE : REVIEW_DISCLOSURE)
+    || ![REVIEW_SCHEMA, TEXT_REVIEW_SCHEMA, SCOPE_REVIEW_SCHEMA, OBSERVATION_REVIEW_SCHEMA, FINITE_CARD_REVIEW_SCHEMA].includes(value.schema) || !['names', 'replay'].includes(value.mode)
+    || (value.schema === TEXT_REVIEW_SCHEMA || observationReview) && value.mode !== 'replay'
+    || !equal(value.disclosure, finiteCardReview ? FINITE_CARD_REVIEW_DISCLOSURE : textReview ? TEXT_REVIEW_DISCLOSURE : REVIEW_DISCLOSURE)
     || !finite(value.created_at_ms) || value.expires_at_ms !== value.created_at_ms + REVIEW_AGE_MS) fail('invalid_file');
   if (now < value.created_at_ms || now >= value.expires_at_ms) fail('expired');
   if (!exactKeys(value.binding, ['database_key', 'source_id', 'source_config_sha256', 'baseline', 'local_account_key', 'scopes', 'verified_self_sha256', ...(scopeReview ? ['scope_config_policy'] : [])])
@@ -175,7 +181,8 @@ function validateArtifact(value, now) {
         if (textReview && display.non_card !== null) fail('invalid_file');
         if (value.mode === 'names' ? display.card !== null : display.canonical.msg_type.value !== 'interactive'
           || !exactKeys(display.card, ['text', 'status', 'reason', 'version', 'omitted_actions'])
-          || display.card.status !== 'rendered' || display.card.reason !== null || display.card.version !== 3
+          || display.card.status !== 'rendered' || display.card.reason !== null
+          || !(display.card.version === 3 || finiteCardReview && display.card.version === 4)
           || typeof display.card.text !== 'string' || !finite(display.card.omitted_actions)) fail('invalid_file');
       }
       if (!exactKeys(record.opaque[side], OPAQUE_FIELDS)) fail('invalid_file');
@@ -184,6 +191,8 @@ function validateArtifact(value, now) {
     }
   }
   if (value.schema === TEXT_REVIEW_SCHEMA && !value.records.some(record => record.display.before.non_card !== null || record.display.after.non_card !== null)) fail('invalid_file');
+  if (finiteCardReview && !value.records.some(record =>
+    record.display.before.card?.version === 4 || record.display.after.card?.version === 4)) fail('invalid_file');
   return value;
 }
 
@@ -286,7 +295,7 @@ function beginMaintenanceReview(options, { db, mode, rows, scopes = [], now = Da
   // member. It needs a fresh preview; optional acquisition_exact is additional
   // comparison evidence, never a reinterpretation of its original exact digest.
   const schema = approval?.schema ?? (mode === 'replay' ? OBSERVATION_REVIEW_SCHEMA : SCOPE_REVIEW_SCHEMA);
-  const observationReview = schema === OBSERVATION_REVIEW_SCHEMA;
+  const observationReview = schema === OBSERVATION_REVIEW_SCHEMA || schema === FINITE_CARD_REVIEW_SCHEMA;
   const scopeReview = schema === SCOPE_REVIEW_SCHEMA || observationReview;
   if (options.reviewOut) privateDestination(options.reviewOut);
   const snapshots = rows.map(recordSnapshot).sort((a,b) => a.id - b.id);
@@ -378,7 +387,7 @@ function beginMaintenanceReview(options, { db, mode, rows, scopes = [], now = Da
           const native = raw.raw_api && typeof raw.raw_api === 'object' ? raw.raw_api : raw;
           if (canonical.msg_type !== 'interactive') fail('incomplete_card');
           const rendered = renderCardContent(native.body?.content ?? native.content, native.mentions);
-          if (rendered.status !== 'rendered') fail('incomplete_card');
+          if (rendered.status !== 'rendered' || Object.hasOwn(rendered, 'media_slots')) fail('incomplete_card');
           card = { text: rendered.text, status: rendered.status, reason: rendered.reason, version: rendered.version, omitted_actions: rendered.omitted_actions || 0 };
         }
         return { fields: pick(row, VISIBLE_FIELDS), sender, canonical: projection(CANONICAL_FIELDS, true), card,
@@ -401,8 +410,14 @@ function beginMaintenanceReview(options, { db, mode, rows, scopes = [], now = Da
     const textReview = schema !== REVIEW_SCHEMA;
     if (textReview) for (const entry of entries) for (const side of ['before', 'after']) entry.display[side].non_card ??= null;
     const binding = { ...control.binding, verified_self_sha256: self };
-    const artifact = { schema, mode, created_at_ms: created, expires_at_ms: created + REVIEW_AGE_MS,
-      disclosure: textReview ? TEXT_REVIEW_DISCLOSURE : REVIEW_DISCLOSURE,
+    // Only a fresh finite-card preview selects v5. An existing approval keeps
+    // its exact schema, disclosure and comparison authority; it never upgrades.
+    const artifactSchema = !approval && mode === 'replay' && entries.some(entry =>
+      entry.display.before.card?.version === 4 || entry.display.after.card?.version === 4)
+      ? FINITE_CARD_REVIEW_SCHEMA : schema;
+    const artifact = { schema: artifactSchema, mode, created_at_ms: created, expires_at_ms: created + REVIEW_AGE_MS,
+      disclosure: artifactSchema === FINITE_CARD_REVIEW_SCHEMA ? FINITE_CARD_REVIEW_DISCLOSURE
+        : textReview ? TEXT_REVIEW_DISCLOSURE : REVIEW_DISCLOSURE,
       binding, constraints: selection, records: entries };
     validateArtifact(artifact, now());
     if (bytes(`${JSON.stringify(artifact, null, 2)}\n`) > REVIEW_MAX_BYTES) fail('too_large');
@@ -513,4 +528,4 @@ function reuseMaintenanceReview(options, { db, mode, now = Date.now, expectedSha
 }
 
 export { beginMaintenanceReview, reuseMaintenanceReview, validateReviewOptions, reviewRequested, MaintenanceReviewError, recordSnapshot,
-  effectiveRecord, OBSERVATION_REVIEW_SCHEMA, publish as publishReviewArtifact, REVIEW_SCHEMA, REVIEW_MAX_BYTES, REVIEW_RECORD_BYTES, REVIEW_TOTAL_BYTES, REVIEW_AGE_MS };
+  effectiveRecord, OBSERVATION_REVIEW_SCHEMA, FINITE_CARD_REVIEW_SCHEMA, publish as publishReviewArtifact, REVIEW_SCHEMA, REVIEW_MAX_BYTES, REVIEW_RECORD_BYTES, REVIEW_TOTAL_BYTES, REVIEW_AGE_MS };
