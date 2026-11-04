@@ -49,7 +49,7 @@ function cases() {
       occurred_at_ms: AT + id * 1000, body, raw_json: rawJson, canonical_json: JSON.stringify(canonical),
       content_hash: hash(rawJson) };
     const mediaState = options.mediaState === undefined ? 'reference_only' : options.mediaState;
-    entries.push({ label, row, type, mediaState, state: options.state || 'blocked',
+    entries.push({ label, row, type, mediaState, state: options.state || 'blocked', recalled: options.recalled === true,
       scene: options.scene || '群聊',
       reason: options.reason ?? (mediaState ? reasonFor(mediaState,type) : null),
       key: options.key ?? (type === 'image' ? payload?.image_key : payload?.file_key) ?? null,
@@ -117,7 +117,7 @@ function cases() {
   add('unknown type with familiar resource key remains unsupported', 'invented_future_media', { image_key: 'synthetic_unknown_type' }, {
     mediaState: null, reason: 'content_unsupported' });
   add('recalled media preserves tombstone priority', 'image', { image_key: 'synthetic_recalled_reference' }, {
-    mediaState: null, state: 'ready', native: item => { item.deleted = true; } });
+    mediaState: null, state: 'ready', recalled: true, native: item => { item.deleted = true; } });
   add('stored-body search finds a blocked sent row', 'sticker', { file_key: 'synthetic_sent_resource_key' }, {
     direction: 'sent', body: 'Invented original STORED_MEDIA_SEARCH paragraph.', search: true });
   add('adjacent ready text remains unchanged', 'text', { text: 'Invented newest ordinary text.' }, {
@@ -182,7 +182,8 @@ test('real messages CLI represents media references faithfully without inventing
     }
     assert.deepEqual(row.raw, JSON.parse(stored.raw_json), `${expected.label}: native raw remains exact`);
     assert.deepEqual(row.canonical, JSON.parse(stored.canonical_json), `${expected.label}: canonical remains exact`);
-    assert.equal(row.display.body, stored.body, `${expected.label}: display.body contract stays unchanged`);
+    assert.equal(row.display.body, expected.recalled ? '[已撤回/已删除]' : stored.body,
+      `${expected.label}: recall marker takes priority only in the default display`);
     assert.equal(row.display.scene, expected.scene, `${expected.label}: conversation scene`);
     assert.equal(row.readiness.state, expected.state, expected.label);
     if (expected.reason) assert(row.readiness.reasons.includes(expected.reason), `${expected.label}: ${row.readiness.reasons}`);
@@ -211,7 +212,10 @@ test('real messages CLI represents media references faithfully without inventing
       assert(!block.includes('\n  资源    '), expected.label);
       if (expected.state === 'ready') {
         assert(block.includes(`\n  发送人  ${NAME}\n  群      ${TITLE}\n`), expected.label);
-        assert(block.includes(stored.body), expected.label);
+        if (expected.recalled) {
+          assert(block.includes('[已撤回/已删除]'), `${expected.label}: neutral marker remains at the original position`);
+          assert(!block.includes(stored.body), `${expected.label}: archived original body is not displayed`);
+        } else assert(block.includes(stored.body), expected.label);
         assert(!block.includes('\n  状态    '), expected.label);
       }
     }
