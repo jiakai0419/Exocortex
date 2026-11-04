@@ -1,5 +1,6 @@
 // @ts-check
 import { CARD_ID_NAMESPACES as ID_NAMESPACES, resolveCardMention, resolveNativeCardReference } from "../../../dist/core/lark-card-reference.js";
+import { MAX_IMAGE_SLOTS, createImageSlot, imageSlotDisplay } from "./media-image-slot.mjs";
 
 const MAX_INPUT_CHARS = 256 * 1024;
 const MAX_OUTPUT_CHARS = 16_000;
@@ -23,6 +24,10 @@ const EXPLANATIONS = {
   unresolved_card_mention: "部分提及未能匹配",
   unsupported_card_link: "不支持的链接已省略",
   card_no_visible_content: "没有可识别正文",
+  media_slot_limit: "图片数量超过解析上限",
+  media_reference_missing: "图片资源引用缺失",
+  media_reference_invalid: "图片资源引用无效或冲突",
+  media_resource_unavailable: "图片资源尚未验证",
 };
 const LOCAL_LIMIT_NOTICES = {
   card_input_limit: "[此处输入超过解析上限]",
@@ -30,13 +35,14 @@ const LOCAL_LIMIT_NOTICES = {
   card_node_limit: "[解析在此达到元素数量上限]",
   card_depth_limit: "[此处嵌套超过解析深度上限]",
   card_cycle: "[此处为循环结构，已停止展开]",
+  media_slot_limit: "[此处图片数量超过解析上限]",
 };
 
 /** @typedef {Record<string, any>} JsonObject */
 /** @typedef {{parent: Identity | null, ids: Map<string, string>, name: string | null, conflict: boolean}} Identity */
 /** @typedef {keyof typeof EXPLANATIONS} Reason */
-/** @typedef {{text: string, status: "rendered" | "partial" | "structured_fallback", reason: string | null, version: 3, omitted_actions?: number}} CardRenderResult */
-/** @typedef {{includePartialNotice?: boolean, includeDecorativeSeparators?: boolean}} CardRenderOptions */
+/** @typedef {{text: string, status: "rendered" | "partial" | "structured_fallback", reason: string | null, version: 3 | 4, omitted_actions?: number, media_slots?: Record<string,any>[]}} CardRenderResult */
+/** @typedef {{includePartialNotice?: boolean, includeDecorativeSeparators?: boolean, imageContext?:unknown, resolveImage?:(slot:Record<string,any>)=>unknown}} CardRenderOptions */
 /** @typedef {{prefix: string, pending: boolean, leading: string[], level: number, parent: ListItem | null}} ListItem */
 
 /** @param {unknown} value @returns {value is JsonObject} */
@@ -130,6 +136,18 @@ function renderCardContent(content, mentions = [], options = {}) {
   let contentEmissions = 0;
   let stopped = false;
   let omittedActions = 0;
+  let finiteSemantics = false;
+  let formDepth = 0;
+  /** The nearest declared attachment scope; absence inherits the wrapper,
+   * while an invalid declaration shadows it instead of borrowing an alias.
+   * @type {JsonObject | null} */
+  let imageAttachment = null;
+  /** @type {Record<string,any>[]} */
+  const mediaSlots = [];
+  let representation = "card";
+  let resolverFailed = false;
+  /** @type {unknown} */
+  let resolverError;
   /** List markers are deferred until visible content; hidden actions leave no empty item.
    * @type {ListItem | null} */
   let currentListItem = null;
@@ -348,9 +366,11 @@ function renderCardContent(content, mentions = [], options = {}) {
   function attachment(value, depth) {
     if (value === undefined) return;
     hasAttachment = true;
+    imageAttachment = null;
     enter(value, depth, () => {
       const decoded = parse(value);
       if (!object(decoded)) { mark("unsupported_card_structure"); return; }
+      imageAttachment = decoded;
       const users = read(decoded, "at_users");
       if (users === undefined) return;
       enter(users, depth + 1, () => {
@@ -600,11 +620,15 @@ function renderCardContent(content, mentions = [], options = {}) {
     return parts.join("");
   }
 
-  /** @param {unknown} value @param {number} depth @param {(item: unknown, depth: number) => void} visit */
-  function each(value, depth, visit) {
+  /** JSON pointers describe the selected source, including decoded JSON wrappers.
+   * They are not filesystem paths. @param {string} path @param {string | number} key */
+  function pointer(path, key) { return `${path}/${String(key).replace(/~/g, "~0").replace(/\//g, "~1")}`; }
+
+  /** @param {unknown} value @param {number} depth @param {(item: unknown, depth: number, path: string) => void} visit @param {string} [path] */
+  function each(value, depth, visit, path = "") {
     if (!Array.isArray(value)) { mark("unsupported_card_structure"); return; }
     enter(value, depth, () => {
-      for (let index = 0; index < value.length && !stopped; index += 1) visit(read(value, String(index)), depth + 1);
+      for (let index = 0; index < value.length && !stopped; index += 1) visit(read(value, String(index)), depth + 1, pointer(path, index));
     });
   }
 
@@ -615,7 +639,7 @@ function renderCardContent(content, mentions = [], options = {}) {
     if (!object(value)) { mark("unsupported_card_structure"); return undefined; }
     for (const language of LOCALES) {
       const translated = read(value, language);
-      if (typeof translated === "string" || Array.isArray(translated) || object(translated)) return translated;
+      if (typeof translated === "string" || Array.isArray(translated) || object(translated)) return { value: translated, key: language };
       if (translated !== undefined) mark("unsupported_card_structure");
     }
     if (!nonemptyLocaleMaps.has(value)) {
@@ -633,41 +657,41 @@ function renderCardContent(content, mentions = [], options = {}) {
     return undefined;
   }
 
-  /** @param {unknown} value @param {number} depth */
-  function inline(value, depth) {
-    if (Array.isArray(value)) each(value, depth, inline);
-    else node(value, depth, true);
+  /** @param {unknown} value @param {number} depth @param {string} [path] */
+  function inline(value, depth, path = "") {
+    if (Array.isArray(value)) each(value, depth, inline, path);
+    else node(value, depth, true, path);
   }
 
-  /** @param {JsonObject} payload @param {number} depth @returns {boolean} */
-  function textSlots(payload, depth) {
+  /** @param {JsonObject} payload @param {number} depth @param {string} [path] @returns {boolean} */
+  function textSlots(payload, depth, path = "") {
     for (const key of ["i18nElements", "i18nContent"]) {
       const mapping = read(payload, key);
       if (mapping === undefined) continue;
       const selected = locale(mapping);
       if (selected === null) continue;
-      inline(selected, depth + 1);
+      inline(selected?.value, depth + 1, pointer(pointer(path, key), selected?.key ?? ""));
       return true;
     }
     const contentText = read(payload, "content");
-    if (contentText !== undefined) { inline(contentText, depth + 1); return true; }
+    if (contentText !== undefined) { inline(contentText, depth + 1, pointer(path, "content")); return true; }
     const text = read(payload, "text");
-    if (text !== undefined) { inline(text, depth + 1); return true; }
+    if (text !== undefined) { inline(text, depth + 1, pointer(path, "text")); return true; }
     const parts = read(payload, "elements");
-    if (parts !== undefined) { inline(parts, depth + 1); return true; }
+    if (parts !== undefined) { inline(parts, depth + 1, pointer(path, "elements")); return true; }
     return false;
   }
 
-  /** @param {unknown} value @param {number} depth */
-  function block(value, depth) { lineBreak(); node(value, depth, false); }
+  /** @param {unknown} value @param {number} depth @param {string} [path] */
+  function block(value, depth, path = "") { lineBreak(); node(value, depth, false, path); }
 
-  /** @param {JsonObject} payload @param {number} depth @param {boolean} columns */
-  function container(payload, depth, columns = false) {
+  /** @param {JsonObject} payload @param {number} depth @param {boolean} columns @param {string} [path] */
+  function container(payload, depth, columns = false, path = "") {
     let recognized = false;
     const start = output.length;
     // Presentation slots are separate blocks; fragments within an inline slot
     // remain adjacent. An empty slot must not split surrounding inline text.
-    /** @param {string} key @param {(value: unknown, childDepth: number) => void} visit */
+    /** @param {string} key @param {(value: unknown, childDepth: number, path: string) => void} visit */
     function slot(key, visit) {
       const value = read(payload, key);
       if (value === undefined) return;
@@ -675,25 +699,25 @@ function renderCardContent(content, mentions = [], options = {}) {
       const emissions = contentEmissions;
       if (output.length > start) lineBreak();
       recognized = true;
-      visit(value, depth + 1);
+      visit(value, depth + 1, pointer(path, key));
       // Hidden actions/empty lists contribute no separator. Explicit br nodes
       // are content emissions, so intentional line breaks remain unchanged.
       if (contentEmissions === emissions) output = output.slice(0, before);
     }
     slot("text", inline);
-    slot("fields", (value, childDepth) => each(value, childDepth, block));
-    slot("elements", (value, childDepth) => each(value, childDepth, columns ? block : inline));
-    slot("actions", (value, childDepth) => each(value, childDepth, block));
-    slot("columns", (value, childDepth) => each(value, childDepth, block));
+    slot("fields", (value, childDepth, childPath) => each(value, childDepth, block, childPath));
+    slot("elements", (value, childDepth, childPath) => each(value, childDepth, columns ? block : inline, childPath));
+    slot("actions", (value, childDepth, childPath) => each(value, childDepth, block, childPath));
+    slot("columns", (value, childDepth, childPath) => each(value, childDepth, block, childPath));
     slot("extra", block);
     if (!recognized) mark("unsupported_card_structure");
   }
 
   /** Native Markdown lists contain typed items, whose elements remain inline.
    * Do not treat unknown item kinds or arbitrary children as presentation slots.
-   * @param {JsonObject} payload @param {number} depth */
-  function list(payload, depth) {
-    each(read(payload, "items"), depth + 1, (value, itemDepth) => enter(value, itemDepth, () => {
+   * @param {JsonObject} payload @param {number} depth @param {string} [path] */
+  function list(payload, depth, path = "") {
+    each(read(payload, "items"), depth + 1, (value, itemDepth, itemPath) => enter(value, itemDepth, () => {
       if (!object(value)) { mark("unsupported_card_structure"); return; }
       const type = read(value, "type");
       if (type !== "ol" && type !== "ul") { mark("unsupported_card_structure"); return; }
@@ -717,13 +741,13 @@ function renderCardContent(content, mentions = [], options = {}) {
       const emissions = contentEmissions;
       lineBreak();
       currentListItem = { prefix: `${"  ".repeat(indent)}${knownLevel ? "" : "[层级未知] "}${marker}`, pending: true, leading: [], level: indent, parent };
-      try { inline(elements, itemDepth + 1); }
+      try { inline(elements, itemDepth + 1, pointer(itemPath, "elements")); }
       finally { currentListItem = parent; }
       // A deferred marker can itself reach the output limit before body text.
       // Preserve that limit notice instead of treating the item as hidden.
       if (contentEmissions === emissions && !stopped) output = output.slice(0, before);
       else lineBreak();
-    }));
+    }), pointer(path, "items"));
   }
 
   /** Inspect only documented navigation slots; action requests remain opaque.
@@ -801,8 +825,180 @@ function renderCardContent(content, mentions = [], options = {}) {
     if (!label && navigation.links.length === 0) mark("unsupported_card_structure");
   }
 
-  /** @param {unknown} value @param {number} depth @param {boolean} inLine */
-  function node(value, depth, inLine) {
+  /** New controls expose presentation only, never their opaque names or action
+   * payloads. An unfilled input is a complete control, not a missing answer.
+   * @param {JsonObject} payload */
+  function controlFlags(payload) {
+    for (const [key, yes, no] of [["required", "必填", "可选"], ["disabled", "禁用", "可用"]]) {
+      const flag = read(payload, key);
+      if (flag === undefined) continue;
+      if (typeof flag !== "boolean") mark("unsupported_card_structure");
+      else emit(` [${flag ? yes : no}]`);
+    }
+  }
+
+  /** @param {JsonObject} payload @param {number} depth @param {string} path @param {string} label */
+  function controlLabel(payload, depth, path, label) {
+    lineBreak();
+    emit(`${label}：`);
+    const source = read(payload, "label");
+    if (source !== undefined) inline(source, depth + 1, pointer(path, "label"));
+    controlFlags(payload);
+    lineBreak();
+  }
+
+  /** @param {JsonObject} payload @param {number} depth @param {string} path */
+  function inputControl(payload, depth, path) {
+    controlLabel(payload, depth, path, "输入框");
+    const kind = read(payload, "inputType");
+    if (kind !== undefined && kind !== "text" && kind !== "multiline_text") {
+      mark("unsupported_card_structure"); return;
+    }
+    const hint = read(payload, "placeholder");
+    if (hint !== undefined) { emit("提示："); inline(hint, depth + 1, pointer(path, "placeholder")); lineBreak(); }
+    // These explicit input slots are not the generic callback `value` of a
+    // button. Reject disagreement rather than choosing an arbitrary alias.
+    const keys = ["value", "default_value", "defaultValue", "initialValue", "initial_value"];
+    const values = keys.map(key => read(payload, key)).filter(value => value !== undefined);
+    if (values.some(value => typeof value !== "string") || values.some(value => value !== values[0])) {
+      mark("unsupported_card_structure"); emit("[输入值声明不一致]"); return;
+    }
+    if (values.length) emit(`源输入值：${visibleText(values[0])}`);
+    else emit("[源未提供输入值]");
+    lineBreak();
+    controlActions(payload, depth);
+  }
+
+  /** Non-navigation control callbacks stay opaque. Unknown action kinds still
+   * prevent readiness. @param {JsonObject} payload @param {number} depth */
+  function controlActions(payload, depth) {
+    const actions = read(payload, "actions");
+    if (actions === undefined) return;
+    each(actions, depth + 1, (action, actionDepth) => enter(action, actionDepth, () => {
+      if (!object(action) || !["request", "action_request"].includes(read(action, "type"))) {
+        mark("unsupported_card_structure"); return;
+      }
+      omittedActions += 1;
+    }));
+  }
+
+  /** @param {JsonObject} payload @param {number} depth @param {string} path */
+  function selectControl(payload, depth, path) {
+    controlLabel(payload, depth, path, "选择框");
+    /** @type {Array<{value: string | null, path: string, text: unknown, disabled: unknown}>} */
+    const choices = [];
+    each(read(payload, "options"), depth + 1, (option, optionDepth, optionPath) => enter(option, optionDepth, () => {
+      if (!object(option)) { mark("unsupported_card_structure"); return; }
+      const value = boundedId(read(option, "value"));
+      const label = read(option, "text");
+      if (value === null || label === undefined) mark("unsupported_card_structure");
+      choices.push({ value, path: optionPath, text: label, disabled: read(option, "disabled") });
+      controlActions(option, optionDepth);
+    }), pointer(path, "options"));
+    if (!choices.length) mark("unsupported_card_structure");
+    const initial = [read(payload, "initialOption"), read(payload, "initial_option")].filter(value => value !== undefined);
+    const index = read(payload, "initialIndex");
+    let selected = -1;
+    let uncertain = false;
+    if (initial.length) {
+      if (initial.some(value => typeof value !== "string" || !value || boundedRawText(value) !== value)
+          || initial.some(value => value !== initial[0])) uncertain = true;
+      else {
+        const matches = choices.flatMap((choice, position) => choice.value === initial[0] ? [position] : []);
+        if (matches.length !== 1) uncertain = true;
+        else selected = matches[0];
+      }
+    }
+    if (index !== undefined) {
+      if (!Number.isSafeInteger(index) || index < 0 || index >= choices.length
+          || initial.length > 0 && selected !== index) uncertain = true;
+      else selected = index;
+    }
+    if (uncertain) { selected = -1; mark("unsupported_card_structure"); }
+    for (const [position, choice] of choices.entries()) {
+      if (stopped) break;
+      emit(position === selected ? "[源初选] " : "- ");
+      inline(choice.text, depth + 2, pointer(choice.path, "text"));
+      if (choice.disabled !== undefined) {
+        if (typeof choice.disabled !== "boolean") mark("unsupported_card_structure");
+        else emit(choice.disabled ? " [禁用]" : " [可用]");
+      }
+      lineBreak();
+    }
+    if (uncertain) emit("[初选声明无法确认]");
+    else if (selected < 0) emit("[源未提供初选]");
+    lineBreak();
+    controlActions(payload, depth);
+  }
+
+  /** @param {JsonObject} payload @param {number} depth @param {string} path */
+  function panel(payload, depth, path) {
+    const expanded = read(payload, "expanded");
+    if (expanded !== undefined && typeof expanded !== "boolean") mark("unsupported_card_structure");
+    const header = read(payload, "header");
+    if (header !== undefined) {
+      const property = read(header, "property");
+      const headerPayload = property === undefined ? header : property;
+      const headerPath = property === undefined ? pointer(path, "header") : pointer(pointer(path, "header"), "property");
+      if (read(headerPayload, "title") !== undefined) {
+        block(read(headerPayload, "title"), depth + 1, pointer(headerPath, "title"));
+        const subtitle = read(headerPayload, "subtitle");
+        if (subtitle !== undefined) block(subtitle, depth + 1, pointer(headerPath, "subtitle"));
+      } else block(header, depth + 1, pointer(path, "header"));
+    }
+    each(read(payload, "elements"), depth + 1, block, pointer(path, "elements"));
+    lineBreak();
+  }
+
+  /** One selected occurrence creates one slot. Neither aliases nor resource
+   * keys are rendered, and no lookup traverses unrelated attachment entries.
+   * @param {JsonObject} payload @param {number} depth @param {string} path */
+  function imageNode(payload, depth, path) {
+    finiteSemantics = true;
+    if (mediaSlots.length >= MAX_IMAGE_SLOTS) { mark("media_slot_limit"); return; }
+    const direct = [read(payload, "image_key"), read(payload, "img_key")].filter(value => value !== undefined);
+    const alias = read(payload, "imageID");
+    /** @type {unknown} */
+    let key = direct[0];
+    /** @type {string | undefined} */
+    let state;
+    const kind = alias !== undefined ? "attachment_origin_key" : "image_key";
+    if (direct.some(value => value !== direct[0]) || direct.length > 0 && alias !== undefined) state = "conflicting_reference";
+    if (alias !== undefined && state === undefined) {
+      key = null;
+      if (typeof alias !== "string" || !alias || boundedRawText(alias) !== alias) state = "invalid_reference";
+      else if (imageAttachment !== null) enter(imageAttachment, depth + 1, () => {
+        const images = read(imageAttachment, "images");
+        if (images === undefined) return;
+        enter(images, depth + 2, () => {
+          if (!object(images)) { state = "invalid_reference"; return; }
+          const image = read(images, alias);
+          if (image === undefined) return;
+          enter(image, depth + 3, () => {
+            if (!object(image)) { state = "invalid_reference"; return; }
+            key = read(image, "origin_key");
+          });
+        });
+      });
+    }
+    if (typeof key === "string" && boundedRawText(key) !== key) state = "invalid_reference";
+    const slot = createImageSlot({ slot_id: path, order: mediaSlots.length,
+      message_type: "interactive", representation, reference_kind: kind,
+      reference_state: state, key, alias }, { imageContext: options.imageContext });
+    if (!slot) { mark("unsupported_card_structure"); emit("[图片] 资源引用无效"); return; }
+    mediaSlots.push(slot);
+    let resolution;
+    if (options.resolveImage) {
+      try { resolution = options.resolveImage(slot); }
+      catch (error) { resolverFailed = true; resolverError = error; throw error; }
+    }
+    const display = imageSlotDisplay(slot, resolution);
+    emit(display.text);
+    if (display.reason !== null) mark(/** @type {Reason} */ (display.reason));
+  }
+
+  /** @param {unknown} value @param {number} depth @param {boolean} inLine @param {string} [path] */
+  function node(value, depth, inLine, path = "") {
     enter(value, depth, () => {
       if (typeof value === "string") {
         const text = visibleText(value);
@@ -818,24 +1014,65 @@ function renderCardContent(content, mentions = [], options = {}) {
       const property = read(value, "property");
       const payload = property === undefined ? value : property;
       if (!object(payload)) { mark("unsupported_card_structure"); return; }
+      const payloadPath = property === undefined ? path : pointer(path, "property");
       const tag = read(value, "tag") ?? read(value, "type") ?? read(payload, "tag") ?? read(payload, "type") ?? "";
       if (tag === "at") {
         emit(mention(nodeMention(payload)));
       } else if (tag === "at_all") {
         emit("@所有人");
       } else if (TEXT_TAGS.has(tag)) {
-        if (!textSlots(payload, depth)) mark("unsupported_card_structure");
+        if (!textSlots(payload, depth, payloadPath)) mark("unsupported_card_structure");
       } else if (tag === "list") {
-        list(payload, depth);
+        list(payload, depth, payloadPath);
+      } else if (tag === "collapsible_panel") {
+        finiteSemantics = true;
+        panel(payload, depth, payloadPath);
+      } else if (tag === "form") {
+        finiteSemantics = true;
+        if (formDepth > 0) mark("unsupported_card_structure");
+        formDepth += 1;
+        try { each(read(payload, "elements"), depth + 1, block, pointer(payloadPath, "elements")); }
+        finally { formDepth -= 1; }
+      } else if (tag === "input" || tag === "select_static") {
+        finiteSemantics = true;
+        if (!formDepth) { mark("unsupported_card_structure"); return; }
+        if (tag === "input") inputControl(payload, depth, payloadPath);
+        else selectControl(payload, depth, payloadPath);
+      } else if (tag === "markdown_v1") {
+        finiteSemantics = true;
+        const previous = representation;
+        representation = "markdown_v1";
+        try {
+          const elements = read(payload, "elements");
+          if (elements !== undefined) each(elements, depth + 1, inline, pointer(payloadPath, "elements"));
+          else if (property === undefined && read(value, "fallback") !== undefined) {
+            node(read(value, "fallback"), depth + 1, inLine, pointer(path, "fallback"));
+          } else mark("unsupported_card_structure");
+        } finally { representation = previous; }
+      } else if (tag === "img") {
+        imageNode(payload, depth, path);
       } else if (tag === "button" || tag === "a" || tag === "link") {
         const navigation = navigationLinks(payload, depth, tag === "button");
-        if (tag === "button" && navigation.usable === 0) { omittedActions += 1; return; }
+        const formActionType = formDepth && tag === "button" ? read(payload, "actionType") : undefined;
+        if (formActionType !== undefined && formActionType !== "form_submit") mark("unsupported_card_structure");
+        if (tag === "button" && navigation.usable === 0) {
+          omittedActions += 1;
+          if (formDepth) {
+            lineBreak();
+            emit(formActionType === "form_submit" ? "提交操作：" : "交互操作：");
+            if (!textSlots(payload, depth, payloadPath)) mark("unsupported_card_structure");
+            controlFlags(payload);
+            emit(" [未在文本视图执行]");
+            lineBreak();
+          }
+          return;
+        }
         if (!inLine) lineBreak();
-        const label = textSlots(payload, depth);
+        const label = textSlots(payload, depth, payloadPath);
         emitLinks(navigation, label);
       } else if (CONTAINER_TAGS.has(tag)) {
         lineBreak();
-        container(payload, depth, tag === "column" || tag === "column_set");
+        container(payload, depth, tag === "column" || tag === "column_set", payloadPath);
         lineBreak();
       } else if (tag === "br") {
         emit("\n");
@@ -850,10 +1087,10 @@ function renderCardContent(content, mentions = [], options = {}) {
         // Untagged native property nodes and common field wrappers have only
         // these presentation slots; never search arbitrary descendants.
         if (["elements", "fields", "actions", "columns", "extra"].some((key) => read(payload, key) !== undefined)) {
-          container(payload, depth);
+          container(payload, depth, false, payloadPath);
         } else if (["url", "href", "multi_url"].some((key) => read(payload, key) !== undefined)) {
-          emitLinks(navigationLinks(payload, depth), textSlots(payload, depth));
-        } else if (!textSlots(payload, depth)) mark("unsupported_card_structure");
+          emitLinks(navigationLinks(payload, depth), textSlots(payload, depth, payloadPath));
+        } else if (!textSlots(payload, depth, payloadPath)) mark("unsupported_card_structure");
       } else mark("unsupported_card_structure");
     });
   }
@@ -907,6 +1144,7 @@ function renderCardContent(content, mentions = [], options = {}) {
     }));
     let card = parse(content);
     let wrapperDepth = 0;
+    let cardPath = "";
     const wrappers = new WeakSet();
     while (!stopped && object(card) && read(card, "json_card") !== undefined) {
       if (wrappers.has(card)) { mark("card_cycle"); card = null; break; }
@@ -916,6 +1154,7 @@ function renderCardContent(content, mentions = [], options = {}) {
       enter(wrapper, wrapperDepth, () => { attachment(read(wrapper, "json_attachment"), wrapperDepth + 1); });
       wrapperDepth += 1;
       card = parse(read(wrapper, "json_card"));
+      cardPath = pointer(cardPath, "json_card");
     }
     if (!object(card)) mark("invalid_card_json");
     else enter(card, wrapperDepth, () => {
@@ -923,50 +1162,56 @@ function renderCardContent(content, mentions = [], options = {}) {
       const header = read(card, "header");
       if (header !== undefined) {
         const headerPayload = read(header, "property") ?? header;
+        const headerPath = read(header, "property") === undefined ? pointer(cardPath, "header") : pointer(pointer(cardPath, "header"), "property");
         const title = read(headerPayload, "title");
-        if (title !== undefined) block(title, wrapperDepth + 1);
+        if (title !== undefined) block(title, wrapperDepth + 1, pointer(headerPath, "title"));
         else mark("unsupported_card_structure");
         const subtitle = read(headerPayload, "subtitle");
-        if (subtitle !== undefined) block(subtitle, wrapperDepth + 1);
+        if (subtitle !== undefined) block(subtitle, wrapperDepth + 1, pointer(headerPath, "subtitle"));
       }
       const body = read(card, "body");
       const bodyPayload = read(body, "property") ?? body;
       const elements = body === undefined ? read(card, "elements") : read(bodyPayload, "elements");
-      if (elements !== undefined) each(elements, wrapperDepth + 1, block);
+      const bodyPath = body === undefined ? cardPath : read(body, "property") === undefined
+        ? pointer(cardPath, "body") : pointer(pointer(cardPath, "body"), "property");
+      if (elements !== undefined) each(elements, wrapperDepth + 1, block, pointer(bodyPath, "elements"));
       else if (body !== undefined || header === undefined) mark("unsupported_card_structure");
       if (read(card, "i18n_elements") !== undefined || read(card, "i18nElements") !== undefined) {
         mark("unsupported_card_structure");
       }
     });
   } catch {
+    if (resolverFailed) throw resolverError;
     // Malformed non-JSON objects (including access traps) are never dumped.
     mark("unsupported_card_structure");
   }
   // Preserve only generated indentation on an initial list; ordinary source
   // whitespace keeps the established trim behavior.
   output = `${"  ".repeat(leadingListLevel)}${output.trim()}`;
-  const omissions = omittedActions > 0 ? { omitted_actions: omittedActions } : {};
+  const version = finiteSemantics ? 4 : 3;
+  const omissions = { ...(omittedActions > 0 ? { omitted_actions: omittedActions } : {}),
+    ...(mediaSlots.length > 0 ? { media_slots: mediaSlots } : {}) };
   if (!output && reasons.size === 0 && omittedActions > 0) {
-    return { text: "[卡片仅含交互操作，文本视图已收起]", status: "rendered", reason: null, version: 3, ...omissions };
+    return { text: "[卡片仅含交互操作，文本视图已收起]", status: "rendered", reason: null, version, ...omissions };
   }
   if (!output && reasons.size === 0) mark("card_no_visible_content");
   const reason = /** @type {Reason | undefined} */ (Object.keys(EXPLANATIONS).find((key) =>
     key !== "unresolved_card_mention" && reasons.has(/** @type {Reason} */ (key))))
     || (reasons.has("unresolved_card_mention") ? "unresolved_card_mention" : undefined);
-  if (!reason) return { text: output, status: "rendered", reason: null, version: 3, ...omissions };
+  if (!reason) return { text: output, status: "rendered", reason: null, version, ...omissions };
   if (reason === "unresolved_card_mention" && reasons.size === 1) {
-    return { text: output, status: "partial", reason, version: 3, ...omissions };
+    return { text: output, status: "partial", reason, version, ...omissions };
   }
   const status = output ? "partial" : "structured_fallback";
   // Human message reading can omit a result-level partial notice without
   // stripping matching source text or weakening local missing-value markers.
   // Default projections (including stored and JSON content) stay unchanged.
   if (output && options.includePartialNotice === false) {
-    return { text: output, status, reason, version: 3, ...omissions };
+    return { text: output, status, reason, version, ...omissions };
   }
   const marker = `[卡片${output ? "部分内容未展开" : "未展开"}：${EXPLANATIONS[reason]}]`;
   return { text: `${output.slice(0, Math.max(0, MAX_OUTPUT_CHARS - marker.length - 1))}${output ? "\n" : ""}${marker}`,
-    status, reason, version: 3, ...omissions };
+    status, reason, version, ...omissions };
 }
 
 export { renderCardContent };
