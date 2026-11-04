@@ -9,8 +9,8 @@ import { larkWriteAdmissionSql } from '../../dist/storage/sqlite/lark-write-admi
 import { readOnlySqliteJson } from '../storage/sqlite/readonly-query.mjs';
 import { captureLarkWriteAdmission } from '../diagnostics/lark-write-admission.mjs';
 import { projectionAccount } from '../adapters/lark-im/message-projection-evidence.mjs';
-import { renderMediaProjection } from '../adapters/lark-im/media-content.mjs';
-import { makeMediaResourceBinding, makeMediaPendingSourceFence, MEDIA_RESOURCE_SOURCE_FIELDS } from '../adapters/lark-im/media-resource-store.mjs';
+import { extractMessageResourceReferences, imageResourceCapability, mediaFromImageSlot } from '../adapters/lark-im/media-resource-references.mjs';
+import { makeMediaResourceBindings, makeMediaPendingSourceFence, MEDIA_RESOURCE_SOURCE_FIELDS } from '../adapters/lark-im/media-resource-store.mjs';
 import { readLarkExecutionReceipt } from '../adapters/lark-im/transport-execution.mjs';
 import { transportOperation } from '../adapters/lark-im/transport.mjs';
 import { tryAcquireLarkApiLease } from '../runtime/lark-api-lease.mjs';
@@ -24,6 +24,7 @@ const PAGE=20, MAX_ROW_BYTES=128*1024, MAX_PAGE_BYTES=8*1024*1024, SCAN_INTERVAL
 const STOP=new Set(['cli_budget','self_budget','time_budget','clock_unavailable','sync_busy','lease_unavailable','rate_cooldown','rate_limited','shared_cooldown_unavailable']);
 const DENIAL=new Map([[210508,'permission_denied'],[231203,'restricted_mode'],[230002,'bot_user_out_of_chat']]);
 const PERMANENT="('permission_denied','restricted_mode','bot_user_out_of_chat')";
+const CAPABILITY=new Set(['resource_endpoint_unverified','resource_identity_conflict']);
 const sha=value=>createHash('sha256').update(value).digest('hex');
 const integer=n=>Number.isSafeInteger(n)&&n>=0;
 const sourceWhere=RESOURCE_CANDIDATE_WHERE;
@@ -37,20 +38,74 @@ const sourceSql=row=>`EXISTS(SELECT 1 FROM records r WHERE ${MEDIA_RESOURCE_SOUR
 const observedSourceSql=(row,id)=>row?sourceSql(row):`NOT EXISTS(SELECT 1 FROM records WHERE id=${id} AND (${sourceBytes})<=${MAX_ROW_BYTES})`;
 const stop=reason=>{throw Object.assign(new Error('resource work stopped'),{resourceStop:reason});};
 
+/** Each bounded source fence occurs once, not once per expanded image slot.
+ * The temporary relation preserves the old per-source skip-on-drift behavior.
+ * @param {Row[]} targets @param {string} account @param {number} wall */
+function resourceEnrollmentSql(targets,account,wall) {
+  const rows=[...new Map(targets.map(t=>[t.record_id,t.row])).values()];
+  const bindingChanged=`${TABLE}.binding_key<>excluded.binding_key`;
+  const reopened=`${TABLE}.state='blocked' AND ${TABLE}.reason='source_changed'`;
+  const exhausted=`${TABLE}.attempts>=8 OR ${TABLE}.failures>=3`;
+  const denied=`${TABLE}.state='blocked' AND ${TABLE}.reason IN ${PERMANENT}`;
+  const capabilityBlocked=`${TABLE}.state='blocked' AND ${TABLE}.reason IS NULL AND ${TABLE}.attempts=0 AND ${TABLE}.failures=0
+    AND ${TABLE}.capability_evidence_json IS NOT NULL`;
+  const capabilityReopened=`(${capabilityBlocked} AND excluded.state='pending')`;
+  const capabilityStopped=`(${TABLE}.state IN ('pending','deferred') AND ${TABLE}.attempts=0 AND excluded.state='blocked')`;
+  const changed=`(${bindingChanged} OR ${reopened} OR ${capabilityReopened} OR ${capabilityStopped})`;
+  return `CREATE TEMP TABLE __resource_scan_source(record_id INTEGER PRIMARY KEY);
+    ${rows.map(row=>`INSERT INTO __resource_scan_source SELECT ${row.id} WHERE ${sourceSql(row)};`).join('\n')}
+    ${targets.map(t=>{const blocked=!t.request_eligible;return `INSERT INTO ${TABLE}(source_id,account_key,work_key,record_id,binding_key,source_fence,enqueued_at_ms,
+        state,reason,capability_evidence_json)
+      SELECT 'lark.im',${q(account)},${q(t.work_key)},${t.record_id},${q(t.binding_key)},${q(t.source_fence)},${wall},
+        ${q(blocked?'blocked':'pending')},NULL,${q(blocked?JSON.stringify({version:1,reason:t.capability_reason,binding_key:t.binding_key,source_fence:t.source_fence}):null)}
+      WHERE EXISTS(SELECT 1 FROM __resource_scan_source WHERE record_id=${t.record_id})
+      ON CONFLICT(source_id,account_key,work_key) DO UPDATE SET record_id=excluded.record_id,binding_key=excluded.binding_key,source_fence=excluded.source_fence,
+        state=CASE WHEN ${denied} THEN 'blocked' WHEN ${bindingChanged} THEN excluded.state WHEN ${reopened} THEN CASE WHEN ${exhausted} THEN 'exhausted' ELSE excluded.state END
+          WHEN ${capabilityReopened} THEN 'pending' WHEN ${capabilityStopped} THEN 'blocked' ELSE ${TABLE}.state END,
+        reason=CASE WHEN ${denied} THEN ${TABLE}.reason WHEN ${bindingChanged} THEN excluded.reason WHEN ${reopened} THEN CASE WHEN ${exhausted} THEN 'retry_exhausted' ELSE excluded.reason END
+          WHEN ${capabilityReopened} THEN NULL WHEN ${capabilityStopped} THEN excluded.reason ELSE ${TABLE}.reason END,
+        attempts=CASE WHEN ${bindingChanged} AND NOT(${denied}) THEN 0 ELSE ${TABLE}.attempts END,
+        failures=CASE WHEN ${bindingChanged} AND NOT(${denied}) THEN 0 ELSE ${TABLE}.failures END,
+        deferrals=CASE WHEN ${bindingChanged} AND NOT(${denied}) THEN 0 ELSE ${TABLE}.deferrals END,
+        retry_at_ms=CASE WHEN ${changed} AND NOT(${denied}) THEN 0 ELSE ${TABLE}.retry_at_ms END,
+        capability_evidence_json=CASE WHEN ${denied} THEN ${TABLE}.capability_evidence_json
+          WHEN ${bindingChanged} THEN excluded.capability_evidence_json WHEN ${exhausted} THEN ${TABLE}.capability_evidence_json
+          WHEN excluded.state='blocked' THEN excluded.capability_evidence_json WHEN ${capabilityReopened} THEN NULL ELSE ${TABLE}.capability_evidence_json END,
+        generation=${TABLE}.generation+1
+      WHERE ${TABLE}.state<>'running' AND (${TABLE}.source_fence<>excluded.source_fence OR ${changed});`;}).join('\n')}`;
+}
+
 /** Exact stable endpoint identity excludes source version and derived names.
  * @param {string} db @param {Row} row @returns {Row|null} */
 export function resourceWorkIdentity(db,row) {
+  const values=resourceWorkIdentities(db,row);return values.length===1?values[0]:null;
+}
+
+/** Plural exact endpoint identities; occurrences are not extra downloads.
+ * `resourceCapability` is internal synthetic-test dependency injection only.
+ * @param {string} db @param {Row} row @param {Row} [deps] @returns {Row[]} */
+export function resourceWorkIdentities(db,row,deps={}) {
   try {
-    if(Buffer.byteLength(row.raw_json||'')>MAX_ROW_BYTES||Buffer.byteLength(row.canonical_json||'')>MAX_ROW_BYTES)return null;
+    if(!integer(row.id)||row.id<1||Buffer.byteLength(row.raw_json||'')>MAX_ROW_BYTES||Buffer.byteLength(row.canonical_json||'')>MAX_ROW_BYTES)return [];
     const raw=JSON.parse(row.raw_json),canonical=JSON.parse(row.canonical_json||'{}');
-    const media=renderMediaProjection(row,canonical,raw),account=projectionAccount(row,canonical,raw);
-    if(media?.type!=='image'||media.resource.state!=='reference_only'||account.state!=='verified')return null;
-    const binding=makeMediaResourceBinding(db,row,account.account_key,media),fence=makeMediaPendingSourceFence(row);
-    if(!binding||!fence)return null;
-    return {source_id:'lark.im',account_key:account.account_key,record_id:row.id,
-      work_key:sha(JSON.stringify(['resource_download/v1','lark.im',account.account_key,row.external_id,'image',media.resource.key,'user'])),
-      binding_key:sha(JSON.stringify(binding)),source_fence:fence,resource_key:media.resource.key,row};
-  } catch {return null;}
+    const extracted=extractMessageResourceReferences(row,canonical,raw),account=projectionAccount(row,canonical,raw);
+    if(account.state!=='verified')return [];
+    const medias=extracted.slots.map(mediaFromImageSlot),bindings=makeMediaResourceBindings(db,row,account.account_key,medias),fence=makeMediaPendingSourceFence(row);
+    if(!fence)return [];
+    const targets=new Map();
+    for(const [index,slot] of extracted.slots.entries()) {
+      const binding=bindings[index];if(!binding)continue;
+      const work_key=sha(JSON.stringify(['resource_download/v1','lark.im',account.account_key,row.external_id,'image',slot.key,'user']));
+      const target={source_id:'lark.im',account_key:account.account_key,record_id:row.id,work_key,
+        binding_key:sha(JSON.stringify(binding)),source_fence:fence,resource_key:slot.key,reference_kind:slot.reference_kind,
+        request_eligible:imageResourceCapability(slot,deps.resourceCapability)==='message_image',capability_reason:'resource_endpoint_unverified',row};
+      const previous=targets.get(work_key);
+      if(previous&&previous.binding_key!==target.binding_key) {
+        previous.request_eligible=false;previous.capability_reason='resource_identity_conflict';
+      } else if(!previous)targets.set(work_key,target);
+    }
+    return [...targets.values()];
+  } catch {return [];}
 }
 
 /** Retained finite attempt diagnosis, never authority to request, retry or deny.
@@ -71,6 +126,25 @@ export function resourceWorkFailureEvidence(task,currentIdentity=null) {
   }
   return {...normalizeResourceFailure({stage:task.failure_stage,reason:task.failure_reason}),
     association:{binding_key:binding,source_fence:fence},applicability};
+}
+
+/** Separate source-qualified eligibility diagnosis, never request authority or
+ * a substitute for the previous real attempt's failure evidence.
+ * @param {Row} task @param {Row|null} [currentIdentity] */
+export function resourceWorkCapabilityEvidence(task,currentIdentity=null) {
+  try {
+    if(typeof task.capability_evidence_json!=='string'||Buffer.byteLength(task.capability_evidence_json)>512)return null;
+    const value=JSON.parse(task.capability_evidence_json),hash=x=>typeof x==='string'&&/^[a-f0-9]{64}$/.test(x);
+    if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).length!==4||value.version!==1
+      ||!CAPABILITY.has(value.reason)||!hash(value.binding_key)||!hash(value.source_fence))return null;
+    let applicability='unknown';
+    if(currentIdentity&&hash(currentIdentity.binding_key)&&hash(currentIdentity.source_fence)&&task.source_id==='lark.im'
+      &&currentIdentity.source_id==='lark.im'&&hash(task.account_key)&&hash(task.work_key)
+      &&hash(currentIdentity.account_key)&&hash(currentIdentity.work_key))
+      applicability=task.account_key!==currentIdentity.account_key||task.work_key!==currentIdentity.work_key||value.binding_key!==currentIdentity.binding_key
+        ?'different_binding':value.source_fence===currentIdentity.source_fence?'exact_source':'same_binding';
+    return {reason:value.reason,association:{binding_key:value.binding_key,source_fence:value.source_fence},applicability};
+  } catch {return null;}
 }
 
 /** Cheap, bounded, read-only scheduling hint, not authority or guaranteed work.
@@ -148,25 +222,10 @@ export function executeResourceWork(options,deps={}) {
       const ids=[...new Set([...latest,...history].filter(x=>integer(x.source_bytes)&&x.source_bytes<=MAX_ROW_BYTES).map(x=>x.id))];
       const rows=ids.length?snapshot(ids):[];
       if(rows.reduce((n,r)=>n+Buffer.byteLength(r.raw_json||'')+Buffer.byteLength(r.canonical_json||''),0)>MAX_PAGE_BYTES)throw new Error('resource page limit');
-      const targets=rows.map(row=>resourceWorkIdentity(options.db,row)).filter(t=>t&&t.account_key===account);
-      const bindingChanged=`${TABLE}.binding_key<>excluded.binding_key`;
-      const reopened=`${TABLE}.state='blocked' AND ${TABLE}.reason='source_changed'`;
-      const changed=`(${bindingChanged} OR ${reopened})`;
-      const exhausted=`${TABLE}.attempts>=8 OR ${TABLE}.failures>=3`;
-      const denied=`${TABLE}.state='blocked' AND ${TABLE}.reason IN ${PERMANENT}`;
+      const targets=rows.flatMap(row=>resourceWorkIdentities(options.db,row,deps)).filter(t=>t.account_key===account);
       const next=history.length?history.at(-1).id:horizon;
       local(()=>write(`INSERT INTO __resource_fence SELECT CASE WHEN EXISTS(SELECT 1 FROM ${SCAN} WHERE source_id='lark.im' AND generation=${scan.generation}) THEN 1 ELSE 0 END;
-        ${targets.map(t=>`INSERT INTO ${TABLE}(source_id,account_key,work_key,record_id,binding_key,source_fence,enqueued_at_ms)
-          SELECT 'lark.im',${q(account)},${q(t.work_key)},${t.record_id},${q(t.binding_key)},${q(t.source_fence)},${wall} WHERE ${sourceSql(t.row)}
-          ON CONFLICT(source_id,account_key,work_key) DO UPDATE SET record_id=excluded.record_id,binding_key=excluded.binding_key,source_fence=excluded.source_fence,
-          state=CASE WHEN ${denied} THEN 'blocked' WHEN ${bindingChanged} THEN 'pending' WHEN ${reopened} THEN CASE WHEN ${exhausted} THEN 'exhausted' ELSE 'pending' END ELSE ${TABLE}.state END,
-          reason=CASE WHEN ${denied} THEN ${TABLE}.reason WHEN ${bindingChanged} THEN NULL WHEN ${reopened} THEN CASE WHEN ${exhausted} THEN 'retry_exhausted' ELSE NULL END ELSE ${TABLE}.reason END,
-          attempts=CASE WHEN ${bindingChanged} AND NOT(${denied}) THEN 0 ELSE ${TABLE}.attempts END,
-          failures=CASE WHEN ${bindingChanged} AND NOT(${denied}) THEN 0 ELSE ${TABLE}.failures END,
-          deferrals=CASE WHEN ${bindingChanged} AND NOT(${denied}) THEN 0 ELSE ${TABLE}.deferrals END,
-          retry_at_ms=CASE WHEN ${changed} AND NOT(${denied}) THEN 0 ELSE ${TABLE}.retry_at_ms END,
-          generation=${TABLE}.generation+1
-          WHERE ${TABLE}.state<>'running' AND (${TABLE}.source_fence<>excluded.source_fence OR ${changed});`).join('\n')}
+        ${resourceEnrollmentSql(targets,account,wall)}
         UPDATE ${SCAN} SET after_id=${next},horizon_id=${horizon},last_head_id=${head},next_scan_at_ms=${wall+SCAN_INTERVAL},generation=generation+1 WHERE source_id='lark.im';`));
       scan=query(`SELECT * FROM ${SCAN} WHERE source_id='lark.im';`,'reread resource scan')[0];
     }
@@ -189,7 +248,7 @@ export function executeResourceWork(options,deps={}) {
     const task=query(`SELECT * FROM ${TABLE} WHERE source_id='lark.im' AND account_key=${q(account)} AND state IN ('pending','deferred') AND retry_at_ms<=${wall} AND attempts<8
       ORDER BY ${lane==='fair'?'enqueued_at_ms,record_id':'record_id DESC,enqueued_at_ms'},work_key LIMIT 1;`,'select resource work')[0];
     if(!task)return finish();
-    const row=snapshot([task.record_id])[0],identity=row&&resourceWorkIdentity(options.db,row);
+    const row=snapshot([task.record_id])[0],identity=row&&resourceWorkIdentities(options.db,row,deps).find(value=>value.work_key===task.work_key);
     if(!identity||identity.account_key!==task.account_key||identity.work_key!==task.work_key||identity.binding_key!==task.binding_key||identity.source_fence!==task.source_fence) {
       // A proved obsolete selection consumes the same fair turn as a claim.
       // Couple both changes to the observed scan/task/source so churn cannot
@@ -201,11 +260,23 @@ export function executeResourceWork(options,deps={}) {
         UPDATE ${SCAN} SET priority_streak=${lane==='fair'?0:Math.min(2,scan.priority_streak+1)},generation=generation+1 WHERE source_id='lark.im';`));
       report.ok=false;report.outcome='source_changed';report.deferred=1;report.failure={stage:'source_fence',reason:'source_changed',persisted:false};return finish();
     }
+    if(!identity.request_eligible) {
+      // Missing endpoint authority is not a failed download and must not claim
+      // or erase a prior real attempt. Consume only this local fair turn.
+      const capability=JSON.stringify({version:1,reason:identity.capability_reason,
+        binding_key:identity.binding_key,source_fence:identity.source_fence});
+      local(()=>write(`INSERT INTO __resource_fence SELECT CASE WHEN ${sourceSql(row)} AND EXISTS(SELECT 1 FROM ${TABLE} WHERE ${keyWhere(task)} AND generation=${task.generation} AND state=${q(task.state)})
+        AND EXISTS(SELECT 1 FROM ${SCAN} WHERE source_id='lark.im' AND generation=${scan.generation}) THEN 1 ELSE 0 END;
+        UPDATE ${TABLE} SET state='blocked',reason=NULL,capability_evidence_json=${q(capability)},generation=generation+1,retry_at_ms=0
+        WHERE ${keyWhere(task)} AND generation=${task.generation} AND state=${q(task.state)};
+        UPDATE ${SCAN} SET priority_streak=${lane==='fair'?0:Math.min(2,scan.priority_streak+1)},generation=generation+1 WHERE source_id='lark.im';`));
+      report.ok=false;report.outcome='blocked';report.blocked=1;return finish();
+    }
     const token=randomUUID();
     if(Math.floor((maxSeconds*1000-elapsed())/1000)<3)stop('time_budget');
     local(()=>write(`INSERT INTO __resource_fence SELECT CASE WHEN ${sourceSql(row)} AND EXISTS(SELECT 1 FROM ${TABLE} WHERE ${keyWhere(task)} AND generation=${task.generation} AND state=${q(task.state)})
       AND EXISTS(SELECT 1 FROM ${SCAN} WHERE source_id='lark.im' AND generation=${scan.generation}) THEN 1 ELSE 0 END;
-      UPDATE ${TABLE} SET state='running',attempt_token=${q(token)},failure_stage=NULL,failure_reason=NULL,failure_binding_key=NULL,failure_source_fence=NULL,claim_owner=${q(DEFAULT_SYNC_LOCK_OWNER)},claim_until_ms=${wall+CLAIM_MS},last_attempt_at_ms=${wall},attempts=attempts+1,generation=generation+1 WHERE ${keyWhere(task)};
+      UPDATE ${TABLE} SET state='running',attempt_token=${q(token)},capability_evidence_json=NULL,failure_stage=NULL,failure_reason=NULL,failure_binding_key=NULL,failure_source_fence=NULL,claim_owner=${q(DEFAULT_SYNC_LOCK_OWNER)},claim_until_ms=${wall+CLAIM_MS},last_attempt_at_ms=${wall},attempts=attempts+1,generation=generation+1 WHERE ${keyWhere(task)};
       UPDATE ${SCAN} SET priority_streak=${lane==='fair'?0:Math.min(2,scan.priority_streak+1)},generation=generation+1 WHERE source_id='lark.im';`));
     claimed={...task,attempts:task.attempts+1,generation:task.generation+1,attempt_token:token,row};
     ready();
@@ -240,22 +311,26 @@ export function executeResourceWork(options,deps={}) {
         throw error;
       }}};
     };
-    const result=(deps.enrichResources||enrichResources)({db:options.db,resourceDir:options.resourceDir,recordIds:[task.record_id],apply:true,
+    const result=(deps.enrichResources||enrichResources)({db:options.db,resourceDir:options.resourceDir,recordIds:[task.record_id],
+      resourceTargets:[{record_id:task.record_id,resource_key:identity.resource_key,reference_kind:identity.reference_kind}],apply:true,
       maxCliAttempts:maxCli,maxSelfAttempts:2,maxSeconds:seconds},{...deps,createRequestSession:factory});
     producerBudget=result.request_budget;
     if(producerStarted&&(!producerBudget||producerBudget.max_cli_attempts!==maxCli||producerBudget.max_self_attempts!==2||producerBudget.max_seconds!==seconds))receiptInvalid=true;
     if(receiptInvalid)throw new Error('resource receipt unavailable');
-    const item=result.results?.length===1&&result.results[0].record_id===task.record_id?result.results[0]:null;
+    const item=result.results?.length===1&&result.results[0].record_id===task.record_id
+      &&(result.results[0].resource_key===undefined||result.results[0].resource_key===identity.resource_key)
+      &&(result.results[0].reference_kind===undefined||result.results[0].reference_kind===identity.reference_kind)?result.results[0]:null;
     if(!item) {receiptInvalid=true;throw new Error('resource result unavailable');}
     if(!producerStarted&&!(result.request_budget===null&&['available','blocked'].includes(item.state))) {receiptInvalid=true;producerStarted=true;throw new Error('resource zero receipt unavailable');}
     const stopped=STOP.has(result.request_budget?.stop_reason)?result.request_budget.stop_reason:null;
     let state='deferred',reason=stopped||'transient_failure',failures=task.failures,deferrals=task.deferrals;
     const confirmedDenial=/** @type {Row|null} */(denial);
-    let diagnostic=item.state==='available'?null:normalizeResourceFailure(item.failure);
+    const capability=CAPABILITY.has(item.reason)?item.reason:null;
+    let diagnostic=item.state==='available'||capability?null:normalizeResourceFailure(item.failure);
     if(diagnostic&&[...DENIAL.values()].includes(diagnostic.reason))diagnostic={...diagnostic,reason:'unverified_remote_failure'};
     if(item.state==='available'){state='available';reason=null;}
     else if(confirmedDenial&&item.state==='failed'&&item.reason===confirmedDenial.result_kind){state='blocked';reason=confirmedDenial.result_kind;diagnostic={stage:'resource_request',reason};}
-    else if(!producerStarted&&item.state==='blocked'){state='blocked';reason='resource_invalid';}
+    else if(!producerStarted&&item.state==='blocked'){state='blocked';reason=capability?null:'resource_invalid';}
     else {if(stopped)deferrals=Math.min(8,deferrals+1);else failures=Math.min(3,failures+1);
       state=failures>=3||task.attempts+1>=8?'exhausted':'deferred';reason=state==='exhausted'?'retry_exhausted':reason;
       report.ok=false;report.outcome=state==='exhausted'?'exhausted':'batch_deferred';report.deferred=1;}
@@ -270,7 +345,7 @@ export function executeResourceWork(options,deps={}) {
         WHERE ${keyWhere(task)} AND generation=${task.generation+1} AND attempt_token=${q(token)} AND state='running';`));
       report.ok=false;report.outcome='source_changed';report.deferred=1;report.failure={stage:'source_fence',reason:'source_changed',persisted:true};return finish();}
     local(()=>write(`INSERT INTO __resource_fence SELECT CASE WHEN ${sourceSql(row)} AND EXISTS(SELECT 1 FROM ${TABLE} WHERE ${keyWhere(task)} AND generation=${task.generation+1} AND attempt_token=${q(token)} AND state='running') THEN 1 ELSE 0 END;
-      UPDATE ${TABLE} SET state=${q(state)},reason=${q(reason)},failure_stage=${q(diagnostic?.stage??null)},failure_reason=${q(diagnostic?.reason??null)},failure_binding_key=${q(diagnostic?identity.binding_key:null)},failure_source_fence=${q(diagnostic?identity.source_fence:null)},failures=${failures},deferrals=${deferrals},retry_at_ms=${state==='deferred'?now()+Math.min(3600000,60000*2**Math.min(5,failures+deferrals)):0},
+      UPDATE ${TABLE} SET state=${q(state)},reason=${q(reason)},capability_evidence_json=${q(capability?JSON.stringify({version:1,reason:capability,binding_key:identity.binding_key,source_fence:identity.source_fence}):null)},failure_stage=${q(diagnostic?.stage??null)},failure_reason=${q(diagnostic?.reason??null)},failure_binding_key=${q(diagnostic?identity.binding_key:null)},failure_source_fence=${q(diagnostic?identity.source_fence:null)},failures=${failures},deferrals=${deferrals},retry_at_ms=${state==='deferred'?now()+Math.min(3600000,60000*2**Math.min(5,failures+deferrals)):0},
       attempt_token=NULL,claim_owner=NULL,claim_until_ms=0,generation=generation+1 WHERE ${keyWhere(task)};`));
     if(diagnostic)report.failure={...diagnostic,persisted:true};
     if(state==='available'){report.outcome='processed';report.processed=1;report.available=1;}

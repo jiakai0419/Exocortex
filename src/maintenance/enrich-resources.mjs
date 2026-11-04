@@ -7,7 +7,8 @@ import { createLarkImAdapter } from '../adapters/lark-im/adapter.mjs';
 import { projectionAccount } from '../adapters/lark-im/message-projection-evidence.mjs';
 import { recipientAccountKey } from '../adapters/lark-im/p2p-recipient.mjs';
 import { renderMediaProjection } from '../adapters/lark-im/media-content.mjs';
-import { assessMediaImageBytes, makeMediaResourceBinding, MAX_MEDIA_RESOURCE_BYTES,
+import { extractMessageResourceReferences, imageResourceCapability, mediaFromImageSlot } from '../adapters/lark-im/media-resource-references.mjs';
+import { assessMediaImageBytes, makeMediaResourceBindings, MAX_MEDIA_RESOURCE_BYTES,
   publishMediaResource, readMediaResource, resourceStorePath, makeMediaPendingSourceFence,
   readPendingMediaResource, retainPendingMediaResource, discardPendingMediaResource, reclaimPendingMediaResources } from '../adapters/lark-im/media-resource-store.mjs';
 import { classifyLarkFailure } from '../adapters/lark-im/transport.mjs';
@@ -114,30 +115,51 @@ export function enrichResources(options,deps={}) {
   const rows=snapshot(options.db,selection).rows, byId=new Map(rows.map(row=>[row.id,row]));
   const cache=resourceStorePath(options.db,options.resourceDir);
   /** @type {Row[]} */ const candidates=[];
-  const results=options.recordIds.map(id=>{
+  const exact=options.resourceTargets;
+  if(exact!==undefined&&(!Array.isArray(exact)||exact.length<1||exact.length>64||exact.some(target=>!target
+    ||!options.recordIds.includes(target.record_id)||typeof target.resource_key!=='string'
+    ||!['image_key','attachment_origin_key'].includes(target.reference_kind))))throw new RangeError('invalid exact resource selection');
+  const results=options.recordIds.flatMap(id=>{
     const row=byId.get(id), entry={record_id:id,state:'blocked',reason:'record_missing'};
-    if(!row)return entry;
-    const canonical=parse(row.canonical_json),raw=parse(row.raw_json),media=renderMediaProjection(row,canonical,raw);
-    if(!media)return {...entry,reason:'content_not_supported'};
-    if(media.type==='sticker')return {...entry,reason:'sticker_resource_unsupported'};
-    if(media.resource.state!=='reference_only')return {...entry,reason:media.reason};
-    const account=projectionAccount(row,canonical,raw);
-    if(account.state!=='verified')return {...entry,reason:'account_unverified'};
-    const binding=makeMediaResourceBinding(options.db,row,account.account_key,media);
-    if(!binding)return {...entry,reason:'source_binding_invalid'};
-    const cached=readMediaResource(cache,binding);
-    if(cached.status==='available')return {...entry,state:'available',reason:null};
-    if(cached.status==='invalid')return {...entry,reason:cached.reason};
-    const planned={...entry,state:'planned',reason:null};
-    const sourceFence=makeMediaPendingSourceFence(row);
-    if(!sourceFence)return {...entry,reason:'source_binding_invalid'};
-    candidates.push({row,account,media,binding,sourceFence,entry:planned});return planned;
+    if(!row)return [entry];
+    const canonical=parse(row.canonical_json),raw=parse(row.raw_json),legacy=renderMediaProjection(row,canonical,raw);
+    if(legacy?.type==='sticker')return [{...entry,reason:'sticker_resource_unsupported'}];
+    const extracted=extractMessageResourceReferences(row,canonical,raw),native=raw.raw_api??raw;
+    const embedded=['post','interactive'].includes(native.msg_type||native.message_type);
+    const unique=new Map();for(const slot of extracted.slots)unique.set(JSON.stringify([slot.reference_kind,slot.key]),slot);
+    const all=[...unique.values()];
+    const selected=exact?exact.filter(target=>target.record_id===id).map(target=>all.find(slot=>slot.key===target.resource_key&&slot.reference_kind===target.reference_kind)):all;
+    if(!selected.length)return [{...entry,reason:extracted.issues.length?'source_binding_invalid':'content_not_supported'}];
+    const slots=selected.filter(Boolean),medias=slots.map(mediaFromImageSlot),account=projectionAccount(row,canonical,raw);
+    const bindings=account.state==='verified'?makeMediaResourceBindings(options.db,row,account.account_key,medias):[];
+    const bound=new Map(slots.map((slot,index)=>[slot,bindings[index]]));
+    const kindsByKey=new Map();for(const slot of all) {
+      if(!kindsByKey.has(slot.key))kindsByKey.set(slot.key,new Set());kindsByKey.get(slot.key).add(slot.reference_kind);
+    }
+    return selected.map(slot=>{
+      if(!slot)return {...entry,reason:'media_reference_missing'};
+      const result=embedded?{...entry,resource_key:slot.key,reference_kind:slot.reference_kind}:entry;
+      if(slot.reference_state!=='reference_only')return {...result,reason:slot.reference_state==='missing_reference'?'media_reference_missing':'media_reference_invalid'};
+      if(account.state!=='verified')return {...result,reason:'account_unverified'};
+      const binding=bound.get(slot),media=mediaFromImageSlot(slot);
+      if(!binding)return {...result,reason:'source_binding_invalid'};
+      if(kindsByKey.get(slot.key).size>1)return {...result,reason:'resource_identity_conflict'};
+      const cached=readMediaResource(cache,binding);
+      if(cached.status==='available')return {...result,state:'available',reason:null};
+      if(cached.status==='invalid')return {...result,reason:cached.reason};
+      if(imageResourceCapability(slot,deps.resourceCapability)!=='message_image')return {...result,reason:'resource_endpoint_unverified'};
+      const planned={...result,state:'planned',reason:null},sourceFence=makeMediaPendingSourceFence(row);
+      if(!sourceFence)return {...result,reason:'source_binding_invalid'};
+      candidates.push({row,account,media,binding,sourceFence,entry:planned});return planned;
+    });
   });
   /** @type {Row} */ const report={target:'resources',dry_run:options.apply!==true,
     selected:results.length,results,request_budget:null,partial:false};
   const finish=()=>{
     for(const entry of results) {
-      if(['blocked','failed'].includes(entry.state))entry.failure=normalizeResourceFailure(entry.failure??{stage:'selection',reason:entry.reason});
+      if(['resource_endpoint_unverified','resource_identity_conflict'].includes(entry.reason)) {
+        entry.capability={reason:entry.reason};entry.failure=null;
+      } else if(['blocked','failed'].includes(entry.state))entry.failure=normalizeResourceFailure(entry.failure??{stage:'selection',reason:entry.reason});
       else entry.failure=null;
     }
     report.available=results.filter(item=>item.state==='available').length;
@@ -162,7 +184,7 @@ export function enrichResources(options,deps={}) {
     sessionDeps.spawnSync=(command,args,settings)=>executor(deps.pythonPath || 'python3',
       ['-B','-c',GUARD,command,...args],{...settings,cwd:stage});
     session=(deps.createRequestSession || createMaintenanceRequestSession)({...options,maxSelfAttempts:Math.min(2,options.maxCliAttempts??candidates.length+2),
-      maxCliAttempts:options.maxCliAttempts??candidates.length+2,maxSeconds:options.maxSeconds??30},sessionDeps);
+      maxCliAttempts:options.maxCliAttempts??Math.min(candidates.length+2,options.recordIds.length+2),maxSeconds:options.maxSeconds??30},sessionDeps);
     const runLark=(args,settings={})=>session.runLark(args,{...settings,retries:0,retryDelayMs:0,
       timeoutMs:8000,retryBudgetMs:8000,maxBufferBytes:1024*1024});
     const adapter=createLarkImAdapter({run:runLark});
@@ -188,6 +210,10 @@ export function enrichResources(options,deps={}) {
       // quarantined, never promoted by today's self profile. A fresh operation
       // must download again; success may remove that exact obsolete generation.
       if(pending.status==='quarantined')candidate.quarantine=pending;
+      // Preserve one closing-account call inside the old total grant. Multi-slot
+      // selection cannot silently turn one record into extra remote allowance.
+      const remaining=session.summary().max_cli_attempts-session.summary().cli_attempts;
+      if(candidates.length>options.recordIds.length&&remaining<=1){candidate.entry.reason='cli_budget';continue;}
       failureStage='resource_request';
       session.assertReady();
       const filename=`resource-${index}.bin`;

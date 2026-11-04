@@ -71,7 +71,15 @@ the default is `<absolute database path>.resources`.
 The Feishu message resource API explicitly excludes stickers. A sticker keeps
 its faithful type and source key with an explicit unsupported-capability
 diagnosis. No speculative sticker request or permission change is attempted.
-Native audio/video/file/post-image support remains outside this image change.
+Native audio/video/file acquisition remains outside this image change. Embedded
+post/card occurrences now share the bounded store/queue/producer chain, but their
+endpoint eligibility remains unverified by default and causes zero requests.
+An attachment `origin_key` is never guessed to be an endpoint `image_key`.
+Exact valid existing v2 bytes can satisfy content independently of that request
+eligibility. A record with multiple references cannot expand its old default
+CLI grant; the producer reserves the closing account observation and leaves
+remaining references planned. These local behaviors do not establish upstream
+support for downloading embedded images.
 
 References: [CLI v1.0.56 generic response handling](https://github.com/larksuite/cli/blob/v1.0.56/internal/client/response.go),
 [shortcut retry behavior](https://github.com/larksuite/cli/blob/v1.0.56/shortcuts/im/im_messages_resources_download.go),

@@ -13,13 +13,14 @@ The runtime exports `resourceWorkAvailable(db,deps)` and
 `executeResourceWork(options,deps)` from `src/maintenance/resource-work.mjs`.
 Availability is a cheap bounded read-only hint; it grants no lock or authority
 and may be true when only local scanning is due. It does not initialize or
-migrate the database. The command requires migrations 019, 021 and 022 already installed.
+migrate the database. The command requires migrations019–024 already installed. Migration024 keeps the original021 image index for supported older readers and adds a separate broader candidate index plus nullable capability diagnosis.
 
 ## Discovery and durable selection
 
 Migration 019 defines `lark_im_resource_work` and `lark_im_resource_scan`.
-Migration 021 adds a conservative image-candidate index on `records(source_id,id)`.
-Each scan inspects the newest 20 image candidates and 20 candidates from an
+Migration021 adds the original image-candidate index on `records(source_id,id)`.
+Migration024 adds a conservative image/post/interactive index.
+Each scan inspects the newest20 candidates and20 candidates from an
 ascending, fixed historical ID horizon. Type declarations are combined by OR,
 with guarded JSON parsing; conflicting, invalid and oversized candidates still
 require the exact identity validator before enrollment. The index grants no
@@ -40,8 +41,13 @@ command also rejects an injected/read projection above 8 MiB. Larger records
 are left for explicit diagnosis/manual work, without blocking the page cursor
 or making a completeness claim.
 
-`resourceWorkIdentity` reuses `projectionAccount`, `renderMediaProjection`,
-`makeMediaResourceBinding`, and `makeMediaPendingSourceFence`. Work is enrolled
+`resourceWorkIdentities` reuses `projectionAccount`, the selected renderer through
+`extractMessageResourceReferences`, `makeMediaResourceBindings`, and
+`makeMediaPendingSourceFence`. Each source produces at most64 ordered image
+occurrences; endpoint work is deduplicated by exact account/message/key. Native
+image bindings retain v1; embedded bindings use v2 with message/reference type.
+The admitted scan evaluates each source SQL fence once before enrolling its
+resources. `resourceWorkIdentity` remains a singular compatibility helper. Work is enrolled
 only under matching local database account admission. The stable work key
 hashes source, account, external message ID, resource type/key and user
 authority. It excludes canonical names, source version and chat routing: those
@@ -85,7 +91,15 @@ claim a successful queue result.
 
 ## One existing producer and unchanged total budget
 
-The wrapper calls the existing `enrichResources` once with one exact ID. There
+The wrapper calls the existing `enrichResources` once with one exact record and
+typed resource target. A record containing many images still gets only the
+existing single-resource unit. Default embedded endpoint eligibility is not
+verified: these tasks persist `blocked` with separate
+`capability_evidence_json`, zero attempts and no request. The diagnosis is not
+authority; existing real failure evidence remains independently associated.
+Only never-attempted capability tasks may become pending when trusted eligibility
+changes. Existing exact v2 bytes are independently validated by `messages` and
+can be readable without a new request. See the [embedded contract](embedded-resource-chain.md). There
 is no duplicate downloader, image validator, pending reader or publication path.
 Both current self observations, ordinary request gaps, shared cooldowns,
 source fences and publication admission remain in that producer.

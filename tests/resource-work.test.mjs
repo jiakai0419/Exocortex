@@ -323,7 +323,7 @@ test('021 upgrade preserves nonzero scan and task generations and resumes remain
   // Use the actual existing scheduler tables, not a replacement schema.
   const names=sqliteQuery(f.db,"SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'lark_im_resource%';").map(x=>x.name);
   const snapshots=names.map(name=>[name,sqliteQuery(f.db,`SELECT * FROM ${name};`)]);
-  sqliteExec(f.db,`DROP INDEX ${RESOURCE_CANDIDATE_INDEX}; DELETE FROM schema_migrations WHERE version='021';`);
+  sqliteExec(f.db,`DROP INDEX records_resource_image_candidates; DELETE FROM schema_migrations WHERE version='021';`);
   ensureInitialized(f.db);
   for(const [name,before] of snapshots)assert.deepEqual(sqliteQuery(f.db,`SELECT * FROM ${name};`),before);
   assert.equal(sqliteQuery(f.db,"SELECT count(*) n FROM schema_migrations WHERE version='021';")[0].n,1);
