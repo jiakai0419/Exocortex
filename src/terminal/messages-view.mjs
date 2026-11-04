@@ -11,7 +11,7 @@ import {
   title,
   value,
 } from "../../dist/terminal/index.js";
-import { displayCard } from "../diagnostics/messages-report.mjs";
+import { displayCardForMessage } from "../diagnostics/messages-report.mjs";
 import { terminalColumns, textWidth, wrapTextLine } from "./text-layout.mjs";
 
 /**
@@ -139,11 +139,11 @@ function renderMessagesText(messages, options = {}) {
       // Reproject source nodes instead of deleting matching text: real prose can
       // contain diagnostic wording or literal Markdown separators. The stored
       // and machine-readable projection retains its original representation.
-      const card = displayCard(message.raw, { includePartialNotice: false, includeDecorativeSeparators: false });
+      const card = displayCardForMessage(message, { includePartialNotice: false, includeDecorativeSeparators: false });
       const text = sanitizeTerminalText(card.text, { preserveNewlines: true });
       for (const line of (text || "[卡片没有可展示的文本]").split("\n")) cardLine(line);
     } else {
-      field("消息", compact(message.display.body), 4);
+      field("消息", compact(message.display.post?.text ?? message.display.body), 4);
     }
     lines.push("");
   }

@@ -1,7 +1,8 @@
 // @ts-check
 
 import { renderMediaProjection } from "../adapters/lark-im/media-content.mjs";
-import { projectMediaResource } from "../adapters/lark-im/media-resource-projection.mjs";
+import { projectMediaResource, projectEmbeddedMediaResources, isCurrentImageContext } from "../adapters/lark-im/media-resource-projection.mjs";
+import { projectPostContent, readPostProjectionEvidence } from "../adapters/lark-im/message-post-projection.mjs";
 import { readOnlySqliteJson } from "../storage/sqlite/readonly-query.mjs";
 import { renderSystemProjection } from "../adapters/lark-im/system-content.mjs";
 import { renderCardContent } from "../adapters/lark-im/card-content.mjs";
@@ -21,6 +22,15 @@ import { isHistoryCommandBudget } from "../maintenance/history-command-budget.mj
 // Ephemeral proof used only during this read. Never serialize it as canonical
 // authority or accept a caller-supplied source label in its place.
 const projectionEvidence = new WeakMap();
+// Only this read's independently verified resources may be reused when the
+// terminal reprojects card decorations. These capabilities never enter JSON.
+const imageProjectionContexts = new WeakMap();
+function retainSourceProofFields(from, to) {
+  for (const field of ['external_version','content_hash']) {
+    const descriptor = Object.getOwnPropertyDescriptor(from,field);
+    if (descriptor) Object.defineProperty(to,field,descriptor);
+  }
+}
 
 /**
  * @typedef {"all" | "sent" | "received"} MessageDirection
@@ -52,6 +62,8 @@ const projectionEvidence = new WeakMap();
  *     body: unknown,
  *     media?: NonNullable<ReturnType<typeof renderMediaProjection>>,
  *     card?: import("../adapters/lark-im/raw-message.mjs").RenderResult,
+ *     post?: import("../adapters/lark-im/raw-message.mjs").RenderResult,
+ *     embedded_media?: Row,
  *     system?: NonNullable<ReturnType<typeof renderSystemProjection>>
  *   }
  * }} EnrichedMessage
@@ -337,6 +349,19 @@ function displayCard(raw, options) {
   return renderCardContent(content, native.mentions, options);
 }
 
+/** Terminal-only reprojection retaining this exact read's byte evidence.
+ * No resource is fetched or re-read here. A cloned or changed message cannot
+ * acquire authority from a serialized display field.
+ * @param {EnrichedMessage} message
+ * @param {import("../adapters/lark-im/card-content.mjs").CardRenderOptions} [options] */
+function displayCardForMessage(message, options) {
+  const context = imageProjectionContexts.get(message);
+  const imageOptions = context && isCurrentImageContext(message, message.canonical, message.raw, context.imageContext)
+    ? { resolveImage: context.resolveImage, imageContext: context.imageContext } : {};
+  return displayCard(message.raw, { includePartialNotice:options?.includePartialNotice,
+    includeDecorativeSeparators:options?.includeDecorativeSeparators,...imageOptions });
+}
+
 /** Read-only sender projection. Raw evidence may fill an old missing name only
  * for the same stored actor and namespace; it cannot undo rejection or clear.
  * @param {Row} row
@@ -406,7 +431,8 @@ function enrichRow(row, currentChat, scopeSourceMatches = true, recipientConfig,
   const chatId = canonical.chat_id || row.container_id || config.chat_id || raw.chat_id || null;
   const { id: senderId, name: senderName } = includeReadiness || savedSender
     ? senderProjection(row,canonical,raw,savedSender) : displaySender(row, canonical, raw);
-  const messageType = canonical.msg_type || raw.msg_type || raw.message_type || null;
+  const native = raw.raw_api && typeof raw.raw_api === 'object' && !Array.isArray(raw.raw_api) ? raw.raw_api : raw;
+  const messageType = canonical.msg_type || raw.msg_type || raw.message_type || native.msg_type || native.message_type || null;
   const identity = senderIdentity(raw);
   const senderType = canonical.sender_type
     || (identity.verified && identity.type === 'app_id' ? 'app'
@@ -418,6 +444,14 @@ function enrichRow(row, currentChat, scopeSourceMatches = true, recipientConfig,
   const sourceMedia = renderMediaProjection(row, canonical, raw);
   const media = resourceContext ? projectMediaResource(resourceContext.db,resourceContext.resourceDir,row,canonical,raw,sourceMedia,
     {executionBudget:resourceContext.executionBudget}) : sourceMedia;
+  const baselinePost = messageType === 'post' ? projectPostContent(row,canonical,raw) : null;
+  const postInvalid = baselinePost && readPostProjectionEvidence(row,canonical,raw,baselinePost).state === 'invalid';
+  const embedded = resourceContext && ['post','interactive'].includes(messageType) && !postInvalid
+    ? projectEmbeddedMediaResources(resourceContext.db,resourceContext.resourceDir,row,canonical,raw,
+      {executionBudget:resourceContext.executionBudget}) : null;
+  const imageOptions = embedded ? {resolveImage:embedded.resolveImage,imageContext:embedded.imageContext} : {};
+  const post = baselinePost && embedded ? projectPostContent(row,canonical,raw,imageOptions) : baselinePost;
+  const card = messageType === 'interactive' ? displayCard(raw,imageOptions) : null;
   /** @type {EnrichedMessage} */
   const result = {
     ...row,
@@ -438,9 +472,14 @@ function enrichRow(row, currentChat, scopeSourceMatches = true, recipientConfig,
       body: system?.text || displayBody(row.body, canonical, raw),
       ...(system ? { system } : {}),
       ...(media ? { media } : {}),
-      ...(messageType === "interactive" ? { card: displayCard(raw) } : {}),
+      ...(card ? { card } : {}),
+      ...(post ? { post } : {}),
+      ...(embedded && (embedded.slots.length || embedded.issues.length) ? {embedded_media:{version:1,
+        slots:embedded.slots,resources:embedded.resources,issues:embedded.issues,extraction_complete:embedded.complete}} : {}),
     },
   };
+  retainSourceProofFields(row,result);
+  if (embedded?.imageContext) imageProjectionContexts.set(result,embedded);
   if (includeReadiness) {
     const evidence=messageProjectionEvidence(row,canonical,raw,result.display,{
       chatType,chatName,titleSource:currentName?.name===chatName?'im.chats.get'
@@ -457,7 +496,9 @@ function enrichRow(row, currentChat, scopeSourceMatches = true, recipientConfig,
  * @param {EnrichedMessage} message @param {Row} sender */
 function applyVerifiedSenderMapping(message,sender) {
   const result={...message,display:{...message.display,sender:senderLabel(sender.name,sender.id,'app')}};
+  retainSourceProofFields(message,result);
   const previous=projectionEvidence.get(message);
+  if (imageProjectionContexts.has(message)) imageProjectionContexts.set(result,imageProjectionContexts.get(message));
   if (previous) {
     const evidence={...previous,sender};
     result.readiness=evaluateMessageCompleteness({row:message,canonical:message.canonical,
@@ -472,6 +513,7 @@ export {
   buildWhere,
   displayBody,
   displayCard,
+  displayCardForMessage,
   enrichRow,
   isInvalidRenderedContent,
   loadMessages,

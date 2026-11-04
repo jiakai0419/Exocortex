@@ -197,6 +197,7 @@ function contentRequirement(canonical, raw, native, display, evidence) {
   if (content.state === 'recalled' && [canonical, raw, native].some(value => value.deleted === true)) {
     return satisfied('content', 'source_tombstone');
   }
+  if (content.state === 'invalid') return missing('content', 'content_invalid');
   const mediaReasons = { media_resource_unavailable: 'content_resource_unavailable',
     media_resource_unsupported:'content_resource_unsupported',media_resource_invalid:'content_resource_invalid',
     media_reference_missing: 'content_reference_missing', media_reference_invalid: 'content_reference_invalid' };
@@ -206,11 +207,10 @@ function contentRequirement(canonical, raw, native, display, evidence) {
     return requirement('content', 'blocked', 'content_unsupported', 'renderer');
   // Read-time renderers use the current raw snapshot. A successfully rebuilt
   // card/system projection supersedes an older stored renderer diagnosis.
-  const renderings = [display.media || display.card || display.system || canonical.content_rendering || raw.content_rendering].filter(object);
+  const renderings = [display.media || display.card || display.post || display.system || canonical.content_rendering || raw.content_rendering].filter(object);
   const unsupported = renderings.find(value => value.status !== 'rendered' && UNSUPPORTED_CONTENT.has(value.reason));
   if (unsupported) return requirement('content', 'blocked', 'content_unsupported', 'renderer');
   if (renderings.some(value => ['partial', 'structured_fallback'].includes(value.status))) return missing('content', 'content_partial');
-  if (content.state === 'invalid') return missing('content', 'content_invalid');
   if (content.state === 'partial' || content.state === 'unsupported') return missing('content', 'content_partial');
   if (content.state !== 'complete') return missing('content', 'content_pending');
   if (!text(canonical.msg_type || native.msg_type || native.message_type)) return missing('content', 'content_pending');
