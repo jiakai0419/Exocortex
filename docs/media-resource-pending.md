@@ -126,3 +126,20 @@ restarts with a fresh bounded budget and the same local flock/cache, and checks
 expiry, discard and quarantine replacement. It also checks partial intent
 preparation, directory/file replacement, unsafe links, unknown files, stale
 receipts, repeated cleanup, capacity reuse and unchanged neighboring resources.
+
+## Rollback qualification
+
+`reclaimPendingMediaResources().status === 'ready'` is not an empty-store proof:
+valid pending or quarantined slots younger than their unchanged TTL remain live.
+Before rollback to code that does not understand cleanup intent, stop new work
+at the approved service boundary, hold the normal mutation lock, and explicitly
+verify that every one of the 20 slot paths, all corresponding intent and
+preparing paths, and any unknown pending entry are absent. The verified private
+mutation lock itself may remain. Read errors, unsafe entries, and an unexpired
+slot fail this gate; do not treat them as empty or force-delete them. Complete
+only normally eligible cleanup under its existing grant and re-inventory while
+quiescent. If this cannot be completed, preserve the evidence and use an
+applicable reviewed recovery plan; a `ready` return cannot authorize downgrade.
+Existing database, migration and native compatibility gates remain necessary.
+Synthetic controls cover both unexpired pending and quarantine returning ready
+with files intact, and their normally expired cleanup reaching physical emptiness.

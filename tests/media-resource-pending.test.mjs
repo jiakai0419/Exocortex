@@ -139,3 +139,19 @@ test('concurrent processes cannot admit more than the twentieth private slot',as
   assert(results.filter(x=>x.status!=='pending').every(x=>['resource_pending_busy','resource_pending_capacity'].includes(x.reason)));
   assert.equal(readdirSync(join(f.cache,'pending-v1')).filter(x=>x.startsWith('slot-')).length,20);
 });
+
+for(const quarantine of [false,true])test(`rollback cannot infer physical emptiness from ready (${quarantine?'quarantined':'pending'})`,t=>{
+  const f=setup(t),saved=retain(f,{originalClosingAtMs:quarantine?null:AT+10}),root=join(f.cache,'pending-v1');
+  assert.equal(saved.status,quarantine?'quarantined':'pending');
+  const before=readFileSync(f.db),claim=readFileSync(join(slot(f),'claim.json'));
+  const empty=()=>readdirSync(root).every(name=>name==='.mutation.lock')
+    &&Array.from({length:MAX_PENDING_MEDIA_RESOURCES},(_,i)=>`slot-${String(i).padStart(2,'0')}`)
+      .every(name=>![name,`.cleanup-${name}.json`,`.cleanup-${name}.preparing`].some(entry=>readdirSync(root).includes(entry)));
+  assert.equal(reclaimPendingMediaResources(f.cache,{nowMs:AT+30}).status,'ready');
+  assert.equal(empty(),false,'unexpired slots survive a successful expiry scan');
+  assert.deepEqual(readFileSync(join(slot(f),'claim.json')),claim);assert.deepEqual(readFileSync(f.db),before);
+  assert.equal(reclaimPendingMediaResources(f.cache,{nowMs:saved.expires_at_ms}).status,'ready');
+  assert.equal(empty(),true,'only normally expired cleanup establishes physical emptiness');
+  writeFileSync(join(root,'unexpected-private-entry'),'authored unknown',{mode:0o600});
+  assert.equal(empty(),false,'unknown entries also prevent qualification; no implicit deletion');
+});

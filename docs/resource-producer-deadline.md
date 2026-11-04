@@ -53,12 +53,23 @@ verification belongs to integration after the independent patches are combined.
 
 ## Implemented result contract
 
-Preparation stops before session creation return the exact selected target fields,
-`state: blocked`, `reason: batch_stopped`, and a finite selection failure. The
+Preparation stops before session creation retain each already-completed local
+outcome with its exact target. A cached available outcome is an existing read
+observation, not a new publication or permission for post-deadline queue writes.
+Targets that were not decided (including planned fetches) return the exact target
+fields, `state: blocked`, `reason: batch_stopped`, and a finite selection failure.
+Preparation accumulates outcomes per target before advancing; an exception in a
+later record or slot cannot discard the completed prefix. The
 non-null zero-call request receipt keeps the original option quotas and the
 branded clock's observed elapsed/stop. Only integration can accept that receipt
 against its identical already-stopped budget; a lookalike result alone authorizes
-nothing. Ordinary cached/unsupported zero-session results retain a null receipt.
+nothing. Retained local outcomes additionally need the producer's private,
+in-process proof bound to the identical budget, returned report object, exact
+target and immutable post-normalization outcome. A fabricated or modified
+diagnostic, another report/budget/target, and an alleged remote denial cannot
+borrow this proof. The wrapper keeps the observed finite failure separately from
+the stopped budget, with `persisted: false`; it performs no late result write.
+Ordinary cached/unsupported zero-session results retain a null receipt.
 The same preparation projection covers parent-directory resolution and staging
 creation before a session exists. Resolution and creation have separate budget
 checks. Ordinary local staging failures do not become budget or permission facts.

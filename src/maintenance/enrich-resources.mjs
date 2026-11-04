@@ -47,6 +47,19 @@ export const RESOURCE_FAILURE_REASONS=Object.freeze(['unknown','request_failed',
   'resource_not_cached','publication_not_attempted','batch_stopped','sync_busy','lease_unavailable','cli_budget','self_budget','time_budget',
   'clock_unavailable','rate_cooldown','rate_limited','shared_cooldown_unavailable']);
 const denialReasons=new Set(['permission_denied','restricted_mode','bot_user_out_of_chat']);
+// Only an actual producer may attest a completed preparation outcome. This
+// ephemeral proof is diagnostic; it authorizes neither requests nor writes.
+const preparationProofs=new WeakMap();
+const preparationTargetKey=target=>JSON.stringify([target.record_id,target.resource_key??null,target.reference_kind??null]);
+export function readResourcePreparationOutcome(report,budget,target) {
+  const proof=report&&typeof report==='object'?preparationProofs.get(report):null;
+  if(!isHistoryCommandBudget(budget)||!proof||proof.budget!==budget)return null;
+  const expected=proof.outcomes.get(preparationTargetKey(target));
+  if(!expected||!Array.isArray(report.results))return null;
+  const actual=report.results.filter(item=>preparationTargetKey(item)===preparationTargetKey(target));
+  return actual.length===1&&JSON.stringify(actual[0])===expected?JSON.parse(expected):null;
+}
+
 /** Bounded diagnostic projection; old nullable columns intentionally map to unknown.
  * This validates shape, not the authority of a remote denial.
  * @param {any} value */
@@ -161,33 +174,50 @@ export function enrichResources(options,deps={}) {
   if(exact!==undefined&&(!Array.isArray(exact)||exact.length<1||exact.length>64||exact.some(target=>!target
     ||!options.recordIds.includes(target.record_id)||typeof target.resource_key!=='string'
     ||!['image_key','attachment_origin_key'].includes(target.reference_kind))))throw new RangeError('invalid exact resource selection');
+  const targetsByRecord=new Map(options.recordIds.map(record_id=>[record_id,
+    exact?exact.filter(target=>target.record_id===record_id):[{record_id}]]));
+  const completedPreparation=new Map();
+  const remember=(target,entry)=>{completedPreparation.set(preparationTargetKey(target),entry);results.push(entry);};
   const preparationStopped=error=>{
     report.stop_reason=error.reason;report.request_budget=zeroBudget();
-    results=(exact??options.recordIds.map(record_id=>({record_id}))).map(target=>({...target,state:'blocked',reason:'batch_stopped',
-      failure:{stage:'selection',reason:error.reason}}));
-    return finish();
+    const retained=new Set();
+    results=options.recordIds.flatMap(id=>targetsByRecord.get(id)).map(target=>{
+      const completed=completedPreparation.get(preparationTargetKey(target));
+      if(completed&&['available','blocked','failed'].includes(completed.state)) {
+        const item={...completed,...target};retained.add(item);return item;
+      }
+      return {...target,state:'blocked',reason:'batch_stopped',failure:{stage:'selection',reason:error.reason}};
+    });
+    const finished=finish(),outcomes=new Map();
+    for(const item of finished.results)if(retained.has(item))outcomes.set(preparationTargetKey(item),JSON.stringify(item));
+    preparationProofs.set(finished,{budget,outcomes});return finished;
   };
   try {
     const rows=snapshot(options.db,selection).rows, byId=new Map(rows.map(row=>[row.id,row]));
-    results=options.recordIds.flatMap(id=>{
+    for(const id of options.recordIds) {
       budget.assertReady();
       const row=byId.get(id), entry={record_id:id,state:'blocked',reason:'record_missing'};
-      if(!row)return [entry];
+      const recordOutcome=value=>{
+        for(const target of targetsByRecord.get(id))completedPreparation.set(preparationTargetKey(target),value);
+        results.push(value);
+      };
+      if(!row){recordOutcome(entry);continue;}
       const canonical=parse(row.canonical_json),raw=parse(row.raw_json),legacy=renderMediaProjection(row,canonical,raw);
-      if(legacy?.type==='sticker')return [{...entry,reason:'sticker_resource_unsupported'}];
+      if(legacy?.type==='sticker'){recordOutcome({...entry,reason:'sticker_resource_unsupported'});continue;}
       const extracted=extractMessageResourceReferences(row,canonical,raw),native=raw.raw_api??raw;
       const embedded=['post','interactive'].includes(native.msg_type||native.message_type);
       const unique=new Map();for(const slot of extracted.slots)unique.set(JSON.stringify([slot.reference_kind,slot.key]),slot);
       const all=[...unique.values()];
-      const selected=exact?exact.filter(target=>target.record_id===id).map(target=>all.find(slot=>slot.key===target.resource_key&&slot.reference_kind===target.reference_kind)):all;
-      if(!selected.length)return [{...entry,reason:extracted.issues.length?'source_binding_invalid':'content_not_supported'}];
+      const selected=exact?targetsByRecord.get(id).map(target=>all.find(slot=>slot.key===target.resource_key&&slot.reference_kind===target.reference_kind)):all;
+      if(!selected.length){recordOutcome({...entry,reason:extracted.issues.length?'source_binding_invalid':'content_not_supported'});continue;}
+      if(!exact)targetsByRecord.set(id,selected.map(slot=>embedded?{record_id:id,resource_key:slot.key,reference_kind:slot.reference_kind}:{record_id:id}));
       const slots=selected.filter(Boolean),medias=slots.map(mediaFromImageSlot),account=projectionAccount(row,canonical,raw);
       const bindings=account.state==='verified'?makeMediaResourceBindings(options.db,row,account.account_key,medias):[];
       const bound=new Map(slots.map((slot,index)=>[slot,bindings[index]]));
       const kindsByKey=new Map();for(const slot of all) {
         if(!kindsByKey.has(slot.key))kindsByKey.set(slot.key,new Set());kindsByKey.get(slot.key).add(slot.reference_kind);
       }
-      return selected.map(slot=>{
+      const prepare=slot=>{
         if(!slot)return {...entry,reason:'media_reference_missing'};
         const result=embedded?{...entry,resource_key:slot.key,reference_kind:slot.reference_kind}:entry;
         if(slot.reference_state!=='reference_only')return {...result,reason:slot.reference_state==='missing_reference'?'media_reference_missing':'media_reference_invalid'};
@@ -202,8 +232,11 @@ export function enrichResources(options,deps={}) {
         const planned={...result,state:'planned',reason:null},sourceFence=makeMediaPendingSourceFence(row);
         if(!sourceFence)return {...result,reason:'source_binding_invalid'};
         candidates.push({row,account,media,binding,sourceFence,entry:planned});return planned;
-      });
-    });
+      };
+      for(const [index,slot] of selected.entries()) {
+        budget.assertReady();remember(targetsByRecord.get(id)[index],prepare(slot));
+      }
+    }
     budget.assertReady();
   } catch(error) {
     if(!(error instanceof HistoryCommandBudgetError))throw error;

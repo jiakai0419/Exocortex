@@ -16,7 +16,7 @@ import { transportOperation } from '../adapters/lark-im/transport.mjs';
 import { tryAcquireLarkApiLease } from '../runtime/lark-api-lease.mjs';
 import { createMaintenanceRequestSession } from './request-session.mjs';
 import { createResourceCommandBudget, HistoryCommandBudgetError } from './history-command-budget.mjs';
-import { enrichResources, normalizeResourceFailure, resourceFailureFromError } from './enrich-resources.mjs';
+import { enrichResources, normalizeResourceFailure, resourceFailureFromError, readResourcePreparationOutcome } from './enrich-resources.mjs';
 import { RESOURCE_CANDIDATE_INDEX, RESOURCE_CANDIDATE_WHERE } from './resource-candidates.mjs';
 
 /** @typedef {Record<string,any>} Row */
@@ -347,15 +347,17 @@ export function executeResourceWork(options,deps={}) {
     if(!item) {receiptInvalid=true;throw new Error('resource result unavailable');}
     if(!producerStarted&&result.request_budget!==null) {
       const observed=executionBudget.summary(),b=result.request_budget;
+      const prepared=readResourcePreparationOutcome(result,executionBudget,{record_id:task.record_id,resource_key:identity.resource_key,reference_kind:identity.reference_kind});
+      const undecided=item.state==='blocked'&&item.reason==='batch_stopped'&&item.failure?.stage==='selection'&&item.failure?.reason===observed.stop_reason;
       const stoppedBeforeSession=['time_budget','clock_unavailable'].includes(observed.stop_reason??'')
         &&b?.stop_reason===observed.stop_reason&&b.max_cli_attempts===maxCli&&b.max_self_attempts===2&&b.max_seconds===seconds
         &&b.cli_attempts===0&&b.self_attempts===0&&b.min_interval_ms===1000
         &&(observed.elapsed_ms===null?b.elapsed_ms===null:integer(b.elapsed_ms)&&b.elapsed_ms<=observed.elapsed_ms)
         &&item.resource_key===identity.resource_key&&item.reference_kind===identity.reference_kind
-        &&item.state==='blocked'&&item.reason==='batch_stopped'&&item.failure?.stage==='selection'&&item.failure?.reason===observed.stop_reason;
+        &&(undecided||prepared!==null);
       if(stoppedBeforeSession) {
         report.ok=false;report.outcome=observed.stop_reason==='clock_unavailable'?'clock_unavailable':'batch_deferred';report.deferred=1;
-        report.failure={stage:'selection',reason:observed.stop_reason,persisted:false};return finish(observed.stop_reason);
+        report.failure=prepared?.failure?{...prepared.failure,persisted:false}:{stage:'selection',reason:observed.stop_reason,persisted:false};return finish(observed.stop_reason);
       }
     }
     if(!producerStarted&&!(result.request_budget===null&&['available','blocked'].includes(item.state))) {receiptInvalid=true;producerStarted=true;throw new Error('resource zero receipt unavailable');}
