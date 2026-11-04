@@ -201,7 +201,7 @@ test('a recalled post retains the established tombstone display and its neighbor
   const recalled=json.find(item=>item.external_id===deleted.raw.message_id);
   assert.equal(recalled.readiness.state,'ready');
   assert.equal(recalled.display.post,undefined);assert.equal(recalled.display.embedded_media,undefined);
-  assert.equal(recalled.display.body,'[已撤回/已删除：飞书未返回原始富文本内容]');
+  assert.equal(recalled.display.body,'[已撤回/已删除]');
   assert.match(terminal,/已撤回\/已删除/);assert.match(terminal,/Invented neighbor before recall/);
   assert.match(terminal,/Invented neighbor after recall/);
   assert.deepEqual(json.map(item=>item.external_id),entries.toReversed().map(item=>item.raw.message_id));

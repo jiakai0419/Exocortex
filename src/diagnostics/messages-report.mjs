@@ -1,6 +1,7 @@
 // @ts-check
 
 import { renderMediaProjection } from "../adapters/lark-im/media-content.mjs";
+import { isSourceTombstone, SOURCE_TOMBSTONE_TEXT } from "../adapters/lark-im/source-tombstone.mjs";
 import { projectMediaResource, projectEmbeddedMediaResources, isCurrentImageContext } from "../adapters/lark-im/media-resource-projection.mjs";
 import { projectPostContent, readPostProjectionEvidence } from "../adapters/lark-im/message-post-projection.mjs";
 import { readOnlySqliteJson } from "../storage/sqlite/readonly-query.mjs";
@@ -264,9 +265,7 @@ function isInvalidRenderedContent(value) {
  * @param {Row} raw
  */
 function displayBody(body, canonical, raw) {
-  if ((canonical.deleted === true || raw.deleted === true) && isInvalidRenderedContent(body)) {
-    return "[已撤回/已删除：飞书未返回原始富文本内容]";
-  }
+  if (isSourceTombstone(canonical, raw)) return SOURCE_TOMBSTONE_TEXT;
   if ((canonical.msg_type || raw.msg_type || raw.message_type) === "system") {
     if (canonical.content_rendering?.status === "structured_fallback" || raw.content_rendering?.status === "structured_fallback") {
       return body;
@@ -340,8 +339,10 @@ function displaySystem(body, canonical, raw, context) {
  * an old human-readable fallback as native card JSON.
  * @param {Row} raw
  * @param {import("../adapters/lark-im/card-content.mjs").CardRenderOptions} [options]
+ * @returns {ReturnType<typeof renderCardContent>}
  */
 function displayCard(raw, options) {
+  if (isSourceTombstone(null, raw)) return { text: SOURCE_TOMBSTONE_TEXT, status: 'rendered', reason: null, version: 3 };
   const native = raw.raw_api && typeof raw.raw_api === "object" && !Array.isArray(raw.raw_api)
     ? raw.raw_api : raw;
   const content = native.body && typeof native.body === "object" && !Array.isArray(native.body)
@@ -353,8 +354,11 @@ function displayCard(raw, options) {
  * No resource is fetched or re-read here. A cloned or changed message cannot
  * acquire authority from a serialized display field.
  * @param {EnrichedMessage} message
- * @param {import("../adapters/lark-im/card-content.mjs").CardRenderOptions} [options] */
+ * @param {import("../adapters/lark-im/card-content.mjs").CardRenderOptions} [options]
+ * @returns {ReturnType<typeof renderCardContent>} */
 function displayCardForMessage(message, options) {
+  if (isSourceTombstone(message.canonical, message.raw))
+    return { text: SOURCE_TOMBSTONE_TEXT, status: 'rendered', reason: null, version: 3 };
   const context = imageProjectionContexts.get(message);
   const imageOptions = context && isCurrentImageContext(message, message.canonical, message.raw, context.imageContext)
     ? { resolveImage: context.resolveImage, imageContext: context.imageContext } : {};
@@ -440,11 +444,14 @@ function enrichRow(row, currentChat, scopeSourceMatches = true, recipientConfig,
     || (messageType === "system" ? "system" : null);
   const isP2p = chatType === "p2p";
   const isGroupLike = !isP2p;
-  const system = messageType === "system" ? displaySystem(row.body, canonical, raw, systemContext(row, canonical, raw, config)) : null;
-  const sourceMedia = renderMediaProjection(row, canonical, raw);
-  const media = resourceContext ? projectMediaResource(resourceContext.db,resourceContext.resourceDir,row,canonical,raw,sourceMedia,
+  const recalled = isSourceTombstone(canonical, raw);
+  // A retained tombstone is projected before every content/resource path, even
+  // when its archived prose is still valid and readable. No cached resource or
+  // newly supported static control may turn it back into a live message.
+  const system = !recalled && messageType === "system" ? displaySystem(row.body, canonical, raw, systemContext(row, canonical, raw, config)) : null;
+  const sourceMedia = recalled ? null : renderMediaProjection(row, canonical, raw);
+  const media = !recalled && resourceContext ? projectMediaResource(resourceContext.db,resourceContext.resourceDir,row,canonical,raw,sourceMedia,
     {executionBudget:resourceContext.executionBudget}) : sourceMedia;
-  const recalled = [canonical,raw,native].some(value => value.deleted === true);
   const baselinePost = messageType === 'post' && !recalled ? projectPostContent(row,canonical,raw) : null;
   const postInvalid = baselinePost && readPostProjectionEvidence(row,canonical,raw,baselinePost).state === 'invalid';
   const embedded = resourceContext && !recalled && ['post','interactive'].includes(messageType) && !postInvalid
@@ -452,7 +459,7 @@ function enrichRow(row, currentChat, scopeSourceMatches = true, recipientConfig,
       {executionBudget:resourceContext.executionBudget}) : null;
   const imageOptions = embedded ? {resolveImage:embedded.resolveImage,imageContext:embedded.imageContext} : {};
   const post = baselinePost && embedded ? projectPostContent(row,canonical,raw,imageOptions) : baselinePost;
-  const card = messageType === 'interactive' ? displayCard(raw,imageOptions) : null;
+  const card = !recalled && messageType === 'interactive' ? displayCard(raw,imageOptions) : null;
   /** @type {EnrichedMessage} */
   const result = {
     ...row,

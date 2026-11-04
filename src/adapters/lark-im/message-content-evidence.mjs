@@ -2,6 +2,7 @@
 import { renderApiMessageContent } from './raw-message.mjs';
 import { validateJsonObjectText } from '../../../dist/core/json-text-patch.js';
 import { readPostProjectionEvidence } from './message-post-projection.mjs';
+import { isSourceTombstone } from './source-tombstone.mjs';
 
 /** @typedef {Record<string, any>} JsonObject */
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -28,7 +29,7 @@ function validateNativeContent(item) {
  * @param {JsonObject} display */
 export function messageContentEvidence(row, canonical, raw, display) {
   const native = object(raw.raw_api) ? raw.raw_api : raw;
-  if (canonical.deleted === true || raw.deleted === true || native.deleted === true)
+  if (isSourceTombstone(canonical, raw))
     return { state: 'recalled', source: 'native_tombstone', reason: null };
   if (display.post) return readPostProjectionEvidence(row, canonical, raw, display.post);
   const rendering = display.media || display.card || display.system || canonical.content_rendering || raw.content_rendering;

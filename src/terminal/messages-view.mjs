@@ -12,6 +12,7 @@ import {
   value,
 } from "../../dist/terminal/index.js";
 import { displayCardForMessage } from "../diagnostics/messages-report.mjs";
+import { isSourceTombstone, SOURCE_TOMBSTONE_TEXT } from "../adapters/lark-im/source-tombstone.mjs";
 import { terminalColumns, textWidth, wrapTextLine } from "./text-layout.mjs";
 
 /**
@@ -88,6 +89,7 @@ function renderMessagesText(messages, options = {}) {
   }
   lines.push("");
   for (const message of messages) {
+    const recalled = isSourceTombstone(message.canonical, message.raw);
     const time = message.occurred_at ? new Date(message.occurred_at).toLocaleString() : "unknown time";
     header(message, time);
     if (message.readiness && message.readiness.state!=='ready') {
@@ -107,7 +109,8 @@ function renderMessagesText(messages, options = {}) {
       };
       field('状态',message.readiness.state==='blocked'?'准备受阻':'等待完整信息',4);
       field('原因',[...new Set((message.readiness.reasons||[]).map(reason=>reasons[reason]||'信息待核验'))].join('；'),4);
-      if (message.display.media) {
+      if (recalled) field('消息',SOURCE_TOMBSTONE_TEXT,4);
+      else if (message.display.media) {
         field('类型',message.display.media.type === 'image' ? '图片' : '贴纸',4);
         field('资源',message.display.media.text,4);
       }
@@ -125,7 +128,9 @@ function renderMessagesText(messages, options = {}) {
       field("当前本地标题来源", "会话配置；观察时间未知", 2);
     }
     field("类型", `${message.display.sender_type} / ${message.display.message_type}`, 4);
-    if (message.display.media) {
+    if (recalled) {
+      field('消息',SOURCE_TOMBSTONE_TEXT,4);
+    } else if (message.display.media) {
       field('资源',message.display.media.text,4);
       if(message.display.media.resource.availability==='available') {
         field('文件',message.display.media.resource.path,4);

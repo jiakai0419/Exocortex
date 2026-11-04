@@ -75,7 +75,7 @@ function fixtures() {
     { body: 'Stored old system text remains unchanged.',
       shown: 'Invented Guest joined Invented Historic Room. New members can view all chat history.', freshProjection: true,
       canonical: { content_rendering: { status: 'partial', reason: 'system_parameters_missing' } } });
-  add('recalled tombstone', 'text', null, { body: '[Invalid text JSON]', shown: '[已撤回/已删除：飞书未返回原始富文本内容]', freshProjection: true,
+  add('recalled tombstone', 'text', null, { body: '[Invalid text JSON]', shown: '[已撤回/已删除]', freshProjection: true,
     mutate: raw => { raw.deleted = true; } });
   add('body disagrees with source', 'text', { text: 'Invented authoritative complete body.' },
     { body: 'Invented shortened body.', state: 'enriching', reason: 'content_invalid' });

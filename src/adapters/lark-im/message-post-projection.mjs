@@ -1,6 +1,7 @@
 // @ts-check
 import { renderApiMessageContent } from './raw-message.mjs';
 import { validateJsonObjectText } from '../../../dist/core/json-text-patch.js';
+import { isSourceTombstone } from './source-tombstone.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { isCurrentImageContext } from './media-resource-projection.mjs';
 
@@ -20,6 +21,7 @@ const evidence = (state, reason = null) => ({ state, source: 'message_renderer',
  * @param {Row} [options]
  * @returns {import('./raw-message.mjs').RenderResult|null} */
 export function projectPostContent(row, canonical, raw, options = {}) {
+  if (isSourceTombstone(canonical, raw)) return null;
   const native = object(raw.raw_api) ? raw.raw_api : raw;
   const declared = [canonical.msg_type, raw.msg_type, raw.message_type, native.msg_type, native.message_type];
   if (!declared.includes('post')) return null;

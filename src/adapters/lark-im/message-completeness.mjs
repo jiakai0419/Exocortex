@@ -3,6 +3,7 @@ import { personName, senderIdentity, senderNameFromSource } from './sender-ident
 import { chatNameCleared, chatTitle, titleMessageMatches } from './chat-title.mjs';
 import { parseLarkTimeMs } from './message-record.mjs';
 import { recipientAccountKey, resolveP2pRecipient } from './p2p-recipient.mjs';
+import { isSourceTombstone } from './source-tombstone.mjs';
 
 /** This evaluator consumes an exact, caller-validated local evidence bundle.
  * It never interprets a rendered label as identity or performs lookup/persistence.
@@ -194,7 +195,7 @@ function contentRequirement(canonical, raw, native, display, evidence) {
   const types = [canonical.msg_type, raw.msg_type, raw.message_type, native.msg_type, native.message_type].filter(text);
   if (new Set(types).size > 1) return conflict('content', 'content_invalid');
   if (content.state === 'pending') return missing('content', 'content_pending');
-  if (content.state === 'recalled' && [canonical, raw, native].some(value => value.deleted === true)) {
+  if (content.state === 'recalled' && isSourceTombstone(canonical, raw)) {
     return satisfied('content', 'source_tombstone');
   }
   if (content.state === 'invalid') return missing('content', 'content_invalid');
