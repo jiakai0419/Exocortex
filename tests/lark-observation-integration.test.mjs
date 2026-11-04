@@ -637,14 +637,15 @@ test('autonomous historical recheck requires a verified account association',t=>
   assert.equal(store.sqliteQuery(f.db,'SELECT COUNT(*) n FROM lark_im_history_progress;')[0].n,0);
 });
 
-test('automatic history retains one audit receipt per scope without pruning explicit repair audits',t=>{
+test('automatic history retains recent marked receipts without pruning explicit repair audits',t=>{
   const f=fixture(t), changed=native(f,0,{update_time:String(f.start+9000),body:{content:'{"text":"Invented explicit repair"}'}});
   const {reviewOut,...options}=replayOptions(f,{apply:true,reviewOut:undefined});
   assert.equal(replay(f,[changed],options).ok,true);
   const manual=store.sqliteQuery(f.db,'SELECT id FROM bounded_replay_runs;')[0].id;
   for(let i=0;i<4;i++)history(f,[changed]);
-  const audits=store.sqliteQuery(f.db,'SELECT id FROM bounded_replay_runs;');
-  assert.equal(audits.length,2);assert.ok(audits.some(row=>row.id===manual));
+  const audits=store.sqliteQuery(f.db,'SELECT id,history_record_id FROM bounded_replay_runs;');
+  assert.equal(audits.length,5);assert.ok(audits.some(row=>row.id===manual&&row.history_record_id===null));
+  assert.equal(audits.filter(row=>row.history_record_id!==null).length,4);
   assert.equal(store.sqliteQuery(f.db,'SELECT generation FROM lark_im_history_progress;')[0].generation,4);
 });
 
