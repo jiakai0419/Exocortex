@@ -201,3 +201,23 @@ admission closes. Remote denial still requires the exact typed execution receipt
 and closing account fence. A local reason string cannot establish permission
 failure or authorize another request. Exhausted work is not automatically
 reopened by this migration; missing historical evidence cannot be reconstructed.
+
+## Local SQL uses the same command deadline
+
+Local preparation and SQLite writes share the resource command's original
+monotonic start and deadline. SQL construction and admission rechecks do not
+renew the grant. Recheck immediately before each read or write dispatch and
+pass the remaining deadline as the SQLite executor's `ExecutionBudget`; the
+executor bounds both its lock wait and subprocess lifetime. No positive
+one-millisecond fallback is permitted after the grant expires. The existing
+CLI/self quotas, fair turns, source/account fences and shared leases remain.
+
+A local execution error and a subsequently observed budget stop are independent:
+`execution_failed` remains a failed operation while `request_budget.stop_reason`
+can also record `time_budget`. A late successful SQLite return cannot make the
+whole command `ok:true`. A write timeout/error does not establish rollback:
+a transaction may have committed before its acknowledgement was lost. The
+command performs no recovery query or retry after expiry; the next normal
+invocation reads the durable state. Preserve previously confirmed effects and
+never infer zero committed tasks from a failed command or zero reported task
+counters.

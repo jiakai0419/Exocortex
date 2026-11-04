@@ -175,7 +175,20 @@ export function executeResourceWork(options,deps={}) {
   /** @type {Row} */ const report={ok:true,profile:PROFILE,outcome:'no_eligible_known_resource',processed:0,available:0,deferred:0,blocked:0,failure:null};
   const elapsed=()=>{const n=mono();if(!Number.isFinite(began)||!Number.isFinite(n)||n<previous)stop('clock_unavailable');previous=n;return n-began;};
   const ready=()=>{if(!integer(wall)||!integer(now())||now()<wall)stop('clock_unavailable');if(elapsed()>=maxSeconds*1000)stop('time_budget');};
-  const query=(sql,label)=>(deps.sqliteJson||readOnlySqliteJson)(options.db,sql,label,{timeoutMs:Math.max(1,Math.min(2000,Math.floor(deadline-mono())))});
+  // The executor receives the original command clock, not a fresh write grant.
+  // SQL construction and admission reads must finish before dispatch is allowed.
+  const executionBudget=Object.freeze({assertReady:ready,
+    timeoutMs(capMs=30000){
+      if(!Number.isFinite(capMs)||capMs<=0)throw new RangeError('invalid resource operation timeout');
+      ready();const left=Math.floor(Math.min(capMs,maxSeconds*1000-elapsed()));
+      if(left<1)stop('time_budget');return left;
+    },
+    runCleanup(work){ready();return work();}});
+  const query=(sql,label)=>{
+    const timeoutMs=executionBudget.timeoutMs(2000);
+    const result=(deps.sqliteJson||readOnlySqliteJson)(options.db,sql,label,{timeoutMs});
+    ready();return result;
+  };
   const snapshot=(ids)=>deps.readSnapshot?deps.readSnapshot(options.db,{direction:'all',limit:ids.length,recordIds:ids}).rows:
     query(`SELECT ${MEDIA_RESOURCE_SOURCE_FIELDS.join(',')} FROM records WHERE id IN (${ids.join(',')})
       AND (${sourceBytes})<=${MAX_ROW_BYTES} ORDER BY id;`,'read bounded resource source rows');
@@ -188,7 +201,12 @@ export function executeResourceWork(options,deps={}) {
   };
   /** @param {string|null} [reason] */
   const finish=(reason=null)=>{
-    let spent;try {spent=Math.max(0,Math.floor(elapsed()));}catch{spent=null;reason='clock_unavailable';report.ok=false;report.outcome='clock_unavailable';}
+    let spent;try {
+      spent=Math.max(0,Math.floor(elapsed()));
+      if(spent>=maxSeconds*1000){reason='time_budget';report.ok=false;
+        if(report.outcome==='no_eligible_known_resource')report.outcome='batch_deferred';}
+    }catch{spent=null;reason='clock_unavailable';
+      if(report.ok)report.outcome='clock_unavailable';report.ok=false;}
     let cli=0,self=0,complete=spent!==null;
     if(producerStarted) {
       const b=producerBudget;
@@ -205,10 +223,17 @@ export function executeResourceWork(options,deps={}) {
     const admission=(deps.captureWriteAdmission||captureLarkWriteAdmission)(options.db,{}, {query:(_db,sql,label)=>query(sql,label)});
     const account=admission.fence.accountKey;
     if(!/^[a-f0-9]{64}$/.test(account||'')){report.ok=false;report.outcome='blocked';report.blocked=1;return finish();}
-    const write=(sql)=>{admission.assertCurrent();return (deps.sqliteWrite||sqliteQuery)(options.db,`BEGIN IMMEDIATE;
+    const write=(sql)=>{
+      ready();admission.assertCurrent();
+      const transaction=`BEGIN IMMEDIATE;
       ${larkWriteAdmissionSql(admission.fence)}
       CREATE TEMP TABLE __resource_fence(allowed INTEGER NOT NULL CHECK(allowed=1));
-      ${sql}\nCOMMIT;`,'commit resource work');};
+      ${sql}\nCOMMIT;`;
+      executionBudget.assertReady();
+      // Do not turn a dispatched failure into a proved rollback. A normal late
+      // return still represents a confirmed effect; finish reports deadline loss.
+      return (deps.sqliteWrite||sqliteQuery)(options.db,transaction,'commit resource work',executionBudget);
+    };
     let scan=query(`SELECT * FROM ${SCAN} WHERE source_id='lark.im';`,'read resource scan')[0];
     if(!scan||!integer(scan.generation)||!integer(scan.after_id)||!integer(scan.horizon_id)||!/^([a-f0-9]{64})?$/.test(scan.recovery_after_work_key??'invalid'))throw new Error('resource schema unavailable');
     const head=query(`SELECT COALESCE(MAX(id),0) AS id FROM ${sourceFrom} WHERE ${sourceWhere};`,'read resource head')[0].id;
