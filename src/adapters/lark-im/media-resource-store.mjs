@@ -571,6 +571,7 @@ function pendingManifest(dir,budget=undefined) {
 /** @param {MediaBudget} [budget] */
 function withPendingMutation(cache,callback,budget=undefined) {
   let fd;
+  /** @type {JsonObject|null} */ let rejectedCallback=null;
   try {
     const dir=pendingDirectory(cache,true,budget),path=join(dir.root,'.mutation.lock');
     budget?.assertReady();
@@ -587,11 +588,15 @@ function withPendingMutation(cache,callback,budget=undefined) {
     if(lock.status!==0||lock.error)throw new Error('pending_lock_failed');
     fileUnchanged(path,info,budget);directoryUnchanged(dir,budget);
     const result=callback(dir);
-    // An unsuccessful callback has no publication/cleanup authority. Do not
-    // replace its finite rejection with a post-result lock read after expiry.
-    if(result?.status==='invalid'&&observeRejectedOperation(result,budget))return result;
+    // Retain an established rejection across every later completion check.
+    // This says nothing about effects that the callback may already have had.
+    if(result?.status==='invalid')rejectedCallback=result;
+    if(rejectedCallback&&observeRejectedOperation(rejectedCallback,budget))return rejectedCallback;
     fileUnchanged(path,info,budget);directoryUnchanged(dir,budget);budget?.assertReady();return result;
-  }catch(error){observeRejectedOperation(error,budget);return finite('invalid','resource_pending_invalid');}
+  }catch(error){
+    if(budget&&error instanceof HistoryCommandBudgetError&&rejectedCallback)return rejectedCallback;
+    observeRejectedOperation(error,budget);return finite('invalid','resource_pending_invalid');
+  }
   finally{if(fd!==undefined)closeSync(fd);}
 }
 const pendingStatKeys=['dev','ino','size','mtimeNs','ctimeNs','mode','uid','nlink'];
