@@ -8,6 +8,8 @@ import { inflateSync } from 'node:zlib';
 import { validateJsonObjectText } from '../../../dist/core/json-text-patch.js';
 import { validateJpegResource } from './jpeg-resource-validator.mjs';
 import { HistoryCommandBudgetError, isHistoryCommandBudget } from '../../maintenance/history-command-budget.mjs';
+import { attestVerifiedImageRead, isImageSlot } from './media-image-slot.mjs';
+import { extractMessageResourceReferences } from './media-resource-references.mjs';
 
 /** @typedef {Record<string,any>} JsonObject */
 export const MAX_MEDIA_RESOURCE_BYTES = 16 * 1024 * 1024;
@@ -18,6 +20,7 @@ const HASH = /^[a-f0-9]{64}$/;
 const hashValid = value => typeof value === 'string' && HASH.test(value);
 const bindingKeys = ['schema','database','source_id','external_id','external_version','content_hash',
   'container_id','account_key','type','key'];
+const embeddedBindingKeys=[...bindingKeys,'message_type','reference_kind'];
 const manifestKeys = ['schema','binding','binding_digest','sha256','size_bytes','mime_type','observed_at'];
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const sha = value => createHash('sha256').update(value).digest('hex');
@@ -40,7 +43,7 @@ function databaseIdentity(db) {
   return { path, dev: String(info.dev), ino: String(info.ino) };
 }
 
-/** @param {string} db @param {JsonObject} row @param {string} accountKey @param {JsonObject} media */
+/** @param {string} db @param {JsonObject} row @param {string} accountKey @param {JsonObject|null} media */
 export function makeMediaResourceBinding(db, row, accountKey, media) {
   try {
     if (!object(row) || row.source_id !== 'lark.im' || row.record_type !== 'lark.im.message'
@@ -48,31 +51,71 @@ export function makeMediaResourceBinding(db, row, accountKey, media) {
       || !hashValid(accountKey) || !(row.external_version === null || text(row.external_version, 512))
       || typeof row.raw_json !== 'string' || row.raw_json.length > 256 * 1024
       || sha(row.raw_json) !== row.content_hash || media?.type !== 'image'
-      || media.resource?.kind !== 'image_key' || media.resource?.state !== 'reference_only'
+      || !['image_key','attachment_origin_key'].includes(media.resource?.kind) || media.resource?.state !== 'reference_only'
       || !keyValid(media.resource?.key)) return null;
     validateJsonObjectText(row.raw_json);
     const raw = JSON.parse(row.raw_json);
     if (Object.hasOwn(raw, 'raw_api') && !object(raw.raw_api)) return null;
     const native = Object.hasOwn(raw, 'raw_api') ? raw.raw_api : raw;
-    if ((native.msg_type || native.message_type) !== 'image' || native.deleted === true
+    const sourceType=native.msg_type||native.message_type;
+    if (!['image','post','interactive'].includes(sourceType) || native.deleted === true
       || native.message_id !== row.external_id || native.chat_id !== row.container_id) return null;
     for (const value of [raw, native]) {
-      if ([value.msg_type, value.message_type].some(type => type != null && type !== 'image')
+      if ([value.msg_type, value.message_type].some(type => type != null && type !== sourceType)
         || [value.message_id, value.id].some(id => id != null && id !== row.external_id)
         || [value.chat_id, value.chat?.id, value.chat?.chat_id].some(id => id != null && id !== row.container_id)) return null;
     }
-    let content = native.body?.content;
-    if (typeof content === 'string') { validateJsonObjectText(content); content = JSON.parse(content); }
-    if (!object(content) || content.image_key !== media.resource.key) return null;
-    return Object.freeze({ schema: 'lark_media_resource_binding/v1', database: Object.freeze(databaseIdentity(db)),
+    let referenceKind='image_key';
+    if(sourceType==='image') {
+      let content = native.body?.content;
+      if (typeof content === 'string') { validateJsonObjectText(content); content = JSON.parse(content); }
+      if (!object(content) || content.image_key !== media.resource.key || media.resource.kind!=='image_key') return null;
+    } else {
+      if(typeof row.canonical_json!=='string'||!isImageSlot(media.slot))return null;
+      validateJsonObjectText(row.canonical_json);
+      const extracted=extractMessageResourceReferences(row,JSON.parse(row.canonical_json),raw);
+      const slot=extracted.slots.find(value=>JSON.stringify(value)===JSON.stringify(media.slot));
+      if(!slot||slot.reference_state!=='reference_only'||slot.key!==media.resource.key||slot.reference_kind!==media.resource.kind)return null;
+      referenceKind=slot.reference_kind;
+    }
+    const base={ schema: 'lark_media_resource_binding/v1', database: Object.freeze(databaseIdentity(db)),
       source_id: 'lark.im', external_id: row.external_id, external_version: row.external_version,
       content_hash: row.content_hash, container_id: row.container_id, account_key: accountKey,
-      type: 'image', key: media.resource.key });
+      type: 'image', key: media.resource.key };
+    return Object.freeze(sourceType==='image'?base:{...base,schema:'lark_media_resource_binding/v2',
+      message_type:sourceType,reference_kind:referenceKind});
   } catch { return null; }
 }
 
+/** Validate one source at bounded cost, then bind its finite occurrence set.
+ * Repeated occurrences share an endpoint without re-parsing the full message
+ * once per image. The single-binding entry remains independently validating.
+ * @param {string} db @param {JsonObject} row @param {string} accountKey @param {Array<JsonObject|null>} medias */
+export function makeMediaResourceBindings(db,row,accountKey,medias) {
+  try {
+    if(!Array.isArray(medias)||medias.length>64)return [];
+    const raw=JSON.parse(row.raw_json),canonical=JSON.parse(row.canonical_json||'{}');
+    const native=Object.hasOwn(raw,'raw_api')?raw.raw_api:raw;
+    if((native?.msg_type||native?.message_type)==='image')return medias.map(media=>makeMediaResourceBinding(db,row,accountKey,media));
+    const extracted=extractMessageResourceReferences(row,canonical,raw);
+    const references=new Map();for(const slot of extracted.slots)references.set(JSON.stringify(slot),slot);
+    const selected=medias.map(media=>{
+      const slot=media&&isImageSlot(media.slot)?references.get(JSON.stringify(media.slot)):null;
+      return slot?.reference_state==='reference_only'&&media?.type==='image'&&media.resource?.state==='reference_only'
+        &&media.resource.kind===slot.reference_kind&&media.resource.key===slot.key?slot:null;
+    });
+    const first=selected.findIndex(Boolean);
+    if(first<0)return medias.map(()=>null);
+    const base=makeMediaResourceBinding(db,row,accountKey,medias[first]);
+    if(!base||base.schema!=='lark_media_resource_binding/v2')return medias.map(()=>null);
+    return selected.map(slot=>slot?Object.freeze({...base,key:slot.key,reference_kind:slot.reference_kind}):null);
+  } catch {return Array.isArray(medias)?medias.map(()=>null):[];}
+}
+
 function normalizedBinding(binding) {
-  if (!exactKeys(binding, bindingKeys) || binding.schema !== 'lark_media_resource_binding/v1'
+  const embedded=binding?.schema==='lark_media_resource_binding/v2',keys=embedded?embeddedBindingKeys:bindingKeys;
+  if (!exactKeys(binding, keys) || !['lark_media_resource_binding/v1','lark_media_resource_binding/v2'].includes(binding.schema)
+    ||embedded&&(!['post','interactive'].includes(binding.message_type)||!['image_key','attachment_origin_key'].includes(binding.reference_kind))
     || !exactKeys(binding.database, ['path','dev','ino']) || !text(binding.database.path, 8192)
     || typeof binding.database.dev !== 'string' || typeof binding.database.ino !== 'string'
     || !/^[0-9]+$/.test(binding.database.dev) || !/^[0-9]+$/.test(binding.database.ino)
@@ -82,7 +125,7 @@ function normalizedBinding(binding) {
     || binding.type !== 'image' || !keyValid(binding.key)) throw new Error('invalid_binding');
   const current = databaseIdentity(binding.database.path);
   if (JSON.stringify(current) !== JSON.stringify(binding.database)) throw new Error('database_changed');
-  return Object.fromEntries(bindingKeys.map(key => [key, binding[key]]));
+  return Object.fromEntries(keys.map(key => [key, binding[key]]));
 }
 
 /** Container validation is not OCR or a semantic/visual interpretation. */
@@ -398,8 +441,8 @@ export function readMediaResource(cacheDir,binding,deps={}) {
     fileUnchanged(file,manifestFile.info);fileUnchanged(path,blobFile.info);
     directoryUnchanged(dir);normalizedBinding(binding);
     budget?.assertReady();
-    return {status:'available',path,sha256:manifest.sha256,size_bytes:asset.length,mime_type:image.mime_type,
-      binding_digest:digest,observed_at:manifest.observed_at};
+    return attestVerifiedImageRead(normalized,{status:'available',path,sha256:manifest.sha256,size_bytes:asset.length,mime_type:image.mime_type,
+      binding_digest:digest,observed_at:manifest.observed_at});
   } catch(error) {
     if(budget&&error instanceof HistoryCommandBudgetError)throw error;
     budget?.assertReady();
