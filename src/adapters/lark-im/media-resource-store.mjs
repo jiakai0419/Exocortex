@@ -41,6 +41,15 @@ function mediaBudget(deps) {
   budget?.assertReady();return budget;
 }
 
+/** Preserve only an operation's established finite failure. A pure budget
+ * exception stays a stop, and normal absence/success never uses this observer.
+ * This records both facts without admitting any further filesystem/helper work.
+ * @param {unknown} error @param {MediaBudget} [budget] */
+function observeRejectedOperation(error,budget=undefined) {
+  if(budget&&error instanceof HistoryCommandBudgetError)throw error;
+  try{budget?.assertReady();return false;}catch(stop){if(!(stop instanceof HistoryCommandBudgetError))throw stop;return true;}
+}
+
 /** @param {string} db @param {string} [override] */
 export function resourceStorePath(db, override) { return override === undefined ? `${resolve(db)}.resources` : resolve(override); }
 
@@ -384,11 +393,7 @@ export function assessMediaImageBytes(bytes,deps={}) {
     budget?.assertReady();
     return {image:{mime_type:image.mime_type,width:image.width,height:image.height}};
   } catch(error) {
-    if(budget&&error instanceof HistoryCommandBudgetError)throw error;
-    // A parser rejection and an exhausted grant are separate facts. Observe
-    // the grant without replacing the finite rejection already established;
-    // this unsuccessful assessment cannot authorize later file publication.
-    try{budget?.assertReady();}catch(stop){if(!(stop instanceof HistoryCommandBudgetError))throw stop;}
+    observeRejectedOperation(error,budget);
     return {reason:errorCode(error)==='MEDIA_FORMAT_UNSUPPORTED'?'resource_format_unsupported':'resource_image_invalid'};
   }
 }
@@ -461,8 +466,8 @@ export function readMediaResource(cacheDir,binding,deps={}) {
     if(asset.length!==manifest.size_bytes||sha(asset)!==manifest.sha256)throw new Error('asset_changed');
     budget?.assertReady();
     const inspected=assessMediaImageBytes(asset,{executionBudget:budget}), image=inspected.image;
-    budget?.assertReady();
     if(!image)return finite('invalid',inspected.reason);
+    budget?.assertReady();
     if(image.mime_type!==manifest.mime_type)throw new Error('invalid_image');
     fileUnchanged(file,manifestFile.info,budget);fileUnchanged(path,blobFile.info,budget);
     directoryUnchanged(dir,budget);normalizedBinding(binding,budget);
@@ -470,10 +475,8 @@ export function readMediaResource(cacheDir,binding,deps={}) {
     return attestVerifiedImageRead(normalized,{status:'available',path,sha256:manifest.sha256,size_bytes:asset.length,mime_type:image.mime_type,
       binding_digest:digest,observed_at:manifest.observed_at});
   } catch(error) {
-    if(budget&&error instanceof HistoryCommandBudgetError)throw error;
-    budget?.assertReady();
-    if(errorCode(error)==='ENOENT')return finite('missing','resource_not_cached');
-    return finite('invalid','resource_verification_failed');
+    if(errorCode(error)==='ENOENT'){budget?.assertReady();return finite('missing','resource_not_cached');}
+    observeRejectedOperation(error,budget);return finite('invalid','resource_verification_failed');
   }
 }
 
@@ -510,7 +513,7 @@ export function publishMediaResource(cacheDir,binding,bytes,options={},deps={}) 
       size_bytes:bytes.length,mime_type:image.mime_type,observed_at:new Date(nowMs).toISOString()};
     publishFile(dir,`${digest}.json`,Buffer.from(JSON.stringify(manifest)+'\n'),budget);
     return readMediaResource(cacheDir,binding,{executionBudget:budget});
-  }catch(error){if(budget&&error instanceof HistoryCommandBudgetError)throw error;budget?.assertReady();return finite('invalid','resource_publish_failed');}
+  }catch(error){observeRejectedOperation(error,budget);return finite('invalid','resource_publish_failed');}
 }
 
 // Explicit maintenance continuation only. The normal reader above never opens
@@ -584,8 +587,11 @@ function withPendingMutation(cache,callback,budget=undefined) {
     if(lock.status!==0||lock.error)throw new Error('pending_lock_failed');
     fileUnchanged(path,info,budget);directoryUnchanged(dir,budget);
     const result=callback(dir);
+    // An unsuccessful callback has no publication/cleanup authority. Do not
+    // replace its finite rejection with a post-result lock read after expiry.
+    if(result?.status==='invalid'&&observeRejectedOperation(result,budget))return result;
     fileUnchanged(path,info,budget);directoryUnchanged(dir,budget);budget?.assertReady();return result;
-  }catch(error){if(budget&&error instanceof HistoryCommandBudgetError)throw error;budget?.assertReady();return finite('invalid','resource_pending_invalid');}
+  }catch(error){observeRejectedOperation(error,budget);return finite('invalid','resource_pending_invalid');}
   finally{if(fd!==undefined)closeSync(fd);}
 }
 const pendingStatKeys=['dev','ino','size','mtimeNs','ctimeNs','mode','uid','nlink'];
@@ -743,7 +749,10 @@ function reclaimExpiredPending(parent,nowMs,deps={}) {
 export function reclaimPendingMediaResources(cache,options={},deps={}) {
   const budget=mediaBudget(deps);
   const nowMs=options.nowMs??Date.now();if(!validTime(nowMs))return finite('invalid','resource_pending_invalid');
-  try{pendingDirectory(cache,false,budget);}catch(error){if(budget&&error instanceof HistoryCommandBudgetError)throw error;budget?.assertReady();return errorCode(error)==='ENOENT'?finite('ready',null):finite('invalid','resource_pending_invalid');}
+  try{pendingDirectory(cache,false,budget);}catch(error){
+    if(errorCode(error)==='ENOENT'){budget?.assertReady();return finite('ready',null);}
+    observeRejectedOperation(error,budget);return finite('invalid','resource_pending_invalid');
+  }
   return withPendingMutation(cache,parent=>{reclaimExpiredPending(parent,nowMs,deps);return finite('ready',null);},budget);
 }
 
@@ -756,7 +765,7 @@ export function readPendingMediaResource(cache,binding,sourceFence,options={},de
     const nowMs=options.nowMs??Date.now(),normalized=normalizedBinding(binding,budget);
     if(!validTime(nowMs)||!hashValid(sourceFence))throw new Error('pending_context_invalid');
     let parent;
-    try{parent=pendingDirectory(cache,false,budget);}catch(error){if(errorCode(error)==='ENOENT')return finite('missing','resource_pending_missing');throw error;}
+    try{parent=pendingDirectory(cache,false,budget);}catch(error){if(errorCode(error)==='ENOENT'){budget?.assertReady();return finite('missing','resource_pending_missing');}throw error;}
     let found=null;
     for(const slot of slots) {
       budget?.assertReady();
@@ -788,7 +797,7 @@ export function readPendingMediaResource(cache,binding,sourceFence,options={},de
       if(!found||current.expires_at_ms<found.expires_at_ms)found=current;
     }
     budget?.assertReady();return found??finite('missing','resource_pending_missing');
-  }catch(error){if(budget&&error instanceof HistoryCommandBudgetError)throw error;budget?.assertReady();return finite('invalid','resource_pending_invalid');}
+  }catch(error){observeRejectedOperation(error,budget);return finite('invalid','resource_pending_invalid');}
 }
 
 /** Persist validated bytes without any available-resource publication.
@@ -824,7 +833,7 @@ export function retainPendingMediaResource(cache,binding,sourceFence,bytes,optio
       writePendingFile(dir,'manifest.json',Buffer.from(JSON.stringify(manifest)+'\n'),budget);
       return readPendingMediaResource(cache,binding,sourceFence,{nowMs},{executionBudget:budget});
     },budget);
-  }catch(error){if(budget&&error instanceof HistoryCommandBudgetError)throw error;budget?.assertReady();return finite('invalid','resource_pending_invalid');}
+  }catch(error){observeRejectedOperation(error,budget);return finite('invalid','resource_pending_invalid');}
 }
 /** Delete only a consumed exact generation; no replacement or arbitrary path.
  * @param {string} cache @param {JsonObject} receipt @param {MediaBudgetDeps} [deps] */

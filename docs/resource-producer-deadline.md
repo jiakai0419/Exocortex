@@ -93,3 +93,32 @@ files, descriptor stats and a real extra hardlink, with only the monotonic clock
 modeled: valid/invalid file crossed with available/expired budget. The cutoff
 control must show no closing request, publication, pending retention or new
 database write; normal validation and ordinary failure controls remain unchanged.
+
+### Store rejection boundaries
+
+The same distinction applies to local store operations: an established unsafe
+file, changed identity, malformed manifest, parser rejection, or storage-command
+failure keeps its existing finite `invalid` diagnostic when the command clock
+expires at the error boundary. One internal observer records the current budget
+stop without replacing that unsuccessful result. It is used only when returning
+a finite failure, never to continue work, publish a resource or approve cleanup.
+An unsuccessful mutation callback also retains its finite rejection if the
+original grant is stopped before post-result lock verification; lock closure
+still runs, and successful callbacks keep every original postcondition.
+A caught `HistoryCommandBudgetError` with the actual branded budget still
+propagates unchanged; it cannot be converted into corruption.
+
+`ENOENT` is different: it may mean an ordinary missing cache or an already
+removed slot. Those normal missing/ready/removed outcomes still require a live
+budget. In particular, a missing pending cache rechecks the original deadline
+before returning `missing`. An invalid image assessment is returned before any
+next operation, while a successful assessment still checks the deadline before
+reading more files or declaring availability.
+
+This changes no cleanup receipt, intent, lock, generation, TTL, retry or
+publication admission. Tests cover real private filesystem rejection boundaries
+for available reads/publication and pending read/retain/reclaim/discard, with
+normal absence and pre-expired controls. Post-cutoff filesystem/helper admission
+stays zero except closing already-owned descriptors and the existing publication
+`finally` attempting to unlink its absent private temporary name (ENOENT, no file
+removed); no request, successful mutation or database write is added. Returned diagnostics do not assert durable task acknowledgement.
