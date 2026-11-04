@@ -245,11 +245,30 @@ function noteEvidenceFailure(f, kind, result) {
 }
 let retainedFixtures = 0, retainedRoot;
 
+// Preserve the executor's output mode after measuring its entire SQL program.
+// Framing values come only from actual SELECT results: never inject markers,
+// remove statements, or accept a parseable prefix after a profiler failure.
+function profiledExecutorStdout(args, report, budget) {
+  complete(report, 'profiled SQLite executor output', budget);
+  assert.equal(report.failure, undefined, 'a profiler failure cannot become successful executor output');
+  assert.ok(Array.isArray(report.rows), 'the complete profiler result must contain rows');
+  if (!args.includes('-list')) return JSON.stringify(report.rows);
+  assert.ok(args.includes('-noheader') && !args.includes('-json'), 'unsupported profiled SQLite output mode');
+  return report.rows.map(row => {
+    assert.ok(row && typeof row === 'object' && !Array.isArray(row), 'plain output requires an object row');
+    const values = Object.values(row);
+    assert.equal(values.length, 1, 'plain output requires exactly one result column');
+    assert.equal(typeof values[0], 'string', 'plain output requires a TEXT result');
+    return values[0] + '\n';
+  }).join('');
+}
+
 // Intercept the actual storage executor only inside this disposable child.
 // SQL is executed, not mocked: prepareObservationRecords reads and the complete
 // succeedRecordRun transaction each go through EXPLAIN + actual sqlite3 steps.
 // createRun is prerequisite fixture setup, outside the measured operation.
 const RUN_DRIVER = String.raw`
+import assert from 'node:assert/strict';
 import cp from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 import { readFileSync } from 'node:fs';
@@ -260,6 +279,8 @@ import { createHash } from 'node:crypto';
 const hash = value => createHash('sha256').update(value).digest('hex');
 ${captureSyntheticEvidence.toString()}
 ${noteEvidenceFailure.toString()}
+${complete.toString()}
+${profiledExecutorStdout.toString()}
 const p = JSON.parse(readFileSync(0, 'utf8'));
 const spawn = cp.spawnSync;
 let measuring = false;
@@ -287,7 +308,10 @@ cp.spawnSync = (command, args, options) => {
   if (!report?.complete) noteEvidenceFailure(p, 'incomplete_report', result);
   reports.push(report);
   if (!report.complete) throw new Error('SQL structural budget or complete-consumption failure: ' + report.failure);
-  return { status: 0, signal: null, error: undefined, stdout: JSON.stringify(report.rows), stderr: '' };
+  assert.equal(report.sql_bytes, Buffer.byteLength(options.input.slice(prefix.length)), 'the entire executor SQL must be measured');
+  assert.equal(report.sql_sha256, hash(options.input.slice(prefix.length)), 'no executor SQL may be stripped or replaced');
+  const stdout = profiledExecutorStdout(args, report, p.budget);
+  return { status: 0, signal: null, error: undefined, stdout, stderr: '' };
 };
 syncBuiltinESMExports();
 try {
@@ -449,6 +473,69 @@ function measuredRun(f, records, budget) {
   assert.ok(value.reports.reduce((n, report) => n + report.opcodes, 0) <= budget);
   return value;
 }
+
+test('profiled executor frame adapter measures marker SELECTs and all transaction statements', t => {
+  const f = fixture(t, { control: true });
+  const begin = '__EXOCORTEX_OBSERVATION_OBJECTS_BEGIN_V1__';
+  const end = '__EXOCORTEX_OBSERVATION_OBJECTS_END_V1__';
+  const statements = [
+    'PRAGMA query_only=ON;', 'BEGIN;', `SELECT '${begin}' AS object_frame;`,
+    `SELECT json_object('synthetic','source','n',1) AS payload;`, 'COMMIT;',
+    `SELECT '${end}' AS object_frame;`,
+  ];
+  const sql = statements.join(''), budget = 1000;
+  const report = profile(f, sql, { budget, readonly: true });
+  complete(report, 'complete marker program', budget);
+  assert.equal(report.sql_sha256, hash(sql));
+  assert.equal(report.sql_bytes, Buffer.byteLength(sql));
+  assert.equal(report.statements.length, statements.length);
+  for (const [index, statement] of statements.entries()) {
+    assert.equal(report.statements[index].sha256, hash(statement));
+    assert.equal(report.statements[index].bytes, Buffer.byteLength(statement));
+    assert.ok(report.statements[index].opcodes > 0);
+  }
+  assert.equal(profiledExecutorStdout(['-list', '-noheader'], report, budget),
+    `${begin}\n{"synthetic":"source","n":1}\n${end}\n`);
+
+  // A CLI directive is NOT SQL. Keep this former failure visible rather than
+  // teaching the adapter to strip it or silently fabricate its result frame.
+  const invalid = `BEGIN;\n.print ${begin}\nSELECT 1;COMMIT;`;
+  const failed = profile(f, invalid, { budget, readonly: true });
+  assert.equal(failed.complete, false);
+  assert.equal(failed.failure, 'OperationalError');
+  assert.equal(failed.sql_sha256, hash(invalid));
+  assert.equal(failed.sql_bytes, Buffer.byteLength(invalid));
+  assert.ok(failed.consumed_bytes < failed.sql_bytes);
+  assert.throws(() => profiledExecutorStdout(['-list', '-noheader'], failed, budget));
+});
+
+test('profiled executor frame adapter preserves JSON mode and never invents missing frame rows', () => {
+  const make = rows => ({ complete: true, consumed_bytes: 1, sql_bytes: 1,
+    statements: [{ bytes: 1, opcodes: 1 }], opcodes: 1, rows });
+  const rows = [{ text: 'Synthetic\0雪', n: 2, nullable: null }];
+  assert.equal(profiledExecutorStdout(['-json'], make(rows), 10), JSON.stringify(rows));
+  assert.equal(profiledExecutorStdout([], make(rows), 10), JSON.stringify(rows));
+  assert.equal(profiledExecutorStdout(['-list', '-noheader'], make([]), 10), '',
+    'empty report rows cannot synthesize BEGIN/END');
+  const prefix = [{ object_frame: '__EXOCORTEX_OBSERVATION_OBJECTS_BEGIN_V1__' }, { payload: '{"synthetic":1}' }];
+  assert.equal(profiledExecutorStdout(['-list', '-noheader'], make(prefix), 10),
+    '__EXOCORTEX_OBSERVATION_OBJECTS_BEGIN_V1__\n{"synthetic":1}\n',
+    'a complete SQL program missing its end SELECT stays incomplete at the product frame parser');
+});
+
+test('profiled executor frame adapter rejects failures, unconsumed programs and unsupported plain rows', () => {
+  const valid = { complete: true, consumed_bytes: 1, sql_bytes: 1,
+    statements: [{ bytes: 1, opcodes: 1 }], opcodes: 1, rows: [{ payload: 'Synthetic text' }] };
+  for (const patch of [{ complete: false }, { failure: 'OperationalError' }, { consumed_bytes: 0 },
+    { statements: [] }, { opcodes: 2 }, { rows: null }]) {
+    assert.throws(() => profiledExecutorStdout(['-list', '-noheader'], { ...valid, ...patch }, 10));
+  }
+  for (const row of [null, [], { a: 'one', b: 'two' }, { a: 1 }, { a: null }])
+    assert.throws(() => profiledExecutorStdout(['-list', '-noheader'], { ...valid, rows: [row] }, 10));
+  assert.throws(() => profiledExecutorStdout(['-list'], valid, 10));
+  assert.throws(() => profiledExecutorStdout(['-list', '-noheader', '-json'], valid, 10));
+  assert.throws(() => profiledExecutorStdout(['-list', '-noheader'], valid, 0));
+});
 
 test('structural harness consumes every statement and trigger subprogram, and fails closed at its budget/tail', t => {
   const f = fixture(t, { control: true });

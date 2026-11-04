@@ -75,7 +75,7 @@ test('actual default observation helper preserves one hundred 100 KiB escape-hea
     if(phase==='observation') {
       assert.deepEqual(args,['-readonly','-batch','-init','/dev/null','-noheader','-list',resolve(db)]);
       assert.match(options.input,/PRAGMA query_only = ON;\nBEGIN;/);
-      assert.match(options.input,/\nCOMMIT;\n\.print __EXOCORTEX_OBSERVATION_OBJECTS_END_V1__\n$/);
+      assert.match(options.input,/\nCOMMIT;\nSELECT '__EXOCORTEX_OBSERVATION_OBJECTS_END_V1__' AS object_frame;\n$/);
       assert.doesNotMatch(options.input,/AS before_json/);
     }
     const began=performance.now();let result;

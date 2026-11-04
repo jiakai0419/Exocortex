@@ -37,7 +37,7 @@ function budget(timeout=7000){
   return {state,error,assertReady(){state.asserts++;if(state.expired)throw error;},
     timeoutMs(){state.timeouts++;return timeout;},runCleanup(work){return work();}};
 }
-const SQL="SELECT json_object('synthetic','source')";
+const SQL="SELECT json_object('synthetic','source');";
 
 test('object wire uses readonly completed framing and preserves the absent-budget process contract',t=>{
   const f=fixture(t),rows=[{n:2,value:'Synthetic\0tail\n雪😀',nullable:null},
@@ -51,7 +51,7 @@ test('object wire uses readonly completed framing and preserves the absent-budge
   assert.equal(Object.hasOwn(options,'timeout'),false,'no new default whole-process timeout');
   assert.equal(Object.hasOwn(options,'killSignal'),false);
   assert.match(options.input,/^\.bail on\n\.timeout 5000\n/);
-  assert(options.input.includes(`PRAGMA query_only = ON;\nBEGIN;\n.print ${BEGIN}\n${SQL}\nCOMMIT;\n.print ${END}\n`));
+  assert(options.input.includes(`PRAGMA query_only = ON;\nBEGIN;\nSELECT '${BEGIN}' AS object_frame;\n${SQL}\nCOMMIT;\nSELECT '${END}' AS object_frame;\n`));
   assert.deepEqual(readFileSync(f.db),f.before);
 });
 

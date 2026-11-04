@@ -135,3 +135,12 @@ authored fixture and receipts instead of guessing a process identity or retrying
 caller-budget cutoffs and the exact 27-to-19-field/CAS interface. Its overflow
 and timeout responses are explicitly simulated; they do not claim an actual
 over-cap process or historical cleanup has been observed.
+
+Frame markers are ordinary single-column SQL SELECTs, including the end marker
+after COMMIT. The structural-cost test must execute and count the complete SQL
+program, including these marker statements and the read transaction. Its CLI
+adapter renders the resulting single-column TEXT rows as plain lines for this
+mode; it must not remove SQL, synthesize a successful end marker, or send CLI
+dot commands to Python's SQL engine. The profiler's original TextIO read,
+30-second / 4 MiB process limits and all opcode limits remain unchanged. Retain
+the first incompatible-adapter failures separately from any corrected run.

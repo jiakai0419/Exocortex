@@ -82,7 +82,7 @@ function sqliteRun(dbPath: string, sql: string, label: string, json: boolean | "
         ? ["-readonly", "-batch", "-init", "/dev/null", "-noheader", "-list"]
         : json ? ["-json"] : []), resolvedDbPath], {
         input: `.bail on\n.timeout ${timeout === undefined ? 5000 : Math.min(5000, timeout)}\nPRAGMA foreign_keys = ON;\n${objectLines
-          ? `PRAGMA query_only = ON;\nBEGIN;\n.print ${OBJECTS_BEGIN}\n${sql}\nCOMMIT;\n.print ${OBJECTS_END}\n`
+          ? `PRAGMA query_only = ON;\nBEGIN;\nSELECT '${OBJECTS_BEGIN}' AS object_frame;\n${sql}\nCOMMIT;\nSELECT '${OBJECTS_END}' AS object_frame;\n`
           : sql}`,
         encoding: "utf8",
         maxBuffer: 50 * 1024 * 1024,
