@@ -15,6 +15,7 @@ import { readLarkExecutionReceipt } from '../adapters/lark-im/transport-executio
 import { transportOperation } from '../adapters/lark-im/transport.mjs';
 import { tryAcquireLarkApiLease } from '../runtime/lark-api-lease.mjs';
 import { createMaintenanceRequestSession } from './request-session.mjs';
+import { createResourceCommandBudget, HistoryCommandBudgetError } from './history-command-budget.mjs';
 import { enrichResources, normalizeResourceFailure, resourceFailureFromError } from './enrich-resources.mjs';
 import { RESOURCE_CANDIDATE_INDEX, RESOURCE_CANDIDATE_WHERE } from './resource-candidates.mjs';
 
@@ -174,16 +175,10 @@ export function executeResourceWork(options,deps={}) {
   /** @type {Row|null} */let claimed=null,denial=null;
   /** @type {Row} */ const report={ok:true,profile:PROFILE,outcome:'no_eligible_known_resource',processed:0,available:0,deferred:0,blocked:0,failure:null};
   const elapsed=()=>{const n=mono();if(!Number.isFinite(began)||!Number.isFinite(n)||n<previous)stop('clock_unavailable');previous=n;return n-began;};
-  const ready=()=>{if(!integer(wall)||!integer(now())||now()<wall)stop('clock_unavailable');if(elapsed()>=maxSeconds*1000)stop('time_budget');};
-  // The executor receives the original command clock, not a fresh write grant.
-  // SQL construction and admission reads must finish before dispatch is allowed.
-  const executionBudget=Object.freeze({assertReady:ready,
-    timeoutMs(capMs=30000){
-      if(!Number.isFinite(capMs)||capMs<=0)throw new RangeError('invalid resource operation timeout');
-      ready();const left=Math.floor(Math.min(capMs,maxSeconds*1000-elapsed()));
-      if(left<1)stop('time_budget');return left;
-    },
-    runCleanup(work){ready();return work();}});
+  const remainingTimeMs=()=>{const current=now();if(!integer(wall)||!integer(current)||current<wall)stop('clock_unavailable');
+    return Math.max(0,maxSeconds*1000-elapsed());};
+  /** @type {ReturnType<typeof createResourceCommandBudget>} */let executionBudget;
+  const ready=()=>executionBudget.assertReady();
   const query=(sql,label)=>{
     const timeoutMs=executionBudget.timeoutMs(2000);
     const result=(deps.sqliteJson||readOnlySqliteJson)(options.db,sql,label,{timeoutMs});
@@ -207,8 +202,9 @@ export function executeResourceWork(options,deps={}) {
         if(report.outcome==='no_eligible_known_resource')report.outcome='batch_deferred';}
     }catch{spent=null;reason='clock_unavailable';
       if(report.ok)report.outcome='clock_unavailable';report.ok=false;}
+    if(reason==='clock_unavailable')spent=null;
     let cli=0,self=0,complete=spent!==null;
-    if(producerStarted) {
+    if(producerStarted||receiptInvalid) {
       const b=producerBudget;
       complete=Boolean(spent!==null&&!receiptInvalid&&b&&b.max_cli_attempts===maxCli&&b.max_self_attempts===2&&integer(b.max_seconds)&&b.max_seconds>=1&&b.max_seconds<=maxSeconds&&
         integer(b.cli_attempts)&&b.cli_attempts<=maxCli&&integer(b.self_attempts)&&b.self_attempts<=2&&b.self_attempts<=b.cli_attempts&&integer(b.elapsed_ms)&&
@@ -219,6 +215,9 @@ export function executeResourceWork(options,deps={}) {
       max_seconds:maxSeconds,min_interval_ms:1000,elapsed_ms:spent,stop_reason:reason&&STOP.has(reason)?reason:null}};
   };
   try {
+    // One trusted clock covers queue preparation and the complete producer.
+    // Creating a session later never grants fresh time after source/cache reads.
+    executionBudget=createResourceCommandBudget({maxSeconds},{monotonicClock:mono,startedMonotonicMs:began,remainingTimeMs});
     ready();
     const admission=(deps.captureWriteAdmission||captureLarkWriteAdmission)(options.db,{}, {query:(_db,sql,label)=>query(sql,label)});
     const account=admission.fence.accountKey;
@@ -338,7 +337,7 @@ export function executeResourceWork(options,deps={}) {
     };
     const result=(deps.enrichResources||enrichResources)({db:options.db,resourceDir:options.resourceDir,recordIds:[task.record_id],
       resourceTargets:[{record_id:task.record_id,resource_key:identity.resource_key,reference_kind:identity.reference_kind}],apply:true,
-      maxCliAttempts:maxCli,maxSelfAttempts:2,maxSeconds:seconds},{...deps,createRequestSession:factory});
+      maxCliAttempts:maxCli,maxSelfAttempts:2,maxSeconds:seconds},{...deps,executionBudget,createRequestSession:factory});
     producerBudget=result.request_budget;
     if(producerStarted&&(!producerBudget||producerBudget.max_cli_attempts!==maxCli||producerBudget.max_self_attempts!==2||producerBudget.max_seconds!==seconds))receiptInvalid=true;
     if(receiptInvalid)throw new Error('resource receipt unavailable');
@@ -346,6 +345,19 @@ export function executeResourceWork(options,deps={}) {
       &&(result.results[0].resource_key===undefined||result.results[0].resource_key===identity.resource_key)
       &&(result.results[0].reference_kind===undefined||result.results[0].reference_kind===identity.reference_kind)?result.results[0]:null;
     if(!item) {receiptInvalid=true;throw new Error('resource result unavailable');}
+    if(!producerStarted&&result.request_budget!==null) {
+      const observed=executionBudget.summary(),b=result.request_budget;
+      const stoppedBeforeSession=['time_budget','clock_unavailable'].includes(observed.stop_reason??'')
+        &&b?.stop_reason===observed.stop_reason&&b.max_cli_attempts===maxCli&&b.max_self_attempts===2&&b.max_seconds===seconds
+        &&b.cli_attempts===0&&b.self_attempts===0&&b.min_interval_ms===1000
+        &&(observed.elapsed_ms===null?b.elapsed_ms===null:integer(b.elapsed_ms)&&b.elapsed_ms<=observed.elapsed_ms)
+        &&item.resource_key===identity.resource_key&&item.reference_kind===identity.reference_kind
+        &&item.state==='blocked'&&item.reason==='batch_stopped'&&item.failure?.stage==='selection'&&item.failure?.reason===observed.stop_reason;
+      if(stoppedBeforeSession) {
+        report.ok=false;report.outcome=observed.stop_reason==='clock_unavailable'?'clock_unavailable':'batch_deferred';report.deferred=1;
+        report.failure={stage:'selection',reason:observed.stop_reason,persisted:false};return finish(observed.stop_reason);
+      }
+    }
     if(!producerStarted&&!(result.request_budget===null&&['available','blocked'].includes(item.state))) {receiptInvalid=true;producerStarted=true;throw new Error('resource zero receipt unavailable');}
     const stopped=STOP.has(result.request_budget?.stop_reason)?result.request_budget.stop_reason:null;
     let state='deferred',reason=stopped||'transient_failure',failures=task.failures,deferrals=task.deferrals;
@@ -396,7 +408,8 @@ export function executeResourceWork(options,deps={}) {
   } catch(error) {
     const ended=/** @type {Row|null} */(producerSession);
     if(ended&&!producerBudget)try{producerBudget=ended.summary();}catch{receiptInvalid=true;}
-    const reason=STOP.has(/** @type {Row} */(error)?.resourceStop)?/** @type {Row} */(error).resourceStop:null;
+    const reason=error instanceof HistoryCommandBudgetError?error.reason:
+      STOP.has(/** @type {Row} */(error)?.resourceStop)?/** @type {Row} */(error).resourceStop:null;
     report.ok=false;report.outcome=reason==='clock_unavailable'?'clock_unavailable':reason?'batch_deferred':'execution_failed';report.deferred=1;
     return finish(reason);
   }
