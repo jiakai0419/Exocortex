@@ -7,7 +7,12 @@ const PRIVATE_FILE_MODE = 0o600;
 function quoteSql(value) {
     if (value === null || value === undefined)
         return "NULL";
-    return `'${String(value).replaceAll("'", "''")}'`;
+    const text = String(value);
+    // A NUL byte belongs to the TEXT value, never to the SQLite CLI's SQL
+    // program. Keep exact UTF-8 bytes for ingestion and all source/CAS fences.
+    if (text.includes("\0"))
+        return `CAST(X'${Buffer.from(text, "utf8").toString("hex")}' AS TEXT)`;
+    return `'${text.replaceAll("'", "''")}'`;
 }
 function sqlJson(value) {
     return quoteSql(JSON.stringify(value));

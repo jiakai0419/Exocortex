@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { compareObservation, isNativeRecord, retainSourceRepresentation, OBSERVATION_POLICY } from "../../core/lark-observation.js";
 import { quoteSql, sqliteQuery } from "./sqlite-executor.js";
+import { REVIEW_RECORD_COLUMNS } from "./maintenance-review.js";
 /** One source decision for accepted records and incomplete detail descriptors.
  * Callers own acquisition, bounded evidence storage and transaction/CAS guards.
  * In particular, this function never treats a descriptor as a stored record or
@@ -73,11 +74,17 @@ function prepareObservationRecords(dbPath, records, acquisition, executionBudget
     const native = records.filter(isNativeRecord);
     if (!native.length)
         return records;
-    const rows = sqliteQuery(dbPath, `SELECT r.*, s.generation AS observation_generation,s.evidence_generation,
+    // The CLI's raw -json TEXT serializer stops at NUL. Encode the complete
+    // predecessor inside SQLite so its exact-row CAS never sees a truncated body.
+    const rows = sqliteQuery(dbPath, `SELECT json_object(${REVIEW_RECORD_COLUMNS.flatMap(column => [quoteSql(column), `r.${column}`]).join(",")}) AS before_json,
+    s.generation AS observation_generation,s.evidence_generation,
     s.candidate_json, s.candidate_generation, s.candidate_attempt, s.candidate_policy, s.candidate_context, s.candidate_observed_at_ms
     FROM records r JOIN record_observation_state s ON s.record_id=r.id
     WHERE r.source_id='lark.im' AND r.external_id IN (${native.map(r => quoteSql(r.external_id)).join(",")});`, "read observation basis", executionBudget);
-    const byId = new Map(rows.map(({ observation_generation, evidence_generation, candidate_json, candidate_generation, candidate_attempt, candidate_policy, candidate_context, candidate_observed_at_ms, ...before }) => [before.external_id, { before, generation: Number(observation_generation), evidenceGeneration: Number(evidence_generation), candidate_json, candidate_generation, candidate_attempt, candidate_policy, candidate_context, candidate_observed_at_ms }]));
+    const byId = new Map(rows.map(({ before_json, observation_generation, evidence_generation, candidate_json, candidate_generation, candidate_attempt, candidate_policy, candidate_context, candidate_observed_at_ms }) => {
+        const before = JSON.parse(before_json);
+        return [before.external_id, { before, generation: Number(observation_generation), evidenceGeneration: Number(evidence_generation), candidate_json, candidate_generation, candidate_attempt, candidate_policy, candidate_context, candidate_observed_at_ms }];
+    }));
     const attempt = acquisition?.attempt || randomUUID(), observedAtMs = Date.now();
     const selectedAcquisition = { ...acquisition, attempt, startedAtMs: acquisition?.startedAtMs ?? observedAtMs };
     return records.map(original => {

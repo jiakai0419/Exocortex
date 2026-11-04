@@ -49,3 +49,45 @@ keeps its rendered content inside the existing renderer limit and places bulk
 authored text in raw metadata; increasing the content limit to make a wire test
 pass would weaken a separate contract. Existing resource/producer/idle/fairness
 and framed-reader regressions remain required, followed by full verification.
+
+## Literal NUL through storage and source fences
+
+Read fidelity alone does not prove enrollment. A valid post can render a literal
+NUL in its stored body. Sending that byte inside a quoted SQL program can truncate
+or alter the comparison, so a source can be skipped while the scan advances.
+The same common value encoder also feeds ordinary ingestion and replay writes.
+
+For application UTF-8 TEXT containing NUL, the shared `quoteSql` value encoder
+must emit a UTF-8 hex literal cast to TEXT. Only that representation changes;
+all non-NUL values and NULL retain the exact previous SQL output. Never strip,
+replace, truncate or normalize source content, and never weaken an exact source
+fence into a prefix/hash-only comparison. The SQL program must contain no literal
+NUL. This single encoding boundary covers source enrollment, claim/result fences
+and incoming record writes without a separate resource-only quoting convention.
+
+Keep the pre-write NUL wire test, but additionally require a real rendered NUL
+post to traverse storage and actual resource enrollment. It must enter the
+endpoint-unverified queue with zero requests, not silently vanish. Mixed normal
+and NUL sources must enroll independently; changing only text after NUL must fail
+the stale exact-source fence while stable neighbors remain eligible. Exercise
+normal claim/result completion and source drift with authored resources and the
+existing request/command budgets. This is not authority to download an unverified
+post/card resource or reopen denied/exhausted work.
+
+Native update preparation must also read its full predecessor, including text
+after NUL. SQLite CLI `-json` truncates a raw TEXT column at that byte. The
+observation-basis query therefore returns the closed record column set inside
+SQLite `json_object`, then decodes it before evaluation. This changes neither
+the predecessor's fields nor the full-row/generation CAS; the ordinary store
+executor, transaction boundaries and execution budget remain unchanged. Test a
+normal native update, equivalent observation and suffix-only competing update,
+as well as rollback and the real messages JSON/terminal output. Do not treat a
+truncated predecessor as a valid basis or relax its guard to make an update pass.
+
+Executable gates are `sqlite-nul-text.test.mjs` (shared encoding, normal native
+ingestion/update/equivalence, exact predecessor race, rollback and real CLI) and
+`resource-source-nul-enrollment.test.mjs` (default enrollment, mixed sources,
+suffix races and synthetic producer claim/result). Keep the original independent
+counterexample as a baseline-negative/candidate-positive control outside Git.
+Existing observation, history, storage-cost and resource suites plus full
+verification are required; no separate deadline or native binary change is needed.
