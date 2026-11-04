@@ -26,11 +26,21 @@ The same independent review also identifies an inherited producer-preparation de
 
 The original command deadline must reach every producer snapshot, cache/validator, request/session and publication boundary through the existing trusted budget interface; do not replace branded evidence with a lookalike object. No new grant after preparation/retry, no helper/SQL/API once exhausted, no increase to CLI/self/time/fairness limits. Preserve finite cleanup and pending-file protection only within the original allowed remainder; when that is unavailable, retain honest not-retained/unknown diagnostics and ordinary claim recovery. Budget aborts are not invalid-image or permission evidence. A passed queue writer test is not whole-producer proof.
 
-Integration will document and test the concrete trusted adapter before connecting the wrapper. The original producer model counterexample must remain available, along with same-input normal preparation, cached JPEG, publication/retention and unknown acknowledgement controls. Do not claim a production wall-clock violation from a modeled clock or an absolute bound on uninterruptible synchronous setup/cleanup.
+The integrated trusted adapter is specified below. The original producer model counterexample remains available, along with same-input normal preparation, cached JPEG, publication/retention and unknown acknowledgement controls. This is not a production wall-clock violation measurement or an absolute bound on uninterruptible synchronous setup/cleanup.
 
 The wrapper creates `createResourceCommandBudget` once with its original monotonic origin and grant. Its remaining-time provider also preserves the existing wall-clock checks and may only shorten the grant. The same branded object reaches queue SQL and `enrichResources`; producer snapshots, cached-byte validators, request session, publication and pending retention obtain fresh timeouts from it. Resource policy retains its existing zero internal reserve; history policy keeps its separate existing reserves unchanged.
 
 A preparation stop before a request session exists may return a finite zero-call receipt. The wrapper accepts it only when its own branded budget has stopped with the same reason, all original settings and zero counters match, and the result identifies the exact selected resource. It returns a budget stop without claiming a result write or resource availability. Ordinary cached/unsupported zero-call results retain the existing null receipt. A fabricated, mismatched or unproved stop receipt remains an incomplete execution result. Expired claims are not rewritten after the deadline; existing owner-qualified recovery remains responsible for them.
+
+Preparation includes resolving the staging parent and creating the private staging directory. A deadline is checked between those operations and before session construction. A proved pre-session stop uses the same exact selection receipt as snapshot/cache preparation; it is not described as a remotely attempted opening account query. Non-budget preparation errors retain their own unknown/error outcome.
+
+## Implemented regression coverage
+
+`source-tombstone.mjs` supplies the shared predicate to completeness, content evidence, post projection, message enrichment and terminal display. The source fields remain archived, while default recalled display is `[已撤回/已删除]`, including messages with unresolved identity. The common-type matrix and actual JSON/terminal CLI tests verify ordinary neighbors and strict boolean flags.
+
+`resource-confirmed-denial-drift.test.mjs` keeps the independent stable/title-drift controls and covers different accounts/endpoints, claim races, untrusted errors, successful-source drift, unknown acknowledgements and restart. Refusal persistence uses the original claim and association plus a current observed-source CAS; successful publication retains its original source CAS.
+
+`resource-producer-shared-deadline.test.mjs` runs the actual queue and producer with the original 3-second grant and modeled 0/4000ms preparation. The positive control uses two selection and two publication snapshot reads. The expired control admits only the first two reads and zero requests/publication; it does not start the later snapshot. Separate producer/store tests cover cached JPEG, staging, pending retention, late/unknown publication and unchanged history reservations. These bounded controls complement, rather than replace, the complete repository verification and independent review.
 
 ## Gates
 
