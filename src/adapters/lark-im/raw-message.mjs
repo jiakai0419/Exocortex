@@ -4,14 +4,15 @@ import { renderSystemContent } from "./system-content.mjs";
 import { renderCardContent } from "./card-content.mjs";
 import { personName } from "./sender-identity.mjs";
 import { mergeRootRelation } from "./merge-root.mjs";
+import { MAX_IMAGE_SLOTS, createImageSlot, imageSlotDisplay } from "./media-image-slot.mjs";
 
 const SOURCE_API = "im.v1.messages";
 const RENDER_VERSION = 1;
 const MENTION_ID_TYPES = ["open_id", "user_id", "union_id", "app_id"];
 
 /** @typedef {Record<string, any>} JsonObject */
-/** @typedef {{mergeItems?: JsonObject[]}} NormalizeOptions */
-/** @typedef {{text: string, status: "rendered" | "partial" | "structured_fallback", reason: string | null, version: number}} RenderResult */
+/** @typedef {{mergeItems?: JsonObject[], resolveImage?: (slot: any) => unknown, imageContext?: unknown, legacyPostImages?: boolean}} NormalizeOptions */
+/** @typedef {{text: string, status: "rendered" | "partial" | "structured_fallback", reason: string | null, version: number, media_slots?: any[]}} RenderResult */
 /** @typedef {{parent: MentionIdentity | null, ids: Map<string, string>, name: string | null, conflict: boolean}} MentionIdentity */
 /** @typedef {{name: string | null, conflict: boolean, identifiers: string[]}} MentionBinding */
 /** @typedef {{unresolved: boolean}} MentionState */
@@ -189,13 +190,15 @@ function resolveTextMentions(text, bindings, state) {
   });
 }
 
-/** @param {JsonObject} payload @returns {JsonObject | null} */
+/** @param {JsonObject} payload @returns {{body: JsonObject, path: string} | null} */
 function postBody(payload) {
-  if (["title", "content", "content_v2"].some((key) => Object.hasOwn(payload, key))) return payload;
+  if (["title", "content", "content_v2"].some((key) => Object.hasOwn(payload, key))) return { body: payload, path: "" };
   const locales = [...new Set(["zh_cn", "en_us", "ja_jp", ...Object.keys(payload).sort()])];
   for (const locale of locales) {
     const body = payload[locale];
-    if (isObject(body) && ["title", "content", "content_v2"].some((key) => Object.hasOwn(body, key))) return body;
+    if (isObject(body) && ["title", "content", "content_v2"].some((key) => Object.hasOwn(body, key))) {
+      return { body, path: `/${locale.replace(/~/g, "~0").replace(/\//g, "~1")}` };
+    }
   }
   return null;
 }
@@ -233,30 +236,70 @@ function postElement(value, bindings, state) {
   }
 }
 
-/** @param {JsonObject} item @param {JsonObject} payload */
-function renderPost(item, payload) {
-  const body = postBody(payload);
-  if (!body) return fallback(item, "unsupported_post_structure", "富文本未完整渲染，以下为原始内容");
-  const blocks = Array.isArray(body.content_v2) && body.content_v2.length > 0 ? body.content_v2 : body.content;
+/** @param {JsonObject} item @param {JsonObject} payload @param {NormalizeOptions} options */
+function renderPost(item, payload, options) {
+  const selected = postBody(payload);
+  if (!selected) return fallback(item, "unsupported_post_structure", "富文本未完整渲染，以下为原始内容");
+  const { body, path } = selected;
+  // The established empty-array branch is explicitly absent. Other declared
+  // invalid primary shapes cannot borrow a successful fallback projection.
+  if (options.legacyPostImages !== true && Object.hasOwn(body, "content_v2") && !Array.isArray(body.content_v2)) {
+    return fallback(item, "unsupported_post_structure", "富文本未完整渲染，以下为原始内容");
+  }
+  const branch = Array.isArray(body.content_v2) && body.content_v2.length > 0 ? "content_v2" : "content";
+  const blocks = body[branch];
   if ((body.title !== undefined && typeof body.title !== "string") || !Array.isArray(blocks)) {
     return fallback(item, "unsupported_post_structure", "富文本未完整渲染，以下为原始内容");
   }
   const bindings = mentionBindings(item);
   const state = { unresolved: false };
   const lines = typeof body.title === "string" && body.title ? [resolveTextMentions(body.title, bindings, state)] : [];
+  /** @type {any[]} */
+  const mediaSlots = [];
+  let imageOccurrences = 0;
+  /** @type {string | null} */
+  let mediaReason = null;
+  let slotOverflow = false;
   let incomplete = false;
-  for (const block of blocks) {
+  for (const [rowIndex, block] of blocks.entries()) {
     if (!Array.isArray(block)) { incomplete = true; continue; }
-    const parts = block.map((element) => postElement(element, bindings, state));
+    const parts = block.map((element, elementIndex) => {
+      if (options.legacyPostImages === true || !isObject(element) || element.tag !== "img") {
+        return postElement(element, bindings, state);
+      }
+      const order = imageOccurrences++;
+      if (order >= MAX_IMAGE_SLOTS) {
+        const firstOverflow = !slotOverflow;
+        slotOverflow = true;
+        return firstOverflow ? "[图片：引用超过解析上限]" : "";
+      }
+      const slot = createImageSlot({ slot_id: `${path}/${branch}/${rowIndex}/${elementIndex}`,
+        order, message_type: "post", representation: branch,
+        reference_kind: "image_key", key: element.image_key }, { imageContext: options.imageContext });
+      if (!slot) {
+        mediaReason ||= "media_reference_invalid";
+        return "[图片：引用无效]";
+      }
+      mediaSlots.push(slot);
+      // The resource boundary alone creates trusted byte-verification evidence.
+      // A resolver can also enforce a deadline: its errors must propagate.
+      const display = imageSlotDisplay(slot, options.resolveImage?.(slot));
+      if (display.status !== "rendered") mediaReason ||= display.reason || "media_resource_unavailable";
+      return display.text;
+    });
     if (parts.some((part) => part === null)) incomplete = true;
     lines.push(parts.filter((part) => part !== null).join(""));
   }
   const text = lines.join("\n");
+  /** @param {RenderResult} projected @returns {RenderResult} */
+  const withMedia = projected => mediaSlots.length > 0 || slotOverflow || mediaReason !== null
+    ? { ...projected, version: 2, media_slots: mediaSlots } : projected;
   if (incomplete) {
     const preserved = fallback(item, "unsupported_post_element", "富文本未完整渲染，以下为完整原始内容");
-    return result(text ? `${text}\n${preserved.text}` : preserved.text, "partial", preserved.reason);
+    return withMedia(result(text ? `${text}\n${preserved.text}` : preserved.text, "partial", preserved.reason));
   }
-  return result(text, state.unresolved ? "partial" : "rendered", state.unresolved ? "unresolved_message_mention" : null);
+  const reason = slotOverflow ? "media_slot_limit" : state.unresolved ? "unresolved_message_mention" : mediaReason;
+  return withMedia(result(text, reason ? "partial" : "rendered", reason));
 }
 
 /** @param {JsonObject} item @param {JsonObject[]} mergeItems */
@@ -314,14 +357,14 @@ function renderApiMessageContent(item, options = {}) {
   const content = sourceContent(item);
   // Cards keep the same raw evidence/hash contract as every native message.
   // The shared bounded projection is also used by read-only historical views.
-  if (type === "interactive") return renderCardContent(content, item.mentions);
+  if (type === "interactive") return renderCardContent(content, item.mentions, options);
   const payload = parseContent(content);
   if (type === "text" && isObject(payload) && typeof payload.text === "string") {
     const state = { unresolved: false };
     const text = resolveTextMentions(payload.text, mentionBindings(item), state);
     return result(text, state.unresolved ? "partial" : "rendered", state.unresolved ? "unresolved_message_mention" : null);
   }
-  if (type === "post" && isObject(payload)) return renderPost(item, payload);
+  if (type === "post" && isObject(payload)) return renderPost(item, payload, options);
   if (type === "system" && isObject(payload) && typeof payload.template === "string") {
     const text = renderSystemContent(payload);
     if (text !== null) {
