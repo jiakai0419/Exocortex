@@ -444,9 +444,10 @@ function enrichRow(row, currentChat, scopeSourceMatches = true, recipientConfig,
   const sourceMedia = renderMediaProjection(row, canonical, raw);
   const media = resourceContext ? projectMediaResource(resourceContext.db,resourceContext.resourceDir,row,canonical,raw,sourceMedia,
     {executionBudget:resourceContext.executionBudget}) : sourceMedia;
-  const baselinePost = messageType === 'post' ? projectPostContent(row,canonical,raw) : null;
+  const recalled = [canonical,raw,native].some(value => value.deleted === true);
+  const baselinePost = messageType === 'post' && !recalled ? projectPostContent(row,canonical,raw) : null;
   const postInvalid = baselinePost && readPostProjectionEvidence(row,canonical,raw,baselinePost).state === 'invalid';
-  const embedded = resourceContext && ['post','interactive'].includes(messageType) && !postInvalid
+  const embedded = resourceContext && !recalled && ['post','interactive'].includes(messageType) && !postInvalid
     ? projectEmbeddedMediaResources(resourceContext.db,resourceContext.resourceDir,row,canonical,raw,
       {executionBudget:resourceContext.executionBudget}) : null;
   const imageOptions = embedded ? {resolveImage:embedded.resolveImage,imageContext:embedded.imageContext} : {};

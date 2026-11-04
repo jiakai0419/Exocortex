@@ -290,6 +290,8 @@ test("new projections reach SQLite and messages JSON/text; reads preserve raw, h
   const rows = payloads.map((value) => recordFromMessage(normalizeApiMessage(value), "lark.im.sent_by_me", "sent"));
   assert.equal(rows[3].body, "@Synthetic Stored Bridge");
   assert.equal(JSON.parse(rows[3].canonical_json).content_rendering.status, "rendered");
+  // Deliberately unrelated stored prose remains available in JSON/search, but
+  // a rendered metadata flag cannot prove that it matches the original post.
   rows[2].body = "HISTORICAL_STORED_POST_BODY";
   const historical = JSON.parse(rows[2].canonical_json);
   historical.content_rendering = { version: 1, status: "rendered", reason: null };
@@ -322,13 +324,23 @@ test("new projections reach SQLite and messages JSON/text; reads preserve raw, h
     assert.equal(value.container_id, row.container_id);
     assert.equal(value.occurred_at, row.occurred_at);
     assert.equal(value.occurred_at_ms, row.occurred_at_ms);
-    assert.deepEqual(value.readiness, { version: 1, state: index === 0 ? "enriching" : "ready", requirements: [
+    const contentReason = index === 0 ? "content_partial" : index === 2 ? "content_invalid" : null;
+    assert.deepEqual(value.readiness, { version: 1, state: contentReason ? "enriching" : "ready", requirements: [
       { field: "sender", state: "satisfied", reason: null, evidence: "message_sender" },
       { field: "recipient", state: "not_applicable", reason: null, evidence: "chat_destination" },
       { field: "conversation", state: "satisfied", reason: null, evidence: "canonical" },
-      { field: "content", state: index === 0 ? "missing" : "satisfied", reason: index === 0 ? "content_partial" : null,
-        evidence: index === 0 ? null : "content_projection" },
-    ], reasons: index === 0 ? ["content_partial"] : [], next_action: index === 0 ? "resolve_content" : "none" });
+      { field: "content", state: contentReason ? "missing" : "satisfied", reason: contentReason,
+        evidence: contentReason ? null : "content_projection" },
+    ], reasons: contentReason ? [contentReason] : [], next_action: contentReason ? "resolve_content" : "none" });
+    if (index === 1 || index === 3) {
+      assert.equal(value.display.post.text, row.body, "valid version-1 post bodies retain their exact mention projection");
+      assert.equal(value.display.post.status, "rendered");
+      assert.equal(value.display.post.reason, null);
+    } else if (index === 2) {
+      assert.equal(value.display.post.status, "partial");
+      assert.equal(value.display.post.reason, "stored_post_projection_mismatch");
+      assert.notEqual(value.display.post.text, row.body);
+    }
   }
   for (const saved of store.sqliteQuery(db, "SELECT external_id, external_version, content_hash FROM records")) {
     const row = rows.find((value) => value.external_id === saved.external_id);
@@ -343,13 +355,15 @@ test("new projections reach SQLite and messages JSON/text; reads preserve raw, h
   assert.doesNotMatch(text, /Owner: @_user_1/);
   assert.match(text, /@Synthetic @_user_2 Amber/);
   assert.match(text, /https:\/\/example.invalid\/@_user_2/);
-  assert.match(text, /HISTORICAL_STORED_POST_BODY/);
+  assert.doesNotMatch(text, /HISTORICAL_STORED_POST_BODY/,
+    "unverified historical prose is not presented as a complete terminal message");
   assert.deepEqual(json.map(value => value.external_id), [...rows].reverse().map(row => row.external_id));
   const blocks = text.trimEnd().split("\n\n");
-  assert.equal(blocks.length, 5, "all four selected messages keep their positions, including the partial one");
-  assert.equal(blocks[0], "Messages (4)\n完整 3 · 待补全 1 · 受阻 0");
+  assert.equal(blocks.length, 5, "all four selected messages keep their positions, including both incomplete ones");
+  assert.equal(blocks[0], "Messages (4)\n完整 2 · 待补全 2 · 受阻 0");
   assert.match(blocks[1], /@Synthetic Stored Bridge/);
-  assert.match(blocks[2], /HISTORICAL_STORED_POST_BODY/);
+  assert.equal(blocks[2], `SENT ${new Date(rows[2].occurred_at).toLocaleString()}  om_synth...  群聊\n  状态    等待完整信息\n  原因    消息内容需核验\n  查看    messages --format json 可检查已保存内容与原因`,
+    "the mismatched stored post keeps its event header and selected position");
   assert.match(blocks[3], /@Synthetic @_user_2 Amber/);
   assert.equal(blocks[4], `SENT ${new Date(rows[0].occurred_at).toLocaleString()}  om_synth...  群聊\n  状态    等待完整信息\n  原因    消息内容未完整解析\n  查看    messages --format json 可检查已保存内容与原因`,
     "the partial message keeps its actual event header and selected position");

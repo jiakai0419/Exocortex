@@ -190,3 +190,20 @@ test('automatic embedded enrollment and admitted work reach actual messages with
   assert.match(terminal,/An unchanged automatic neighbor/);assert.doesNotMatch(terminal,/synthetic_automatic_[ab]/);
   assert.deepEqual(sqliteQuery(f.dbPath,'SELECT * FROM records ORDER BY id;'),before);
 });
+
+
+test('a recalled post retains the established tombstone display and its neighbors',t=>{
+  const deleted=post('fictional_recall','{invalid fictional recalled content');
+  deleted.raw.deleted=true;deleted.canonical.deleted=true;deleted.body='[Invalid post JSON]';
+  const entries=[post('before_recall',text('Invented neighbor before recall.')),deleted,
+    post('after_recall',text('Invented neighbor after recall.'))];
+  const f=database(t,entries),before=snapshot(f),json=messages(f,'json'),terminal=messages(f,'text');
+  const recalled=json.find(item=>item.external_id===deleted.raw.message_id);
+  assert.equal(recalled.readiness.state,'ready');
+  assert.equal(recalled.display.post,undefined);assert.equal(recalled.display.embedded_media,undefined);
+  assert.equal(recalled.display.body,'[已撤回/已删除：飞书未返回原始富文本内容]');
+  assert.match(terminal,/已撤回\/已删除/);assert.match(terminal,/Invented neighbor before recall/);
+  assert.match(terminal,/Invented neighbor after recall/);
+  assert.deepEqual(json.map(item=>item.external_id),entries.toReversed().map(item=>item.raw.message_id));
+  assert.deepEqual(snapshot(f),before);
+});
