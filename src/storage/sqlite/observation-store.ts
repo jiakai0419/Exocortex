@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { compareObservation, isNativeRecord, retainSourceRepresentation, OBSERVATION_POLICY } from "../../core/lark-observation.js";
 import type { ExecutionBudget, StoredRecord } from "./ingestion-types.js";
-import { quoteSql, sqliteQuery } from "./sqlite-executor.js";
+import { quoteSql, sqliteQueryJsonObjects } from "./sqlite-executor.js";
 import { REVIEW_RECORD_COLUMNS } from "./maintenance-review.js";
 
 type Acquisition = { attempt: string; startedAtMs: number; basis?: Map<string, number>; confirm?: boolean; contextKey?: string };
@@ -77,20 +77,22 @@ function evaluateObservation(before: StoredRecord | null, incoming: StoredRecord
 function prepareObservationRecords(dbPath: string, records: StoredRecord[], acquisition?: Acquisition, executionBudget?: ExecutionBudget): StoredRecord[] {
   const native = records.filter(isNativeRecord);
   if (!native.length) return records;
-  // The CLI's raw -json TEXT serializer stops at NUL. Encode the complete
-  // predecessor inside SQLite so its exact-row CAS never sees a truncated body.
-  const rows = sqliteQuery(dbPath, `SELECT json_object(${REVIEW_RECORD_COLUMNS.flatMap(column => [quoteSql(column), `r.${column}`]).join(",")}) AS before_json,
-    s.generation AS observation_generation,s.evidence_generation,
-    s.candidate_json, s.candidate_generation, s.candidate_attempt, s.candidate_policy, s.candidate_context, s.candidate_observed_at_ms
+  // Encode all source and state fields once. Raw CLI TEXT truncates at NUL,
+  // while wrapping a JSON object in CLI JSON doubles escaping for large pages.
+  const stateColumns = ["generation", "evidence_generation", "candidate_json", "candidate_generation",
+    "candidate_attempt", "candidate_policy", "candidate_context", "candidate_observed_at_ms"];
+  const fields = [...REVIEW_RECORD_COLUMNS.flatMap(column => [quoteSql(column), `r.${column}`]),
+    ...stateColumns.flatMap(column => [quoteSql(column === "generation" ? "observation_generation" : column), `s.${column}`])];
+  const rows = sqliteQueryJsonObjects(dbPath, `SELECT json_object(${fields.join(",")})
     FROM records r JOIN record_observation_state s ON s.record_id=r.id
     WHERE r.source_id='lark.im' AND r.external_id IN (${native.map(r => quoteSql(r.external_id)).join(",")});`, "read observation basis", executionBudget);
-  const byId = new Map(rows.map(({ before_json, observation_generation, evidence_generation, candidate_json, candidate_generation, candidate_attempt, candidate_policy, candidate_context, candidate_observed_at_ms }) => {
-    const before = JSON.parse(before_json);
+  const byId = new Map(rows.map(({ observation_generation, evidence_generation, candidate_json, candidate_generation, candidate_attempt, candidate_policy, candidate_context, candidate_observed_at_ms, ...before }) => {
     return [before.external_id, { before, generation: Number(observation_generation), evidenceGeneration: Number(evidence_generation), candidate_json, candidate_generation, candidate_attempt, candidate_policy, candidate_context, candidate_observed_at_ms }];
   }));
   const attempt = acquisition?.attempt || randomUUID(), observedAtMs = Date.now();
   const selectedAcquisition = { ...acquisition, attempt, startedAtMs: acquisition?.startedAtMs ?? observedAtMs };
-  return records.map(original => {
+  const prepared = records.map(original => {
+    executionBudget?.assertReady();
     if (!isNativeRecord(original)) return original;
     const { observation: ignored, ...incoming } = original;
     const state = byId.get(original.external_id), before = state?.before || null;
@@ -103,6 +105,8 @@ function prepareObservationRecords(dbPath: string, records: StoredRecord[], acqu
     return { ...record, observation: { action, reason, before, generation: state?.generation ?? null, evidenceGeneration: state?.evidenceGeneration ?? null,
       incoming, attempt, observedAtMs, contextKey: acquisition?.contextKey || null, preserveCandidate } };
   });
+  executionBudget?.assertReady();
+  return prepared;
 }
 
 /** The preparation basis is checked even for a no-op, so preview and commit

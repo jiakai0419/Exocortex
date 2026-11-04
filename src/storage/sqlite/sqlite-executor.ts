@@ -5,6 +5,8 @@ import type { ExecutionBudget, SqliteRow } from "./ingestion-types.js";
 import { markSqlDispatch, observeSqlProcess } from './execution-evidence.js';
 const PRIVATE_DIRECTORY_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
+const OBJECTS_BEGIN = "__EXOCORTEX_OBSERVATION_OBJECTS_BEGIN_V1__";
+const OBJECTS_END = "__EXOCORTEX_OBSERVATION_OBJECTS_END_V1__";
 
 function quoteSql(value: unknown) {
   if (value === null || value === undefined) return "NULL";
@@ -64,7 +66,7 @@ function sqliteFailure(result: ReturnType<typeof spawnSync>, label: string) {
   return new Error(`${label} failed: ${detail}`);
 }
 
-function sqliteRun(dbPath: string, sql: string, label: string, json = false, executionBudget?: ExecutionBudget, evidence?: object) {
+function sqliteRun(dbPath: string, sql: string, label: string, json: boolean | "objects" = false, executionBudget?: ExecutionBudget, evidence?: object) {
   executionBudget?.assertReady();
   const resolvedDbPath = prepareWritableDatabasePaths(dbPath);
   let result;
@@ -75,8 +77,13 @@ function sqliteRun(dbPath: string, sql: string, label: string, json = false, exe
     }
     result = withPrivateUmask(() => {
       markSqlDispatch(evidence);
-      const observed = spawnSync("sqlite3", [...(json ? ["-json"] : []), resolvedDbPath], {
-        input: `.bail on\n.timeout ${timeout === undefined ? 5000 : Math.min(5000, timeout)}\nPRAGMA foreign_keys = ON;\n${sql}`,
+      const objectLines = json === "objects";
+      const observed = spawnSync("sqlite3", [...(objectLines
+        ? ["-readonly", "-batch", "-init", "/dev/null", "-noheader", "-list"]
+        : json ? ["-json"] : []), resolvedDbPath], {
+        input: `.bail on\n.timeout ${timeout === undefined ? 5000 : Math.min(5000, timeout)}\nPRAGMA foreign_keys = ON;\n${objectLines
+          ? `PRAGMA query_only = ON;\nBEGIN;\n.print ${OBJECTS_BEGIN}\n${sql}\nCOMMIT;\n.print ${OBJECTS_END}\n`
+          : sql}`,
         encoding: "utf8",
         maxBuffer: 50 * 1024 * 1024,
         ...(timeout === undefined ? {} : { timeout, killSignal: "SIGKILL" as const }),
@@ -87,7 +94,7 @@ function sqliteRun(dbPath: string, sql: string, label: string, json = false, exe
   } finally {
     prepareWritableDatabasePaths(resolvedDbPath);
   }
-  if (result.status !== 0 || result.error || executionBudget && result.signal) throw sqliteFailure(result, label);
+  if (result.status !== 0 || result.error || (executionBudget || json === "objects") && result.signal) throw sqliteFailure(result, label);
   return String(result.stdout || "");
 }
 
@@ -100,5 +107,29 @@ function sqliteQuery(dbPath: string, sql: string, label: string, executionBudget
   return trimmed ? JSON.parse(trimmed) : [];
 }
 
+/** Only for a trusted SELECT producing one SQL-encoded JSON object per row.
+ * A second CLI JSON layer can double large TEXT values; a completed read
+ * transaction and strict framing replace that layer without accepting prefixes.
+ */
+function sqliteQueryJsonObjects(dbPath: string, sql: string, label: string, executionBudget?: ExecutionBudget): SqliteRow[] {
+  const output = sqliteRun(dbPath, sql, label, "objects", executionBudget);
+  executionBudget?.assertReady();
+  const lines = output.split(/\r?\n/);
+  if (lines.at(-1) === "") lines.pop();
+  if (output.includes("\0") || lines.length < 2 || lines[0] !== OBJECTS_BEGIN || lines.at(-1) !== OBJECTS_END) {
+    throw new Error(`${label} failed: incomplete or invalid SQLite object frame`);
+  }
+  const rows: SqliteRow[] = [];
+  for (const line of lines.slice(1, -1)) {
+    executionBudget?.assertReady();
+    const row: unknown = JSON.parse(line);
+    if (!row || typeof row !== "object" || Array.isArray(row)) {
+      throw new Error(`${label} failed: SQLite object row required`);
+    }
+    rows.push(row as SqliteRow);
+  }
+  executionBudget?.assertReady();
+  return rows;
+}
 
-export { quoteSql, sqlJson, secureDatabasePaths, prepareWritableDatabasePaths, withPrivateUmask, sqliteExec, sqliteQuery };
+export { quoteSql, sqlJson, secureDatabasePaths, prepareWritableDatabasePaths, withPrivateUmask, sqliteExec, sqliteQuery, sqliteQueryJsonObjects };

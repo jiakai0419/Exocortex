@@ -91,3 +91,47 @@ suffix races and synthetic producer claim/result). Keep the original independent
 counterexample as a baseline-negative/candidate-positive control outside Git.
 Existing observation, history, storage-cost and resource suites plus full
 verification are required; no separate deadline or native binary change is needed.
+
+## Predecessor page capacity
+
+The observation predecessor must have only one JSON transport layer. Encoding
+the 19 record columns as `before_json` TEXT and then asking CLI `-json` to encode
+that string again doubles escaping and can exceed the existing 50 MiB output
+limit for valid 100-record pages. Raw metadata is not subject to the separate
+128 KiB resource-discovery limit. Do not fix this by dropping predecessors,
+raising a buffer/timeout, or weakening exact-row and generation checks.
+
+The observation query emits one flat SQL `json_object` containing all 19 record
+columns and all eight observation-state columns. The existing store executor
+has a narrowly scoped, read-only framed plain-output mode for this query.
+It must receive a successful process result and the end marker after COMMIT,
+parse every line exactly once as an object, and reject missing/trailing frames,
+invalid JSON, raw NUL and non-object rows. No valid prefix may be returned.
+The observation evaluator separates the eight state fields after decoding;
+all record fields, NULLs, integers, text bytes and both generation fences stay
+unchanged. Source/generation drift must still roll back the whole write.
+
+This mode retains the store's 50 MiB process output limit, caller-provided
+execution deadline and 5-second maximum lock wait. It checks the shared budget
+after the process returns and after decoding. Callers without an execution
+budget retain their previous lack of a whole-process timeout; this correction
+does not claim to solve that separate inherited contract. Ordinary store SQL
+and JSON queries use their unchanged execution mode.
+
+Acceptance must exercise the actual default predecessor helper on 100 authored
+records with 100 KiB of backslashes per raw metadata value, without nested wire
+serialization or a substitute reader. Keep the original 30-second test deadline
+and 50 MiB limit, exact values/types, NUL tails, candidate state, mixed rows,
+and full-row/generation CAS controls. Setup is outside the timed read; test
+processes are owned and completion receipts retained. A failed/capped/truncated
+read cannot return a partial basis or authorize a write. Retain the earlier
+capacity timeouts and unexplained SQL stdin timeout separately, even if the new
+representation passes. None of these synthetic measurements is production p95.
+
+`observation-wire-capacity.test.mjs` exercises the default helper with the real
+SQLite process and schema. Its unexpected-failure path retains the original
+authored fixture and receipts instead of guessing a process identity or retrying.
+`sqlite-object-query.test.mjs` isolates malformed frames, process-result errors,
+caller-budget cutoffs and the exact 27-to-19-field/CAS interface. Its overflow
+and timeout responses are explicitly simulated; they do not claim an actual
+over-cap process or historical cleanup has been observed.
