@@ -12,6 +12,10 @@ import {ensureInitialized,sqliteExec,sqliteQuery,quoteSql as q} from '../dist/st
 import {captureLarkWriteAdmission} from '../src/diagnostics/lark-write-admission.mjs';
 import {executeResourceWork} from '../src/maintenance/resource-work.mjs';
 import {renderApiMessageContent} from '../src/adapters/lark-im/raw-message.mjs';
+import {projectionAccount} from '../src/adapters/lark-im/message-projection-evidence.mjs';
+import {extractMessageResourceReferences,mediaFromImageSlot} from '../src/adapters/lark-im/media-resource-references.mjs';
+import {makeMediaResourceBindings,publishMediaResource} from '../src/adapters/lark-im/media-resource-store.mjs';
+import {readMessageSnapshot} from '../src/diagnostics/message-read-snapshot.mjs';
 import {SENT_SCOPE_ID} from '../src/adapters/lark-im/core.mjs';
 
 const AT=Date.UTC(2025,4,1),SELF='ou_synthetic_sql_deadline';
@@ -32,8 +36,8 @@ function fixture(t,count=1,slots=2) {
       content_hash:createHash('sha256').update(raw_json).digest('hex'),body:rendered.text};
     sqliteExec(db,`INSERT INTO records(${Object.keys(row)}) VALUES(${Object.values(row).map(q)});`);
   }
-  const f={db,tick:1,requests:0};
-  f.options={db,maxCliAttempts:3,maxSelfAttempts:2,maxSeconds:1};
+  const f={db,resourceDir:join(root,'resources'),tick:1,requests:0};
+  f.options={db,resourceDir:f.resourceDir,maxCliAttempts:3,maxSelfAttempts:2,maxSeconds:1};
   f.deps={now:()=>AT+100000,monotonicClock:()=>f.tick,tryAcquireLease:()=>({state:'acquired',release(){}}),
     requestSessionDeps:{spawnSync(){f.requests++;throw Error('unexpected synthetic external request');}}};
   f.run=()=>executeResourceWork(f.options,f.deps);
@@ -128,10 +132,24 @@ test('forty sources with sixty-four slots use bounded default SQLite dispatch an
   t.diagnostic(JSON.stringify({elapsed_ms:elapsed,spawns,tasks,outcome:report.outcome,stop_reason:report.request_budget.stop_reason}));
 });
 
+
+// A real, identity-bound synthetic cache provides the producer's local result.
+// No fabricated available object may stand in for its private provenance.
+function cacheSyntheticResources(f,ids,bytes) {
+  for(const row of readMessageSnapshot(f.db,{recordIds:ids}).rows) {
+    const raw=JSON.parse(row.raw_json),canonical=JSON.parse(row.canonical_json),account=projectionAccount(row,canonical,raw);
+    assert.equal(account.state,'verified');
+    const slots=extractMessageResourceReferences(row,canonical,raw).slots;
+    const bindings=makeMediaResourceBindings(f.db,row,account.account_key,slots.map(mediaFromImageSlot));
+    assert.equal(bindings.length,slots.length);assert(bindings.length>0);
+    for(const binding of bindings)assert.equal(publishMediaResource(f.resourceDir,binding,bytes,{nowMs:AT}).status,'available');
+  }
+}
+
 for(const acknowledgement of ['returned','lost'])test(`late task-result commit ${acknowledgement} retains effects without a false successful command`,t=>{
   const f=fixture(t,1,1);f.options.maxSeconds=4;f.deps.resourceCapability=()=> 'message_image';
-  // This control isolates queue acknowledgement, not byte/readiness authority.
-  f.deps.enrichResources=options=>({request_budget:null,results:[{...options.resourceTargets[0],state:'available'}]});
+  cacheSyntheticResources(f,[1],Buffer.from('47494638396101000100800000000000ffffff21f90401000000002c00000000010001000002024401003b','hex'));
+  // The actual producer reads trusted bytes; only the commit acknowledgement is injected.
   let resultWrites=0;
   f.deps.sqliteWrite=(db,sql,label,budget)=>{
     const result=sqliteQuery(db,sql,label,budget);

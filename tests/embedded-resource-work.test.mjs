@@ -1,3 +1,6 @@
+import {projectionAccount} from '../src/adapters/lark-im/message-projection-evidence.mjs';
+import {extractMessageResourceReferences,mediaFromImageSlot} from '../src/adapters/lark-im/media-resource-references.mjs';
+import {makeMediaResourceBindings,publishMediaResource} from '../src/adapters/lark-im/media-resource-store.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
@@ -188,24 +191,42 @@ test('true version recovery retains the old failure but diagnoses the new unveri
   assert.equal(resourceWorkCapabilityEvidence(after,identity).reason,'resource_endpoint_unverified');assert.equal(f.calls.length,calls);
 });
 
+
+// A real, identity-bound synthetic cache provides the producer's local result.
+// No fabricated available object may stand in for its private provenance.
+function cacheSyntheticResources(f,ids,bytes) {
+  for(const row of readMessageSnapshot(f.db,{recordIds:ids}).rows) {
+    const raw=JSON.parse(row.raw_json),canonical=JSON.parse(row.canonical_json),account=projectionAccount(row,canonical,raw);
+    assert.equal(account.state,'verified');
+    const slots=extractMessageResourceReferences(row,canonical,raw).slots;
+    const bindings=makeMediaResourceBindings(f.db,row,account.account_key,slots.map(mediaFromImageSlot));
+    assert.equal(bindings.length,slots.length);assert(bindings.length>0);
+    for(const binding of bindings)assert.equal(publishMediaResource(f.resourceDir,binding,bytes,{nowMs:AT}).status,'available');
+  }
+}
+
 test('multi-slot fair turns persist across processes while newer messages keep arriving',t=>{
   const f=fixture(t),oldest=f.add('post',['synthetic_old_a','synthetic_old_b']),turns=[];
-  // Selection/claim/result are real. This specific fairness test stubs the
-  // acquisition boundary; the preceding positive cases validate actual bytes.
+  // Each restarted producer validates real synthetic cached slots, without API calls.
+  cacheSyntheticResources(f,[oldest],GIF);
   for(let i=0;i<3;i++){
-    f.add('post',[`synthetic_fresh_${i}_a`,`synthetic_fresh_${i}_b`]);f.advance();
+    const fresh=f.add('post',[`synthetic_fresh_${i}_a`,`synthetic_fresh_${i}_b`]);f.advance();
+    cacheSyntheticResources(f,[fresh],GIF);
     const program=`import {executeResourceWork} from ${JSON.stringify(new URL('../src/maintenance/resource-work.mjs',import.meta.url).href)};
       import {sqliteQuery} from ${JSON.stringify(new URL('../dist/storage/sqlite/ingestion-store.js',import.meta.url).href)};
-      const selected=[];const db=${JSON.stringify(f.db)};
-      const result=executeResourceWork({db,maxCliAttempts:3,maxSelfAttempts:2,maxSeconds:30},{
+      import {enrichResources} from ${JSON.stringify(new URL('../src/maintenance/enrich-resources.mjs',import.meta.url).href)};
+      const selected=[];let requests=0;const db=${JSON.stringify(f.db)};
+      const result=executeResourceWork({db,resourceDir:${JSON.stringify(f.resourceDir)},maxCliAttempts:3,maxSelfAttempts:2,maxSeconds:30},{
         now:()=>${f.wall},monotonicClock:()=>1,resourceCapability:()=> 'message_image',tryAcquireLease:()=>({state:'acquired',release(){}}),
-        enrichResources(options){const target=options.resourceTargets[0];selected.push(target);return {request_budget:null,results:[{...target,state:'available'}]};}
-      });process.stdout.write(JSON.stringify({pid:process.pid,result,selected,scan:sqliteQuery(db,'SELECT * FROM lark_im_resource_scan;')[0]}));`;
+        requestSessionDeps:{spawnSync(){requests++;throw Error('unexpected synthetic external request');}},
+        enrichResources(options,deps){const target=options.resourceTargets[0];selected.push(target);return enrichResources(options,deps);}
+      });process.stdout.write(JSON.stringify({pid:process.pid,result,selected,requests,scan:sqliteQuery(db,'SELECT * FROM lark_im_resource_scan;')[0]}));`;
     const child=spawnSync(process.execPath,['--input-type=module','-e',program],{encoding:'utf8',timeout:15000});
     assert.equal(child.status,0,child.stderr);turns.push(JSON.parse(child.stdout));
   }
   assert.equal(new Set(turns.map(x=>x.pid)).size,3);assert.deepEqual(turns.map(x=>x.scan.priority_streak),[1,2,0]);
   assert.equal(turns[2].selected[0].record_id,oldest);assert(turns.every(x=>x.selected.length===1&&x.result.processed===1));
+  assert(turns.every(x=>x.requests===0&&x.result.request_budget.cli_attempts===0&&x.result.request_budget.self_attempts===0));
   assert.equal(f.tasks().filter(x=>x.record_id===oldest&&x.state==='available').length,1,'one exact old slot is serviced');
   assert.equal(f.calls.length,0);
 });

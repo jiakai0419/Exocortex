@@ -1,3 +1,6 @@
+import {projectionAccount} from '../src/adapters/lark-im/message-projection-evidence.mjs';
+import {extractMessageResourceReferences,mediaFromImageSlot} from '../src/adapters/lark-im/media-resource-references.mjs';
+import {makeMediaResourceBindings,publishMediaResource} from '../src/adapters/lark-im/media-resource-store.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
@@ -346,15 +349,30 @@ test('invalid image prefixes advance bounded discovery and cannot permanently hi
 });
 
 
+
+// A real, identity-bound synthetic cache provides the producer's local result.
+// No fabricated available object may stand in for its private provenance.
+function cacheSyntheticResources(f,ids,bytes) {
+  for(const row of readMessageSnapshot(f.db,{recordIds:ids}).rows) {
+    const raw=JSON.parse(row.raw_json),canonical=JSON.parse(row.canonical_json),account=projectionAccount(row,canonical,raw);
+    assert.equal(account.state,'verified');
+    const slots=extractMessageResourceReferences(row,canonical,raw).slots;
+    const bindings=makeMediaResourceBindings(f.db,row,account.account_key,slots.map(mediaFromImageSlot));
+    assert.equal(bindings.length,slots.length);assert(bindings.length>0);
+    for(const binding of bindings)assert.equal(publishMediaResource(f.resourceDir,binding,bytes,{nowMs:AT}).status,'available');
+  }
+}
+
 // A new Node process on every turn proves that no in-memory cursor repairs the
-// queue. Only the acquisition boundary is stubbed: this is not download/readiness
-// evidence, and all lease/clock/SQLite inputs belong to this synthetic fixture.
+// queue. A real cached image and producer attest the stable row's local result;
+// all lease/clock/SQLite inputs belong to this synthetic fixture.
 function restartedSourceChangeTurn(f,stableOldest) {
   const code=`
     import {executeResourceWork,resourceWorkIdentity} from ${JSON.stringify(new URL('../src/maintenance/resource-work.mjs',import.meta.url).href)};
     import {sqliteExec,sqliteQuery,quoteSql as q} from ${JSON.stringify(new URL('../dist/storage/sqlite/ingestion-store.js',import.meta.url).href)};
-    const db=${JSON.stringify(f.db)},oldest=${stableOldest},wall=${f.wall},selected=[];
-    const result=executeResourceWork({db,maxCliAttempts:3,maxSelfAttempts:2,maxSeconds:30},{
+    import {enrichResources} from ${JSON.stringify(new URL('../src/maintenance/enrich-resources.mjs',import.meta.url).href)};
+    const db=${JSON.stringify(f.db)},oldest=${stableOldest},wall=${f.wall},selected=[];let requests=0;
+    const result=executeResourceWork({db,resourceDir:${JSON.stringify(f.resourceDir)},maxCliAttempts:3,maxSelfAttempts:2,maxSeconds:30},{
       now:()=>wall,monotonicClock:()=>1,tryAcquireLease:()=>({state:'acquired',release(){}}),
       sqliteJson(db,sql,label){
         const rows=sqliteQuery(db,sql,label);
@@ -366,9 +384,10 @@ function restartedSourceChangeTurn(f,stableOldest) {
         }
         return rows;
       },
-      enrichResources(options){selected.push(options.recordIds[0]);return {request_budget:null,results:[{record_id:options.recordIds[0],state:'available'}]};}
+      requestSessionDeps:{spawnSync(){requests++;throw Error('unexpected synthetic external request');}},
+      enrichResources(options,deps){selected.push(options.recordIds[0]);return enrichResources(options,deps);}
     });
-    process.stdout.write(JSON.stringify({pid:process.pid,result,selected,scan:sqliteQuery(db,'SELECT * FROM lark_im_resource_scan;')[0]}));
+    process.stdout.write(JSON.stringify({pid:process.pid,result,selected,requests,scan:sqliteQuery(db,'SELECT * FROM lark_im_resource_scan;')[0]}));
   `;
   const child=spawnSync(process.execPath,['--input-type=module','-e',code],{encoding:'utf8',timeout:15000});
   assert.equal(child.status,0,JSON.stringify({status:child.status,signal:child.signal,error:child.error?.message,stdout:child.stdout,stderr:child.stderr}));
@@ -377,6 +396,7 @@ function restartedSourceChangeTurn(f,stableOldest) {
 
 test('source-change transitions consume durable fresh turns so stable oldest is attempted on turn three across restarts',t=>{
   const f=fixture(t),oldest=1,original=sqliteQuery(f.db,'SELECT * FROM records WHERE id=1;')[0],turns=[];
+  cacheSyntheticResources(f,[oldest],PNG);
   for(let i=0;i<9;i++){f.add();turns.push(restartedSourceChangeTurn(f,oldest));}
   assert.equal(new Set(turns.map(x=>x.pid)).size,9,'nine independent processes, one durable queue');
   assert.deepEqual(turns.map(x=>x.scan.priority_streak),[1,2,0,1,2,0,1,2,0]);
@@ -384,6 +404,7 @@ test('source-change transitions consume durable fresh turns so stable oldest is 
     'stable oldest must receive the third service opportunity despite ongoing newer source changes');
   assert.deepEqual(turns.map(x=>x.result.outcome),['source_changed','source_changed','processed',...Array(6).fill('source_changed')]);
   for(const turn of turns){
+    assert.equal(turn.requests,0);assert.equal(turn.result.request_budget.complete,true);
     assert.equal(turn.result.request_budget.cli_attempts,0);assert.equal(turn.result.request_budget.self_attempts,0);
     assert.equal(turn.result.request_budget.max_cli_attempts,3);assert.equal(turn.result.request_budget.max_self_attempts,2);assert.equal(turn.result.request_budget.max_seconds,30);
   }
@@ -533,9 +554,11 @@ test('resource diagnostic migration preserves pre-022 task byte values and keeps
 test('resource diagnostic SQL and summary exclude arbitrary strings paths identities and response objects',t=>{
   const f=fixture(t),secret='synthetic-private-payload/'+f.root;
   f.deps.enrichResources=()=>({results:[{record_id:1,state:'blocked',reason:secret,failure:{stage:secret,reason:{payload:secret},extra:secret}}],request_budget:null});
-  const result=f.run();assert.deepEqual(result.failure,{stage:'unknown',reason:'unknown',persisted:true});
-  const row=f.tasks()[0];assert.equal(row.failure_stage,'unknown');assert.equal(row.failure_reason,'unknown');
-  assert.equal(row.state,'blocked');assert.equal(row.reason,'resource_invalid');
+  const result=f.run();assert.equal(result.failure,null);
+  assert.equal(result.ok,false);assert.equal(result.outcome,'execution_failed');assert.equal(result.processed,0);
+  assert.equal(result.request_budget.complete,false);assert.equal(result.request_budget.cli_attempts,null);assert.equal(result.request_budget.self_attempts,null);
+  const row=f.tasks()[0];assert.equal(row.failure_stage,null);assert.equal(row.failure_reason,null);
+  assert.equal(row.state,'running');assert.equal(row.reason,null);assert.equal(f.calls.length,0);
   assert(!JSON.stringify(result).includes(secret));
   assert.throws(()=>sqliteExec(f.db,`UPDATE lark_im_resource_work SET failure_reason=${q(secret)};`));
   assert.throws(()=>sqliteExec(f.db,`UPDATE lark_im_resource_work SET failure_stage=${q(secret)};`));
@@ -544,8 +567,11 @@ test('resource diagnostic SQL and summary exclude arbitrary strings paths identi
 
 for(const reason of ['permission_denied','restricted_mode','bot_user_out_of_chat'])test(`resource diagnostic producer-only ${reason} never upgrades remote evidence`,t=>{
   const f=fixture(t);f.deps.enrichResources=()=>({results:[{record_id:1,state:'blocked',reason,failure:{stage:'resource_request',reason}}],request_budget:null});
-  const result=f.run();assert.deepEqual(result.failure,{stage:'resource_request',reason:'unverified_remote_failure',persisted:true});
-  assert.equal(f.tasks()[0].reason,'resource_invalid');assert.equal(f.tasks()[0].failure_reason,'unverified_remote_failure');assert.equal(f.calls.length,0);
+  const result=f.run();assert.equal(result.failure,null);
+  assert.equal(result.ok,false);assert.equal(result.outcome,'execution_failed');assert.equal(result.processed,0);
+  assert.equal(result.request_budget.complete,false);assert.equal(result.request_budget.cli_attempts,null);assert.equal(result.request_budget.self_attempts,null);
+  const row=f.tasks()[0];assert.equal(row.state,'running');assert.equal(row.reason,null);
+  assert.equal(row.failure_stage,null);assert.equal(row.failure_reason,null);assert.equal(f.calls.length,0);
 });
 
 test('resource diagnostic exhaustion preserves final concrete cause without reopening work',t=>{
