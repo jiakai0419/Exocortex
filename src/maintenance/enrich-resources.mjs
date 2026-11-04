@@ -15,6 +15,7 @@ import { classifyLarkFailure } from '../adapters/lark-im/transport.mjs';
 import { readLarkExecutionReceipt } from '../adapters/lark-im/transport-execution.mjs';
 import { readMessageSnapshot } from '../diagnostics/message-read-snapshot.mjs';
 import { createMaintenanceRequestSession, MaintenanceRequestError } from './request-session.mjs';
+import { createResourceCommandBudget, isHistoryCommandBudget, HistoryCommandBudgetError } from './history-command-budget.mjs';
 
 /** @typedef {Record<string,any>} Row */
 const GUARD = 'import os,resource,sys\nos.umask(0o077)\nresource.setrlimit(resource.RLIMIT_FSIZE,(16777216,16777216))\nos.execvp(sys.argv[1],sys.argv[1:])';
@@ -57,6 +58,7 @@ export function normalizeResourceFailure(value) {
  * Exact endpoint/closing-account denial verification belongs to resource-work.
  * @param {any} error @param {string} stage */
 export function resourceFailureFromError(error,stage) {
+  if(error instanceof HistoryCommandBudgetError)return normalizeResourceFailure({stage,reason:error.reason});
   if(error?.resourceFailure) {
     const diagnostic=normalizeResourceFailure(error.resourceFailure);
     return denialReasons.has(diagnostic.reason)?{...diagnostic,reason:'unverified_remote_failure'}:diagnostic;
@@ -75,87 +77,67 @@ export function resourceFailureFromError(error,stage) {
 }
 
 function failure(error) {
-  if (error instanceof MaintenanceRequestError) return error.reason;
+  if (error instanceof MaintenanceRequestError || error instanceof HistoryCommandBudgetError) return error.reason;
   if (localReasons.has(error?.resourceReason)) return error.resourceReason;
   return classifyLarkFailure(error instanceof Error ? error.message : error).kind;
 }
 
 /** A CLI saved_path is a claim, not a path we are allowed to follow. */
-function readDownload(stage, filename, response) {
+function readDownload(stage, filename, response, budget) {
+  budget.assertReady();
   const path=join(stage,filename);
   if (!response || typeof response.saved_path!=='string' || resolve(stage,response.saved_path)!==path
     || !Number.isSafeInteger(response.size_bytes) || response.size_bytes<1 || response.size_bytes>MAX_MEDIA_RESOURCE_BYTES
     || typeof response.content_type!=='string') throw localFailure('download_response_invalid');
   let fd;
   try {
+    budget.assertReady();
     fd=openSync(path,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
     const before=fstatSync(fd,{bigint:true});
     if (!before.isFile() || before.nlink!==1n || before.uid!==BigInt(process.getuid?.() ?? -1)
       || (before.mode&0o077n)!==0n || before.size!==BigInt(response.size_bytes)) throw localFailure('download_file_invalid');
     const bytes=Buffer.alloc(response.size_bytes+1);let length=0;
-    while(length<bytes.length) {const n=readSync(fd,bytes,length,bytes.length-length,length);if(!n)break;length+=n;}
+    while(length<bytes.length) {budget.assertReady();const n=readSync(fd,bytes,length,bytes.length-length,length);if(!n)break;length+=n;}
     const after=fstatSync(fd,{bigint:true}), current=lstatSync(path,{bigint:true});
     if(length!==response.size_bytes||current.isSymbolicLink()||!current.isFile()||!same(before,after)||!same(after,current))
       throw localFailure('download_file_invalid');
-    const result=bytes.subarray(0,length), assessment=assessMediaImageBytes(result), image=assessment.image;
+    budget.assertReady();
+    const result=bytes.subarray(0,length), assessment=assessMediaImageBytes(result,{executionBudget:budget}), image=assessment.image;
     if(['resource_format_unsupported','resource_decoder_unavailable','resource_validation_limit'].includes(assessment.reason || ''))
       throw localFailure(assessment.reason);
     if (!image || response.content_type.split(';')[0].trim().toLowerCase()!==image.mime_type)
       throw localFailure('download_image_invalid');
     return result;
-  } catch(error) {if(localReasons.has(/** @type {Row} */(error)?.resourceReason))throw error;throw localFailure('download_file_invalid');}
+  } catch(error) {if(error instanceof HistoryCommandBudgetError)throw error;budget.assertReady();if(localReasons.has(/** @type {Row} */(error)?.resourceReason))throw error;throw localFailure('download_file_invalid');}
   finally {if(fd!==undefined)closeSync(fd);}
 }
 
 /** Exact, opt-in acquisition. No DB writes, source rewriting, retry or identity fallback.
  * @param {Row} options @param {Row} [deps] */
 export function enrichResources(options,deps={}) {
-  const snapshot=deps.readSnapshot || readMessageSnapshot, now=deps.now || Date.now;
+  const budget=deps.executionBudget ?? createResourceCommandBudget({maxSeconds:options.maxSeconds??30},{
+    monotonicClock:deps.monotonicClock??deps.requestSessionDeps?.monotonicClock});
+  if(!isHistoryCommandBudget(budget))throw new TypeError('invalid internal resource command budget');
+  const reader=deps.readSnapshot || readMessageSnapshot, now=deps.now || Date.now;
+  const snapshot=(db,selected)=>{budget.assertReady();
+    const result=reader(db,selected,{sqliteReadOptions:()=>({timeoutMs:budget.timeoutMs(30000)})});
+    budget.assertReady();return result;};
   const selection={direction:'all',search:'',limit:options.recordIds.length,recordIds:options.recordIds};
-  const rows=snapshot(options.db,selection).rows, byId=new Map(rows.map(row=>[row.id,row]));
   const cache=resourceStorePath(options.db,options.resourceDir);
   /** @type {Row[]} */ const candidates=[];
-  const exact=options.resourceTargets;
-  if(exact!==undefined&&(!Array.isArray(exact)||exact.length<1||exact.length>64||exact.some(target=>!target
-    ||!options.recordIds.includes(target.record_id)||typeof target.resource_key!=='string'
-    ||!['image_key','attachment_origin_key'].includes(target.reference_kind))))throw new RangeError('invalid exact resource selection');
-  const results=options.recordIds.flatMap(id=>{
-    const row=byId.get(id), entry={record_id:id,state:'blocked',reason:'record_missing'};
-    if(!row)return [entry];
-    const canonical=parse(row.canonical_json),raw=parse(row.raw_json),legacy=renderMediaProjection(row,canonical,raw);
-    if(legacy?.type==='sticker')return [{...entry,reason:'sticker_resource_unsupported'}];
-    const extracted=extractMessageResourceReferences(row,canonical,raw),native=raw.raw_api??raw;
-    const embedded=['post','interactive'].includes(native.msg_type||native.message_type);
-    const unique=new Map();for(const slot of extracted.slots)unique.set(JSON.stringify([slot.reference_kind,slot.key]),slot);
-    const all=[...unique.values()];
-    const selected=exact?exact.filter(target=>target.record_id===id).map(target=>all.find(slot=>slot.key===target.resource_key&&slot.reference_kind===target.reference_kind)):all;
-    if(!selected.length)return [{...entry,reason:extracted.issues.length?'source_binding_invalid':'content_not_supported'}];
-    const slots=selected.filter(Boolean),medias=slots.map(mediaFromImageSlot),account=projectionAccount(row,canonical,raw);
-    const bindings=account.state==='verified'?makeMediaResourceBindings(options.db,row,account.account_key,medias):[];
-    const bound=new Map(slots.map((slot,index)=>[slot,bindings[index]]));
-    const kindsByKey=new Map();for(const slot of all) {
-      if(!kindsByKey.has(slot.key))kindsByKey.set(slot.key,new Set());kindsByKey.get(slot.key).add(slot.reference_kind);
-    }
-    return selected.map(slot=>{
-      if(!slot)return {...entry,reason:'media_reference_missing'};
-      const result=embedded?{...entry,resource_key:slot.key,reference_kind:slot.reference_kind}:entry;
-      if(slot.reference_state!=='reference_only')return {...result,reason:slot.reference_state==='missing_reference'?'media_reference_missing':'media_reference_invalid'};
-      if(account.state!=='verified')return {...result,reason:'account_unverified'};
-      const binding=bound.get(slot),media=mediaFromImageSlot(slot);
-      if(!binding)return {...result,reason:'source_binding_invalid'};
-      if(kindsByKey.get(slot.key).size>1)return {...result,reason:'resource_identity_conflict'};
-      const cached=readMediaResource(cache,binding);
-      if(cached.status==='available')return {...result,state:'available',reason:null};
-      if(cached.status==='invalid')return {...result,reason:cached.reason};
-      if(imageResourceCapability(slot,deps.resourceCapability)!=='message_image')return {...result,reason:'resource_endpoint_unverified'};
-      const planned={...result,state:'planned',reason:null},sourceFence=makeMediaPendingSourceFence(row);
-      if(!sourceFence)return {...result,reason:'source_binding_invalid'};
-      candidates.push({row,account,media,binding,sourceFence,entry:planned});return planned;
-    });
-  });
+  /** @type {Row[]} */ let results=[];
+  let session;
   /** @type {Row} */ const report={target:'resources',dry_run:options.apply!==true,
-    selected:results.length,results,request_budget:null,partial:false};
+    selected:0,results,request_budget:null,partial:false};
+  const zeroBudget=()=>{const observed=budget.summary();return {
+    max_cli_attempts:options.maxCliAttempts??Math.min((candidates.length||options.recordIds.length)+2,options.recordIds.length+2),cli_attempts:0,
+    max_self_attempts:Math.min(2,options.maxCliAttempts??candidates.length+2),self_attempts:0,
+    max_seconds:options.maxSeconds??30,min_interval_ms:1000,elapsed_ms:observed.elapsed_ms,stop_reason:observed.stop_reason};};
   const finish=()=>{
+    if(session)report.request_budget=session.summary();
+    try {budget.assertReady();}catch(error){if(!(error instanceof HistoryCommandBudgetError))throw error;
+      report.stop_reason ||= error.reason;report.request_budget=session?.summary()??zeroBudget();}
+    report.results=results;report.selected=results.length;
     for(const entry of results) {
       if(['resource_endpoint_unverified','resource_identity_conflict'].includes(entry.reason)) {
         entry.capability={reason:entry.reason};entry.failure=null;
@@ -165,21 +147,72 @@ export function enrichResources(options,deps={}) {
     report.available=results.filter(item=>item.state==='available').length;
     report.planned=results.filter(item=>item.state==='planned').length;
     report.failed=results.filter(item=>['blocked','failed'].includes(item.state)).length;
-    report.partial=report.failed>0 || options.apply===true && report.planned>0;
+    report.partial=report.failed>0 || options.apply===true && report.planned>0 || Boolean(report.stop_reason);
     report.ok=!report.partial;return report;
   };
+  const exact=options.resourceTargets;
+  if(exact!==undefined&&(!Array.isArray(exact)||exact.length<1||exact.length>64||exact.some(target=>!target
+    ||!options.recordIds.includes(target.record_id)||typeof target.resource_key!=='string'
+    ||!['image_key','attachment_origin_key'].includes(target.reference_kind))))throw new RangeError('invalid exact resource selection');
+  try {
+    const rows=snapshot(options.db,selection).rows, byId=new Map(rows.map(row=>[row.id,row]));
+    results=options.recordIds.flatMap(id=>{
+      budget.assertReady();
+      const row=byId.get(id), entry={record_id:id,state:'blocked',reason:'record_missing'};
+      if(!row)return [entry];
+      const canonical=parse(row.canonical_json),raw=parse(row.raw_json),legacy=renderMediaProjection(row,canonical,raw);
+      if(legacy?.type==='sticker')return [{...entry,reason:'sticker_resource_unsupported'}];
+      const extracted=extractMessageResourceReferences(row,canonical,raw),native=raw.raw_api??raw;
+      const embedded=['post','interactive'].includes(native.msg_type||native.message_type);
+      const unique=new Map();for(const slot of extracted.slots)unique.set(JSON.stringify([slot.reference_kind,slot.key]),slot);
+      const all=[...unique.values()];
+      const selected=exact?exact.filter(target=>target.record_id===id).map(target=>all.find(slot=>slot.key===target.resource_key&&slot.reference_kind===target.reference_kind)):all;
+      if(!selected.length)return [{...entry,reason:extracted.issues.length?'source_binding_invalid':'content_not_supported'}];
+      const slots=selected.filter(Boolean),medias=slots.map(mediaFromImageSlot),account=projectionAccount(row,canonical,raw);
+      const bindings=account.state==='verified'?makeMediaResourceBindings(options.db,row,account.account_key,medias):[];
+      const bound=new Map(slots.map((slot,index)=>[slot,bindings[index]]));
+      const kindsByKey=new Map();for(const slot of all) {
+        if(!kindsByKey.has(slot.key))kindsByKey.set(slot.key,new Set());kindsByKey.get(slot.key).add(slot.reference_kind);
+      }
+      return selected.map(slot=>{
+        if(!slot)return {...entry,reason:'media_reference_missing'};
+        const result=embedded?{...entry,resource_key:slot.key,reference_kind:slot.reference_kind}:entry;
+        if(slot.reference_state!=='reference_only')return {...result,reason:slot.reference_state==='missing_reference'?'media_reference_missing':'media_reference_invalid'};
+        if(account.state!=='verified')return {...result,reason:'account_unverified'};
+        const binding=bound.get(slot),media=mediaFromImageSlot(slot);
+        if(!binding)return {...result,reason:'source_binding_invalid'};
+        if(kindsByKey.get(slot.key).size>1)return {...result,reason:'resource_identity_conflict'};
+        const cached=readMediaResource(cache,binding,{executionBudget:budget});
+        if(cached.status==='available')return {...result,state:'available',reason:null};
+        if(cached.status==='invalid')return {...result,reason:cached.reason};
+        if(imageResourceCapability(slot,deps.resourceCapability)!=='message_image')return {...result,reason:'resource_endpoint_unverified'};
+        const planned={...result,state:'planned',reason:null},sourceFence=makeMediaPendingSourceFence(row);
+        if(!sourceFence)return {...result,reason:'source_binding_invalid'};
+        candidates.push({row,account,media,binding,sourceFence,entry:planned});return planned;
+      });
+    });
+    budget.assertReady();
+  } catch(error) {
+    if(!(error instanceof HistoryCommandBudgetError))throw error;
+    report.stop_reason=error.reason;report.request_budget=zeroBudget();
+    results=(exact??options.recordIds.map(record_id=>({record_id}))).map(target=>({...target,state:'blocked',reason:'batch_stopped',
+      failure:{stage:'selection',reason:error.reason}}));
+    return finish();
+  }
   if(options.apply!==true || !candidates.length)return finish();
   // Staging stays outside the source DB/store until all remote and local fences
   // pass. The private directory is removed even after a timeout/denial.
-  const stage=mkdtempSync(join(realpathSync(deps.tmpdir || tmpdir()),'exocortex-media-'));
-  let session;
+  let stage;
   /** @type {Row|null} */ let activeCandidate=null;
   let activeAttempts=0;
   let openingAtMs=null,originalClosingAtMs=null;
   let failureStage='opening_account';
   /** @type {Row|null} */ let failureOwner=null;
   try {
-    const sessionDeps={env:deps.env,now:deps.now,...deps.requestSessionDeps};
+    budget.assertReady();
+    stage=mkdtempSync(join(realpathSync(deps.tmpdir || tmpdir()),'exocortex-media-'));
+    budget.assertReady();
+    const sessionDeps={env:deps.env,now:deps.now,...deps.requestSessionDeps,commandBudget:budget};
     const executor=sessionDeps.spawnSync || spawnSync;
     sessionDeps.spawnSync=(command,args,settings)=>executor(deps.pythonPath || 'python3',
       ['-B','-c',GUARD,command,...args],{...settings,cwd:stage});
@@ -195,12 +228,12 @@ export function enrichResources(options,deps={}) {
     if(candidates.some(candidate=>candidate.account.account_key!==account))throw localFailure('account_mismatch');
     openingAtMs=now();
     failureStage='pending_recovery';
-    const prepared=reclaimPendingMediaResources(cache,{nowMs:now()});
+    const prepared=reclaimPendingMediaResources(cache,{nowMs:now()},{executionBudget:budget});
     if(prepared.status!=='ready')throw localFailure(prepared.reason);
     for(const [index,candidate] of candidates.entries()) {
       failureOwner=candidate;
       failureStage='pending_recovery';
-      const pending=readPendingMediaResource(cache,candidate.binding,candidate.sourceFence,{nowMs:now()});
+      const pending=readPendingMediaResource(cache,candidate.binding,candidate.sourceFence,{nowMs:now()},{executionBudget:budget});
       if(pending.status==='invalid')throw localFailure('resource_pending_invalid');
       if(pending.status==='pending') {
         candidate.bytes=pending.bytes;candidate.continuation=pending;
@@ -223,7 +256,7 @@ export function enrichResources(options,deps={}) {
         '--as','user','--params','{"type":"image"}','--output',filename,'--format','json']);
       failureStage='download_validation';
       try {
-        candidate.bytes=readDownload(stage,filename,response);candidate.entry.state='verified_download';
+        candidate.bytes=readDownload(stage,filename,response,budget);candidate.entry.state='verified_download';
       } catch(error) {
         const reason=/** @type {Row} */(error)?.resourceReason;
         if(!itemContentFailures.has(reason))throw error;
@@ -242,6 +275,7 @@ export function enrichResources(options,deps={}) {
     session.withCommit(()=>{
       const current=snapshot(options.db,selection).rows;
       for(const candidate of downloaded) {
+        budget.assertReady();
         failureOwner=candidate;
         failureStage='source_fence';
         const publicationAtMs=now();
@@ -253,14 +287,16 @@ export function enrichResources(options,deps={}) {
           candidate.entry.state='blocked';candidate.entry.reason='source_changed';candidate.entry.failure={stage:'source_fence',reason:'source_changed'};continue;
         }
         failureStage='publication';
-        const saved=publishMediaResource(cache,candidate.binding,candidate.bytes,{nowMs:publicationAtMs});
+        budget.assertReady();candidate.entry.publication_state='unknown';
+        const saved=publishMediaResource(cache,candidate.binding,candidate.bytes,{nowMs:publicationAtMs},{executionBudget:budget});
+        if(saved.status==='available')candidate.entry.publication_state='confirmed';
         candidate.entry.state=saved.status==='available'?'available':'blocked';
         candidate.entry.reason=saved.status==='available'?null:saved.reason;
         if(saved.status!=='available')candidate.entry.failure=normalizeResourceFailure({stage:'publication',reason:saved.reason});
         if(saved.status!=='available')throw localFailure('resource_publish_failed');
         const receipt=candidate.continuation?.receipt??candidate.quarantine?.receipt;
         if(receipt) {
-          const cleaned=discardPendingMediaResource(cache,receipt);
+          const cleaned=discardPendingMediaResource(cache,receipt,{executionBudget:budget});
           if(cleaned.status!=='removed')candidate.entry.pending_cleanup_reason=cleaned.reason;
         }
       }
@@ -268,28 +304,37 @@ export function enrichResources(options,deps={}) {
   } catch(error) {
     const reason=failure(error);report.stop_reason=reason;
     const diagnostic=resourceFailureFromError(error,failureStage);
-    if(resumableStops.has(reason)&&openingAtMs!==null) {
+    if(resumableStops.has(reason)&&openingAtMs!==null&&candidates.some(item=>item.entry.state==='verified_download')) {
       // Local retention never publishes available evidence or obtains an API
       // lease. Recheck the exact row before preserving this original operation.
       try {
-        const current=snapshot(options.db,selection).rows;
+        budget.runCleanup(()=>{
+          const current=snapshot(options.db,selection).rows;
+          for(const candidate of candidates.filter(item=>item.entry.state==='verified_download')) {
+            budget.assertReady();
+            const retentionAtMs=now();
+            if(candidate.continuation && !continuationCurrent(candidate.continuation,retentionAtMs)) {
+              candidate.entry.pending_state='not_retained';candidate.entry.pending_reason='resource_pending_expired';continue;
+            }
+            const row=current.find(row=>row.id===candidate.row.id);
+            if(!row||makeMediaPendingSourceFence(row)!==candidate.sourceFence) {
+              candidate.entry.state='blocked';candidate.entry.reason='source_changed';candidate.entry.failure={stage:'source_fence',reason:'source_changed'};continue;
+            }
+            candidate.entry.pending_state='unknown';
+            const retained=retainPendingMediaResource(cache,candidate.binding,candidate.sourceFence,candidate.bytes,{nowMs:retentionAtMs,
+              openingAtMs:candidate.continuation?.opening_at_ms??openingAtMs,
+              originalClosingAtMs:candidate.continuation?.original_closing_at_ms??originalClosingAtMs,stopReason:reason,
+              freshDownload:!candidate.continuation},{executionBudget:budget});
+            candidate.entry.pending_state=retained.status==='pending'?'retained':retained.status==='quarantined'?'quarantined':'not_retained';
+            if(!['pending','quarantined'].includes(retained.status))candidate.entry.pending_reason=retained.reason;
+          }
+        });
+      }catch(retentionError) {
+        report.pending_reason=retentionError instanceof HistoryCommandBudgetError?retentionError.reason:'resource_pending_invalid';
         for(const candidate of candidates.filter(item=>item.entry.state==='verified_download')) {
-          const retentionAtMs=now();
-          if(candidate.continuation && !continuationCurrent(candidate.continuation,retentionAtMs)) {
-            candidate.entry.pending_state='not_retained';candidate.entry.pending_reason='resource_pending_expired';continue;
-          }
-          const row=current.find(row=>row.id===candidate.row.id);
-          if(!row||makeMediaPendingSourceFence(row)!==candidate.sourceFence) {
-            candidate.entry.state='blocked';candidate.entry.reason='source_changed';candidate.entry.failure={stage:'source_fence',reason:'source_changed'};continue;
-          }
-          const retained=retainPendingMediaResource(cache,candidate.binding,candidate.sourceFence,candidate.bytes,{nowMs:retentionAtMs,
-            openingAtMs:candidate.continuation?.opening_at_ms??openingAtMs,
-            originalClosingAtMs:candidate.continuation?.original_closing_at_ms??originalClosingAtMs,stopReason:reason,
-            freshDownload:!candidate.continuation});
-          candidate.entry.pending_state=retained.status==='pending'?'retained':retained.status==='quarantined'?'quarantined':'not_retained';
-          if(!['pending','quarantined'].includes(retained.status))candidate.entry.pending_reason=retained.reason;
+          candidate.entry.pending_state ||= 'not_retained';candidate.entry.pending_reason ||= report.pending_reason;
         }
-      }catch {report.pending_reason='resource_pending_invalid';}
+      }
     }
     // A failed request is evidence about one resource, never its neighbors.
     // Pre-execution admission failures have no resource response to attribute.
@@ -307,8 +352,8 @@ export function enrichResources(options,deps={}) {
       }
     }
   } finally {
-    report.request_budget=session?.summary() || null;
-    rmSync(stage,{recursive:true,force:true});
+    report.request_budget=session?.summary() || (report.stop_reason?zeroBudget():null);
+    if(stage!==undefined)rmSync(stage,{recursive:true,force:true});
   }
   return finish();
 }

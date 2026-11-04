@@ -23,6 +23,24 @@ export class HistoryCommandBudgetError extends Error {
  */
 export function createHistoryCommandBudget(options, deps = {}) {
   if (!Number.isSafeInteger(options?.maxSeconds) || options.maxSeconds < 1 || options.maxSeconds > 30) throw new RangeError('invalid history command budget');
+  return createCommandBudget(options,deps,true);
+}
+
+/** Resource production uses the original full grant without adding a history
+ * reservation or resetting its invocation origin. The private brand is shared
+ * with the established session/media boundary, never reconstructed by shape.
+ * @param {{maxSeconds:number}} options
+ * @param {{monotonicClock?:()=>number,remainingTimeMs?:()=>number,startedMonotonicMs?:number}} [deps]
+ */
+export function createResourceCommandBudget(options,deps={}) {
+  if(!Number.isSafeInteger(options?.maxSeconds)||options.maxSeconds<1||options.maxSeconds>180)throw new RangeError('invalid resource command budget');
+  return createCommandBudget(options,deps,false);
+}
+
+/** @param {{maxSeconds:number}} options
+ * @param {{monotonicClock?:()=>number,remainingTimeMs?:()=>number,startedMonotonicMs?:number}} deps
+ * @param {boolean} reserveCleanup */
+function createCommandBudget(options,deps,reserveCleanup) {
   const clock = deps.monotonicClock || (() => performance.now());
   let created;
   try { created = clock(); } catch { created = NaN; }
@@ -35,7 +53,7 @@ export function createHistoryCommandBudget(options, deps = {}) {
   const grant = options.maxSeconds * 1000;
   // These are contained reservations, not extra grace or the sole deadline
   // protection. A blocked release is interrupted and remains an explicit error.
-  const completionReserve = Math.min(1000, Math.floor(grant / 4));
+  const completionReserve = reserveCleanup ? Math.min(1000, Math.floor(grant / 4)) : 0;
   const outputReserve = Math.min(100, Math.floor(completionReserve / 4));
   const fail = reason => { stopped = reason === 'clock_unavailable' ? reason : stopped || reason; throw new HistoryCommandBudgetError(stopped || 'clock_unavailable'); };
   function observe() {

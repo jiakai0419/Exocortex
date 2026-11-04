@@ -12,6 +12,8 @@ import { attestVerifiedImageRead, isImageSlot } from './media-image-slot.mjs';
 import { extractMessageResourceReferences } from './media-resource-references.mjs';
 
 /** @typedef {Record<string,any>} JsonObject */
+/** @typedef {ReturnType<typeof import('../../maintenance/history-command-budget.mjs').createHistoryCommandBudget>} MediaBudget */
+/** @typedef {{executionBudget?:MediaBudget}} MediaBudgetDeps */
 export const MAX_MEDIA_RESOURCE_BYTES = 16 * 1024 * 1024;
 const MAX_PIXELS = 40 * 1024 * 1024;
 const MAX_DECODED_BYTES = 64 * 1024 * 1024;
@@ -32,13 +34,21 @@ const exactKeys = (value, keys) => object(value) && Object.keys(value).length ==
 const text = (value, max = 2048) => typeof value === 'string' && value.length > 0 && value.length <= max && !/[\x00-\x1f\x7f-\x9f]/u.test(value);
 const keyValid = value => text(value) && !/[\s/:\\]/u.test(value);
 const errorCode = error => /** @type {NodeJS.ErrnoException} */ (error)?.code;
+/** @param {MediaBudgetDeps} deps */
+function mediaBudget(deps) {
+  const budget=deps.executionBudget;
+  if(budget!==undefined&&!isHistoryCommandBudget(budget))throw new TypeError('invalid media execution budget');
+  budget?.assertReady();return budget;
+}
 
 /** @param {string} db @param {string} [override] */
 export function resourceStorePath(db, override) { return override === undefined ? `${resolve(db)}.resources` : resolve(override); }
 
-/** DB growth/checkpoint/mtime is unrelated to source or resource identity. */
-function databaseIdentity(db) {
-  const path = realpathSync(db), info = lstatSync(path, { bigint: true });
+/** DB growth/checkpoint/mtime is unrelated to source or resource identity.
+ * @param {MediaBudget} [budget] */
+function databaseIdentity(db,budget=undefined) {
+  budget?.assertReady();const path = realpathSync(db);
+  budget?.assertReady();const info = lstatSync(path, { bigint: true });
   if (!info.isFile() || info.isSymbolicLink()) throw new Error('invalid_database');
   return { path, dev: String(info.dev), ino: String(info.ino) };
 }
@@ -112,7 +122,9 @@ export function makeMediaResourceBindings(db,row,accountKey,medias) {
   } catch {return Array.isArray(medias)?medias.map(()=>null):[];}
 }
 
-function normalizedBinding(binding) {
+/** @param {MediaBudget} [budget] */
+function normalizedBinding(binding,budget=undefined) {
+  budget?.assertReady();
   const embedded=binding?.schema==='lark_media_resource_binding/v2',keys=embedded?embeddedBindingKeys:bindingKeys;
   if (!exactKeys(binding, keys) || !['lark_media_resource_binding/v1','lark_media_resource_binding/v2'].includes(binding.schema)
     ||embedded&&(!['post','interactive'].includes(binding.message_type)||!['image_key','attachment_origin_key'].includes(binding.reference_kind))
@@ -123,7 +135,7 @@ function normalizedBinding(binding) {
     || !(binding.external_version === null || text(binding.external_version, 512))
     || !hashValid(binding.content_hash) || !hashValid(binding.account_key)
     || binding.type !== 'image' || !keyValid(binding.key)) throw new Error('invalid_binding');
-  const current = databaseIdentity(binding.database.path);
+  const current = databaseIdentity(binding.database.path,budget);
   if (JSON.stringify(current) !== JSON.stringify(binding.database)) throw new Error('database_changed');
   return Object.fromEntries(keys.map(key => [key, binding[key]]));
 }
@@ -380,32 +392,43 @@ export function assessMediaImageBytes(bytes,deps={}) {
 /** @param {Buffer} bytes */
 export function inspectMediaImageBytes(bytes) {return assessMediaImageBytes(bytes).image ?? null;}
 
-function directory(cacheDir, create) {
+/** @param {MediaBudget} [budget] */
+function directory(cacheDir, create,budget=undefined) {
+  budget?.assertReady();
   const requested = resolve(cacheDir), root = join(realpathSync(dirname(requested)), basename(requested));
-  if (create) { try { mkdirSync(root,{mode:0o700}); } catch(error) { if(errorCode(error)!=='EEXIST') throw error; } }
+  if (create) { budget?.assertReady();try { mkdirSync(root,{mode:0o700}); } catch(error) { if(errorCode(error)!=='EEXIST') throw error; } }
+  budget?.assertReady();
   const info = lstatSync(root,{bigint:true});
   if (!info.isDirectory() || info.isSymbolicLink() || !privateOwned(info)) throw new Error('unsafe_store');
   return { root, info };
 }
-function directoryUnchanged(dir) {
+/** @param {MediaBudget} [budget] */
+function directoryUnchanged(dir,budget=undefined) {
+  budget?.assertReady();
   const now=lstatSync(dir.root,{bigint:true});
   if (!now.isDirectory() || now.isSymbolicLink() || !sameDirectory(dir.info,now)) throw new Error('store_changed');
 }
-function readPrivateBytes(path, maximum, afterRead) {
+/** @param {MediaBudget} [budget] */
+function readPrivateBytes(path, maximum, afterRead,budget=undefined) {
   let fd;
   try {
+    budget?.assertReady();
     fd=openSync(path,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
+    budget?.assertReady();
     const before=fstatSync(fd,{bigint:true});
     if (!before.isFile() || before.nlink!==1n || !privateOwned(before) || before.size<1n || before.size>BigInt(maximum)) throw new Error('unsafe_file');
     const bytes=Buffer.alloc(Number(before.size)+1);let length=0;
-    while(length<bytes.length){const n=readSync(fd,bytes,length,bytes.length-length,length);if(!n)break;length+=n;}
-    afterRead?.();
-    const after=fstatSync(fd,{bigint:true}), current=lstatSync(path,{bigint:true});
+    while(length<bytes.length){budget?.assertReady();const n=readSync(fd,bytes,length,bytes.length-length,length);if(!n)break;length+=n;}
+    budget?.assertReady();afterRead?.();
+    budget?.assertReady();const after=fstatSync(fd,{bigint:true});
+    budget?.assertReady();const current=lstatSync(path,{bigint:true});
     if(length!==Number(before.size)||!current.isFile()||current.isSymbolicLink()||!same(before,after)||!same(after,current))throw new Error('file_changed');
     return {bytes:bytes.subarray(0,length),info:after};
   } finally { if(fd!==undefined)closeSync(fd); }
 }
-function fileUnchanged(path,info) {
+/** @param {MediaBudget} [budget] */
+function fileUnchanged(path,info,budget=undefined) {
+  budget?.assertReady();
   const now=lstatSync(path,{bigint:true});
   if(!now.isFile()||now.isSymbolicLink()||!same(info,now))throw new Error('file_changed');
 }
@@ -418,10 +441,10 @@ export function readMediaResource(cacheDir,binding,deps={}) {
   if(budget!==undefined&&!isHistoryCommandBudget(budget))throw new TypeError('invalid media read budget');
   budget?.assertReady();
   try {
-    const normalized=normalizedBinding(binding), digest=sha(JSON.stringify(normalized));
+    const normalized=normalizedBinding(binding,budget), digest=sha(JSON.stringify(normalized));
     budget?.assertReady();
-    const dir=directory(cacheDir,false), file=join(dir.root,`${digest}.json`);
-    const manifestFile=readPrivateBytes(file,MAX_MANIFEST_BYTES,undefined);
+    const dir=directory(cacheDir,false,budget), file=join(dir.root,`${digest}.json`);
+    const manifestFile=readPrivateBytes(file,MAX_MANIFEST_BYTES,undefined,budget);
     budget?.assertReady();
     const json=manifestFile.bytes.toString('utf8');validateJsonObjectText(json);const manifest=JSON.parse(json);
     if(!exactKeys(manifest,manifestKeys)||manifest.schema!=='lark_media_resource/v1'
@@ -430,7 +453,7 @@ export function readMediaResource(cacheDir,binding,deps={}) {
       ||typeof manifest.observed_at!=='string'||!Number.isFinite(Date.parse(manifest.observed_at))||Date.parse(manifest.observed_at)<0
       ||new Date(manifest.observed_at).toISOString()!==manifest.observed_at)throw new Error('invalid_manifest');
     budget?.assertReady();
-    const path=join(dir.root,`${manifest.sha256}.blob`), blobFile=readPrivateBytes(path,MAX_MEDIA_RESOURCE_BYTES,deps.afterBlobRead), asset=blobFile.bytes;
+    const path=join(dir.root,`${manifest.sha256}.blob`), blobFile=readPrivateBytes(path,MAX_MEDIA_RESOURCE_BYTES,deps.afterBlobRead,budget), asset=blobFile.bytes;
     budget?.assertReady();
     if(asset.length!==manifest.size_bytes||sha(asset)!==manifest.sha256)throw new Error('asset_changed');
     budget?.assertReady();
@@ -438,8 +461,8 @@ export function readMediaResource(cacheDir,binding,deps={}) {
     budget?.assertReady();
     if(!image)return finite('invalid',inspected.reason);
     if(image.mime_type!==manifest.mime_type)throw new Error('invalid_image');
-    fileUnchanged(file,manifestFile.info);fileUnchanged(path,blobFile.info);
-    directoryUnchanged(dir);normalizedBinding(binding);
+    fileUnchanged(file,manifestFile.info,budget);fileUnchanged(path,blobFile.info,budget);
+    directoryUnchanged(dir,budget);normalizedBinding(binding,budget);
     budget?.assertReady();
     return attestVerifiedImageRead(normalized,{status:'available',path,sha256:manifest.sha256,size_bytes:asset.length,mime_type:image.mime_type,
       binding_digest:digest,observed_at:manifest.observed_at});
@@ -451,37 +474,40 @@ export function readMediaResource(cacheDir,binding,deps={}) {
   }
 }
 
-function publishFile(dir,name,bytes) {
+/** @param {MediaBudget} [budget] */
+function publishFile(dir,name,bytes,budget=undefined) {
   const temporary=join(dir.root,`.${randomUUID()}.tmp`), target=join(dir.root,name);let fd;
   try {
-    directoryUnchanged(dir);fd=openSync(temporary,'wx',0o600);writeFileSync(fd,bytes);fsyncSync(fd);closeSync(fd);fd=undefined;
-    directoryUnchanged(dir);
+    directoryUnchanged(dir,budget);budget?.assertReady();fd=openSync(temporary,'wx',0o600);
+    budget?.assertReady();writeFileSync(fd,bytes);budget?.assertReady();fsyncSync(fd);closeSync(fd);fd=undefined;
+    directoryUnchanged(dir,budget);budget?.assertReady();
     try {linkSync(temporary,target);}catch(error){if(errorCode(error)!=='EEXIST')throw error;}
   } finally {if(fd!==undefined)closeSync(fd);try{unlinkSync(temporary);}catch{}}
-  directoryUnchanged(dir);return target;
+  directoryUnchanged(dir,budget);return target;
 }
 
 /** No replacement of an existing manifest; caller owns source/account admission.
  * @param {string} cacheDir @param {JsonObject|null} binding @param {Buffer} bytes
- * @param {{nowMs?:number}} [options] @param {{beforeManifest?:()=>void}} [deps] */
+ * @param {{nowMs?:number}} [options] @param {MediaBudgetDeps & {beforeManifest?:()=>void}} [deps] */
 export function publishMediaResource(cacheDir,binding,bytes,options={},deps={}) {
+  const budget=mediaBudget(deps);
   try {
     const {nowMs=Date.now()}=options;
-    const normalized=normalizedBinding(binding), digest=sha(JSON.stringify(normalized)), inspected=assessMediaImageBytes(bytes), image=inspected.image;
+    const normalized=normalizedBinding(binding,budget), digest=sha(JSON.stringify(normalized)), inspected=assessMediaImageBytes(bytes,{executionBudget:budget}), image=inspected.image;
     if(!image)return finite('invalid',inspected.reason);
     if(!Number.isSafeInteger(nowMs)||nowMs<0||!Number.isFinite(new Date(nowMs).getTime()))return finite('invalid','resource_time_invalid');
-    const existing=readMediaResource(cacheDir,binding);
+    const existing=readMediaResource(cacheDir,binding,{executionBudget:budget});
     if(existing.status==='available')return existing;
     if(existing.status==='invalid')return existing;
-    const dir=directory(cacheDir,true), hash=sha(bytes), blob=publishFile(dir,`${hash}.blob`,bytes);
-    const checked=readPrivateBytes(blob,MAX_MEDIA_RESOURCE_BYTES,undefined);
+    const dir=directory(cacheDir,true,budget), hash=sha(bytes), blob=publishFile(dir,`${hash}.blob`,bytes,budget);
+    const checked=readPrivateBytes(blob,MAX_MEDIA_RESOURCE_BYTES,undefined,budget);
     if(!checked.bytes.equals(bytes))return finite('invalid','resource_verification_failed');
-    deps.beforeManifest?.();normalizedBinding(binding);
+    budget?.assertReady();deps.beforeManifest?.();normalizedBinding(binding,budget);
     const manifest={schema:'lark_media_resource/v1',binding:normalized,binding_digest:digest,sha256:hash,
       size_bytes:bytes.length,mime_type:image.mime_type,observed_at:new Date(nowMs).toISOString()};
-    publishFile(dir,`${digest}.json`,Buffer.from(JSON.stringify(manifest)+'\n'));
-    return readMediaResource(cacheDir,binding);
-  }catch{return finite('invalid','resource_publish_failed');}
+    publishFile(dir,`${digest}.json`,Buffer.from(JSON.stringify(manifest)+'\n'),budget);
+    return readMediaResource(cacheDir,binding,{executionBudget:budget});
+  }catch(error){if(budget&&error instanceof HistoryCommandBudgetError)throw error;budget?.assertReady();return finite('invalid','resource_publish_failed');}
 }
 
 // Explicit maintenance continuation only. The normal reader above never opens
@@ -503,134 +529,159 @@ export function makeMediaPendingSourceFence(row) {
     !Object.hasOwn(row,key) || !(row[key]===null || typeof row[key]==='string' || typeof row[key]==='number' && Number.isFinite(row[key])))) return null;
   return sha(JSON.stringify(MEDIA_RESOURCE_SOURCE_FIELDS.map(key=>[key,row[key]])));
 }
-function pendingDirectory(cache,create) {
-  const outer=directory(cache,create), dir=directory(join(outer.root,'pending-v1'),create);
-  directoryUnchanged(outer);return dir;
+/** @param {MediaBudget} [budget] */
+function pendingDirectory(cache,create,budget=undefined) {
+  const outer=directory(cache,create,budget), dir=directory(join(outer.root,'pending-v1'),create,budget);
+  directoryUnchanged(outer,budget);return dir;
 }
-function readPendingJson(dir,name,keys) {
-  const file=readPrivateBytes(join(dir.root,name),MAX_MANIFEST_BYTES,undefined),json=file.bytes.toString('utf8');
+/** @param {MediaBudget} [budget] */
+function readPendingJson(dir,name,keys,budget=undefined) {
+  const file=readPrivateBytes(join(dir.root,name),MAX_MANIFEST_BYTES,undefined,budget),json=file.bytes.toString('utf8');
   validateJsonObjectText(json);const value=JSON.parse(json);
   if(!exactKeys(value,keys))throw new Error('pending_manifest_invalid');
   return {value,info:file.info};
 }
-function pendingClaim(dir) {
-  const claim=readPendingJson(dir,'claim.json',claimKeys);
+/** @param {MediaBudget} [budget] */
+function pendingClaim(dir,budget=undefined) {
+  const claim=readPendingJson(dir,'claim.json',claimKeys,budget);
   if(claim.value.schema!=='lark_media_pending_claim/v1'||!validGeneration(claim.value.generation)||!validTime(claim.value.created_at_ms))
     throw new Error('pending_claim_invalid');
   return claim;
 }
-function pendingManifest(dir) {
-  const claim=pendingClaim(dir), file=readPendingJson(dir,'manifest.json',pendingKeys),m=file.value;
+/** @param {MediaBudget} [budget] */
+function pendingManifest(dir,budget=undefined) {
+  const claim=pendingClaim(dir,budget), file=readPendingJson(dir,'manifest.json',pendingKeys,budget),m=file.value;
   if(m.schema!=='lark_media_pending/v1'||m.generation!==claim.value.generation||m.created_at_ms!==claim.value.created_at_ms
     ||!hashValid(m.source_fence)||!hashValid(m.sha256)||!Number.isSafeInteger(m.size_bytes)||m.size_bytes<1||m.size_bytes>MAX_MEDIA_RESOURCE_BYTES
     ||!validTime(m.opening_at_ms)||m.opening_at_ms>m.created_at_ms||!validTime(m.expires_at_ms)||m.expires_at_ms-m.created_at_ms!==MEDIA_PENDING_TTL_MS
     ||!(m.original_closing_at_ms===null||validTime(m.original_closing_at_ms)&&m.original_closing_at_ms>=m.opening_at_ms&&m.original_closing_at_ms<=m.created_at_ms)
     ||!resumableStops.has(m.stop_reason))throw new Error('pending_manifest_invalid');
-  fileUnchanged(join(dir.root,'claim.json'),claim.info);directoryUnchanged(dir);
+  fileUnchanged(join(dir.root,'claim.json'),claim.info,budget);directoryUnchanged(dir,budget);
   return {...file,claim};
 }
 // A private, nonblocking file lock serializes only local slot mutation/GC.
 // flock is on the inherited open-file description, retained by this Node fd;
 // process death releases it. This is unrelated to the API admission lease.
-function withPendingMutation(cache,callback) {
+/** @param {MediaBudget} [budget] */
+function withPendingMutation(cache,callback,budget=undefined) {
   let fd;
   try {
-    const dir=pendingDirectory(cache,true),path=join(dir.root,'.mutation.lock');
+    const dir=pendingDirectory(cache,true,budget),path=join(dir.root,'.mutation.lock');
+    budget?.assertReady();
     fd=openSync(path,constants.O_RDWR|constants.O_CREAT|constants.O_NOFOLLOW|constants.O_NONBLOCK,0o600);
+    budget?.assertReady();
     const info=fstatSync(fd,{bigint:true});
     if(!info.isFile()||info.nlink!==1n||!privateOwned(info)||info.size!==0n)throw new Error('pending_lock_invalid');
+    budget?.assertReady();
+    const timeout=budget?budget.timeoutMs(1000):1000;
     const lock=spawnSync('python3',['-B','-c','import fcntl,sys\ntry: fcntl.flock(3,fcntl.LOCK_EX|fcntl.LOCK_NB)\nexcept BlockingIOError: sys.exit(73)'],
-      {stdio:['ignore','ignore','ignore',fd],timeout:1000});
+      {stdio:['ignore','ignore','ignore',fd],timeout});
+    budget?.assertReady();
     if(lock.status===73)return finite('blocked','resource_pending_busy');
     if(lock.status!==0||lock.error)throw new Error('pending_lock_failed');
-    fileUnchanged(path,info);directoryUnchanged(dir);
+    fileUnchanged(path,info,budget);directoryUnchanged(dir,budget);
     const result=callback(dir);
-    fileUnchanged(path,info);directoryUnchanged(dir);return result;
-  }catch{return finite('invalid','resource_pending_invalid');}
+    fileUnchanged(path,info,budget);directoryUnchanged(dir,budget);budget?.assertReady();return result;
+  }catch(error){if(budget&&error instanceof HistoryCommandBudgetError)throw error;budget?.assertReady();return finite('invalid','resource_pending_invalid');}
   finally{if(fd!==undefined)closeSync(fd);}
 }
 const pendingStatKeys=['dev','ino','size','mtimeNs','ctimeNs','mode','uid','nlink'];
 const pendingStat=info=>Object.fromEntries(pendingStatKeys.map(key=>[key,String(info[key])]));
-function capturePendingSlot(parent,slot) {
-  const dir=directory(join(parent.root,slot),false),names=readdirSync(dir.root).sort();
+/** @param {MediaBudget} [budget] */
+function capturePendingSlot(parent,slot,budget=undefined) {
+  const dir=directory(join(parent.root,slot),false,budget);budget?.assertReady();const names=readdirSync(dir.root).sort();
   /** @type {JsonObject[]} */ const files=names.map(name=>{
     if(!['claim.json','manifest.json','payload.blob'].includes(name))throw new Error('pending_unknown_file');
-    const info=lstatSync(join(dir.root,name),{bigint:true});
+    budget?.assertReady();const info=lstatSync(join(dir.root,name),{bigint:true});
     if(!info.isFile()||info.isSymbolicLink()||info.nlink!==1n||!privateOwned(info)||info.size>BigInt(MAX_MEDIA_RESOURCE_BYTES))throw new Error('pending_unsafe_file');
     return {name,...pendingStat(info)};
   });
-  directoryUnchanged(dir);
+  directoryUnchanged(dir,budget);
   return {dir,receipt:{slot,dev:String(dir.info.dev),ino:String(dir.info.ino),files}};
 }
-function removePendingSlot(parent,expected) {
-  const current=capturePendingSlot(parent,expected.slot),dir=current.dir;
+/** @param {MediaBudget} [budget] */
+function removePendingSlot(parent,expected,budget=undefined) {
+  const current=capturePendingSlot(parent,expected.slot,budget),dir=current.dir;
   if(JSON.stringify(current.receipt)!==JSON.stringify(expected))throw new Error('pending_replaced');
   for(const file of expected.files){
-    const path=join(dir.root,file.name),info=lstatSync(path,{bigint:true});
+    budget?.assertReady();const path=join(dir.root,file.name),info=lstatSync(path,{bigint:true});
     if(JSON.stringify({name:file.name,...pendingStat(info)})!==JSON.stringify(file))throw new Error('pending_replaced');
-    directoryUnchanged(dir);unlinkSync(path);
+    directoryUnchanged(dir,budget);budget?.assertReady();unlinkSync(path);
   }
-  directoryUnchanged(dir);rmdirSync(dir.root);directoryUnchanged(parent);
+  directoryUnchanged(dir,budget);budget?.assertReady();rmdirSync(dir.root);directoryUnchanged(parent,budget);
 }
 // No link/unlink publication window: an interrupted exclusive write is merely
 // incomplete pending data. Never used for available-resource publication.
-function writePendingFile(dir,name,bytes) {
+/** @param {MediaBudget} [budget] */
+function writePendingFile(dir,name,bytes,budget=undefined) {
   let fd;const path=join(dir.root,name);
-  try{directoryUnchanged(dir);fd=openSync(path,'wx',0o600);writeFileSync(fd,bytes);fsyncSync(fd);}
+  try{directoryUnchanged(dir,budget);budget?.assertReady();fd=openSync(path,'wx',0o600);
+    budget?.assertReady();writeFileSync(fd,bytes);budget?.assertReady();fsyncSync(fd);}
   finally{if(fd!==undefined)closeSync(fd);}
-  directoryUnchanged(dir);
+  directoryUnchanged(dir,budget);
 }
+/** @param {MediaBudgetDeps & {beforeReclaim?:()=>void}} [deps] */
 function reclaimExpiredPending(parent,nowMs,deps={}) {
+  const budget=deps.executionBudget;
   for(const slot of slots) {
+    budget?.assertReady();
     let captured;
-    try{captured=capturePendingSlot(parent,slot);}catch(error){if(errorCode(error)==='ENOENT')continue;throw error;}
+    try{captured=capturePendingSlot(parent,slot,budget);}catch(error){if(errorCode(error)==='ENOENT')continue;throw error;}
     const {dir,receipt}=captured;let created;
     try{
-      const claim=pendingClaim(dir);created=claim.value.created_at_ms;
+      const claim=pendingClaim(dir,budget);created=claim.value.created_at_ms;
       if(JSON.stringify({name:'claim.json',...pendingStat(claim.info)})!==JSON.stringify(receipt.files.find(file=>file.name==='claim.json')))
         throw new Error('pending_replaced');
     }catch(error){
+      if(budget&&error instanceof HistoryCommandBudgetError)throw error;
       if(error instanceof Error&&error.message==='pending_replaced'||receipt.files.some(file=>['payload.blob','manifest.json'].includes(file.name)))throw error;
       // An incomplete first claim has no trustworthy logical time. Its entire
       // known private file set must age for an hour by filesystem timestamps.
       created=Math.max(Number(dir.info.birthtimeMs),...receipt.files.flatMap(file=>[Number(file.mtimeNs)/1e6,Number(file.ctimeNs)/1e6]));
     }
     if(!Number.isFinite(created)||created<0||created>nowMs)throw new Error('pending_clock_invalid');
-    if(nowMs-created>=MEDIA_PENDING_TTL_MS){deps.beforeReclaim?.();removePendingSlot(parent,receipt);}
+    if(nowMs-created>=MEDIA_PENDING_TTL_MS){deps.beforeReclaim?.();removePendingSlot(parent,receipt,budget);}
   }
 }
-/** Explicit apply only. Reads/messages never initialize or prune this cache. */
+/** Explicit apply only. Reads/messages never initialize or prune this cache.
+ * @param {string} cache @param {{nowMs?:number}} [options]
+ * @param {MediaBudgetDeps & {beforeReclaim?:()=>void}} [deps] */
 export function reclaimPendingMediaResources(cache,options={},deps={}) {
+  const budget=mediaBudget(deps);
   const nowMs=options.nowMs??Date.now();if(!validTime(nowMs))return finite('invalid','resource_pending_invalid');
-  try{pendingDirectory(cache,false);}catch(error){return errorCode(error)==='ENOENT'?finite('ready',null):finite('invalid','resource_pending_invalid');}
-  return withPendingMutation(cache,parent=>{reclaimExpiredPending(parent,nowMs,deps);return finite('ready',null);});
+  try{pendingDirectory(cache,false,budget);}catch(error){if(budget&&error instanceof HistoryCommandBudgetError)throw error;budget?.assertReady();return errorCode(error)==='ENOENT'?finite('ready',null):finite('invalid','resource_pending_invalid');}
+  return withPendingMutation(cache,parent=>{reclaimExpiredPending(parent,nowMs,deps);return finite('ready',null);},budget);
 }
 
-/** Read-only; exact original binding and source fence, including row ID. */
+/** Read-only; exact original binding and source fence, including row ID.
+ * @param {string} cache @param {JsonObject|null} binding @param {string|null} sourceFence
+ * @param {{nowMs?:number}} [options] @param {MediaBudgetDeps & {afterBlobRead?:()=>void}} [deps] */
 export function readPendingMediaResource(cache,binding,sourceFence,options={},deps={}) {
+  const budget=mediaBudget(deps);
   try {
-    const nowMs=options.nowMs??Date.now(),normalized=normalizedBinding(binding);
+    const nowMs=options.nowMs??Date.now(),normalized=normalizedBinding(binding,budget);
     if(!validTime(nowMs)||!hashValid(sourceFence))throw new Error('pending_context_invalid');
     let parent;
-    try{parent=pendingDirectory(cache,false);}catch(error){if(errorCode(error)==='ENOENT')return finite('missing','resource_pending_missing');throw error;}
+    try{parent=pendingDirectory(cache,false,budget);}catch(error){if(errorCode(error)==='ENOENT')return finite('missing','resource_pending_missing');throw error;}
     let found=null;
     for(const slot of slots) {
+      budget?.assertReady();
       let dir,document;
-      try{dir=directory(join(parent.root,slot),false);document=pendingManifest(dir);}
+      try{dir=directory(join(parent.root,slot),false,budget);document=pendingManifest(dir,budget);}
       catch(error){
         if(errorCode(error)==='ENOENT'){
-          if(dir && readdirSync(dir.root).includes('manifest.json'))throw new Error('pending_incomplete_manifest');
+          budget?.assertReady();if(dir && readdirSync(dir.root).includes('manifest.json'))throw new Error('pending_incomplete_manifest');
           continue;
         }throw error;
       }
       const m=document.value;
       if(m.created_at_ms>nowMs)throw new Error('pending_clock_invalid');
       if(m.expires_at_ms<=nowMs||m.source_fence!==sourceFence||JSON.stringify(m.binding)!==JSON.stringify(normalized))continue;
-      const file=readPrivateBytes(join(dir.root,'payload.blob'),MAX_MEDIA_RESOURCE_BYTES,deps.afterBlobRead),image=assessMediaImageBytes(file.bytes).image;
+      const file=readPrivateBytes(join(dir.root,'payload.blob'),MAX_MEDIA_RESOURCE_BYTES,deps.afterBlobRead,budget),image=assessMediaImageBytes(file.bytes,{executionBudget:budget}).image;
       if(file.bytes.length!==m.size_bytes||sha(file.bytes)!==m.sha256||!image||image.mime_type!==m.mime_type)throw new Error('pending_payload_invalid');
-      fileUnchanged(join(dir.root,'manifest.json'),document.info);fileUnchanged(join(dir.root,'payload.blob'),file.info);
-      directoryUnchanged(dir);directoryUnchanged(parent);normalizedBinding(binding);
-      const captured=capturePendingSlot(parent,slot);
+      fileUnchanged(join(dir.root,'manifest.json'),document.info,budget);fileUnchanged(join(dir.root,'payload.blob'),file.info,budget);
+      directoryUnchanged(dir,budget);directoryUnchanged(parent,budget);normalizedBinding(binding,budget);
+      const captured=capturePendingSlot(parent,slot,budget);
       if(!sameDirectory(dir.info,captured.dir.info)||[["claim.json",document.claim.info],["manifest.json",document.info],["payload.blob",file.info]].some(([name,info])=>
         JSON.stringify({name,...pendingStat(info)})!==JSON.stringify(captured.receipt.files.find(entry=>entry.name===name))))throw new Error('pending_replaced');
       const current={status:m.original_closing_at_ms===null?'quarantined':'pending',reason:m.original_closing_at_ms===null?'resource_pending_account_unverified':null,
@@ -640,49 +691,55 @@ export function readPendingMediaResource(cache,binding,sourceFence,options={},de
       if(found && (!found.bytes.equals(current.bytes)||found.original_closing_at_ms!==current.original_closing_at_ms))throw new Error('pending_conflict');
       if(!found||current.expires_at_ms<found.expires_at_ms)found=current;
     }
-    return found??finite('missing','resource_pending_missing');
-  }catch{return finite('invalid','resource_pending_invalid');}
+    budget?.assertReady();return found??finite('missing','resource_pending_missing');
+  }catch(error){if(budget&&error instanceof HistoryCommandBudgetError)throw error;budget?.assertReady();return finite('invalid','resource_pending_invalid');}
 }
 
-/** Persist validated bytes without any available-resource publication. */
+/** Persist validated bytes without any available-resource publication.
+ * @param {string} cache @param {JsonObject|null} binding @param {string|null} sourceFence @param {Buffer} bytes
+ * @param {{nowMs?:number,openingAtMs:number,originalClosingAtMs?:number|null,stopReason:string,freshDownload?:boolean}} options
+ * @param {MediaBudgetDeps & {beforeReclaim?:()=>void,beforeReplace?:()=>void}} [deps] */
 export function retainPendingMediaResource(cache,binding,sourceFence,bytes,options,deps={}) {
+  const budget=mediaBudget(deps);
   try {
-    const normalized=normalizedBinding(binding),image=assessMediaImageBytes(bytes).image;
+    const normalized=normalizedBinding(binding,budget),image=assessMediaImageBytes(bytes,{executionBudget:budget}).image;
     const {nowMs=Date.now(),openingAtMs,originalClosingAtMs=null,stopReason,freshDownload=false}=options;
     if(!image||!hashValid(sourceFence)||!validTime(nowMs)||!validTime(openingAtMs)||openingAtMs>nowMs
       ||!(originalClosingAtMs===null||validTime(originalClosingAtMs)&&originalClosingAtMs>=openingAtMs&&originalClosingAtMs<=nowMs)
       ||!resumableStops.has(stopReason)||!validTime(nowMs+MEDIA_PENDING_TTL_MS))return finite('invalid','resource_pending_invalid');
     return withPendingMutation(cache,parent=>{
       reclaimExpiredPending(parent,nowMs,deps);
-      const existing=readPendingMediaResource(cache,binding,sourceFence,{nowMs});
+      const existing=readPendingMediaResource(cache,binding,sourceFence,{nowMs},{executionBudget:budget});
       if(['pending','quarantined'].includes(existing.status)) {
         if(!existing.bytes.equals(bytes))return finite('invalid','resource_pending_conflict');
         if(!(existing.status==='quarantined'&&freshDownload===true&&originalClosingAtMs!==null))return existing;
         // This is a newly downloaded operation with its own closing proof,
         // never an upgrade from a later profile over the old quarantined bytes.
         const {slot,dev,ino,files}=existing.receipt;deps.beforeReplace?.();
-        removePendingSlot(parent,{slot,dev,ino,files});
+        removePendingSlot(parent,{slot,dev,ino,files},budget);
       } else if(existing.status!=='missing')return existing;
-      const slot=slots.find(name=>{try{lstatSync(join(parent.root,name));return false;}catch(error){if(errorCode(error)==='ENOENT')return true;throw error;}});
+      const slot=slots.find(name=>{budget?.assertReady();try{lstatSync(join(parent.root,name));return false;}catch(error){if(errorCode(error)==='ENOENT')return true;throw error;}});
       if(!slot)return finite('blocked','resource_pending_capacity');
-      mkdirSync(join(parent.root,slot),{mode:0o700});const dir=directory(join(parent.root,slot),false),generation=randomUUID();
-      writePendingFile(dir,'claim.json',Buffer.from(JSON.stringify({schema:'lark_media_pending_claim/v1',generation,created_at_ms:nowMs})+'\n'));
-      writePendingFile(dir,'payload.blob',bytes);normalizedBinding(binding);
+      budget?.assertReady();mkdirSync(join(parent.root,slot),{mode:0o700});const dir=directory(join(parent.root,slot),false,budget),generation=randomUUID();
+      writePendingFile(dir,'claim.json',Buffer.from(JSON.stringify({schema:'lark_media_pending_claim/v1',generation,created_at_ms:nowMs})+'\n'),budget);
+      writePendingFile(dir,'payload.blob',bytes,budget);normalizedBinding(binding,budget);
       const manifest={schema:'lark_media_pending/v1',generation,binding:normalized,source_fence:sourceFence,sha256:sha(bytes),size_bytes:bytes.length,
         mime_type:image.mime_type,opening_at_ms:openingAtMs,original_closing_at_ms:originalClosingAtMs,created_at_ms:nowMs,
         expires_at_ms:nowMs+MEDIA_PENDING_TTL_MS,stop_reason:stopReason};
-      writePendingFile(dir,'manifest.json',Buffer.from(JSON.stringify(manifest)+'\n'));
-      return readPendingMediaResource(cache,binding,sourceFence,{nowMs});
-    });
-  }catch{return finite('invalid','resource_pending_invalid');}
+      writePendingFile(dir,'manifest.json',Buffer.from(JSON.stringify(manifest)+'\n'),budget);
+      return readPendingMediaResource(cache,binding,sourceFence,{nowMs},{executionBudget:budget});
+    },budget);
+  }catch(error){if(budget&&error instanceof HistoryCommandBudgetError)throw error;budget?.assertReady();return finite('invalid','resource_pending_invalid');}
 }
-/** Delete only a consumed exact generation; no replacement or arbitrary path. */
-export function discardPendingMediaResource(cache,receipt) {
+/** Delete only a consumed exact generation; no replacement or arbitrary path.
+ * @param {string} cache @param {JsonObject} receipt @param {MediaBudgetDeps} [deps] */
+export function discardPendingMediaResource(cache,receipt,deps={}) {
+  const budget=mediaBudget(deps);
   if(!exactKeys(receipt,['slot','dev','ino','files','generation','manifest_sha256'])||!slots.includes(receipt.slot)||!validGeneration(receipt.generation)||!hashValid(receipt.manifest_sha256))
     return finite('invalid','resource_pending_invalid');
   return withPendingMutation(cache,parent=>{
-    const dir=directory(join(parent.root,receipt.slot),false),document=pendingManifest(dir);
+    const dir=directory(join(parent.root,receipt.slot),false,budget),document=pendingManifest(dir,budget);
     if(document.value.generation!==receipt.generation||sha(JSON.stringify(document.value))!==receipt.manifest_sha256)throw new Error('pending_replaced');
-    const {slot,dev,ino,files}=receipt;removePendingSlot(parent,{slot,dev,ino,files});return finite('removed',null);
-  });
+    const {slot,dev,ino,files}=receipt;removePendingSlot(parent,{slot,dev,ino,files},budget);return finite('removed',null);
+  },budget);
 }

@@ -224,7 +224,13 @@ function createMaintenanceRequestSession(options = {}, deps = {}) {
     // A successful storage response is a committed receipt. A later clock
     // observation must stop new work, not erase those already durable effects.
     let primary;
-    try { markReplayActionEntered(executionEvidence);return action(); }
+    try {
+      // Admission can itself consume the remaining grant. Recheck the same
+      // command budget before entering a producer/storage action, not after its
+      // confirmed effects. Legacy unbudgeted callers keep their old contract.
+      if(commandBudget)commandRemaining(Math.min(2000,deadline-elapsedNow()));
+      markReplayActionEntered(executionEvidence);return action();
+    }
     catch (error) { primary=error;throw error; }
     // This release only closes our already-owned descriptor; it never starts
     // another process or write. Always close it even when the clock has expired.
