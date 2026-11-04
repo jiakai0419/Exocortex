@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import childProcess, { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, readdirSync, copyFileSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,6 +11,8 @@ import test from 'node:test';
 import { commitBoundedReplayRecords, ensureInitialized, quoteSql, releaseMaintenanceLock, REVIEW_LIFETIME_MS,
   sqliteExec, sqliteQuery, upsertRecordsSql } from '../dist/storage/sqlite/ingestion-store.js';
 import { BoundedReplayCleanupError } from '../dist/storage/sqlite/lark-ingestion.js';
+import { initializeDatabase } from '../dist/storage/sqlite/initialize.js';
+import { createReplayExecutionEvidence, readReplayExecutionEvidence } from '../dist/storage/sqlite/execution-evidence.js';
 
 // Only authored databases and test-owned SQLite processes are used. No adapter,
 // API lease, cooldown root or user configuration is involved in this storage seam.
@@ -35,11 +37,11 @@ function record(version = 100) {
       sender_id_type: 'open_id', chat_id: CHAT, chat_type: 'group', msg_type: 'text', text: `Synthetic storage body ${version}` }) };
 }
 
-function fixture(t) {
+function fixture(t, initialize = ensureInitialized) {
   const dir = mkdtempSync(join(tmpdir(), 'synthetic-history-storage-budget-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const db = join(dir, 'synthetic.sqlite');
-  ensureInitialized(db);
+  initialize(db);
   sqliteExec(db, `UPDATE sources SET config_json=${quoteSql(SOURCE_CONFIG)} WHERE id='lark.im';
     INSERT INTO sync_scopes(id,source_id,name,config_json) VALUES(${quoteSql(SCOPE)},'lark.im','Synthetic budget scope',${quoteSql(SCOPE_CONFIG)});
     ${upsertRecordsSql([record()])}`, 'seed synthetic command storage');
@@ -53,6 +55,93 @@ function options(f, overrides = {}) {
     planId: '1'.repeat(64), attemptId: 'synthetic-command-attempt', selfIdHash: '2'.repeat(64),
     pages: 1, fetchedCount: 1, records: [record(101)], ...overrides };
 }
+
+function historyInput(f, attempt) {
+  const now=Date.now(),before=read(f.db,'SELECT * FROM records ORDER BY id;');
+  const progress=read(f.db,`SELECT * FROM lark_im_history_progress WHERE scope_id=${quoteSql(f.scope.id)};`)[0];
+  const generation=read(f.db,`SELECT generation FROM record_observation_state WHERE record_id=${before[0].id};`)[0].generation;
+  return options(f,{records:[record()],attemptId:attempt,executionBudget:budget(),
+    executionEvidence:createReplayExecutionEvidence(attempt,'a'.repeat(64)),
+    observationAcquisition:{attempt,startedAtMs:now,basis:new Map([[record().external_id,generation]]),confirm:true,contextKey:'3'.repeat(64)},
+    reviewFence:{createdAtMs:now,expiresAtMs:now+REVIEW_LIFETIME_MS,sourceConfigJson:SOURCE_CONFIG,sentActor:null,
+      records:before,scopes:[f.scope]},
+    history:{generation:progress?.generation||0,afterId:progress?.after_id||0,sweepMaxId:progress?.sweep_max_id||0,
+      completedSweeps:progress?.completed_sweeps||0,selectedId:before[0].id,nextSweepMaxId:before[0].id,
+      startedAtMs:now,error:null,requestBudget:{}}});
+}
+
+test('marked history receipts retain newest 64 plus all current references and never evict unmarked manual audits',t=>{
+  const f=fixture(t),manual=commitBoundedReplayRecords(f.db,options(f,{records:[record()]}));
+  const audits=[];
+  for(let i=0;i<70;i++) {
+    const input=historyInput(f,`invented-retention-${i}`),r=commitBoundedReplayRecords(f.db,input);audits.push(r.audit_id);
+    assert.equal(readReplayExecutionEvidence(input.executionEvidence).receipt_validated,true);
+    if(i===0)sqliteExec(f.db,`INSERT INTO lark_im_history_scheduler(id,generation,priority_streak,last_attempt_id,last_result_json,fair_round)
+      VALUES(1,1,0,'invented-retained-scheduler',${quoteSql(JSON.stringify({effects:{audit_id:r.audit_id}}))},0);`,'retain scheduler audit');
+    if(i===1)sqliteExec(f.db,`INSERT INTO lark_im_history_debt(record_id,scope_id,finding_key,database_key,account_key,context_fingerprint,debt_fingerprint,debts_json,enqueued_at_ms,sample_checked_at_ms,last_result_json)
+      VALUES(${f.before[0].id},${quoteSql(SCOPE)},'invented-finding','invented-db','invented-account','invented-context','invented-debt','{}',0,0,${quoteSql(JSON.stringify({effects:{audit_id:r.audit_id}}))});`,'retain debt audit');
+    if(i===2)sqliteExec(f.db,`INSERT INTO sync_scopes(id,source_id,name,config_json) VALUES('invented-reference-scope','lark.im','Invented reference','{}');
+      INSERT INTO lark_im_history_progress(scope_id,generation,sweep_max_id,after_id,last_attempt_at_ms,last_attempt_id,last_result_json,completed_sweeps)
+      VALUES('invented-reference-scope',1,1,1,0,'invented-retained-progress',${quoteSql(JSON.stringify({effects:{audit_id:r.audit_id}}))},0);`,'retain progress audit');
+    // Insertion order, not a wall clock or same-millisecond tie, drives eviction.
+    sqliteExec(f.db,`UPDATE bounded_replay_runs SET finished_at='2042-01-01T00:00:00.000Z' WHERE id=${quoteSql(r.audit_id)};`,'invented tied clocks');
+  }
+  const rows=read(f.db,'SELECT id,history_record_id,history_fence_hash FROM bounded_replay_runs ORDER BY rowid;');
+  assert.equal(rows.length,68);assert.equal(rows[0].id,manual.audit_id);assert.equal(rows[0].history_record_id,null);
+  assert.deepEqual(rows.filter(r=>r.history_record_id!==null).map(r=>r.id),[...audits.slice(0,3),...audits.slice(-64)]);
+  assert.ok(rows.filter(r=>r.history_record_id!==null).every(r=>/^[a-f0-9]{64}$/.test(r.history_fence_hash)));
+  // A null reference cannot poison NOT IN and retain an unbounded tail.
+  sqliteExec(f.db,"UPDATE lark_im_history_scheduler SET last_result_json=NULL; UPDATE lark_im_history_debt SET last_result_json=NULL; UPDATE lark_im_history_progress SET last_result_json=NULL WHERE scope_id='invented-reference-scope';",'retire invented reference');
+  const next=commitBoundedReplayRecords(f.db,historyInput(f,'invented-retention-next'));
+  const after=read(f.db,'SELECT id FROM bounded_replay_runs WHERE history_record_id IS NOT NULL ORDER BY rowid;');
+  assert.deepEqual(after.map(r=>r.id),[...audits.slice(-63),next.audit_id]);
+  assert.equal(read(f.db,`SELECT COUNT(*) n FROM bounded_replay_runs WHERE id=${quoteSql(manual.audit_id)};`)[0].n,1);
+});
+
+test('idempotent replay validates the actual target/fence/effects audit without an additional SQL call',t=>{
+  const f=fixture(t),input=historyInput(f,'invented-idempotent-receipt');
+  const effects=commitBoundedReplayRecords(f.db,input);assert.equal(readReplayExecutionEvidence(input.executionEvidence).receipt_validated,true);
+  const again={...input,executionBudget:budget(),executionEvidence:createReplayExecutionEvidence(input.attemptId,'a'.repeat(64))};
+  let calls=0;
+  const replay=withSpawn((run,...args)=>{calls++;return run(...args)},()=>commitBoundedReplayRecords(f.db,again));
+  assert.deepEqual(replay,effects);assert.equal(calls,1);assert.equal(readReplayExecutionEvidence(again.executionEvidence).receipt_validated,true);
+  const row=read(f.db,'SELECT last_result_json FROM lark_im_history_progress;')[0],saved=JSON.parse(row.last_result_json);
+  for(const mutation of ['forged_effect','missing_audit','wrong_fence','legacy_marker']) {
+    sqliteExec(f.db,`UPDATE lark_im_history_progress SET last_result_json=${quoteSql(row.last_result_json)};`,'restore authored receipt');
+    sqliteExec(f.db,`UPDATE bounded_replay_runs SET history_record_id=${f.before[0].id},history_fence_hash=${quoteSql(saved.history_key)} WHERE id=${quoteSql(effects.audit_id)};`,'restore authored fence');
+    if(mutation==='forged_effect')sqliteExec(f.db,"UPDATE lark_im_history_progress SET last_result_json=json_set(last_result_json,'$.effects.updated',7);",'corrupt invented receipt');
+    if(mutation==='missing_audit')sqliteExec(f.db,"UPDATE lark_im_history_progress SET last_result_json=json_set(last_result_json,'$.effects.audit_id','00000000-0000-0000-0000-000000000000');",'invent missing audit');
+    if(mutation==='wrong_fence')sqliteExec(f.db,"UPDATE bounded_replay_runs SET history_fence_hash='invalid';",'invent wrong fence');
+    if(mutation==='legacy_marker')sqliteExec(f.db,"UPDATE bounded_replay_runs SET history_record_id=NULL,history_fence_hash=NULL;",'simulate unmarked legacy audit');
+    const token=createReplayExecutionEvidence(input.attemptId,'a'.repeat(64));
+    const replay=()=>commitBoundedReplayRecords(f.db,{...input,executionBudget:budget(),executionEvidence:token});
+    if(mutation==='legacy_marker')replay();else assert.throws(replay,/history receipt audit mismatch/);
+    assert.equal(readReplayExecutionEvidence(token).receipt_validated,false,mutation);
+    assert.equal(readReplayExecutionEvidence(token).commit_state,'unknown',mutation);
+  }
+});
+
+test('025 preserves predecessor rows and permits rollback-era explicit audit reads and writes',t=>{
+  const directory=mkdtempSync(join(tmpdir(),'invented-receipt-migration-'));
+  t.after(()=>rmSync(directory,{recursive:true,force:true}));
+  const migrations=join(directory,'migrations');mkdirSync(migrations);
+  const current=new URL('../migrations/',import.meta.url);
+  for(const name of readdirSync(current))if(name.endsWith('.sql')&&!name.startsWith('025_'))copyFileSync(new URL(name,current),join(migrations,name));
+  const f=fixture(t,db=>initializeDatabase(db,{migrationsDir:migrations}));
+  const columns='id,plan_id,attempt_id,source_id,scope_id,initial_sync_start_ms,window_start_ms,window_end_ms,self_id_hash,page_count,fetched_count,candidate_count,inserted_count,updated_count,duplicate_count,conflict_count,finished_at';
+  const oldInsert=id=>`INSERT INTO bounded_replay_runs(${columns}) VALUES(${quoteSql(id)},'invented-manual-plan','invented-manual-attempt','lark.im',${quoteSql(SCOPE)},${START},${START},${START+10000},'invented-self',1,0,0,0,0,0,0,'2042-02-03T04:00:00.000Z');`;
+  sqliteExec(f.db,oldInsert('invented-old-audit'),'seed old unmarked audit');
+  const before=read(f.db,`SELECT ${columns} FROM bounded_replay_runs;`),records=read(f.db,'SELECT * FROM records;');
+  initializeDatabase(f.db);
+  assert.deepEqual(read(f.db,`SELECT ${columns} FROM bounded_replay_runs;`),before);
+  assert.deepEqual(read(f.db,'SELECT * FROM records;'),records);
+  assert.deepEqual(read(f.db,'SELECT history_record_id,history_fence_hash FROM bounded_replay_runs;'),[{history_record_id:null,history_fence_hash:null}]);
+  sqliteExec(f.db,oldInsert('invented-rollback-audit'),'rollback-era explicit-column write');
+  assert.equal(read(f.db,'SELECT COUNT(*) n FROM bounded_replay_runs WHERE history_record_id IS NULL;')[0].n,2);
+  const newReceipt=commitBoundedReplayRecords(f.db,historyInput(f,'invented-upgraded-attempt'));
+  assert.equal(read(f.db,`SELECT history_record_id FROM bounded_replay_runs WHERE id=${quoteSql(newReceipt.audit_id)};`)[0].history_record_id,f.before[0].id);
+  assert.equal(read(f.db,'PRAGMA foreign_key_check;').length,0);
+});
 
 // The storage contract is structural. This fixture consumes real monotonic time
 // and reserves cleanup within one original grant; it never freezes or extends it.
@@ -190,7 +279,7 @@ test('history receipt, observation read, preflight, acquire, commit and release 
   });
   assert.deepEqual([failure.inserted, failure.updated, failure.duplicate, failure.conflicts], [0, 0, 0, 0],
     'an audited zero-record failed history attempt has a valid zero-sum receipt');
-  assert.equal(read(f.db, 'SELECT candidate_count FROM bounded_replay_runs;')[0].candidate_count, 0);
+  assert.equal(read(f.db, `SELECT candidate_count FROM bounded_replay_runs WHERE id=${quoteSql(failure.audit_id)};`)[0].candidate_count, 0);
   assert.equal(read(f.db, 'SELECT history_error FROM record_observation_state;')[0].history_error, 'incomplete');
   assertUnlocked(f);
 });

@@ -128,8 +128,8 @@ test('batch keeps its first committed target at cutoff and a fresh invocation re
   assert.equal(next.ok,true);
   const resumed=store.sqliteQuery(f.db,'SELECT after_id,generation FROM lark_im_history_progress;')[0];
   assert.equal(resumed.after_id,f.before[1].id,JSON.stringify({next,first,resumed}));assert.equal(resumed.generation,2);
-  const latestAudit=store.sqliteQuery(f.db,'SELECT id FROM bounded_replay_runs;');
-  assert.deepEqual(latestAudit,[{id:next.audit_id}],'existing history policy retains the latest per-scope receipt');
+  const latestAudit=store.sqliteQuery(f.db,'SELECT id FROM bounded_replay_runs ORDER BY rowid;');
+  assert.deepEqual(latestAudit,[{id:first.audit_id},{id:next.audit_id}],'bounded history policy retains both recent per-scope receipts');
   assert.notEqual(next.audit_id,first.audit_id);
   assert.equal(store.sqliteQuery(f.db,"SELECT COUNT(*) AS n FROM records WHERE json_type(canonical_json,'$.message_account_evidence')='object';")[0].n,2);
   const after=store.sqliteQuery(f.db,'SELECT * FROM records;');

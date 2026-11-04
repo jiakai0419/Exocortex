@@ -1,7 +1,8 @@
 // @ts-check
 import { spawnSync } from "node:child_process";
 import { performance } from "node:perf_hooks";
-import { registerHistoryLocalFailure, preserveHistoryFailure } from "./history-diagnostics.mjs";
+import { registerHistoryLocalFailure, preserveHistoryFailure, registerHistoryLeaseFailure } from "./history-diagnostics.mjs";
+import { markReplayCleanup, markReplayActionEntered } from '../../dist/storage/sqlite/execution-evidence.js';
 import { isHistoryCommandBudget, HistoryCommandBudgetError } from "./history-command-budget.mjs";
 import { classifyLarkFailure, createLarkCliRunner, createTransportState, transportOperation } from "../adapters/lark-im/transport.mjs";
 import { NAME_LOOKUP_RETRY_BUDGET_MS } from "../adapters/lark-im/name-resolver.mjs";
@@ -65,8 +66,11 @@ function createMaintenanceRequestSession(options = {}, deps = {}) {
   let insideTransport = false;
   /** @type {MaintenanceRequestError | null} */ let transportAdmissionStop = null;
   /** @param {string} reason @returns {never} */
-  function stop(reason) {
-    stopped ||= new MaintenanceRequestError(reason);
+  function stop(reason, leaseResult = null, phase = 'request') {
+    if (!stopped) {
+      stopped = new MaintenanceRequestError(reason);
+      registerHistoryLeaseFailure(stopped,leaseResult,phase);
+    }
     stopped.requestBudget = summary();
     if (insideTransport) transportAdmissionStop ||= stopped;
     throw stopped;
@@ -160,7 +164,7 @@ function createMaintenanceRequestSession(options = {}, deps = {}) {
     let lease;
     try { lease = acquire({ db: options.db, role: "probe", monotonicDeadlineMs: Math.min(deadline, elapsedNow() + commandRemaining(deadline - elapsedNow())) }); }
     catch { stop("lease_unavailable"); }
-    if (lease?.state !== "acquired") stop(lease?.state === "busy" ? "sync_busy" : "lease_unavailable");
+    if (lease?.state !== "acquired") stop(lease?.state === "busy" ? "sync_busy" : "lease_unavailable",lease,'request');
     heldLease = lease;
     try {
       assertReady();
@@ -206,7 +210,7 @@ function createMaintenanceRequestSession(options = {}, deps = {}) {
   }
   /** Keep cooperating sync/sidecar publishers out of the local admission and
    * transaction interval. No CLI is spawned or charged by this local lease. */
-  function withCommit(action, { allowStoppedForFailure = false } = {}) {
+  function withCommit(action, { allowStoppedForFailure = false, executionEvidence = undefined } = {}) {
     // Legacy callers retain their remote-only clock. Whole-command history
     // must also admit and finish local transactions within its work remainder;
     // its storage owner uses the reserved cleanup phase for lock release.
@@ -216,13 +220,22 @@ function createMaintenanceRequestSession(options = {}, deps = {}) {
     let lease;
     try { lease = acquire({ db: options.db, role: "probe", monotonicDeadlineMs: commitStarted + commitRemaining }); }
     catch { stop("lease_unavailable"); }
-    if (lease?.state !== "acquired") stop(lease?.state === "busy" ? "sync_busy" : "lease_unavailable");
+    if (lease?.state !== "acquired") stop(lease?.state === "busy" ? "sync_busy" : "lease_unavailable",lease,'commit');
     // A successful storage response is a committed receipt. A later clock
     // observation must stop new work, not erase those already durable effects.
-    try { return action(); }
+    let primary;
+    try { markReplayActionEntered(executionEvidence);return action(); }
+    catch (error) { primary=error;throw error; }
     // This release only closes our already-owned descriptor; it never starts
     // another process or write. Always close it even when the clock has expired.
-    finally { lease.release(); }
+    finally {
+      try { lease.release();markReplayCleanup(executionEvidence,'lease','complete'); }
+      catch(error) {
+        markReplayCleanup(executionEvidence,'lease','failed');
+        if(primary)throw preserveHistoryFailure(new AggregateError([primary,error],'commit failed and lease cleanup failed',{cause:primary}),primary);
+        throw error;
+      }
+    }
   }
   return { runLark, assertReady, summary, withCommit };
 }

@@ -2,7 +2,7 @@ import { WORKER_DEFAULTS } from "./options.mjs";
 import { REQUIRED_CYCLE_STEPS } from "./step-vocabulary.mjs";
 import { compactIdleEvidence } from "./idle-admission.mjs";
 import { parseWorkerEventTimestamp } from "../../diagnostics/worker-event-time.mjs";
-import { sanitizeHistoryDiagnostic, sanitizeHistorySelectionStops } from "../../core/history-diagnostics.js";
+import { sanitizeHistoryDiagnostic, sanitizeHistorySelectionStops, sanitizeHistoryCommitEvidence } from "../../core/history-diagnostics.js";
 import { normalizeReadinessObservation } from "../../core/readiness-observer-result.js";
 
 type JsonObject = Record<string, any>;
@@ -525,7 +525,14 @@ function compactHistorySummary(summary: SyncSummary | null | undefined) {
   if (summary.commit_state === 'committed' && summary.cleanup_state === 'failed') {
     result.commit_state = 'committed'; result.cleanup_state = 'failed';
   }
-  if (summary.failed_target_commit_state === 'unknown') result.failed_target_commit_state = 'unknown';
+  const commitEvidence=sanitizeHistoryCommitEvidence(summary.commit_evidence);
+  if(commitEvidence)result.commit_evidence=commitEvidence;
+  if(summary.failed_target_commit_state==='unknown')result.failed_target_commit_state='unknown';
+  else if(commitEvidence && summary.failed_target_commit_state===commitEvidence.commit_state)result.failed_target_commit_state=commitEvidence.commit_state;
+  if(Array.isArray(summary.returned_commit_evidence)&&summary.returned_commit_evidence.length<=12) {
+    const receipts=summary.returned_commit_evidence.map(sanitizeHistoryCommitEvidence);
+    if(receipts.length&&receipts.every(value=>value?.receipt_validated))result.returned_commit_evidence=receipts;
+  }
   const command = summary.command_budget as JsonObject | undefined;
   const commandKeys = ['version','max_ms','elapsed_ms','stop_reason','complete'];
   if (command && typeof command === 'object' && !Array.isArray(command)

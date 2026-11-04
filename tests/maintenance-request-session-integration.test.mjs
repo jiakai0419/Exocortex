@@ -220,7 +220,7 @@ test('a successful real helper returning after its two-second boundary fails clo
   };
   assert.throws(() => executeEnrichment({ target: 'records', db: f.db, apply: true }, { requestSessionDeps: deps }),
     error => error instanceof MaintenanceRequestError && error.reason === 'lease_unavailable');
-  assert.deepEqual(observed, { state: 'unavailable', reason: 'lease_helper_unavailable' });
+  assert.deepEqual(observed, { state: 'unavailable', reason: 'lease_deadline' });
   assert.equal(helpers, 1, 'no helper retry is allowed'); assert.equal(calls, 0);
   assertNoCommit(f, before, 'intent');
 });

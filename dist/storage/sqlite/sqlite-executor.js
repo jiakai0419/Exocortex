@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { markSqlDispatch, observeSqlProcess } from './execution-evidence.js';
 const PRIVATE_DIRECTORY_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 function quoteSql(value) {
@@ -56,7 +57,7 @@ function sqliteFailure(result, label) {
     const detail = stderr || error?.message || `sqlite3 exited with status ${String(result.status)}`;
     return new Error(`${label} failed: ${detail}`);
 }
-function sqliteRun(dbPath, sql, label, json = false, executionBudget) {
+function sqliteRun(dbPath, sql, label, json = false, executionBudget, evidence) {
     executionBudget?.assertReady();
     const resolvedDbPath = prepareWritableDatabasePaths(dbPath);
     let result;
@@ -65,12 +66,17 @@ function sqliteRun(dbPath, sql, label, json = false, executionBudget) {
         if (executionBudget && (!Number.isSafeInteger(timeout) || Number(timeout) <= 0)) {
             throw new RangeError("SQLite execution budget must provide a positive integer timeout");
         }
-        result = withPrivateUmask(() => spawnSync("sqlite3", [...(json ? ["-json"] : []), resolvedDbPath], {
-            input: `.bail on\n.timeout ${timeout === undefined ? 5000 : Math.min(5000, timeout)}\nPRAGMA foreign_keys = ON;\n${sql}`,
-            encoding: "utf8",
-            maxBuffer: 50 * 1024 * 1024,
-            ...(timeout === undefined ? {} : { timeout, killSignal: "SIGKILL" }),
-        }));
+        result = withPrivateUmask(() => {
+            markSqlDispatch(evidence);
+            const observed = spawnSync("sqlite3", [...(json ? ["-json"] : []), resolvedDbPath], {
+                input: `.bail on\n.timeout ${timeout === undefined ? 5000 : Math.min(5000, timeout)}\nPRAGMA foreign_keys = ON;\n${sql}`,
+                encoding: "utf8",
+                maxBuffer: 50 * 1024 * 1024,
+                ...(timeout === undefined ? {} : { timeout, killSignal: "SIGKILL" }),
+            });
+            observeSqlProcess(evidence, observed);
+            return observed;
+        });
     }
     finally {
         prepareWritableDatabasePaths(resolvedDbPath);
@@ -82,8 +88,8 @@ function sqliteRun(dbPath, sql, label, json = false, executionBudget) {
 function sqliteExec(dbPath, sql, label, executionBudget) {
     return sqliteRun(dbPath, sql, label, false, executionBudget);
 }
-function sqliteQuery(dbPath, sql, label, executionBudget) {
-    const trimmed = sqliteRun(dbPath, sql, label, true, executionBudget).trim();
+function sqliteQuery(dbPath, sql, label, executionBudget, evidence) {
+    const trimmed = sqliteRun(dbPath, sql, label, true, executionBudget, evidence).trim();
     return trimmed ? JSON.parse(trimmed) : [];
 }
 export { quoteSql, sqlJson, secureDatabasePaths, prepareWritableDatabasePaths, withPrivateUmask, sqliteExec, sqliteQuery };

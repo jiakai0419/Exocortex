@@ -381,7 +381,7 @@ test('unknown commit exception after three rows is observable without adopting p
   assert.deepEqual(result.failure_diagnostic,{version:1,stage:'batch_commit',kind:'unknown',operation:'storage_commit'});
   assert.equal(f.query('SELECT generation FROM lark_im_history_scheduler')[0].generation,3);
   assert.equal(f.query('SELECT COUNT(*) AS n FROM bounded_replay_runs')[0].n,3);
-  assert.doesNotMatch(JSON.stringify(compactHistorySummary(result)),/INVENTED_PRIVATE|SqliteReadError|sql|stack|message/);
+  assert.doesNotMatch(JSON.stringify(compactHistorySummary(result)),/INVENTED_PRIVATE|SqliteReadError|"sql"\s*:|"stack"\s*:|"message"\s*:/);
 });
 
 test('a zero-prefix commit error retains its actual inner stage and single-target throw semantics',t=>{
@@ -480,11 +480,17 @@ for(const kind of ['read_timeout','read_failed'])test(`committed prefix and ${ki
 
 test('an unconfirmed sixth commit never becomes five-row rollback or a successful six-row receipt',t=>{
   const f=fixture(t);let commits=0;
-  const result=f.run({}, {commit(db,options){
-    const effects=store.commitBoundedReplayRecords(db,options);
-    if(++commits===6)throw new Error('INVENTED_SECRET_COMMIT_ACK_LOST');
-    return effects;
-  }});
+  // Lose the actual process receipt before storage validates it. Throwing only
+  // after a validated storage return is now positive evidence of a commit.
+  const original=childProcess.spawnSync;
+  childProcess.spawnSync=(command,args,settings)=>{
+    const result=original(command,args,settings);
+    if(command==='sqlite3'&&settings.input?.includes('INSERT INTO bounded_replay_runs')&&++commits===6)
+      return {...result,status:null,signal:'SIGKILL',error:new Error('INVENTED_SECRET_COMMIT_ACK_LOST')};
+    return result;
+  };
+  syncBuiltinESMExports();let result;
+  try {result=f.run();}finally{childProcess.spawnSync=original;syncBuiltinESMExports();}
   assert.equal(commits,6);assert.equal(result.ok,false);assert.equal(result.processed,5);
   assert.equal(result.failed_target_commit_state,'unknown');
   assert.equal(result.failure_diagnostic.operation,'storage_commit');

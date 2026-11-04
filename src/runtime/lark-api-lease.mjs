@@ -15,6 +15,19 @@ const FLOCK_HELPER = fileURLToPath(new URL("./lark-api-flock.py", import.meta.ur
 // real acquisitions use their explicitly injected directory for both files.
 /** @type {WeakMap<object, {intent?: ReturnType<typeof acquireKernelLock>}>} */
 const syncWaitContexts = new WeakMap();
+/** Only this boundary can mint a lease failure receipt. Clones are untrusted. */
+const leaseFailures = new WeakMap();
+export function readLarkApiLeaseFailure(value) {
+  return value && typeof value === 'object' ? leaseFailures.get(value) || null : null;
+}
+function failedLease(state, reason, stage, timing) {
+  const result = {state,reason,release() {}};
+  const grant = timing && Number.isFinite(timing.deadline-timing.started) ? Math.max(0,Math.min(2000,Math.floor(timing.deadline-timing.started))) : null;
+  const elapsed = timing && Number.isFinite(timing.last-timing.started) && timing.last>=timing.started
+    ? Math.min(180000,Math.floor(timing.last-timing.started)) : null;
+  leaseFailures.set(result,Object.freeze({version:1,stage,state,reason,grant_ms:grant,elapsed_ms:elapsed}));
+  return result;
+}
 const COOLDOWN_OPERATIONS = new Set(["message_history_bundle", "message_search_bundle", "chat_discovery_bundle",
   "self_profile", "contact_search", "chat_members", "chat_bots", "application_info", "other"]);
 const MAX_COOLDOWNS = 128;
@@ -281,29 +294,36 @@ function getLarkApiLeaseStdio() {
  * @returns {{state: "acquired"|"busy"|"unavailable", reason: string|null, release: () => void, stdio?: import("node:child_process").StdioOptions}}
  */
 function tryAcquireLarkApiLease(options, deps = {}) {
-  const failed = (/** @type {"busy"|"unavailable"} */ state, /** @type {string} */ reason) => ({ state, reason, release() {} });
+  let timing = null;
+  const failed = (/** @type {"busy"|"unavailable"} */ state, /** @type {string} */ reason, stage='preflight') => failedLease(state,reason,stage,timing);
   const uid = process.getuid?.();
   if (!["sync", "probe"].includes(options.role) || uid === undefined) return failed("unavailable", "lease_platform_unavailable");
   const directory = deps.directory || `/tmp/exocortex-lark-api-${uid}`;
   const clock = deps.clock || Date.now;
-  const monotonicClock = deps.monotonicClock || (() => performance.now());
+  const clockSource = deps.monotonicClock || (() => performance.now());
+  const monotonicClock = () => { const value=clockSource(); if(timing)timing.last=value; return value; };
   const started = monotonicClock();
   const wallRemaining = options.monotonicDeadlineMs !== undefined || options.deadlineMs === undefined
     ? 2000 : Math.max(0, options.deadlineMs - clock());
   const deadline = Math.min(options.monotonicDeadlineMs ?? started + wallRemaining, started + 2000);
+  timing={started,deadline,last:started};
   if (!Number.isFinite(started) || !Number.isFinite(deadline) || deadline <= started) return failed("unavailable", "lease_deadline");
   const context = options.role === "sync" ? syncWaitContexts.get(options) : undefined;
   const intent = context?.intent || acquireKernelLock("sync-intent.lock", options.role === "sync" ? "shared" : "exclusive", deadline,
-    { ...deps, directory, clock, monotonicClock });
+    { ...deps, directory, clock, monotonicClock, timing });
   if (intent.state !== "acquired") return intent;
   if (context) context.intent = intent;
   try {
-    if (!intent.isCurrent?.()) return failed("unavailable", "lease_evidence_unavailable");
-    const api = acquireKernelLock("api.lock", "exclusive", deadline, { ...deps, directory, clock, monotonicClock });
+    if (!intent.isCurrent?.()) return failed("unavailable", "lease_evidence_unavailable",'post_acquire');
+    const api = acquireKernelLock("api.lock", "exclusive", deadline, { ...deps, directory, clock, monotonicClock, timing });
     if (api.state === "acquired") {
-      if (!intent.isCurrent?.() || monotonicClock() >= deadline) {
+      if (!intent.isCurrent?.()) {
         api.release();
-        return failed("unavailable", "lease_evidence_unavailable");
+        return failed("unavailable", "lease_evidence_unavailable",'post_acquire');
+      }
+      if (monotonicClock() >= deadline) {
+        api.release();
+        return failed('unavailable','lease_deadline','post_acquire');
       }
       if (api.stdio) activeLeaseDescriptors.add(/** @type {number} */ (api.stdio[3]));
     }
@@ -320,10 +340,10 @@ function tryAcquireLarkApiLease(options, deps = {}) {
  * @param {string} filename
  * @param {"shared"|"exclusive"} mode
  * @param {number} deadline
- * @param {{directory: string, clock: () => number, monotonicClock: () => number, spawnSync?: typeof spawnSync}} deps
+ * @param {{directory: string, clock: () => number, monotonicClock: () => number, spawnSync?: typeof spawnSync,timing?:any}} deps
  */
 function acquireKernelLock(filename, mode, deadline, deps) {
-  const failed = (/** @type {"busy"|"unavailable"} */ state, /** @type {string} */ reason) => ({ state, reason, release() {} });
+  const failed = (/** @type {"busy"|"unavailable"} */ state, /** @type {string} */ reason) => failedLease(state,reason,filename==='sync-intent.lock'?'intent':'api',deps.timing);
   const { directory, monotonicClock } = deps;
   const uid = process.getuid?.();
   /** @type {number|undefined} */ let fd;
@@ -340,10 +360,16 @@ function acquireKernelLock(filename, mode, deadline, deps) {
     if (!info.isFile() || info.uid !== uid || (info.mode & 0o077) !== 0 || info.nlink !== 1) throw new Error("unsafe_lock");
     const timeout = Math.floor(deadline - monotonicClock());
     if (timeout <= 0) { release(); return failed("unavailable", "lease_deadline"); }
-    const result = (deps.spawnSync || spawnSync)("python3", ["-B", FLOCK_HELPER, mode], {
+    let result;
+    try { result = (deps.spawnSync || spawnSync)("python3", ["-B", FLOCK_HELPER, mode], {
       stdio: ["ignore", "ignore", "ignore", fd], timeout, killSignal: "SIGKILL",
-    });
-    if (result.error || result.signal || monotonicClock() > deadline) { release(); return failed("unavailable", "lease_helper_unavailable"); }
+    }); } catch {
+      try { monotonicClock(); } catch { if(deps.timing)deps.timing.last=NaN; }
+      release();return failed('unavailable','lease_helper_unavailable');
+    }
+    const finished=monotonicClock();
+    if (result.error || result.signal) { release(); return failed("unavailable", "lease_helper_unavailable"); }
+    if (finished > deadline) { release(); return failed('unavailable','lease_deadline'); }
     if (result.status !== 0) { release(); return failed(result.status === 75 ? "busy" : "unavailable", result.status === 75 ? "lark_api_busy" : "lease_helper_unavailable"); }
     const isCurrent = () => {
       try {

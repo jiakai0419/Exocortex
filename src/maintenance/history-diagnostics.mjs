@@ -2,11 +2,27 @@
 import { SqliteReadError } from '../storage/sqlite/readonly-query.mjs';
 import { readLarkExecutionFailure } from '../adapters/lark-im/transport.mjs';
 import { sanitizeHistoryDiagnostic, isHistoryFailureOperation } from '../../dist/core/history-diagnostics.js';
+import { readLarkApiLeaseFailure } from '../runtime/lark-api-lease.mjs';
+import { readReplayExecutionEvidence } from '../../dist/storage/sqlite/execution-evidence.js';
 
 // These maps contain only evidence observed by our synchronous boundaries.
 // Never traverse a caller's .cause, .errors, message, name, code or payload.
 const failures = new WeakMap();
 const localAdmissions = new WeakSet();
+const commits = new WeakMap();
+export function registerHistoryCommitEvidence(error, token) {
+  if (object(error) && readReplayExecutionEvidence(token)) commits.set(error,token);
+}
+export function readHistoryCommitEvidence(error) {
+  return object(error) ? readReplayExecutionEvidence(commits.get(error)) : null;
+}
+export function registerHistoryLeaseFailure(error, result, phase) {
+  const lease=readLarkApiLeaseFailure(result);
+  if (object(error) && lease && ['request','commit'].includes(phase)) {
+    const previous=failures.get(error);
+    if (previous && !previous.lease) failures.set(error,{...previous,lease:{...lease,phase}});
+  }
+}
 const LOCAL_KINDS = new Set(['cli_budget','self_budget','time_budget','clock_unavailable','sync_busy',
   'lease_unavailable','rate_cooldown','rate_limited','shared_cooldown_unavailable']);
 /** @param {unknown} value @returns {value is object} */
@@ -76,6 +92,7 @@ export function registerHistoryLocalFailure(error, kind) {
  * @returns {T} */
 export function preserveHistoryFailure(wrapper, cause) {
   remember(wrapper, failureEvidence(cause));
+  if(object(wrapper) && object(cause) && commits.has(cause))commits.set(/** @type {object} */(wrapper),commits.get(cause));
   return wrapper;
 }
 

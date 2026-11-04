@@ -98,6 +98,8 @@ export type ExecutionBudget = {
 };
 export type BoundedReplayOptions = {
     executionBudget?: ExecutionBudget;
+    /** Opaque, command-owned evidence; ordinary JSON objects convey no authority. */
+    executionEvidence?: object;
     scope: SyncScope;
     initialSyncStartMs: number;
     startMs: number;

@@ -25,6 +25,10 @@ Use opaque attempt/target references in compact output. Do not publish raw targe
 
 No pre-commit diagnostic database write or unbounded separate log is introduced. A target without durable dispatch/commit evidence can remain unknown; the candidate must not claim to reconstruct an older missing target or receipt.
 
+Execution implementation detail: lease evidence is owned by the lease boundary and read through an opaque-object registry. The additive diagnostic is `{version,phase,stage,state,reason,grant_ms,elapsed_ms}`; its phase is request/commit and its stage is preflight/intent/API/post-acquire. A copied result or exception cannot supply this provenance. Existing stop reasons stay compatible.
+
+An owned replay token separately records action entry, SQL execution (`not_started`, `started`, `unknown`), validated receipt and cleanup. SQL evidence comes from the actual process-dispatch boundary, not entry into `sqliteQuery`. Compact output contains only random-attempt-derived references and closed states. A receipt read on an idempotent retry must join the actual audit and validate its target/fence/effects before becoming evidence. Migration 025 adds nullable `history_record_id` and `history_fence_hash`; old/manual audits stay NULL. Retention uses insertion order, keeps the latest 64 marked rows plus current references, and runs inside the existing commit. Rolling back code remains data-compatible but restores the old version's weaker receipt-retention behavior.
+
 ## Shared embedded-image interface
 
 Keep the existing renderer text/status/reason interfaces. Only messages containing embedded references gain an additive `media_slots` array. One slot is an occurrence in the single selected representation, not a download job. Genuine repeated occurrences remain in order; primary/fallback representations must not be rendered twice.

@@ -10,6 +10,8 @@ import { readOnlySqliteJson } from '../storage/sqlite/readonly-query.mjs';
 import { captureRemoteAccountBinding, readRemoteAccountBinding, accountBindingAdmissionError } from '../diagnostics/remote-account-binding.mjs';
 import { captureLarkWriteAdmission } from '../diagnostics/lark-write-admission.mjs';
 import { BoundedReplayCleanupError } from '../../dist/storage/sqlite/lark-ingestion.js';
+import { createReplayExecutionEvidence, markReplayActionEntered, readReplayExecutionEvidence } from '../../dist/storage/sqlite/execution-evidence.js';
+import { registerHistoryCommitEvidence, readHistoryCommitEvidence } from './history-diagnostics.mjs';
 import { commitBoundedReplayRecords, quoteSql, normalizeBoundedReplayRecords } from '../../dist/storage/sqlite/ingestion-store.js';
 import { scopeObservationContext } from './scope-config-policy.mjs';
 import { loadHistoryDebtHints, readHistoryDebtSchedule, selectHistoryDebtTarget, readHistoryFairRound, readHistoryCandidatePool } from './history-debt.mjs';
@@ -209,6 +211,8 @@ function commitHistoryTarget(options, deps, session, input) {
   const db=options.db;
   const {target,schedule,priority,binding,self,accountKey,startedAtMs,attemptId,records,pages,fetchedCount,error,writeAdmission}=input;
   const row=target.record,scope=target.scope,config=JSON.parse(scope.config_json);
+  const executionEvidence=createReplayExecutionEvidence(attemptId,sha(JSON.stringify({source:scope.source_id,scope:scope.id,
+    record:row.id,generation:target.observationGeneration,sourceConfig:target.sourceConfigJson,row})));
   const {policy:scopePolicy,configJson:scopeConfig}=scopeObservationContext(scope.config_json);
   const startMs=Math.max(target.baseline,Math.floor(row.occurred_at_ms/1000)*1000),endMs=Math.floor(row.occurred_at_ms/1000)*1000+1000;
   const checkBinding = () => historyOperation('binding_recheck', () => {
@@ -219,8 +223,9 @@ function commitHistoryTarget(options, deps, session, input) {
   });
   checkBinding();
   const requestBudget = { ...session.summary(), ...(input.acquisitionMode ? {acquisition_mode:input.acquisitionMode,batch_targets:input.batchTargets} : {}) };
-  const commit = () => (deps.commit || commitBoundedReplayRecords)(db, {
+  const commit = () => { markReplayActionEntered(executionEvidence); return (deps.commit || commitBoundedReplayRecords)(db, {
     executionBudget: deps.historyCommandBudget,
+    executionEvidence,
     scope, initialSyncStartMs: target.baseline, startMs, endMs,
     planId: sha(JSON.stringify({ profile: PROFILE, scope: scope.id, horizon: target.checkpoint.nextSweepMaxId })),
     attemptId, selfIdHash: sha(self.open_id), pages, fetchedCount, records,
@@ -237,16 +242,18 @@ function commitHistoryTarget(options, deps, session, input) {
     reviewFence: { mode: 'replay', createdAtMs: startedAtMs, expiresAtMs: startedAtMs + 30 * 60 * 1000,
       sourceConfigJson: target.sourceConfigJson, sentActor: binding.sent_actor || null, records: [row],
       scopes: [{ id: scope.id, source_id: scope.source_id, enabled: scope.enabled, config_json: scope.config_json }] },
-  });
+  }); };
   let effects, cleanupFailed = false, cleanupCause = null;
-  try { effects = historyOperation('storage_commit', () => session.withCommit ? session.withCommit(commit, { allowStoppedForFailure: error !== null && records.length === 0 }) : commit()); }
+  try { effects = historyOperation('storage_commit', () => session.withCommit ? session.withCommit(commit, { allowStoppedForFailure: error !== null && records.length === 0, executionEvidence }) : commit()); }
   catch (failure) {
+    registerHistoryCommitEvidence(failure,executionEvidence);
     // Only storage's validated completed-transaction receipt may preserve known
     // effects through a cleanup failure. Arbitrary exception properties cannot.
     if (!(failure instanceof BoundedReplayCleanupError)) throw failure;
     effects = failure.committedEffects; cleanupFailed = true; cleanupCause = failure;
   }
   return withFailureCause({ ok: error === null && !cleanupFailed, profile: PROFILE, outcome: cleanupFailed ? 'commit_cleanup_failed' : error || (effects.conflicts ? 'pending_observation' : 'processed'),
+    commit_evidence:readReplayExecutionEvidence(executionEvidence),
     ...(cleanupFailed ? { commit_state: 'committed', cleanup_state: 'failed' } : {}),
     ...effects, request_budget: requestBudget, cursor_policy: 'unchanged', coverage: 'known_rows_only',
     ...(schedule ? { lane: priority ? 'priority' : 'fair', priority_hint_reason: schedule.reason, fair_round_reason: schedule.fairRound.reason,
@@ -391,13 +398,17 @@ function executeHistoryWithinBudget(options, deps = {}, execution = { session: n
   const results = [];
   let stopReason = null, interrupted = false, legacyRequired = false, bulkUnavailable = false;
   let failureDiagnostic = /** @type {Record<string,any>|null} */ (null), failureCause = null, stage = 'batch_prepare';
+  let failedCommitEvidence = /** @type {Record<string,any>|null} */ (null);
   const recordFailure = (error, errorStage, diagnostic = /** @type {Record<string,any>|null} */ (null)) => {
+    failedCommitEvidence=readHistoryCommitEvidence(error);
     const directStop = isDirectBudgetAdmissionStop(error);
     stopReason = session.summary().stop_reason || (directStop ? error.reason : null);
     interrupted = !directStop;
+    const observedDiagnostic = diagnostic || historyFailureDiagnostic(error, errorStage, 'failure');
+    if(observedDiagnostic?.lease)failureDiagnostic=observedDiagnostic;
     if (interrupted) {
       failureCause = error;
-      failureDiagnostic = diagnostic || historyFailureDiagnostic(error, errorStage, 'failure');
+      failureDiagnostic = observedDiagnostic;
     }
   };
   const selectionStops = {};
@@ -455,8 +466,13 @@ function executeHistoryWithinBudget(options, deps = {}, execution = { session: n
     ...(results.some(result => result.cleanup_state === 'failed') ? { commit_state: 'committed', cleanup_state: 'failed' } : {}),
     priority_hint_reason: results.at(-1)?.priority_hint_reason || 'not_attempted',
     ...(results.at(-1)?.priority_hint_diagnostic ? { priority_hint_diagnostic: results.at(-1).priority_hint_diagnostic } : {}),
-    ...(interrupted && failureDiagnostic ? { failure_diagnostic: failureDiagnostic } : {}),
-    ...(interrupted && failureDiagnostic?.operation === 'storage_commit' ? { failed_target_commit_state: 'unknown' } : {}),
+    ...(failureDiagnostic ? { failure_diagnostic: failureDiagnostic } : {}),
+    ...(interrupted && failureDiagnostic?.operation === 'storage_commit' ? {
+      failed_target_commit_state:readHistoryCommitEvidence(failureCause)?.commit_state || 'unknown',
+      ...(readHistoryCommitEvidence(failureCause)?{commit_evidence:readHistoryCommitEvidence(failureCause)}:{})} : {}),
+    ...(failedCommitEvidence ? {commit_evidence:failedCommitEvidence,failed_target_commit_state:failedCommitEvidence.commit_state} : {}),
+    ...(results.some(result=>result.commit_evidence?.receipt_validated) ? {returned_commit_evidence:results
+      .filter(result=>result.commit_evidence?.receipt_validated).map(result=>result.commit_evidence)} : {}),
     ...(Object.keys(selectionStops).length ? { selection_stop_counts: selectionStops } : {}),
     ...(results.length ? { fair_round_reason: results.at(-1).fair_round_reason } : {}),
     request_budget: budget, cursor_policy: 'unchanged', coverage: 'known_rows_only' }, failureCause);

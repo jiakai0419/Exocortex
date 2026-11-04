@@ -11,6 +11,7 @@ import { reviewFenceSql } from "./maintenance-review.js";
 import { sourceProof } from "../../core/lark-observation.js";
 import { prepareObservationRecords, observationEvidenceSql, observationGuardSql } from "./observation-store.js";
 import { pendingDetailGuardSql, preparePendingDetailObservation } from "./pending-detail-observation.js";
+import { markReplayStorageEntered, markReplayCleanup, markReplayReceipt, markReplayUncertain, replaySqlEvidence } from './execution-evidence.js';
 /** A successful, validated transaction receipt survives a later cleanup failure. */
 class BoundedReplayCleanupError extends Error {
     committedEffects;
@@ -54,9 +55,6 @@ function historySchedulingSql(history, records, attemptId, resultSql) {
         return "";
     const selected = scheduling.queue.find(row => row.record_id === history.selectedId);
     const queue = scheduling.hints === null ? "" : `
-    DELETE FROM bounded_replay_runs WHERE id IN (SELECT json_extract(last_result_json,'$.effects.audit_id') FROM lark_im_history_debt
-      ${scheduling.queue.length ? `WHERE record_id NOT IN (${scheduling.queue.map(row => row.record_id).join(',')})` : ''})
-      AND id NOT IN (SELECT json_extract(last_result_json,'$.effects.audit_id') FROM lark_im_history_progress WHERE last_result_json IS NOT NULL);
     DELETE FROM lark_im_history_debt ${scheduling.queue.length ? `WHERE record_id NOT IN (${scheduling.queue.map(row => row.record_id).join(',')})` : ''};
     ${scheduling.queue.map(row => `INSERT INTO lark_im_history_debt
       (record_id,scope_id,finding_key,database_key,account_key,context_fingerprint,debt_fingerprint,debts_json,
@@ -148,6 +146,7 @@ function validateHistoryScheduling(history) {
  * normal runs, scope cursors, or freshness markers. Remote work belongs outside
  * this method; only this short transaction holds a maintenance lease. */
 function commitBoundedReplayRecords(dbPath, options) {
+    markReplayStorageEntered(options.executionEvidence);
     const executionBudget = options.executionBudget;
     executionBudget?.assertReady();
     const { scope, initialSyncStartMs, startMs, endMs, planId, attemptId, selfIdHash, pages, fetchedCount } = options;
@@ -200,15 +199,35 @@ function commitBoundedReplayRecords(dbPath, options) {
             || ![null, "incomplete", "size_limit", "identity", "ambiguous", "missing", "fetch_unavailable"].includes(history.error)) {
             throw new Error("invalid historical recheck fence");
         }
-        const receipt = sqliteQuery(dbPath, history.scheduling ? `SELECT last_attempt_id,last_result_json FROM lark_im_history_scheduler
+        const receiptSql = history.scheduling ? `SELECT last_attempt_id,last_result_json FROM lark_im_history_scheduler
       WHERE id=1 AND last_attempt_id=${quoteSql(attemptId)} UNION ALL
       SELECT last_attempt_id,last_result_json FROM lark_im_history_debt WHERE record_id=${history.selectedId} AND last_attempt_id=${quoteSql(attemptId)}
-      UNION ALL SELECT last_attempt_id,last_result_json FROM lark_im_history_progress WHERE scope_id=${quoteSql(scope.id)} AND last_attempt_id=${quoteSql(attemptId)};`
-            : `SELECT last_attempt_id,last_result_json FROM lark_im_history_progress WHERE scope_id=${quoteSql(scope.id)};`, "read history receipt", executionBudget)[0];
+      UNION ALL SELECT last_attempt_id,last_result_json FROM lark_im_history_progress WHERE scope_id=${quoteSql(scope.id)} AND last_attempt_id=${quoteSql(attemptId)}`
+            : `SELECT last_attempt_id,last_result_json FROM lark_im_history_progress WHERE scope_id=${quoteSql(scope.id)}`;
+        const receipt = sqliteQuery(dbPath, `WITH receipt AS (${receiptSql}) SELECT receipt.*,
+      audit.id AS checked_audit_id,audit.source_id AS checked_source,audit.scope_id AS checked_scope,
+      audit.attempt_id AS checked_attempt,audit.self_id_hash AS checked_self,
+      audit.history_record_id AS checked_target,audit.history_fence_hash AS checked_fence,
+      audit.inserted_count AS checked_inserted,audit.updated_count AS checked_updated,
+      audit.duplicate_count AS checked_duplicate,audit.conflict_count AS checked_conflicts
+      FROM receipt LEFT JOIN bounded_replay_runs audit ON audit.id=json_extract(receipt.last_result_json,'$.effects.audit_id');`, "read history receipt", executionBudget)[0];
         if (receipt?.last_attempt_id === attemptId) {
+            markReplayUncertain(options.executionEvidence);
             const saved = JSON.parse(receipt.last_result_json);
             if (saved.history_key !== historyKey)
                 throw new Error("history acquisition identity reused");
+            const effects = saved.effects;
+            const bound = effects && receipt.checked_audit_id === effects.audit_id && receipt.checked_source === scope.source_id
+                && receipt.checked_scope === scope.id && receipt.checked_attempt === attemptId && receipt.checked_self === selfIdHash
+                && ['inserted', 'updated', 'duplicate', 'conflicts'].every(key => Number.isSafeInteger(effects[key]) && effects[key] >= 0
+                    && effects[key] === receipt[`checked_${key}`])
+                && effects.inserted + effects.updated + effects.duplicate + effects.conflicts === options.records.length;
+            if (!bound || receipt.checked_target !== null && (receipt.checked_target !== history.selectedId || receipt.checked_fence !== historyKey)) {
+                throw new Error('history receipt audit mismatch');
+            }
+            if (receipt.checked_target === history.selectedId && receipt.checked_fence === historyKey) {
+                markReplayReceipt(options.executionEvidence, effects.audit_id, { inserted: effects.inserted, updated: effects.updated, duplicate: effects.duplicate, conflicts: effects.conflicts });
+            }
             return saved.effects;
         }
     }
@@ -330,21 +349,15 @@ function commitBoundedReplayRecords(dbPath, options) {
       CREATE TEMP TABLE __replay_effects (changed INTEGER NOT NULL, existed INTEGER NOT NULL, same_fact INTEGER NOT NULL);
       ${statements}
       ${history ? historyDetailCoordinationSql(scope, history, records) : ""}
-      ${history ? `DELETE FROM bounded_replay_runs WHERE scope_id=${quoteSql(scope.id)} AND id=(
-        SELECT json_extract(last_result_json,'$.effects.audit_id') FROM ${history.scheduling?.lane === 'priority' ?
-            `lark_im_history_debt WHERE record_id=${history.selectedId}` : `lark_im_history_progress WHERE scope_id=${quoteSql(scope.id)}`}
-      ) ${history.scheduling?.lane === 'priority' ? "AND id NOT IN (SELECT json_extract(last_result_json,'$.effects.audit_id') FROM lark_im_history_progress WHERE last_result_json IS NOT NULL)" : ''};` : ""}
-      ${history?.scheduling ? `DELETE FROM bounded_replay_runs WHERE id=(SELECT json_extract(last_result_json,'$.effects.audit_id')
-        FROM lark_im_history_debt WHERE record_id=${history.selectedId})
-        AND id NOT IN (SELECT json_extract(last_result_json,'$.effects.audit_id') FROM lark_im_history_progress WHERE last_result_json IS NOT NULL);` : ''}
       INSERT INTO bounded_replay_runs (
         id,plan_id,attempt_id,source_id,scope_id,initial_sync_start_ms,window_start_ms,window_end_ms,self_id_hash,
-        page_count,fetched_count,candidate_count,inserted_count,updated_count,duplicate_count,conflict_count,finished_at
+        page_count,fetched_count,candidate_count,inserted_count,updated_count,duplicate_count,conflict_count,finished_at,
+        history_record_id,history_fence_hash
       ) SELECT ${quoteSql(auditId)},${quoteSql(planId)},${quoteSql(attemptId)},${quoteSql(scope.source_id)},${quoteSql(scope.id)},
         ${initialSyncStartMs},${startMs},${endMs},${quoteSql(selfIdHash)},${pages},${fetchedCount},${records.length},
         COALESCE(SUM(changed=1 AND existed=0),0), COALESCE(SUM(changed=1 AND existed=1),0),
         COALESCE(SUM(changed=0 AND same_fact=1),0), COALESCE(SUM(changed=0 AND same_fact=0),0),
-        strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM __replay_effects;
+        strftime('%Y-%m-%dT%H:%M:%fZ','now'),${history?.selectedId ?? 'NULL'},${quoteSql(historyKey)} FROM __replay_effects;
       ${history ? `UPDATE record_observation_state SET history_error=${quoteSql(history.error)} WHERE record_id=${history.selectedId};
         ${history.scheduling?.lane === 'priority' ? '' : `INSERT INTO lark_im_history_progress(scope_id,generation,sweep_max_id,after_id,last_attempt_at_ms,last_attempt_id,last_result_json,completed_sweeps)
         SELECT ${quoteSql(scope.id)},${history.generation + 1},${history.nextSweepMaxId},${history.selectedId},${history.startedAtMs},${quoteSql(attemptId)},
@@ -359,10 +372,15 @@ function commitBoundedReplayRecords(dbPath, options) {
           'request_budget',json(${quoteSql(JSON.stringify(history.requestBudget))}),
           'effects',json_object('audit_id',id,'inserted',inserted_count,'updated',updated_count,'duplicate',duplicate_count,'conflicts',conflict_count))
           FROM bounded_replay_runs WHERE id=${quoteSql(auditId)})`)} ` : ""}
+      ${history ? `DELETE FROM bounded_replay_runs WHERE history_record_id IS NOT NULL
+        AND rowid NOT IN (SELECT rowid FROM bounded_replay_runs WHERE history_record_id IS NOT NULL ORDER BY rowid DESC LIMIT 64)
+        AND NOT EXISTS (SELECT 1 FROM lark_im_history_progress p WHERE json_extract(p.last_result_json,'$.effects.audit_id')=bounded_replay_runs.id)
+        AND NOT EXISTS (SELECT 1 FROM lark_im_history_debt d WHERE json_extract(d.last_result_json,'$.effects.audit_id')=bounded_replay_runs.id)
+        AND NOT EXISTS (SELECT 1 FROM lark_im_history_scheduler s WHERE json_extract(s.last_result_json,'$.effects.audit_id')=bounded_replay_runs.id);` : ''}
       SELECT id AS audit_id,inserted_count AS inserted,updated_count AS updated,
         duplicate_count AS duplicate,conflict_count AS conflicts FROM bounded_replay_runs WHERE id=${quoteSql(auditId)};
       COMMIT;
-    `, "commit bounded replay", executionBudget);
+    `, "commit bounded replay", executionBudget, replaySqlEvidence(options.executionEvidence));
         if (!rows[0])
             throw new Error("bounded replay commit returned no evidence");
         const effects = { audit_id: String(rows[0].audit_id), inserted: Number(rows[0].inserted), updated: Number(rows[0].updated),
@@ -376,6 +394,11 @@ function commitBoundedReplayRecords(dbPath, options) {
             }
             committedEffects = effects;
         }
+        if (rows.length === 1 && rows[0].audit_id === auditId
+            && [rows[0].inserted, rows[0].updated, rows[0].duplicate, rows[0].conflicts].every(value => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0)
+            && effects.inserted + effects.updated + effects.duplicate + effects.conflicts === records.length) {
+            markReplayReceipt(options.executionEvidence, auditId, { inserted: effects.inserted, updated: effects.updated, duplicate: effects.duplicate, conflicts: effects.conflicts });
+        }
         return effects;
     }
     catch (error) {
@@ -384,13 +407,23 @@ function commitBoundedReplayRecords(dbPath, options) {
         throw error;
     }
     finally {
-        if (!executionBudget)
-            releaseMaintenanceLock(dbPath, owner);
+        if (!executionBudget) {
+            try {
+                releaseMaintenanceLock(dbPath, owner);
+                markReplayCleanup(options.executionEvidence, 'storage', 'complete');
+            }
+            catch (error) {
+                markReplayCleanup(options.executionEvidence, 'storage', 'failed');
+                throw error;
+            }
+        }
         else if (acquisitionAttempted) {
             try {
                 executionBudget.runCleanup(() => releaseMaintenanceLock(dbPath, owner, executionBudget));
+                markReplayCleanup(options.executionEvidence, 'storage', 'complete');
             }
             catch (cleanupError) {
+                markReplayCleanup(options.executionEvidence, 'storage', 'failed');
                 if (failed)
                     throw new AggregateError([primaryError, cleanupError], "bounded replay failed and maintenance lock cleanup failed", { cause: primaryError });
                 if (committedEffects)
