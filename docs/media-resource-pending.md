@@ -86,3 +86,43 @@ Also cover all source/account/DB/version/key fences, expiry, capacity races,
 replacing files, unsafe permissions/links, unsupported content, remote denial
 and untouched neighboring message/source bytes. Tests use only newly authored
 image bytes and fictional accounts/messages.
+
+## Interrupted cleanup contract
+
+Cleanup must remain resumable after every budget boundary and process restart,
+including a consumed, nonexpired slot. Deleting `claim.json` before the payload
+formerly destroyed the only cleanup authority; simply deleting it last would
+still leave nonexpired discard/replacement unable to prove its original intent.
+
+Under the existing private flock, capture and compare the exact slot receipt
+before publishing a bounded cleanup intent in the parent pending directory.
+There is one fixed intent and one preparation filename per slot. The intent
+contains the original directory identity and complete file identities, with the
+consumer generation/manifest proof when cleanup follows successful consumption
+or quarantine replacement. Exclusively write and fsync preparation, then link it without replacing an existing intent
+and remove the preparation name before deleting any slot file. An interrupted preparation
+has no deletion authority; a subsequent mutation may remove only that safe,
+private, unchanged preparation file and restart preparation. Readers never do so. An interrupted no-replace link may leave the two
+known names on the same inode; recovery accepts exactly those two links, removes
+the preparation name, and validates the now-single-link intent. Any external
+link or conflicting preparation/intent identity is rejected.
+
+A published intent authorizes only removal of an unchanged subset of its
+original files, in the original directory. Unknown files, changed identities,
+unsafe links/modes, or a replaced directory fail closed. Remove manifest and
+payload before claim, remove the now-empty directory, then remove the intent
+last. Every operation uses the same remaining command budget. If the budget
+ends, the intent survives for a later normally admitted operation. Recovery
+runs before expiry selection and before slot reuse; it does not reset expiry or
+grant an API call. A missing directory with a valid intent is a completed file
+removal awaiting intent cleanup. A repeated consumed receipt with neither slot
+nor intent is an idempotent no-op, but cannot remove a replacement generation.
+Read-only pending lookup excludes slots with a valid active cleanup intent and
+does not resurrect their bytes. This is process-interruption recovery, not a
+claim about storage-device durability after power loss.
+
+Verification cuts off the synthetic clock after each real filesystem mutation,
+restarts with a fresh bounded budget and the same local flock/cache, and checks
+expiry, discard and quarantine replacement. It also checks partial intent
+preparation, directory/file replacement, unsafe links, unknown files, stale
+receipts, repeated cleanup, capacity reuse and unchanged neighboring resources.

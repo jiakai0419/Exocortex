@@ -599,16 +599,105 @@ function capturePendingSlot(parent,slot,budget=undefined) {
   directoryUnchanged(dir,budget);
   return {dir,receipt:{slot,dev:String(dir.info.dev),ino:String(dir.info.ino),files}};
 }
+const cleanupKeys=['schema','receipt','proof'];
+const cleanupNames=slot=>({intent:`.cleanup-${slot}.json`,preparing:`.cleanup-${slot}.preparing`});
+const slotReceipt=value=>({slot:value.slot,dev:value.dev,ino:value.ino,files:value.files});
+const equalJson=(left,right)=>JSON.stringify(left)===JSON.stringify(right);
+function validSlotReceipt(value) {
+  return exactKeys(value,['slot','dev','ino','files'])&&slots.includes(value.slot)
+    &&[value.dev,value.ino].every(v=>typeof v==='string'&&/^[0-9]+$/.test(v))
+    &&Array.isArray(value.files)&&value.files.length<=3
+    &&value.files.every((file,index)=>exactKeys(file,['name',...pendingStatKeys])
+      &&['claim.json','manifest.json','payload.blob'].includes(file.name)
+      &&(index===0||value.files[index-1].name<file.name)
+      &&pendingStatKeys.every(key=>typeof file[key]==='string'&&/^[0-9]+$/.test(file[key]))
+      &&file.nlink==='1'&&BigInt(file.size)<=BigInt(MAX_MEDIA_RESOURCE_BYTES));
+}
+const validCleanupProof=value=>value===null||exactKeys(value,['generation','manifest_sha256'])
+  &&validGeneration(value.generation)&&hashValid(value.manifest_sha256);
+/** Only the two fixed preparation/intent paths may temporarily share an inode.
+ * This avoids replacing an existing intent when publishing it. No slot file is
+ * deleted until preparation has become a validated single-link intent.
+ * @param {MediaBudget} [budget] */
+function cleanupPathInfo(parent,name,budget=undefined) {
+  budget?.assertReady();
+  try {
+    const info=lstatSync(join(parent.root,name),{bigint:true});
+    if(!info.isFile()||info.isSymbolicLink()||!privateOwned(info)||info.size>BigInt(MAX_MANIFEST_BYTES))throw new Error('pending_cleanup_unsafe');
+    directoryUnchanged(parent,budget);return info;
+  } catch(error){if(errorCode(error)==='ENOENT')return null;throw error;}
+}
+/** @param {MediaBudget} [budget] */
+function readCleanupIntent(parent,slot,mutate,budget=undefined) {
+  const names=cleanupNames(slot),intent=cleanupPathInfo(parent,names.intent,budget),preparing=cleanupPathInfo(parent,names.preparing,budget);
+  if(preparing&&mutate) {
+    if(intent?(!same(intent,preparing)||intent.nlink!==2n):preparing.nlink!==1n)throw new Error('pending_cleanup_replaced');
+    if(intent)fileUnchanged(join(parent.root,names.intent),intent,budget);
+    fileUnchanged(join(parent.root,names.preparing),preparing,budget);directoryUnchanged(parent,budget);
+    budget?.assertReady();unlinkSync(join(parent.root,names.preparing));
+  }
+  if(!intent)return null;
+  const file=readPrivateBytes(join(parent.root,names.intent),MAX_MANIFEST_BYTES,undefined,budget);
+  validateJsonObjectText(file.bytes.toString('utf8'));const value=JSON.parse(file.bytes.toString('utf8'));
+  if(!exactKeys(value,cleanupKeys)||value.schema!=='lark_media_pending_cleanup/v1'
+    ||!validSlotReceipt(value.receipt)||value.receipt.slot!==slot||!validCleanupProof(value.proof))throw new Error('pending_cleanup_invalid');
+  directoryUnchanged(parent,budget);return {...file,value,path:join(parent.root,names.intent)};
+}
+/** @param {MediaBudget} [budget] */
+function cleanupRemainder(parent,document,budget=undefined) {
+  const expected=document.value.receipt;let current;
+  fileUnchanged(document.path,document.info,budget);directoryUnchanged(parent,budget);
+  try{current=capturePendingSlot(parent,expected.slot,budget);}
+  catch(error){if(errorCode(error)==='ENOENT') {
+    // Only a genuinely absent directory is a completed removal. A missing file
+    // during capture is a concurrent change, not proof of an absent slot.
+    budget?.assertReady();try{lstatSync(join(parent.root,expected.slot));}catch(missing){if(errorCode(missing)==='ENOENT')return null;throw missing;}
+  }throw error;}
+  if(current.receipt.dev!==expected.dev||current.receipt.ino!==expected.ino
+    ||current.receipt.files.some(file=>!equalJson(file,expected.files.find(original=>original.name===file.name))))throw new Error('pending_replaced');
+  return current;
+}
+/** Finish only a previously authorized subset, never infer permission from a
+ * missing claim. Intent outlives the slot, so even post-rmdir cutoff can resume.
+ * @param {MediaBudget} [budget] */
+function finishPendingCleanup(parent,document,budget=undefined) {
+  const current=cleanupRemainder(parent,document,budget);
+  if(current) {
+    const {dir,receipt}=current;
+    const files=[...receipt.files].sort((a,b)=>Number(a.name==='claim.json')-Number(b.name==='claim.json')||a.name.localeCompare(b.name));
+    for(const file of files) {
+      fileUnchanged(document.path,document.info,budget);directoryUnchanged(parent,budget);directoryUnchanged(dir,budget);
+      budget?.assertReady();const path=join(dir.root,file.name),info=lstatSync(path,{bigint:true});
+      if(!equalJson({name:file.name,...pendingStat(info)},file))throw new Error('pending_replaced');
+      directoryUnchanged(dir,budget);budget?.assertReady();unlinkSync(path);
+    }
+    fileUnchanged(document.path,document.info,budget);directoryUnchanged(parent,budget);directoryUnchanged(dir,budget);
+    budget?.assertReady();rmdirSync(dir.root);
+  }
+  fileUnchanged(document.path,document.info,budget);directoryUnchanged(parent,budget);
+  budget?.assertReady();unlinkSync(document.path);directoryUnchanged(parent,budget);
+}
 /** @param {MediaBudget} [budget] */
 function removePendingSlot(parent,expected,budget=undefined) {
-  const current=capturePendingSlot(parent,expected.slot,budget),dir=current.dir;
-  if(JSON.stringify(current.receipt)!==JSON.stringify(expected))throw new Error('pending_replaced');
-  for(const file of expected.files){
-    budget?.assertReady();const path=join(dir.root,file.name),info=lstatSync(path,{bigint:true});
-    if(JSON.stringify({name:file.name,...pendingStat(info)})!==JSON.stringify(file))throw new Error('pending_replaced');
-    directoryUnchanged(dir,budget);budget?.assertReady();unlinkSync(path);
+  const receipt=slotReceipt(expected),proof=expected.generation===undefined?null:{generation:expected.generation,manifest_sha256:expected.manifest_sha256};
+  if(!validSlotReceipt(receipt)||!validCleanupProof(proof))throw new Error('pending_cleanup_invalid');
+  let document=readCleanupIntent(parent,receipt.slot,true,budget);
+  if(document) {
+    if(!equalJson(document.value.receipt,receipt)||!equalJson(document.value.proof,proof))throw new Error('pending_replaced');
+  } else {
+    const current=capturePendingSlot(parent,receipt.slot,budget);
+    if(!equalJson(current.receipt,receipt))throw new Error('pending_replaced');
+    const names=cleanupNames(receipt.slot),value={schema:'lark_media_pending_cleanup/v1',receipt,proof};
+    writePendingFile(parent,names.preparing,Buffer.from(JSON.stringify(value)+'\n'),budget);
+    const prepared=readPrivateBytes(join(parent.root,names.preparing),MAX_MANIFEST_BYTES,undefined,budget);
+    if(!prepared.bytes.equals(Buffer.from(JSON.stringify(value)+'\n')))throw new Error('pending_cleanup_replaced');
+    if(!equalJson(capturePendingSlot(parent,receipt.slot,budget).receipt,receipt))throw new Error('pending_replaced');
+    fileUnchanged(join(parent.root,names.preparing),prepared.info,budget);directoryUnchanged(parent,budget);
+    budget?.assertReady();linkSync(join(parent.root,names.preparing),join(parent.root,names.intent));
+    document=readCleanupIntent(parent,receipt.slot,true,budget);
+    if(!document||!equalJson(document.value,value))throw new Error('pending_cleanup_replaced');
   }
-  directoryUnchanged(dir,budget);budget?.assertReady();rmdirSync(dir.root);directoryUnchanged(parent,budget);
+  finishPendingCleanup(parent,document,budget);
 }
 // No link/unlink publication window: an interrupted exclusive write is merely
 // incomplete pending data. Never used for available-resource publication.
@@ -625,6 +714,8 @@ function reclaimExpiredPending(parent,nowMs,deps={}) {
   const budget=deps.executionBudget;
   for(const slot of slots) {
     budget?.assertReady();
+    const cleanup=readCleanupIntent(parent,slot,true,budget);
+    if(cleanup){finishPendingCleanup(parent,cleanup,budget);continue;}
     let captured;
     try{captured=capturePendingSlot(parent,slot,budget);}catch(error){if(errorCode(error)==='ENOENT')continue;throw error;}
     const {dir,receipt}=captured;let created;
@@ -666,6 +757,8 @@ export function readPendingMediaResource(cache,binding,sourceFence,options={},de
     let found=null;
     for(const slot of slots) {
       budget?.assertReady();
+      const cleanup=readCleanupIntent(parent,slot,false,budget);
+      if(cleanup){cleanupRemainder(parent,cleanup,budget);continue;}
       let dir,document;
       try{dir=directory(join(parent.root,slot),false,budget);document=pendingManifest(dir,budget);}
       catch(error){
@@ -715,8 +808,7 @@ export function retainPendingMediaResource(cache,binding,sourceFence,bytes,optio
         if(!(existing.status==='quarantined'&&freshDownload===true&&originalClosingAtMs!==null))return existing;
         // This is a newly downloaded operation with its own closing proof,
         // never an upgrade from a later profile over the old quarantined bytes.
-        const {slot,dev,ino,files}=existing.receipt;deps.beforeReplace?.();
-        removePendingSlot(parent,{slot,dev,ino,files},budget);
+        deps.beforeReplace?.();removePendingSlot(parent,existing.receipt,budget);
       } else if(existing.status!=='missing')return existing;
       const slot=slots.find(name=>{budget?.assertReady();try{lstatSync(join(parent.root,name));return false;}catch(error){if(errorCode(error)==='ENOENT')return true;throw error;}});
       if(!slot)return finite('blocked','resource_pending_capacity');
@@ -735,11 +827,20 @@ export function retainPendingMediaResource(cache,binding,sourceFence,bytes,optio
  * @param {string} cache @param {JsonObject} receipt @param {MediaBudgetDeps} [deps] */
 export function discardPendingMediaResource(cache,receipt,deps={}) {
   const budget=mediaBudget(deps);
-  if(!exactKeys(receipt,['slot','dev','ino','files','generation','manifest_sha256'])||!slots.includes(receipt.slot)||!validGeneration(receipt.generation)||!hashValid(receipt.manifest_sha256))
+  if(!exactKeys(receipt,['slot','dev','ino','files','generation','manifest_sha256'])||!validSlotReceipt(slotReceipt(receipt))||!validGeneration(receipt.generation)||!hashValid(receipt.manifest_sha256))
     return finite('invalid','resource_pending_invalid');
   return withPendingMutation(cache,parent=>{
-    const dir=directory(join(parent.root,receipt.slot),false,budget),document=pendingManifest(dir,budget);
+    const cleanup=readCleanupIntent(parent,receipt.slot,true,budget);
+    if(cleanup) {
+      if(!equalJson(cleanup.value.receipt,slotReceipt(receipt))
+        ||!equalJson(cleanup.value.proof,{generation:receipt.generation,manifest_sha256:receipt.manifest_sha256}))throw new Error('pending_replaced');
+      finishPendingCleanup(parent,cleanup,budget);return finite('removed',null);
+    }
+    let dir;
+    try{dir=directory(join(parent.root,receipt.slot),false,budget);}
+    catch(error){if(errorCode(error)==='ENOENT')return finite('removed',null);throw error;}
+    const document=pendingManifest(dir,budget);
     if(document.value.generation!==receipt.generation||sha(JSON.stringify(document.value))!==receipt.manifest_sha256)throw new Error('pending_replaced');
-    const {slot,dev,ino,files}=receipt;removePendingSlot(parent,{slot,dev,ino,files},budget);return finite('removed',null);
+    removePendingSlot(parent,receipt,budget);return finite('removed',null);
   },budget);
 }
