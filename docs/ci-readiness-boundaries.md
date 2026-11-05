@@ -101,3 +101,66 @@ Both real guardian cases retained299ms granted work and2299ms outer backstop in
 this sample. The tail marker and exact JSON were observed before a deadline with
 successful cleanup. This local sample does not explain the CI marker failure.
 The complete fixed-revision verification and independent review remain required.
+
+## Exact866 failure: bounded phase diagnosis
+
+The exact866 first CI run41992842765 failed the unchanged real-tail prerequisite:
+the serial file reported35/36, and the remaining suite was not run. Its guardian
+returned `deadline` without a cleanup error, but there was no worker stdout or
+tail marker. This does not identify whether the deadline expired before READY,
+between READY/GO and worker startup, or after worker entry. The normal fixture
+never wrote its old anchor marker, so that marker's absence is not startup
+evidence. The original log and earlier failures remain failures; a successful
+local run cannot reconstruct them or identify a runner/CPU cause.
+
+Before further execution, add a test-only bounded stage ledger to the same
+generated guardian and anchor source. Match every injection point exactly once
+and bind both originals by SHA256. Observe imports complete, deadline creation,
+anchor spawn, READY/GO, worker spawn, capture, cleanup and envelope publication.
+The shell records entry/output/tail using builtins with no invented timestamp.
+Each Python process records its own monotonic and CPU clocks; do not subtract
+Node performance.now from Python timestamps. Keep the finite observer files
+separate from the actual stdout/envelope. Missing or malformed events remain
+unknown, never inferred from duration or replaced by synthetic success.
+
+The real300ms work cap,2000ms cleanup reserve,2300ms outer bound and3000ms
+overall assertion stay unchanged, as do all original marker/JSON/deadline
+assertions. Observation cost is charged to the existing clocks. No prestarted
+helper, clock reset, enlarged grant, retry, or skipped prerequisite is allowed.
+Only authored finite controls may deliberately pause at identified boundaries;
+their results demonstrate mechanisms, not the historical cause. Recorder and
+assertion negative controls must reject missing/forged observations. Product,
+production data, permissions and the failed release remain untouched.
+
+The first instrumented results select any subsequent correction. If they do not
+reproduce the unforced failure, report that limit and retain the diagnostic
+candidate for independent review; do not call the historical cause repaired.
+
+Implementation remains four test/document files, with no product change. A
+failed fixture retains its raw ledgers, final executed guardian/anchor sources,
+source hashes, raw outer stdout/stderr and an evidence manifest. Successful
+fixtures are cleaned only when no unexplained outer stderr needs retaining.
+The parser requires phase-specific fields and causal predecessors; a valid
+partial ledger is only a list of observations, never a completion verdict.
+Normal anchor-marker now reports null because that old marker was never wired
+there. Cleanup-null is described as no reported error, while separate events
+prove only the actual owned-group syscall return and anchor wait return.
+
+The first instrumented run passed53/53: normal tail entry/output were observed;
+authored400ms pauses distinguished GO-to-spawn and worker-entry-to-output gaps.
+Those controls are not historical reproductions. Independent pre-review found
+retention and missing-field holes; after correcting them, the first expanded
+run passed107/107, including original guardian lifecycle and verify inventory
+regressions. Original missing-tail and exact-JSON assertions are preserved in
+one shared function with negative controls. A success-looking mock envelope
+with cleanup failure is rejected through the actual wrapper and runStep.
+P2 claims only no observed spawn return, plus same-guardian timing proves its
+group kill returned before the authored400ms pause could finish.
+
+The expanded local run retained an outer Apple Python warning about confstr
+failing to find DARWIN_USER_TEMP_DIR and falling back to/tmp. It was110bytes;
+the first run retained only its length, so matching content is not presumed.
+Original CI had0 outer stderr bytes. This local warning is not an explanation
+of that CI failure. The unforced historical failure was not reproduced, and
+its precise expired stage remains unknown. Complete fixed-SHA regression and
+independent review are still required; no new release is authorized here.

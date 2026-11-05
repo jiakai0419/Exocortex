@@ -1,15 +1,17 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtempSync, writeFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, existsSync, rmSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { performance } from 'node:perf_hooks';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { runGuardedWorkerStep, WORKER_STEP_GUARDIAN } from '../src/runtime/worker/step-process.mjs';
 import { createMaintenanceRequestSession } from '../src/maintenance/request-session.mjs';
 import { runWorker, runStep, runCycle, compactResourceSummary } from '../src/runtime/worker/worker.mjs';
 import { runCycleWithRunner } from '../dist/runtime/worker/lark-im-worker-core.js';
 import { WORKER_DEFAULTS } from '../src/runtime/worker/options.mjs';
+import { instrumentResourceGuardian, readResourceGuardianPhases, shellPhase, assertResourceTailPrerequisites, archiveResourceGuardianEvidence } from './helpers/resource-guardian-phases.mjs';
 
 const readArg = (args, flag) => Number(args[args.indexOf(flag) + 1]);
 function harness(options = {}) {
@@ -232,18 +234,30 @@ test('sampler-only eligibility preserves its existing 55-second allowance', () =
 // A shell builtin reaches the invented local tail without an unrelated second
 // Node bootstrap. Production Node startup still spends the same work deadline;
 // this test does not promise any runtime can start within 300ms on a suspended host.
-function resourceTailFixture(t, { delayedAnchor = false } = {}) {
+function resourceTailFixture(t, { delayedAnchor = false, delayBeforeWorker = false, delayedShell = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'synthetic-resource-idle-guardian-'));
-  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  let retain = true;
+  t.after(() => {
+    if (!retain) { rmSync(dir, { recursive: true, force: true }); return; }
+    try {
+      const files = Object.fromEntries(readdirSync(dir).map(name => {
+        const data = readFileSync(join(dir, name));
+        return [name, { bytes: data.length, sha256: createHash('sha256').update(data).digest('hex') }];
+      }));
+      writeFileSync(join(dir, 'evidence-manifest.json'), JSON.stringify(files, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+      t.diagnostic(JSON.stringify({ observation: 'synthetic_resource_guardian_retained/v1', directory: dir, files }));
+    } catch { t.diagnostic(JSON.stringify({ observation: 'synthetic_resource_guardian_retained/v1', directory: dir, state: 'retention_failed' })); }
+  });
   const marker = join(dir, 'entered-tail'), anchorMarker = join(dir, 'entered-anchor');
   const script = join(dir, 'child.sh');
-  writeFileSync(script, `printf '%s' '{"ok":true,"profile":"known_record_resources/v1"}'\n` +
-    `printf '%s' 'synthetic' > "$2"\nexec /bin/sleep 10\n`);
+  writeFileSync(script, shellPhase('entry') + (delayedShell ? '/bin/sleep 0.4\n' : '') +
+    `printf '%s' '{"ok":true,"profile":"known_record_resources/v1"}'\n` + shellPhase('output_returned') +
+    `printf '%s' 'synthetic' > "$2"\n` + shellPhase('tail_returned') + `exec /bin/sleep 10\n`);
   const env = { PATH: process.env.PATH, LANG: 'C', LC_ALL: 'C',
     PYTHONNOUSERSITE: '1', PYTHONDONTWRITEBYTECODE: '1' };
   const started = performance.now();
-  let captured, workTimeout, outerTimeout, guardianProcess;
-  const step = runStep('resources', [marker], { execPath: '/bin/sh', scriptPath: script, timeoutMs: 300,
+  let captured, workTimeout, outerTimeout, guardianProcess, binding, sourceEvidence, rawGuardianResult;
+  const step = runStep('resources', [marker, join(dir, 'worker.jsonl')], { execPath: '/bin/sh', scriptPath: script, timeoutMs: 300,
     remainingTimeMs: () => 2300 - (performance.now() - started),
     runProcess: (command, args, options) => {
       workTimeout = options.timeout;
@@ -251,7 +265,10 @@ function resourceTailFixture(t, { delayedAnchor = false } = {}) {
         spawnSync: (binary, argv, settings) => {
           assert.equal(argv[1], WORKER_STEP_GUARDIAN);
           outerTimeout = settings.timeout;
-          let source = argv[1];
+          const instrumented = instrumentResourceGuardian(argv[1], dir, { delayBeforeWorker });
+          binding = instrumented.binding;
+          let source = instrumented.source;
+          let executedAnchor = instrumented.anchorSource;
           if (delayedAnchor) {
             // Only the invented anchor's startup is delayed. The guardian's
             // original deadline, READY/GO checks and cleanup code are unchanged.
@@ -259,18 +276,31 @@ function resourceTailFixture(t, { delayedAnchor = false } = {}) {
             assert(declaration);
             const prelude = `import os,time\nwith open(${JSON.stringify(anchorMarker)},'x') as f: f.write('synthetic')\ntime.sleep(1.0)\n`;
             source = source.replace(declaration, `${declaration}\nANCHOR_CODE=${JSON.stringify(prelude)}+ANCHOR_CODE`);
+            executedAnchor = prelude + executedAnchor;
           }
+          binding.executed_guardian_sha256 = createHash('sha256').update(source).digest('hex');
+          binding.executed_anchor_sha256 = createHash('sha256').update(executedAnchor).digest('hex');
+          sourceEvidence = { 'executed-guardian.py': source, 'executed-anchor.py': executedAnchor,
+            'source-binding.json': JSON.stringify(binding, null, 2) + '\n' };
           const result = spawnSync(binary, [argv[0], source, ...argv.slice(2)], settings);
+          rawGuardianResult = result;
           guardianProcess = { status: result.status ?? null, signal: result.signal ?? null,
             error_code: result.error?.code ?? null, stdout_bytes: Buffer.byteLength(result.stdout || ''),
-            stderr_bytes: Buffer.byteLength(result.stderr || '') };
+            stderr_bytes: Buffer.byteLength(result.stderr || ''),
+            stderr_sha256: createHash('sha256').update(result.stderr || '').digest('hex') };
           return result;
         },
       });
       return captured;
     },
   });
-  return { step, captured, marker, anchorMarker, elapsed: performance.now() - started, workTimeout, outerTimeout, guardianProcess };
+  const archive = archiveResourceGuardianEvidence({ ...sourceEvidence,
+    'guardian-stdout.txt': rawGuardianResult?.stdout || '', 'guardian-stderr.txt': rawGuardianResult?.stderr || '' },
+  (name, value) => writeFileSync(join(dir, name), value, { mode: 0o600, flag: 'wx' }));
+  const elapsed = performance.now() - started;
+  return { step, captured, marker, anchorMarker, elapsed, workTimeout, outerTimeout, guardianProcess,
+    binding, archive, phases: readResourceGuardianPhases(dir), releaseEvidence: () => { retain = archive.state !== 'written' || guardianProcess?.stderr_bytes !== 0; }, intervention: delayedAnchor ? 'anchor_prelude_1000ms'
+      : delayBeforeWorker ? 'before_worker_spawn_400ms' : delayedShell ? 'shell_before_output_400ms' : 'none' };
 }
 
 function observeResourceGuardian(t, f) {
@@ -279,10 +309,12 @@ function observeResourceGuardian(t, f) {
     JSON.stringify({ ok: true, profile: 'known_record_resources/v1' }); } catch { /* report, never accept */ }
   t.diagnostic(JSON.stringify({ observation: 'synthetic_resource_guardian_phase/v1',
     work_timeout_ms: f.workTimeout ?? null, outer_timeout_ms: f.outerTimeout ?? null,
-    elapsed_ms: f.elapsed, anchor_marker: existsSync(f.anchorMarker), tail_marker: existsSync(f.marker),
+    elapsed_ms: f.elapsed, anchor_marker: f.intervention === 'anchor_prelude_1000ms' ? existsSync(f.anchorMarker) : null,
+    tail_marker: existsSync(f.marker),
     stdout_bytes: Buffer.byteLength(f.captured?.stdout || ''), stderr_bytes: Buffer.byteLength(f.captured?.stderr || ''),
     expected_json: expectedJson, guardian_process: f.guardianProcess ?? null,
-    wrapper_status: f.captured?.status ?? null, wrapper_signal: f.captured?.signal ?? null, guardian_diagnostic: f.step.guardian_diagnostic ?? null }));
+    wrapper_status: f.captured?.status ?? null, wrapper_signal: f.captured?.signal ?? null, guardian_diagnostic: f.step.guardian_diagnostic ?? null,
+    intervention: f.intervention, source_binding: f.binding, archive: f.archive, phases: f.phases }));
 }
 
 function assertResourceGuardianDeadline(f) {
@@ -293,8 +325,19 @@ function assertResourceGuardianDeadline(f) {
   assert.equal(f.step.exit_code, undefined);
   assert(['deadline', 'anchor_deadline'].includes(f.step.guardian_diagnostic?.primary?.stage),
     `require an actual deadline result, got ${JSON.stringify(f.step.guardian_diagnostic)}`);
-  assert.equal(f.step.guardian_diagnostic.cleanup, null, 'owned-group kill/reap and descriptor cleanup succeeded');
+  assert.equal(f.step.guardian_diagnostic.cleanup, null, 'guardian reported no cleanup error');
   assert(f.elapsed < 3000, 'bounded guardian exited well before the ten-second synthetic tail');
+}
+
+function assertObservedCleanup(f) {
+  assert.equal(f.archive.state, 'written', 'artifact failure is a separate observation gate');
+  assert.equal(f.phases.guardian.state, 'valid');
+  const events = f.phases.guardian.events;
+  assert(events.some(e => e.phase === 'group_kill_returned'));
+  assert(events.some(e => e.phase === 'anchor_reap_returned' && e.sigkill));
+  assert(events.some(e => e.phase === 'cleanup_finished' && e.killed === true && e.reaped === true && e.cleanup_error === false));
+  // These observations concern the owned group syscall and anchor wait only;
+  // they are not an inventory of all processes or proof about unrelated PIDs.
 }
 
 test('resource admission exhausted before spawn starts no guardian or child', () => {
@@ -316,15 +359,52 @@ test('the real guardian expires during anchor startup before the resource child 
   assert.equal(existsSync(f.marker), false, 'startup time consumed the grant before worker launch');
   assert.equal(f.captured.stdout, '');
   assertResourceGuardianDeadline(f);
+  assertObservedCleanup(f);
+  f.releaseEvidence();
 });
 
 test('the existing real guardian encloses a slow resource local tail', t => {
   const f = resourceTailFixture(t);
   observeResourceGuardian(t, f);
-  assert.equal(existsSync(f.marker), true, 'synthetic child entered its local tail');
-  assert.deepEqual(JSON.parse(f.captured.stdout), { ok: true, profile: 'known_record_resources/v1' },
-    'the child really emitted success JSON before the deadline');
+  assertResourceTailPrerequisites(existsSync(f.marker), f.captured.stdout);
   assertResourceGuardianDeadline(f); // success JSON cannot bypass the guardian deadline
+  assertObservedCleanup(f);
+  assert.equal(f.phases.anchor.state, 'valid');
+  assert(f.phases.anchor.events.some(e => e.phase === 'worker_spawn_returned'));
+  assert.equal(f.phases.worker.state, 'valid');
+  assert.deepEqual(f.phases.worker.events.map(e => e.phase), ['entry', 'output_returned', 'tail_returned']);
+  assert(f.phases.worker.events.slice(1).every(e => e.return_code === 0));
+  f.releaseEvidence();
+});
+
+test('phase control records the post-GO pause with no observed worker spawn return', t => {
+  const f = resourceTailFixture(t, { delayBeforeWorker: true });
+  observeResourceGuardian(t, f);
+  assert.equal(f.phases.anchor.state, 'valid');
+  assert(f.phases.anchor.events.some(e => e.phase === 'worker_spawn_begin'));
+  assert(!f.phases.anchor.events.some(e => e.phase === 'worker_spawn_returned'));
+  assert.equal(f.phases.worker.state, 'missing');
+  assert.equal(existsSync(f.marker), false);
+  assert.equal(f.captured.stdout, '');
+  assertResourceGuardianDeadline(f);
+  assertObservedCleanup(f);
+  const g = f.phases.guardian.events;
+  const interval = g.find(e => e.phase === 'group_kill_returned').monotonic_us -
+    g.find(e => e.phase === 'anchor_spawn_begin').monotonic_us;
+  assert(interval >= 0 && interval < 400_000, 'same-guardian clock: kill returned before the authored 400ms pause could finish');
+  f.releaseEvidence();
+});
+
+test('phase control distinguishes an entered worker from a missing output and tail', t => {
+  const f = resourceTailFixture(t, { delayedShell: true });
+  observeResourceGuardian(t, f);
+  assert.equal(f.phases.worker.state, 'valid');
+  assert.deepEqual(f.phases.worker.events.map(e => e.phase), ['entry']);
+  assert.equal(existsSync(f.marker), false);
+  assert.equal(f.captured.stdout, '');
+  assertResourceGuardianDeadline(f);
+  assertObservedCleanup(f);
+  f.releaseEvidence();
 });
 
 
